@@ -6,6 +6,14 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		D6145EF32F7CDE7E00D54F75 /* main.cpp in Sources */ = {isa = PBXBuildFile; fileRef = D6145EF02F7CDE7E00D54F75 /* main.cpp */; };
+		D6145EF52F7CDE7E00D54F75 /* Shaders.metal in Sources */ = {isa = PBXBuildFile; fileRef = D6145EF22F7CDE7E00D54F75 /* Shaders.metal */; };
+		D6E396A52F7CEACC007F637C /* MetalImpl.cpp in Sources */ = {isa = PBXBuildFile; fileRef = D6E396A42F7CE908007F637C /* MetalImpl.cpp */; };
+		D6E396AB2F7D5DC4007F637C /* gemm_fp16.cpp in Sources */ = {isa = PBXBuildFile; fileRef = D6E396AA2F7D5DBC007F637C /* gemm_fp16.cpp */; };
+		D6E396AE2F7D60CC007F637C /* _m2_fp16.metal in Sources */ = {isa = PBXBuildFile; fileRef = D6E396AD2F7D60CC007F637C /* _m2_fp16.metal */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXCopyFilesBuildPhase section */
 		D6145ECA2F7CDE7E00D54F75 /* CopyFiles */ = {
 			isa = PBXCopyFilesBuildPhase;
@@ -20,12 +28,32 @@
 
 /* Begin PBXFileReference section */
 		D6145ECC2F7CDE7E00D54F75 /* SuperKittens */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = SuperKittens; sourceTree = BUILT_PRODUCTS_DIR; };
+		D6145EF02F7CDE7E00D54F75 /* main.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = main.cpp; sourceTree = "<group>"; };
+		D6145EF22F7CDE7E00D54F75 /* Shaders.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = Shaders.metal; sourceTree = "<group>"; };
+		D6E396A42F7CE908007F637C /* MetalImpl.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = MetalImpl.cpp; sourceTree = "<group>"; };
+		D6E396A92F7D5A19007F637C /* README.md */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = README.md; sourceTree = "<group>"; };
+		D6E396AA2F7D5DBC007F637C /* gemm_fp16.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = gemm_fp16.cpp; sourceTree = "<group>"; };
+		D6E396AC2F7D5DC7007F637C /* SuperKittens-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "SuperKittens-Bridging-Header.h"; sourceTree = "<group>"; };
+		D6E396AD2F7D60CC007F637C /* _m2_fp16.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = _m2_fp16.metal; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet section */
+		D6E396B72F7D6469007F637C /* Exceptions for "attn" folder in "Compile Sources" phase from "SuperKittens" target */ = {
+			isa = PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet;
+			buildPhase = D6145EC82F7CDE7E00D54F75 /* Sources */;
+			membershipExceptions = (
+				attn.h,
+			);
+		};
+/* End PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
-		D6145ECE2F7CDE7E00D54F75 /* SuperKittens */ = {
+		D6E396AF2F7D641D007F637C /* attn */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
-			path = SuperKittens;
+			exceptions = (
+				D6E396B72F7D6469007F637C /* Exceptions for "attn" folder in "Compile Sources" phase from "SuperKittens" target */,
+			);
+			path = attn;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -44,8 +72,10 @@
 		D6145EC32F7CDE7E00D54F75 = {
 			isa = PBXGroup;
 			children = (
-				D6145ECE2F7CDE7E00D54F75 /* SuperKittens */,
+				D6E396A92F7D5A19007F637C /* README.md */,
+				D6145EEF2F7CDE7E00D54F75 /* SuperKittens */,
 				D6145ECD2F7CDE7E00D54F75 /* Products */,
+				D614608C2F7CE28600D54F75 /* metal-cpp */,
 			);
 			sourceTree = "<group>";
 		};
@@ -55,6 +85,51 @@
 				D6145ECC2F7CDE7E00D54F75 /* SuperKittens */,
 			);
 			name = Products;
+			sourceTree = "<group>";
+		};
+		D6145EEF2F7CDE7E00D54F75 /* SuperKittens */ = {
+			isa = PBXGroup;
+			children = (
+				D6E396A62F7D58B4007F637C /* kernels */,
+				D6E396A42F7CE908007F637C /* MetalImpl.cpp */,
+				D6145EF02F7CDE7E00D54F75 /* main.cpp */,
+				D6145EF22F7CDE7E00D54F75 /* Shaders.metal */,
+			);
+			path = SuperKittens;
+			sourceTree = "<group>";
+		};
+		D614608C2F7CE28600D54F75 /* metal-cpp */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			path = "metal-cpp";
+			sourceTree = "<group>";
+		};
+		D6E396A62F7D58B4007F637C /* kernels */ = {
+			isa = PBXGroup;
+			children = (
+				D6E396AF2F7D641D007F637C /* attn */,
+				D6E396A72F7D5902007F637C /* gemm */,
+			);
+			path = kernels;
+			sourceTree = "<group>";
+		};
+		D6E396A72F7D5902007F637C /* gemm */ = {
+			isa = PBXGroup;
+			children = (
+				D6E396A82F7D5907007F637C /* m2 */,
+			);
+			path = gemm;
+			sourceTree = "<group>";
+		};
+		D6E396A82F7D5907007F637C /* m2 */ = {
+			isa = PBXGroup;
+			children = (
+				D6E396AA2F7D5DBC007F637C /* gemm_fp16.cpp */,
+				D6E396AC2F7D5DC7007F637C /* SuperKittens-Bridging-Header.h */,
+				D6E396AD2F7D60CC007F637C /* _m2_fp16.metal */,
+			);
+			path = m2;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -73,7 +148,7 @@
 			dependencies = (
 			);
 			fileSystemSynchronizedGroups = (
-				D6145ECE2F7CDE7E00D54F75 /* SuperKittens */,
+				D6E396AF2F7D641D007F637C /* attn */,
 			);
 			name = SuperKittens;
 			packageProductDependencies = (
@@ -93,6 +168,7 @@
 				TargetAttributes = {
 					D6145ECB2F7CDE7E00D54F75 = {
 						CreatedOnToolsVersion = 26.0;
+						LastSwiftMigration = 2600;
 					};
 				};
 			};
@@ -120,6 +196,11 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				D6E396AE2F7D60CC007F637C /* _m2_fp16.metal in Sources */,
+				D6E396AB2F7D5DC4007F637C /* gemm_fp16.cpp in Sources */,
+				D6145EF32F7CDE7E00D54F75 /* main.cpp in Sources */,
+				D6E396A52F7CEACC007F637C /* MetalImpl.cpp in Sources */,
+				D6145EF52F7CDE7E00D54F75 /* Shaders.metal in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -244,16 +325,41 @@
 		D6145ED42F7CDE7E00D54F75 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
+				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/metal-cpp";
+				OTHER_LDFLAGS = (
+					"-framework",
+					Metal,
+					"-framework",
+					Foundation,
+					"-framework",
+					QuartzCore,
+				);
 				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_OBJC_BRIDGING_HEADER = "SuperKittens/kernels/gemm/m2/SuperKittens-Bridging-Header.h";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 6.0;
 			};
 			name = Debug;
 		};
 		D6145ED52F7CDE7E00D54F75 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
+				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/metal-cpp";
+				OTHER_LDFLAGS = (
+					"-framework",
+					Metal,
+					"-framework",
+					Foundation,
+					"-framework",
+					QuartzCore,
+				);
 				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_OBJC_BRIDGING_HEADER = "SuperKittens/kernels/gemm/m2/SuperKittens-Bridging-Header.h";
+				SWIFT_VERSION = 6.0;
 			};
 			name = Release;
 		};
