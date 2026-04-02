@@ -1,13 +1,14 @@
+//
+//  fp16_baseline.metal
+//  SuperKittens — naive FP16 GEMM (one thread per output element)
+//
+
+#include <metal_stdlib>
+
+using namespace metal;
 
 
-
-
-
-
-
-
-
-kernel void fp16_gemm(
+kernel void baseline_gemm(
     device const half*  A       [[buffer(0)]],
     device const half*  B       [[buffer(1)]],
     device half*        C       [[buffer(2)]],
