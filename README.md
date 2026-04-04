@@ -1,9 +1,11 @@
 ## SuperKitten
 
 
-<img alt="image of a cute cat standing fearless" height="300" src="meow.png" title="cute cat" width="200"/>
+<div align="center">
+    <img src="meow.png" height=350 alt="ThunderKittens logo" style="margin-bottom:px"/><br/>
+    <em>SuperKittens: Metal-based tiling primitives for Apple Silicon, inspired by <a href="https://github.com/HazyResearch/ThunderKittens">ThunderKittens</a></em><br/><br/>
+</div>
 
-**TK inspired kernels in Apple's Metal Shading Language!**
 
 
 ## Why?
