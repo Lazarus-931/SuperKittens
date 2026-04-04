@@ -11,12 +11,13 @@
 Writing deep learning metal kernels should be easy; this library aims to do such that, without sacrificing performance.
 
 It is:
-1. ** Simple **
+
+1. **Simple**
 
 SuperKittens is straightforward to write and works seamlessly out the box with your existing apple silicon code running 
 on any of the M(1, 2, 3, 4, 5) chips.
 
-2. ** Fast **
+2. **Fast**
 
 The aim was never sacrificing perf for easier abstractions, we didn't! In opposite, we aim to provide simpler, yet 
 much faster kernels that are still performant. 
