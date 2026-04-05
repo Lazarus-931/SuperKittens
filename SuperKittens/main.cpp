@@ -20,7 +20,7 @@
 int main(int argc, const char* argv[]) {
     
     
-    const char* kernelName = "fused_attention";
+    const char* kernelName = "attn_2048_128";
     uint32_t seq = 2048;
     uint32_t d = 128;
 

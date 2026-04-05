@@ -22,8 +22,19 @@ namespace tools {
 /// float2 is perfect because this holds 8 bytes (.x and .y x 2), defined as a fragment used in the tile
 
 // Reduction op types for templated row_reduce
-struct MaxOp { static float apply(float a, float b) { return metal::max(a, b); } };
-struct SumOp { static float apply(float a, float b) { return a + b; } };
+template<typename T>
+struct MaxOp {
+    static T apply(T a, T b) {
+        return metal::max(a, b);
+    }
+};
+
+template<typename T>
+struct SumOp {
+    static T apply(T a, T b) {
+        return a + b;
+    }
+};
 
 struct Frag {
 
@@ -45,12 +56,12 @@ struct Frag {
 
     void set_coord(uint lane_id) { coord = get_coord(lane_id); }
 
-    void load(const threadgroup float* src, uint stride) {
+    void load(const threadgroup half* src, uint stride) {
         data.x = src[coord.y * stride + coord.x];
         data.y = src[coord.y * stride + coord.x + 1];
     }
 
-    void store(threadgroup float* dst, uint stride) const {
+    void store(threadgroup half* dst, uint stride) const {
         dst[coord.y * stride + coord.x]     = data.x;
         dst[coord.y * stride + coord.x + 1] = data.y;
     }
@@ -69,8 +80,8 @@ struct Frag {
         return v;
     }
 
-    float row_max() const { return row_reduce<MaxOp>(); }
-    float row_sum() const { return row_reduce<SumOp>(); }
+    float row_max() const { return row_reduce<MaxOp<float>>(); }
+    float row_sum() const { return row_reduce<SumOp<float>>(); }
 
     /// in-register arithmetic — no shared memory
     void scale(float s)    { data *= s; }
@@ -84,6 +95,10 @@ struct Frag {
     /// convert from native simdgroup
     void from_simd(thread simdgroup_float8x8& m) {
         data = reinterpret_cast<thread float2&>(m.thread_elements());
+    }
+    
+    void to_simd(thread simdgroup_half8x8& m) const {
+        reinterpret_cast<thread half2&>(m.thread_elements()) = half2(data);
     }
 
     /// convert to native simdgroup
@@ -117,8 +132,13 @@ struct Tile {
         for (int i = 0; i < ROWS * COLS; i++) frags[i].set_coord(lane_id);
     }
 
-    thread Frag& at(int r, int c) { return frags[r * COLS + c]; }
-    const thread Frag& at(int r, int c) const { return frags[r * COLS + c]; }
+    thread Frag& at(int r, int c) {
+        return frags[r * COLS + c];
+    }
+    
+    const thread Frag& at(int r, int c) const {
+        return frags[r * COLS + c];
+    }
 
     /// templated row reduction — works for max, sum, any Op
     template <typename Op>
@@ -130,8 +150,16 @@ struct Tile {
         }
     }
 
-    void row_max(thread float* out) const { row_reduce<MaxOp>(out); }
-    void row_sum(thread float* out) const { row_reduce<SumOp>(out); }
+    void row_max(thread half* out) const {
+        float tmp[ROWS];
+        row_reduce<MaxOp<float>>(tmp);
+        for (int i = 0; i < ROWS; i++) out[i] = half(tmp[i]);
+    }
+    void row_sum(thread half* out) const {
+        float tmp[ROWS];
+        row_reduce<SumOp<float>>(tmp);
+        for (int i = 0; i < ROWS; i++) out[i] = half(tmp[i]);
+    }
 
     /// multiply each row by a per-row scalar
     void row_scale(const thread float* vals) {
@@ -141,7 +169,7 @@ struct Tile {
     }
 
     /// subtract per-row scalar then exp — online softmax in one call
-    void row_softmax_exp(const thread float* maxes) {
+    void row_softmax_exp(const thread half* maxes) {
         for (int i = 0; i < ROWS; i++)
             for (int j = 0; j < COLS; j++) {
                 frags[i * COLS + j].sub(maxes[i]);
@@ -150,7 +178,7 @@ struct Tile {
     }
 
     /// same but exp2 — faster on Apple GPU
-    void row_softmax_exp2(const thread float* maxes) {
+    void row_softmax_exp2(const thread half* maxes) {
         for (int i = 0; i < ROWS; i++)
             for (int j = 0; j < COLS; j++) {
                 frags[i * COLS + j].sub(maxes[i]);
@@ -170,14 +198,14 @@ struct Tile {
     }
 
     /// load all frags from shared memory (frags laid out at frag_stride apart)
-    void load(const threadgroup float* src, uint stride, uint frag_stride) {
+    void load(const threadgroup half* src, uint stride, uint frag_stride) {
         for (int i = 0; i < ROWS; i++)
             for (int j = 0; j < COLS; j++)
                 at(i, j).load(src + i * 8 * stride + j * frag_stride, stride);
     }
 
     /// store all frags to shared memory
-    void store(threadgroup float* dst, uint stride, uint frag_stride) const {
+    void store(threadgroup half* dst, uint stride, uint frag_stride) const {
         for (int i = 0; i < ROWS; i++)
             for (int j = 0; j < COLS; j++)
                 at(i, j).store(dst + i * 8 * stride + j * frag_stride, stride);
