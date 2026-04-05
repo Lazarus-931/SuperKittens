@@ -1,0 +1,11 @@
+import torch, torch.nn.functional as F, time, sys
+seq, d = int(sys.argv[1]), int(sys.argv[2])
+Q = torch.randn(1, 1, seq, d, dtype=torch.float16, device='mps')
+K = torch.randn(1, 1, seq, d, dtype=torch.float16, device='mps')
+V = torch.randn(1, 1, seq, d, dtype=torch.float16, device='mps')
+for _ in range(5): F.scaled_dot_product_attention(Q, K, V)
+torch.mps.synchronize()
+t0 = time.perf_counter()
+F.scaled_dot_product_attention(Q, K, V)
+torch.mps.synchronize()
+print(f"{(time.perf_counter()-t0)*1e6:.1f}")

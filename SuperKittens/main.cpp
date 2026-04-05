@@ -4,142 +4,182 @@
 //
 //  Created by Alazar Manakelew on 3/31/26.
 //
+//  Usage: ./SuperKittens <kernel_name> <seq> <d>
+//  Example: ./SuperKittens fused_attention 2048 128
 
 #include "../metal-cpp/Foundation/Foundation.hpp"
 #include "../metal-cpp/Metal/Metal.hpp"
 #include "../metal-cpp/QuartzCore/QuartzCore.hpp"
 #include <iostream>
 #include <cstring>
-#include <chrono>
 #include <vector>
+#include <algorithm>
+#include <functional>
+#include "attention_ref.h"
 
 int main(int argc, const char* argv[]) {
-    // Defaults
-    uint32_t M = 512, N = 512, K = 512;
-    const char* kernel_name = "fp16_gemm_baseline";
-    int iters = 10;
-
-    // Parse args: ./SuperKittens [kernel] [M] [N] [K] [iters]
-    if (argc > 1) kernel_name = argv[1];
-    if (argc > 2) M = atoi(argv[2]);
-    if (argc > 3) N = atoi(argv[3]);
-    if (argc > 4) K = atoi(argv[4]);
-    if (argc > 5) iters = atoi(argv[5]);
     
+    
+    const char* kernelName = "fused_attention";
+    uint32_t seq = 2048;
+    uint32_t d = 128;
 
+    if (argc > 1) kernelName = argv[1];
+    if (argc > 2) seq = atoi(argv[2]);
+    if (argc > 3) d = atoi(argv[3]);
 
     MTL::Device* device = MTL::CreateSystemDefaultDevice();
     if (!device) { std::cerr << "No Metal device\n"; return 1; }
-    std::cout << "GPU: " << device->name()->utf8String() << std::endl;
 
-    NS::Error* error = nullptr;
+    MTL::CommandQueue* queue = device->newCommandQueue();
     MTL::Library* lib = device->newDefaultLibrary();
     if (!lib) { std::cerr << "No default Metal library\n"; return 1; }
 
-    auto* fn = lib->newFunction(NS::String::string(kernel_name, NS::UTF8StringEncoding));
-    if (!fn) { std::cerr << "Kernel '" << kernel_name << "' not found\n"; return 1; }
-    auto* pso = device->newComputePipelineState(fn, &error);
-    if (!pso) { std::cerr << "Pipeline failed\n"; return 1; }
+    std::cout << "SuperKittens — " << device->name()->utf8String() << std::endl;
 
-    std::cout << "Kernel: " << kernel_name << std::endl;
-    std::cout << "M=" << M << " N=" << N << " K=" << K << " iters=" << iters << std::endl;
+    // find kernel
+    NS::Error* err = nullptr;
+    auto* fn = lib->newFunction(NS::String::string(kernelName, NS::UTF8StringEncoding));
+    if (!fn) { std::cerr << "Kernel not found: " << kernelName << std::endl; return 1; }
+    auto* pso = device->newComputePipelineState(fn, &err);
+    fn->release();
+    if (!pso) { std::cerr << "PSO failed\n"; return 1; }
 
-    // Buffers
-    uint32_t sizeA = M * K, sizeB = K * N, sizeC = M * N;
-    std::vector<__fp16> A(sizeA), B(sizeB);
+    int iters = (seq <= 512) ? 20 : 10;
+
+    // buffers
+    size_t qkv_bytes = seq * d * sizeof(__fp16);
+    auto* bufQ = device->newBuffer(qkv_bytes, MTL::ResourceStorageModeShared);
+    auto* bufK = device->newBuffer(qkv_bytes, MTL::ResourceStorageModeShared);
+    auto* bufV = device->newBuffer(qkv_bytes, MTL::ResourceStorageModeShared);
+    auto* bufO = device->newBuffer(qkv_bytes, MTL::ResourceStorageModeShared);
+    __fp16* pQ = (__fp16*)bufQ->contents();
+    __fp16* pK = (__fp16*)bufK->contents();
+    __fp16* pV = (__fp16*)bufV->contents();
     srand(42);
-    for (uint32_t i = 0; i < sizeA; i++) A[i] = (__fp16)(((float)rand() / RAND_MAX) * 0.5f);
-    for (uint32_t i = 0; i < sizeB; i++) B[i] = (__fp16)(((float)rand() / RAND_MAX) * 0.5f);
-
-    auto* bufA = device->newBuffer(A.data(), sizeA * sizeof(__fp16), MTL::ResourceStorageModeShared);
-    auto* bufB = device->newBuffer(B.data(), sizeB * sizeof(__fp16), MTL::ResourceStorageModeShared);
-    auto* bufC = device->newBuffer(sizeC * sizeof(__fp16), MTL::ResourceStorageModeShared);
-    auto* bufM = device->newBuffer(&M, sizeof(uint32_t), MTL::ResourceStorageModeShared);
-    auto* bufN = device->newBuffer(&N, sizeof(uint32_t), MTL::ResourceStorageModeShared);
-    auto* bufK = device->newBuffer(&K, sizeof(uint32_t), MTL::ResourceStorageModeShared);
-
-    MTL::CommandQueue* queue = device->newCommandQueue();
-
-    // GPU capture — save to tmp/run_N.gputrace
-    std::string traceDir = std::string(getenv("HOME")) + "/SuperKittens/tmp/";
-    int runNum = 1;
-    while (true) {
-        std::string p = traceDir + "run_" + std::to_string(runNum) + ".gputrace";
-        FILE* f = fopen(p.c_str(), "r");
-        if (!f) break;
-        fclose(f);
-        runNum++;
+    for (size_t i = 0; i < seq * d; i++) {
+        pQ[i] = (__fp16)((float)rand() / RAND_MAX * 0.5f);
+        pK[i] = (__fp16)((float)rand() / RAND_MAX * 0.5f);
+        pV[i] = (__fp16)((float)rand() / RAND_MAX * 0.5f);
     }
-    std::string tracePath = traceDir + "run_" + std::to_string(runNum) + ".gputrace";
+    // Params struct for attn_2048_128 and similar kernels
+    struct { uint32_t seq; uint32_t head_dim; uint32_t num_heads; uint32_t causal; } params;
+    params.seq = seq;
+    params.head_dim = d;
+    params.num_heads = 32;
+    params.causal = 0;
+    auto* bufParams = device->newBuffer(&params, sizeof(params), MTL::ResourceStorageModeShared);
 
-    auto* captureMgr = MTL::CaptureManager::sharedCaptureManager();
-    auto* capDesc = MTL::CaptureDescriptor::alloc()->init();
-    capDesc->setCaptureObject(device);
-    capDesc->setDestination(MTL::CaptureDestinationGPUTraceDocument);
-    capDesc->setOutputURL(NS::URL::fileURLWithPath(
-        NS::String::string(tracePath.c_str(), NS::UTF8StringEncoding)));
-    NS::Error* captureErr = nullptr;
-    bool capturing = false;
-    if (!captureMgr->supportsDestination(MTL::CaptureDestinationGPUTraceDocument)) {
-        std::cerr << "GPU trace not supported — enable GPU Frame Capture in Xcode scheme (Edit Scheme > Run > Options > GPU Frame Capture > Metal)" << std::endl;
-    } else {
-        capturing = captureMgr->startCapture(capDesc, &captureErr);
-        if (!capturing && captureErr) {
-            std::cerr << "Capture failed: " << captureErr->localizedDescription()->utf8String() << std::endl;
+    // also keep separate buffers for old-style kernels (fused_attention, naive)
+    auto* bufSeq = device->newBuffer(&seq, sizeof(uint32_t), MTL::ResourceStorageModeShared);
+    auto* bufD = device->newBuffer(&d, sizeof(uint32_t), MTL::ResourceStorageModeShared);
+
+    uint32_t gy = (seq + 15) / 16;
+    bool uses_params = (strstr(kernelName, "attn_") != nullptr);
+
+    // GPU dispatch lambda
+    auto run = [&]() -> double {
+        auto* cmd = queue->commandBuffer();
+        auto* enc = cmd->computeCommandEncoder();
+        enc->setComputePipelineState(pso);
+        enc->setBuffer(bufQ, 0, 0); enc->setBuffer(bufK, 0, 1);
+        enc->setBuffer(bufV, 0, 2); enc->setBuffer(bufO, 0, 3);
+        if (uses_params) {
+            enc->setBuffer(bufParams, 0, 4);
+        } else {
+            enc->setBuffer(bufSeq, 0, 4); enc->setBuffer(bufD, 0, 5);
+        }
+        enc->dispatchThreadgroups(MTL::Size(1, gy, 1), MTL::Size(128, 1, 1));
+        enc->endEncoding();
+        cmd->commit(); cmd->waitUntilCompleted();
+        return cmd->GPUEndTime() - cmd->GPUStartTime();
+    };
+
+    // ── Step 1: Correctness check vs CPU reference ──
+    printf("\n%-20s seq=%-6u d=%-6u\n", kernelName, seq, d);
+    printf("  Verifying against CPU reference...\n");
+
+    // Run CPU reference (float32)
+    std::vector<float> cpu_out(seq * d);
+    attention_cpu(pQ, pK, pV, cpu_out.data(), seq, d);
+
+    // Run GPU once to get output
+    memset(bufO->contents(), 0, qkv_bytes);
+    run();
+
+    __fp16* gpu_out = (__fp16*)bufO->contents();
+    auto vr = verify_attention(gpu_out, cpu_out.data(), seq, d);
+
+    printf("  max_abs_err:  %.6f  (row %u, col %u)\n", vr.max_abs_err, vr.worst_row, vr.worst_col);
+    printf("  mean_abs_err: %.6f\n", vr.mean_abs_err);
+    printf("  l2_rel_err:   %.6f\n", vr.l2_rel_err);
+
+    if (!vr.pass) {
+        printf("  FAIL — output diverges from CPU reference. Skipping benchmark.\n");
+
+        // Print a few bad rows for debugging
+        printf("\n  Sample mismatches (first 5):\n");
+        int shown = 0;
+        for (uint32_t i = 0; i < seq && shown < 5; i++) {
+            for (uint32_t k = 0; k < d && shown < 5; k++) {
+                float g = (float)gpu_out[i * d + k];
+                float c = cpu_out[i * d + k];
+                if (fabsf(g - c) > 0.05f) {
+                    printf("    [%u,%u] gpu=%.4f cpu=%.4f diff=%.4f\n", i, k, g, c, g - c);
+                    shown++;
+                }
+            }
+        }
+
+        bufQ->release(); bufK->release(); bufV->release(); bufO->release();
+        bufSeq->release(); bufD->release(); bufParams->release(); pso->release();
+        queue->release(); lib->release(); device->release();
+        return 1;
+    }
+
+    printf("  PASS\n");
+
+    // ── Step 2: Benchmark (only if correct) ──
+    for (int i = 0; i < 3; i++) run();  // warmup
+    std::vector<double> times;
+    for (int i = 0; i < iters; i++) times.push_back(run());
+    std::sort(times.begin(), times.end());
+    double t = times[iters / 2];
+
+    double us = t * 1e6;
+    double flops = 4.0 * seq * seq * d + 5.0 * seq * seq;
+    double gflops = flops / (us * 1e3);
+
+    printf("  Time:     %.0f us\n", us);
+    printf("  GFLOPS:   %.1f\n", gflops);
+    printf("  Eff:      %.1f%%\n", gflops / 5170.0 * 100);
+
+    // run baselines
+    printf("\n  Baselines:\n");
+    std::string python = "/opt/miniconda3/bin/python3";
+    std::string baseDir = std::string(getenv("HOME")) + "/SuperKittens/SuperKittens/kernels/attn/baseline/";
+    const char* scripts[] = {"torch/bench.py", "mlx/bench.py"};
+    const char* names[] = {"torch", "mlx"};
+    for (int i = 0; i < 2; i++) {
+        std::string cmd = python + " " + baseDir + scripts[i] + " " +
+                          std::to_string(seq) + " " + std::to_string(d);
+        FILE* pipe = popen(cmd.c_str(), "r");
+        if (pipe) {
+            char buf[256];
+            if (fgets(buf, sizeof(buf), pipe)) {
+                float bt, bgf;
+                if (sscanf(buf, "%f,%f", &bt, &bgf) == 2) {
+                    printf("  %-10s %.0f us, %.1f GFLOPS", names[i], bt, bgf);
+                    if (bt > 0) printf(" (%.1fx vs yours)", us / bt);
+                    printf("\n");
+                }
+            }
+            pclose(pipe);
         }
     }
-    capDesc->release();
 
-    // Threadgroup size: 128 for tiled kernels, 256 for baseline
-    bool is_baseline = (strstr(kernel_name, "baseline") != nullptr);
-    MTL::Size threads = is_baseline ? MTL::Size(16, 16, 1) : MTL::Size(16, 8, 1);
-    MTL::Size grid(N, M, 1);
-
-    // Warmup
-    for (int w = 0; w < 3; w++) {
-        auto* cmd = queue->commandBuffer();
-        auto* enc = cmd->computeCommandEncoder();
-        enc->setComputePipelineState(pso);
-        enc->setBuffer(bufA, 0, 0); enc->setBuffer(bufB, 0, 1);
-        enc->setBuffer(bufC, 0, 2); enc->setBuffer(bufM, 0, 3);
-        enc->setBuffer(bufN, 0, 4); enc->setBuffer(bufK, 0, 5);
-        enc->dispatchThreads(grid, threads);
-        enc->endEncoding();
-        cmd->commit();
-        cmd->waitUntilCompleted();
-    }
-
-    // Benchmark
-    auto start = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < iters; i++) {
-        auto* cmd = queue->commandBuffer();
-        auto* enc = cmd->computeCommandEncoder();
-        enc->setComputePipelineState(pso);
-        enc->setBuffer(bufA, 0, 0); enc->setBuffer(bufB, 0, 1);
-        enc->setBuffer(bufC, 0, 2); enc->setBuffer(bufM, 0, 3);
-        enc->setBuffer(bufN, 0, 4); enc->setBuffer(bufK, 0, 5);
-        enc->dispatchThreads(grid, threads);
-        enc->endEncoding();
-        cmd->commit();
-        cmd->waitUntilCompleted();
-    }
-    auto end = std::chrono::high_resolution_clock::now();
-
-    double us = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() / (double)iters;
-    double gflops = (2.0 * M * N * K) / (us * 1e3);
-
-    if (capturing) {
-        captureMgr->stopCapture();
-        std::cout << "\nGPU trace: " << tracePath << std::endl;
-    }
-
-    std::cout << "Time:   " << us << " us" << std::endl;
-    std::cout << "GFLOPS: " << gflops << std::endl;
-
-    // Cleanup
-    bufA->release(); bufB->release(); bufC->release();
-    bufM->release(); bufN->release(); bufK->release();
-    fn->release(); pso->release();
+    bufQ->release(); bufK->release(); bufV->release(); bufO->release();
+    bufSeq->release(); bufD->release(); bufParams->release(); pso->release();
     queue->release(); lib->release(); device->release();
     return 0;
 }

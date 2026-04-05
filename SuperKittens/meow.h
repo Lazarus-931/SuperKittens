@@ -8,20 +8,6 @@
 #ifndef SUPERKITTENS_MEOW_H
 #define SUPERKITTENS_MEOW_H
 
-// Kernel host-side headers
-#include "kernels/gemm/fp16_m2/fp16_m2_gemm.cc"
-#include "kernel/gemm/fp32_m2/fp32_m2_gemm.cc"
-#include "kernels/attn/attn.h"
-
+// nothing here yet — kernel pipeline creation happens in main.cpp
 
 #endif // SUPERKITTENS_MEOW_H
-
-
-#if defined(M1)
-#include <>
-
-#if defined(M2)
-#include <>
-
-#if defined(M3)
-#include <>

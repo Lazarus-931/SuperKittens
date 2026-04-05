@@ -10,4 +10,4 @@ struct GEMM_params {
     const int DB;
     bool tranpose_a;
     bool tranpose_b;
-}
+};

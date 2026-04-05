@@ -7,11 +7,12 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		D60567A02F7FE00100AEC8B0 /* common.metal in Sources */ = {isa = PBXBuildFile; fileRef = D60567A12F7FE00100AEC8B0 /* common.metal */; };
 		D6145EF32F7CDE7E00D54F75 /* main.cpp in Sources */ = {isa = PBXBuildFile; fileRef = D6145EF02F7CDE7E00D54F75 /* main.cpp */; };
 		D6145EF52F7CDE7E00D54F75 /* Shaders.metal in Sources */ = {isa = PBXBuildFile; fileRef = D6145EF22F7CDE7E00D54F75 /* Shaders.metal */; };
+		D6C142602F821CCF003BEB17 /* common.h in Sources */ = {isa = PBXBuildFile; fileRef = D60567A22F7FE00200AEC8B0 /* common.h */; };
+		D6C142612F821CCF003BEB17 /* types.h in Sources */ = {isa = PBXBuildFile; fileRef = D60567A32F7FE00300AEC8B0 /* types.h */; };
 		D6E396A52F7CEACC007F637C /* MetalImpl.cpp in Sources */ = {isa = PBXBuildFile; fileRef = D6E396A42F7CE908007F637C /* MetalImpl.cpp */; };
-		D6E396AB2F7D5DC4007F637C /* fp16_m2_gemm.cpp in Sources */ = {isa = PBXBuildFile; fileRef = D6E396AA2F7D5DBC007F637C /* fp16_m2_gemm.cpp */; };
-		D6E396AE2F7D60CC007F637C /* fp16_m2_gemm.metal in Sources */ = {isa = PBXBuildFile; fileRef = D6E396AD2F7D60CC007F637C /* fp16_m2_gemm.metal */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -27,27 +28,99 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		D60567A12F7FE00100AEC8B0 /* common.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = common.metal; sourceTree = "<group>"; };
+		D60567A22F7FE00200AEC8B0 /* common.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = common.h; sourceTree = "<group>"; };
+		D60567A32F7FE00300AEC8B0 /* types.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = types.h; sourceTree = "<group>"; };
 		D6145ECC2F7CDE7E00D54F75 /* SuperKittens */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = SuperKittens; sourceTree = BUILT_PRODUCTS_DIR; };
 		D6145EF02F7CDE7E00D54F75 /* main.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = main.cpp; sourceTree = "<group>"; };
 		D6145EF22F7CDE7E00D54F75 /* Shaders.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = Shaders.metal; sourceTree = "<group>"; };
 		D6E396A42F7CE908007F637C /* MetalImpl.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = MetalImpl.cpp; sourceTree = "<group>"; };
-		D6E396A92F7D5A19007F637C /* README.md */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = README.md; sourceTree = "<group>"; };
-		D6E396AA2F7D5DBC007F637C /* fp16_m2_gemm.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = fp16_m2_gemm.cpp; sourceTree = "<group>"; };
-		D6E396AD2F7D60CC007F637C /* fp16_m2_gemm.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = fp16_m2_gemm.metal; sourceTree = "<group>"; };
+		D6E396A92F7D5A19007F637C /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
 		D6E396C02F7D718D007F637C /* meow.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = meow.h; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet section */
+		D6C1425D2F821CBE003BEB17 /* Exceptions for "ops" folder in "Compile Sources" phase from "SuperKittens" target */ = {
+			isa = PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet;
+			buildPhase = D6145EC82F7CDE7E00D54F75 /* Sources */;
+			membershipExceptions = (
+				global.h,
+				math.h,
+				memory.h,
+				mma.h,
+			);
+		};
 		D6E396B72F7D6469007F637C /* Exceptions for "attn" folder in "Compile Sources" phase from "SuperKittens" target */ = {
 			isa = PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet;
 			buildPhase = D6145EC82F7CDE7E00D54F75 /* Sources */;
 			membershipExceptions = (
-				attn.h,
+				attn_utils.h,
+				ops.h,
+				params.h,
+				types.h,
 			);
 		};
 /* End PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
+		AA0000010000000000000001 /* traces */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = traces;
+			sourceTree = "<group>";
+		};
+		AA0000020000000000000001 /* ops */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				D6C1425D2F821CBE003BEB17 /* Exceptions for "ops" folder in "Compile Sources" phase from "SuperKittens" target */,
+			);
+			path = ops;
+			sourceTree = "<group>";
+		};
+		D60567A42F7FE00400AEC8B0 /* baseline */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = baseline;
+			sourceTree = "<group>";
+		};
+		D60567A52F7FE00500AEC8B0 /* fp16 */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = fp16;
+			sourceTree = "<group>";
+		};
+		D60567A62F7FE00600AEC8B0 /* M4 */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = M4;
+			sourceTree = "<group>";
+		};
+		D60567A72F7FE00700AEC8B0 /* use */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = use;
+			sourceTree = "<group>";
+		};
+		D60567A82F7FE00800AEC8B0 /* docs */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = docs;
+			sourceTree = "<group>";
+		};
+		D60567A92F7FE00900AEC8B0 /* records */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = records;
+			sourceTree = "<group>";
+		};
+		D6C1420D2F81E84A003BEB17 /* plots */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = plots;
+			sourceTree = "<group>";
+		};
+		D6D9C7FF2F80C7C300CE87B3 /* common */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = common;
+			sourceTree = "<group>";
+		};
+		D6D9C8002F80C8A600CE87B3 /* ffn */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = ffn;
+			sourceTree = "<group>";
+		};
 		D6E396AF2F7D641D007F637C /* attn */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
@@ -69,11 +142,22 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
+		D60567AA2F7FE00A00AEC8B0 /* fp16 */ = {
+			isa = PBXGroup;
+			children = (
+				D60567A32F7FE00300AEC8B0 /* types.h */,
+				D60567A52F7FE00500AEC8B0 /* fp16 */,
+				D60567A92F7FE00900AEC8B0 /* records */,
+			);
+			path = fp16;
+			sourceTree = "<group>";
+		};
 		D6145EC32F7CDE7E00D54F75 = {
 			isa = PBXGroup;
 			children = (
 				D6E396A92F7D5A19007F637C /* README.md */,
 				D6145EEF2F7CDE7E00D54F75 /* SuperKittens */,
+				AA0000010000000000000001 /* traces */,
 				D6145ECD2F7CDE7E00D54F75 /* Products */,
 				D614608C2F7CE28600D54F75 /* metal-cpp */,
 			);
@@ -90,11 +174,14 @@
 		D6145EEF2F7CDE7E00D54F75 /* SuperKittens */ = {
 			isa = PBXGroup;
 			children = (
+				AA0000020000000000000001 /* ops */,
+				D60567A82F7FE00800AEC8B0 /* docs */,
 				D6E396C02F7D718D007F637C /* meow.h */,
 				D6E396A62F7D58B4007F637C /* kernels */,
 				D6E396A42F7CE908007F637C /* MetalImpl.cpp */,
 				D6145EF02F7CDE7E00D54F75 /* main.cpp */,
 				D6145EF22F7CDE7E00D54F75 /* Shaders.metal */,
+				D6C1420D2F81E84A003BEB17 /* plots */,
 			);
 			path = SuperKittens;
 			sourceTree = "<group>";
@@ -109,6 +196,8 @@
 		D6E396A62F7D58B4007F637C /* kernels */ = {
 			isa = PBXGroup;
 			children = (
+				D6D9C8002F80C8A600CE87B3 /* ffn */,
+				D6D9C7FF2F80C7C300CE87B3 /* common */,
 				D6E396AF2F7D641D007F637C /* attn */,
 				D6E396A72F7D5902007F637C /* gemm */,
 			);
@@ -118,18 +207,14 @@
 		D6E396A72F7D5902007F637C /* gemm */ = {
 			isa = PBXGroup;
 			children = (
-				D6E396A82F7D5907007F637C /* fp16_m2 */,
+				D60567A22F7FE00200AEC8B0 /* common.h */,
+				D60567A12F7FE00100AEC8B0 /* common.metal */,
+				D60567A42F7FE00400AEC8B0 /* baseline */,
+				D60567AA2F7FE00A00AEC8B0 /* fp16 */,
+				D60567A62F7FE00600AEC8B0 /* M4 */,
+				D60567A72F7FE00700AEC8B0 /* use */,
 			);
 			path = gemm;
-			sourceTree = "<group>";
-		};
-		D6E396A82F7D5907007F637C /* fp16_m2 */ = {
-			isa = PBXGroup;
-			children = (
-				D6E396AA2F7D5DBC007F637C /* fp16_m2_gemm.cpp */,
-				D6E396AD2F7D60CC007F637C /* fp16_m2_gemm.metal */,
-			);
-			path = fp16_m2;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -148,6 +233,15 @@
 			dependencies = (
 			);
 			fileSystemSynchronizedGroups = (
+				D60567A42F7FE00400AEC8B0 /* baseline */,
+				D60567A52F7FE00500AEC8B0 /* fp16 */,
+				D60567A62F7FE00600AEC8B0 /* M4 */,
+				D60567A72F7FE00700AEC8B0 /* use */,
+				D60567A82F7FE00800AEC8B0 /* docs */,
+				D60567A92F7FE00900AEC8B0 /* records */,
+				D6C1420D2F81E84A003BEB17 /* plots */,
+				D6D9C7FF2F80C7C300CE87B3 /* common */,
+				D6D9C8002F80C8A600CE87B3 /* ffn */,
 				D6E396AF2F7D641D007F637C /* attn */,
 			);
 			name = SuperKittens;
@@ -196,11 +290,12 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				D6E396AE2F7D60CC007F637C /* fp16_m2_gemm.metal in Sources */,
-				D6E396AB2F7D5DC4007F637C /* fp16_m2_gemm.cpp in Sources */,
+				D6C142602F821CCF003BEB17 /* common.h in Sources */,
+				D6C142612F821CCF003BEB17 /* types.h in Sources */,
 				D6145EF32F7CDE7E00D54F75 /* main.cpp in Sources */,
 				D6E396A52F7CEACC007F637C /* MetalImpl.cpp in Sources */,
 				D6145EF52F7CDE7E00D54F75 /* Shaders.metal in Sources */,
+				D60567A02F7FE00100AEC8B0 /* common.metal in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -337,6 +432,8 @@
 					QuartzCore,
 				);
 				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 6.0;
 			};
 			name = Debug;
 		};
@@ -355,6 +452,7 @@
 					QuartzCore,
 				);
 				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 6.0;
 			};
 			name = Release;
 		};
