@@ -2,10 +2,8 @@
 //  main.cpp
 //  SuperKittens
 //
-//  Created by Alazar Manakelew on 3/31/26.
-//
 //  Usage: ./SuperKittens <kernel_name> <seq> <d>
-//  Example: ./SuperKittens fused_attention 2048 128
+//  Example: ./SuperKittens attn_2048_128 2048 128
 
 #include "../metal-cpp/Foundation/Foundation.hpp"
 #include "../metal-cpp/Metal/Metal.hpp"
@@ -18,8 +16,7 @@
 #include "attention_ref.h"
 
 int main(int argc, const char* argv[]) {
-    
-    
+
     const char* kernelName = "attn_2048_128";
     uint32_t seq = 2048;
     uint32_t d = 128;
@@ -37,7 +34,6 @@ int main(int argc, const char* argv[]) {
 
     std::cout << "SuperKittens — " << device->name()->utf8String() << std::endl;
 
-    // find kernel
     NS::Error* err = nullptr;
     auto* fn = lib->newFunction(NS::String::string(kernelName, NS::UTF8StringEncoding));
     if (!fn) { std::cerr << "Kernel not found: " << kernelName << std::endl; return 1; }
@@ -47,7 +43,6 @@ int main(int argc, const char* argv[]) {
 
     int iters = (seq <= 512) ? 20 : 10;
 
-    // buffers
     size_t qkv_bytes = seq * d * sizeof(__fp16);
     auto* bufQ = device->newBuffer(qkv_bytes, MTL::ResourceStorageModeShared);
     auto* bufK = device->newBuffer(qkv_bytes, MTL::ResourceStorageModeShared);
@@ -62,7 +57,7 @@ int main(int argc, const char* argv[]) {
         pK[i] = (__fp16)((float)rand() / RAND_MAX * 0.5f);
         pV[i] = (__fp16)((float)rand() / RAND_MAX * 0.5f);
     }
-    // Params struct for attn_2048_128 and similar kernels
+
     struct { uint32_t seq; uint32_t head_dim; uint32_t num_heads; uint32_t causal; } params;
     params.seq = seq;
     params.head_dim = d;
@@ -70,14 +65,12 @@ int main(int argc, const char* argv[]) {
     params.causal = 0;
     auto* bufParams = device->newBuffer(&params, sizeof(params), MTL::ResourceStorageModeShared);
 
-    // also keep separate buffers for old-style kernels (fused_attention, naive)
     auto* bufSeq = device->newBuffer(&seq, sizeof(uint32_t), MTL::ResourceStorageModeShared);
     auto* bufD = device->newBuffer(&d, sizeof(uint32_t), MTL::ResourceStorageModeShared);
 
     uint32_t gy = (seq + 15) / 16;
     bool uses_params = (strstr(kernelName, "attn_") != nullptr);
 
-    // GPU dispatch lambda
     auto run = [&]() -> double {
         auto* cmd = queue->commandBuffer();
         auto* enc = cmd->computeCommandEncoder();
@@ -95,15 +88,13 @@ int main(int argc, const char* argv[]) {
         return cmd->GPUEndTime() - cmd->GPUStartTime();
     };
 
-    // ── Step 1: Correctness check vs CPU reference ──
+    // ── Correctness check ──
     printf("\n%-20s seq=%-6u d=%-6u\n", kernelName, seq, d);
     printf("  Verifying against CPU reference...\n");
 
-    // Run CPU reference (float32)
     std::vector<float> cpu_out(seq * d);
     attention_cpu(pQ, pK, pV, cpu_out.data(), seq, d);
 
-    // Run GPU once to get output
     memset(bufO->contents(), 0, qkv_bytes);
     run();
 
@@ -116,8 +107,6 @@ int main(int argc, const char* argv[]) {
 
     if (!vr.pass) {
         printf("  FAIL — output diverges from CPU reference. Skipping benchmark.\n");
-
-        // Print a few bad rows for debugging
         printf("\n  Sample mismatches (first 5):\n");
         int shown = 0;
         for (uint32_t i = 0; i < seq && shown < 5; i++) {
@@ -130,7 +119,6 @@ int main(int argc, const char* argv[]) {
                 }
             }
         }
-
         bufQ->release(); bufK->release(); bufV->release(); bufO->release();
         bufSeq->release(); bufD->release(); bufParams->release(); pso->release();
         queue->release(); lib->release(); device->release();
@@ -139,8 +127,8 @@ int main(int argc, const char* argv[]) {
 
     printf("  PASS\n");
 
-    // ── Step 2: Benchmark (only if correct) ──
-    for (int i = 0; i < 3; i++) run();  // warmup
+    // ── Benchmark ──
+    for (int i = 0; i < 3; i++) run();
     std::vector<double> times;
     for (int i = 0; i < iters; i++) times.push_back(run());
     std::sort(times.begin(), times.end());
@@ -154,7 +142,7 @@ int main(int argc, const char* argv[]) {
     printf("  GFLOPS:   %.1f\n", gflops);
     printf("  Eff:      %.1f%%\n", gflops / 5170.0 * 100);
 
-    // run baselines
+    // ── Baselines ──
     printf("\n  Baselines:\n");
     std::string python = "/opt/miniconda3/bin/python3";
     std::string baseDir = std::string(getenv("HOME")) + "/SuperKittens/SuperKittens/kernels/attn/baseline/";
