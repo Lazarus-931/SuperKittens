@@ -65,12 +65,10 @@ kernel void attn_2048_128(
         simdgroup_float8x8 scores[8] = {};
 
         for (uint kb = 0; kb < D; kb += 16) {
-            // Load Q tile: 16 rows × 16 cols
             for (uint i = lid; i < 16 * 16; i += 128) {
                 uint r = i / 16, c = i % 16;
                 Qs[r * Q_STRIDE + c] = half(Q[(tileRow + r) * D + kb + c]) * SCALE;
             }
-            // Load K^T tile: 16 rows × 128 cols (coalesced device reads)
             for (uint i = lid; i < 16 * 128; i += 128) {
                 uint r = i % 16, c = i / 16;
                 KVs[r * KV_STRIDE + c] = K[(t * 128 + c) * D + kb + r];
@@ -78,8 +76,7 @@ kernel void attn_2048_128(
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             simdgroup_half8x8 a0, b0, b1, b2, b3, b4, b5, b6, b7;
-            
-            // First 8 rows of K^T × Q rows at sr
+
             simdgroup_load(a0, Qs + sr * Q_STRIDE, Q_STRIDE);
             simdgroup_load(b0, KVs + sc,      KV_STRIDE);
             simdgroup_load(b1, KVs + sc + 8,  KV_STRIDE);
@@ -98,7 +95,6 @@ kernel void attn_2048_128(
             simdgroup_multiply_accumulate(scores[6], a0, b6, scores[6]);
             simdgroup_multiply_accumulate(scores[7], a0, b7, scores[7]);
 
-            // Second 8 rows of K^T
             simdgroup_load(a0, Qs + sr * Q_STRIDE + 8, Q_STRIDE);
             simdgroup_load(b0, KVs + 8 * KV_STRIDE + sc,      KV_STRIDE);
             simdgroup_load(b1, KVs + 8 * KV_STRIDE + sc + 8,  KV_STRIDE);
@@ -217,7 +213,7 @@ kernel void attn_2048_128(
         }
     }
 
-    // ── Normalize + write to device ──
+    
     Tile<1, 8> O_final;
     O_final.set_coord(lane_id);
     O_final.from_simd(output_acc);
@@ -225,6 +221,16 @@ kernel void attn_2048_128(
     float inv_sum[1] = {1.0f / rsum};
     O_final.row_scale(inv_sum);
 
+    // Store to shared memory (each SIMD writes its 8×64 region)
     for (int j = 0; j < 8; j++)
-        O_final.at(0, j).store(O + (tileRow + sr) * D + sc + j * 8, D);
+        O_final.at(0, j).store(KVs + sr * KV_STRIDE + sc + j * 8, KV_STRIDE);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Coalesced write: 128 threads write 16×128 = 2048 halfs
+    for (uint i = lid; i < 16 * D; i += 128) {
+        uint r = i / D, c = i % D;
+        O[(tileRow + r) * D + c] = KVs[r * KV_STRIDE + c];
+    }
 }
+
+
