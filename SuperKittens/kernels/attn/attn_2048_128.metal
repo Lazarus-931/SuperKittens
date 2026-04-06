@@ -4,7 +4,7 @@
 //
 //  Specialized fused attention for seq=2048, d=128
 //  2×2 SIMD layout: 2 row groups × 2 col groups
-//  Q reloaded per k-block to shrink shared memory → better occupancy
+//  Q loaded once (persistent); K then V loaded through shared KVs buffer
 
 #include <metal_stdlib>
 #include "params.h"
@@ -30,29 +30,20 @@ kernel void attn_2048_128(
     constexpr uint D = 128;
     constexpr uint SEQ = 2048;
     constexpr uint KEY_TILES = SEQ / 128;
-    constexpr float SCALE = 1.0f / 11.3137f;
-    // Autotuned strides (swept 350 configs, best avg for seq=2048 d=128):
-    //   Q_STRIDE=17 KV_STRIDE=134 V_STRIDE=67 → 553 GFLOPS / 3921 us on M2
-    //   Runner-up: qs=17 kvs=132 vs=67 → 580 avg, qs=18 kvs=134 vs=67 → 573 avg
-    constexpr uint Q_STRIDE = 17;
+    constexpr float SCALE = (1.0f / 11.3137f) * 1.4426950408889634f; // prescale by log2(e) for exp2
     constexpr uint KV_STRIDE = 134;
-    constexpr uint V_STRIDE = 67;
 
-    // Shared memory layout (~9.5 KB total, autotuned strides):
-    //   Qs:      16 × 17  = 0.5 KB   (Q reloaded per k-block)
-    //   KVs:     16 × 134 = 4.3 KB   (K^T, then softmax scores)
-    //   Vs:   2× 16 × 67  = 4.3 KB   (V: one block per col group)
-    //   scratch:  32 halfs = 0.1 KB
-    threadgroup half Qs[16 * Q_STRIDE];
+   
+    constexpr uint Q_FULL_STRIDE = 136; // D + 8 padding
+    threadgroup half Qs[16 * Q_FULL_STRIDE];
     threadgroup half KVs[16 * KV_STRIDE];
-    threadgroup half Vs[2 * 16 * V_STRIDE];
     threadgroup half simd_scratch[4 * 8];
 
     uint tileRow = gid.y * 16;
     uint sr = (simd_id / 2) * 8;
     uint sc = (simd_id % 2) * 64;
     uint partner = simd_id ^ 1;
-    uint col_group = simd_id % 2;      
+    uint col_group = simd_id % 2;
 
     float rmax = -INFINITY;
     float rsum = 0.0f;
@@ -61,14 +52,18 @@ kernel void attn_2048_128(
     using namespace superkittens::tools;
     short my_row = Frag::get_coord(lane_id).y;
 
+  
+    for (uint i = lid; i < 16 * D; i += 128) {
+        uint r = i / D, c = i % D;
+        Qs[r * Q_FULL_STRIDE + c] = half(Q[(tileRow + r) * D + c]) * SCALE;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
     for (uint t = 0; t < KEY_TILES; t++) {
         simdgroup_float8x8 scores[8] = {};
 
         for (uint kb = 0; kb < D; kb += 16) {
-            for (uint i = lid; i < 16 * 16; i += 128) {
-                uint r = i / 16, c = i % 16;
-                Qs[r * Q_STRIDE + c] = half(Q[(tileRow + r) * D + kb + c]) * SCALE;
-            }
+           
             for (uint i = lid; i < 16 * 128; i += 128) {
                 uint r = i % 16, c = i / 16;
                 KVs[r * KV_STRIDE + c] = K[(t * 128 + c) * D + kb + r];
@@ -77,7 +72,8 @@ kernel void attn_2048_128(
 
             simdgroup_half8x8 a0, b0, b1, b2, b3, b4, b5, b6, b7;
 
-            simdgroup_load(a0, Qs + sr * Q_STRIDE, Q_STRIDE);
+           
+            simdgroup_load(a0, Qs + sr * Q_FULL_STRIDE + kb, Q_FULL_STRIDE);
             simdgroup_load(b0, KVs + sc,      KV_STRIDE);
             simdgroup_load(b1, KVs + sc + 8,  KV_STRIDE);
             simdgroup_load(b2, KVs + sc + 16, KV_STRIDE);
@@ -95,7 +91,7 @@ kernel void attn_2048_128(
             simdgroup_multiply_accumulate(scores[6], a0, b6, scores[6]);
             simdgroup_multiply_accumulate(scores[7], a0, b7, scores[7]);
 
-            simdgroup_load(a0, Qs + sr * Q_STRIDE + 8, Q_STRIDE);
+            simdgroup_load(a0, Qs + sr * Q_FULL_STRIDE + kb + 8, Q_FULL_STRIDE);
             simdgroup_load(b0, KVs + 8 * KV_STRIDE + sc,      KV_STRIDE);
             simdgroup_load(b1, KVs + 8 * KV_STRIDE + sc + 8,  KV_STRIDE);
             simdgroup_load(b2, KVs + 8 * KV_STRIDE + sc + 16, KV_STRIDE);
@@ -116,12 +112,12 @@ kernel void attn_2048_128(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 
-        // ── Step 2: online softmax in registers ──
+
         Tile<1, 8> S;
         S.set_coord(lane_id);
         S.from_simd(scores);
 
-        // Row max — local then cross-SIMD (per-row, between partners)
+        
         half tile_max[1];
         S.row_max(tile_max);
         simd_scratch[simd_id * 8 + my_row] = tile_max[0];
@@ -129,21 +125,22 @@ kernel void attn_2048_128(
         tile_max[0] = max(tile_max[0], simd_scratch[partner * 8 + my_row]);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Online softmax state update
+        
         float old_max = rmax;
+        
         rmax = max(rmax, float(tile_max[0]));
-        float rescale = metal::fast::exp(old_max - rmax);
+        
+        float rescale = metal::fast::exp2(old_max - rmax);
         rsum *= rescale;
 
-        // Rescale previous output in registers
         Tile<1, 8> Out;
         Out.set_coord(lane_id);
         Out.from_simd(output_acc);
         float rescale_arr[1] = {rescale};
         Out.row_scale(rescale_arr);
 
-        // exp(score - max) + row sum, then cross-SIMD sum (per-row)
-        S.row_softmax_exp(tile_max);
+       
+        S.row_softmax_exp2(tile_max);
         half tile_sum[1];
         S.row_sum(tile_sum);
         simd_scratch[simd_id * 8 + my_row] = tile_sum[0];
@@ -152,21 +149,22 @@ kernel void attn_2048_128(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         rsum += tile_sum[0];
 
-        // ── Step 3: scores × V ──
+
         for (int i = 0; i < 8; i++) Out.at(0, i).to_simd(output_acc[i]);
 
-        // Store softmax scores to KVs (full 16×128)
+        
         for (int i = 0; i < 8; i++)
             S.at(0, i).store(KVs + sr * KV_STRIDE + sc + i * 8, KV_STRIDE);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        threadgroup half* my_Vs = Vs + col_group * 16 * V_STRIDE;
+        uint v_col_off = col_group * 68; // 0 or 68
+        threadgroup half* my_Vs = Qs + v_col_off;
 
         for (uint vk = 0; vk < 128; vk += 16) {
             uint pair_lid = (simd_id / 2) * 32 + lane_id;
             for (uint i = pair_lid; i < 16 * 64; i += 64) {
                 uint r = i / 64, c = i % 64;
-                my_Vs[r * V_STRIDE + c] = half(V[(t * 128 + vk + r) * D + sc + c]);
+                my_Vs[r * Q_FULL_STRIDE + c] = V[(t * 128 + vk + r) * D + sc + c];
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -174,15 +172,14 @@ kernel void attn_2048_128(
             simdgroup_load(s0, KVs + sr * KV_STRIDE + vk,     KV_STRIDE);
             simdgroup_load(s1, KVs + sr * KV_STRIDE + vk + 8, KV_STRIDE);
 
-            // First 8 rows of V
-            simdgroup_load(v0, my_Vs,      V_STRIDE);
-            simdgroup_load(v1, my_Vs + 8,  V_STRIDE);
-            simdgroup_load(v2, my_Vs + 16, V_STRIDE);
-            simdgroup_load(v3, my_Vs + 24, V_STRIDE);
-            simdgroup_load(v4, my_Vs + 32, V_STRIDE);
-            simdgroup_load(v5, my_Vs + 40, V_STRIDE);
-            simdgroup_load(v6, my_Vs + 48, V_STRIDE);
-            simdgroup_load(v7, my_Vs + 56, V_STRIDE);
+            simdgroup_load(v0, my_Vs,      Q_FULL_STRIDE);
+            simdgroup_load(v1, my_Vs + 8,  Q_FULL_STRIDE);
+            simdgroup_load(v2, my_Vs + 16, Q_FULL_STRIDE);
+            simdgroup_load(v3, my_Vs + 24, Q_FULL_STRIDE);
+            simdgroup_load(v4, my_Vs + 32, Q_FULL_STRIDE);
+            simdgroup_load(v5, my_Vs + 40, Q_FULL_STRIDE);
+            simdgroup_load(v6, my_Vs + 48, Q_FULL_STRIDE);
+            simdgroup_load(v7, my_Vs + 56, Q_FULL_STRIDE);
             simdgroup_multiply_accumulate(output_acc[0], s0, v0, output_acc[0]);
             simdgroup_multiply_accumulate(output_acc[1], s0, v1, output_acc[1]);
             simdgroup_multiply_accumulate(output_acc[2], s0, v2, output_acc[2]);
@@ -192,15 +189,14 @@ kernel void attn_2048_128(
             simdgroup_multiply_accumulate(output_acc[6], s0, v6, output_acc[6]);
             simdgroup_multiply_accumulate(output_acc[7], s0, v7, output_acc[7]);
 
-            // Second 8 rows of V
-            simdgroup_load(v0, my_Vs + 8 * V_STRIDE,      V_STRIDE);
-            simdgroup_load(v1, my_Vs + 8 * V_STRIDE + 8,  V_STRIDE);
-            simdgroup_load(v2, my_Vs + 8 * V_STRIDE + 16, V_STRIDE);
-            simdgroup_load(v3, my_Vs + 8 * V_STRIDE + 24, V_STRIDE);
-            simdgroup_load(v4, my_Vs + 8 * V_STRIDE + 32, V_STRIDE);
-            simdgroup_load(v5, my_Vs + 8 * V_STRIDE + 40, V_STRIDE);
-            simdgroup_load(v6, my_Vs + 8 * V_STRIDE + 48, V_STRIDE);
-            simdgroup_load(v7, my_Vs + 8 * V_STRIDE + 56, V_STRIDE);
+            simdgroup_load(v0, my_Vs + 8 * Q_FULL_STRIDE,      Q_FULL_STRIDE);
+            simdgroup_load(v1, my_Vs + 8 * Q_FULL_STRIDE + 8,  Q_FULL_STRIDE);
+            simdgroup_load(v2, my_Vs + 8 * Q_FULL_STRIDE + 16, Q_FULL_STRIDE);
+            simdgroup_load(v3, my_Vs + 8 * Q_FULL_STRIDE + 24, Q_FULL_STRIDE);
+            simdgroup_load(v4, my_Vs + 8 * Q_FULL_STRIDE + 32, Q_FULL_STRIDE);
+            simdgroup_load(v5, my_Vs + 8 * Q_FULL_STRIDE + 40, Q_FULL_STRIDE);
+            simdgroup_load(v6, my_Vs + 8 * Q_FULL_STRIDE + 48, Q_FULL_STRIDE);
+            simdgroup_load(v7, my_Vs + 8 * Q_FULL_STRIDE + 56, Q_FULL_STRIDE);
             simdgroup_multiply_accumulate(output_acc[0], s1, v0, output_acc[0]);
             simdgroup_multiply_accumulate(output_acc[1], s1, v1, output_acc[1]);
             simdgroup_multiply_accumulate(output_acc[2], s1, v2, output_acc[2]);
@@ -209,6 +205,14 @@ kernel void attn_2048_128(
             simdgroup_multiply_accumulate(output_acc[5], s1, v5, output_acc[5]);
             simdgroup_multiply_accumulate(output_acc[6], s1, v6, output_acc[6]);
             simdgroup_multiply_accumulate(output_acc[7], s1, v7, output_acc[7]);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (t + 1 < KEY_TILES) {
+            for (uint i = lid; i < 16 * D; i += 128) {
+                uint r = i / D, c = i % D;
+                Qs[r * Q_FULL_STRIDE + c] = half(Q[(tileRow + r) * D + c]) * SCALE;
+            }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
     }
@@ -221,12 +225,10 @@ kernel void attn_2048_128(
     float inv_sum[1] = {1.0f / rsum};
     O_final.row_scale(inv_sum);
 
-    // Store to shared memory (each SIMD writes its 8×64 region)
     for (int j = 0; j < 8; j++)
         O_final.at(0, j).store(KVs + sr * KV_STRIDE + sc + j * 8, KV_STRIDE);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Coalesced write: 128 threads write 16×128 = 2048 halfs
     for (uint i = lid; i < 16 * D; i += 128) {
         uint r = i / D, c = i % D;
         O[(tileRow + r) * D + c] = KVs[r * KV_STRIDE + c];
