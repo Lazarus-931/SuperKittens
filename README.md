@@ -10,7 +10,11 @@
 
 ## Why?
 
-Writing deep learning metal kernels should be easy; this library aims to do such that, without sacrificing performance.
+Writing deep learning metal kernels should be easy; this library aims to do such that, without sacrificing performance for abstraction, it delivers the fastest compute (not theoretical), so you can sqeeze out maximum perf! It is .metal, headers and .c, and was developed with easy use in mind. It has an assortment of metal kernels so your chips don't starve!
+
+Bridging the gap between bleeding intelligence and consumer hardware!
+
+list it MEOW! - **Maxamizing effficient operation's** per **Watt**
 
 It is:
 
@@ -43,4 +47,16 @@ April 2026:
   - [ ] M4
   - [ ] M5
 - [ ] Fp16 Support across GEMM for all chips
-- 
+
+### What's coming
+
+The whole point of SuperKittens is giving you fast, composable Metal primitives you can drop into any project — a Swift app, a C++ inference engine, whatever. No framework lock-in, just headers and shaders.
+
+Here's where we're headed:
+
+- **Templated attention** — support any head dim (64, 96, 128, 256) and sequence length out of the box, not just hardcoded configs
+- **Causal masking** — fused into the attention kernel, not bolted on after
+- **Multi-head and GQA** — batched heads with grouped-query attention so you can run real models
+- **GEMM for common inference shapes** — not trying to be a general BLAS, just the shapes that actually show up in transformer inference
+- **One include, everything works** — `#include "superkittens.h"` gives you BlockMMA, Tile, Frag, loaders, and every fused kernel. Compose them into your own stuff or use the ready-made ones
+- **Docs that actually help** — examples showing how to build a custom kernel from the primitives, not just API reference
