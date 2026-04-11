@@ -57,7 +57,7 @@ METAL_FUNC void apply_causal_decay(thread superkittens::mma::Tile<ROWS, COLS>& t
             uint abs_col0 = c * 8 + local_col;
             uint abs_col1 = abs_col0 + 1;
 
-            auto& d = reinterpret_cast<thread float2&>(tile.data[r][c].thread_elements());
+            auto d = reinterpret_cast<thread float2&>(tile.data[r][c].thread_elements());
 
             d.x *= (abs_col0 <= abs_row) ? exp(cs_row - a_cumsum[abs_col0]) : 0.0f;
             d.y *= (abs_col1 <= abs_row) ? exp(cs_row - a_cumsum[abs_col1]) : 0.0f;
@@ -78,6 +78,47 @@ METAL_FUNC bool is_contiguous(const thread int* shape, const thread int* strides
     }
     return true;
 }
+
+
+////////////////////////////////////////////////////////////////////////////////////////////
+/// SIMD-based threadgroup cumsum helper
+///
+////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename T, int N>
+METAL_FUNC void threadgroup_cumsum(
+    threadgroup T* data,
+    threadgroup T* simd_totals,
+    uint lid, uint lane_id, uint simd_id)
+{
+    static_assert(N % 32 == 0, "N must be a multiple of SIMD width (32)");
+    constexpr int N_SIMDS = N / 32;
+
+    // Stage 1: each SIMD scans its own 32-lane slice
+    if (lid < N) {
+        T val = data[lid];
+        cumsum_simd<T>(val, lane_id);
+        data[lid] = val;
+        if (lane_id == 31) simd_totals[simd_id] = val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Stage 2: SIMD 0 scans the per-SIMD totals (N_SIMDS <= 32 by construction)
+    if (simd_id == 0 && lane_id < N_SIMDS) {
+        T t = simd_totals[lane_id];
+        cumsum_simd<T>(t, lane_id);
+        simd_totals[lane_id] = t;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Stage 3: add the prefix of preceding SIMDs back into each slice
+    if (lid < N && simd_id > 0) {
+        data[lid] += simd_totals[simd_id - 1];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+
 
 } // namespace tools
 } // namespace superkittens

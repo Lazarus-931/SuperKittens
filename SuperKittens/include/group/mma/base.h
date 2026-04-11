@@ -60,7 +60,7 @@ struct Tile {
     METAL_FUNC void scale(float s) {
         for (int r = 0; r < ROWS; r++)
             for (int c = 0; c < COLS; c++) {
-                auto& d = reinterpret_cast<thread float2&>(data[r][c].thread_elements());
+                auto&\ d = reinterpret_cast<thread float2&>(data[r][c].thread_elements());
                 d *= s;
             }
     }
@@ -89,6 +89,10 @@ struct Tile {
                 auto s = reinterpret_cast<const thread float2&>(src.data[r][c].thread_elements());
                 d = s;
             }
+    }
+    
+    METAL_FUNC void copy_to_global(device half* dst, uint ld) const {
+        
     }
 
 

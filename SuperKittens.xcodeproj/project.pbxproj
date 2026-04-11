@@ -7,10 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		D60567A02F7FE00100AEC8B0 /* common.metal in Sources */ = {isa = PBXBuildFile; fileRef = D60567A12F7FE00100AEC8B0 /* common.metal */; };
 		D6145EF32F7CDE7E00D54F75 /* main.cpp in Sources */ = {isa = PBXBuildFile; fileRef = D6145EF02F7CDE7E00D54F75 /* main.cpp */; };
 		D6BC3CA42F8546EF00DC6D4F /* utils.metal in Sources */ = {isa = PBXBuildFile; fileRef = D6BC3CA32F8546EC00DC6D4F /* utils.metal */; };
-		D6C142602F821CCF003BEB17 /* gemm.h in Sources */ = {isa = PBXBuildFile; fileRef = D60567A22F7FE00200AEC8B0 /* gemm.h */; };
 		D6E396A52F7CEACC007F637C /* MetalImpl.cpp in Sources */ = {isa = PBXBuildFile; fileRef = D6E396A42F7CE908007F637C /* MetalImpl.cpp */; };
 /* End PBXBuildFile section */
 
@@ -27,8 +25,6 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
-		D60567A12F7FE00100AEC8B0 /* common.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = common.metal; sourceTree = "<group>"; };
-		D60567A22F7FE00200AEC8B0 /* gemm.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = gemm.h; sourceTree = "<group>"; };
 		D6145ECC2F7CDE7E00D54F75 /* SuperKittens */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = SuperKittens; sourceTree = BUILT_PRODUCTS_DIR; };
 		D6145EF02F7CDE7E00D54F75 /* main.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = main.cpp; sourceTree = "<group>"; };
 		D6BC3CA32F8546EC00DC6D4F /* utils.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = utils.metal; sourceTree = "<group>"; };
@@ -57,17 +53,21 @@
 				types.h,
 			);
 		};
+		D6FF000F2F90000000000001 /* Exceptions for "gemm" folder in "Compile Sources" phase from "SuperKittens" target */ = {
+			isa = PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet;
+			buildPhase = D6145EC82F7CDE7E00D54F75 /* Sources */;
+			membershipExceptions = (
+				gemm.h,
+				ops.h,
+				utils/accumilate.h,
+			);
+		};
 /* End PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		AA0000010000000000000001 /* traces */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			path = traces;
-			sourceTree = "<group>";
-		};
-		D60567A72F7FE00700AEC8B0 /* utils */ = {
-			isa = PBXFileSystemSynchronizedRootGroup;
-			path = utils;
 			sourceTree = "<group>";
 		};
 		D60567A82F7FE00800AEC8B0 /* docs */ = {
@@ -106,6 +106,14 @@
 		D6D9C8002F80C8A600CE87B3 /* ffn */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			path = ffn;
+			sourceTree = "<group>";
+		};
+		D6E396A72F7D5902007F637C /* gemm */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				D6FF000F2F90000000000001 /* Exceptions for "gemm" folder in "Compile Sources" phase from "SuperKittens" target */,
+			);
+			path = gemm;
 			sourceTree = "<group>";
 		};
 		D6E396AF2F7D641D007F637C /* attn */ = {
@@ -191,16 +199,6 @@
 			path = kernels;
 			sourceTree = "<group>";
 		};
-		D6E396A72F7D5902007F637C /* gemm */ = {
-			isa = PBXGroup;
-			children = (
-				D60567A22F7FE00200AEC8B0 /* gemm.h */,
-				D60567A12F7FE00100AEC8B0 /* common.metal */,
-				D60567A72F7FE00700AEC8B0 /* utils */,
-			);
-			path = gemm;
-			sourceTree = "<group>";
-		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -217,7 +215,6 @@
 			dependencies = (
 			);
 			fileSystemSynchronizedGroups = (
-				D60567A72F7FE00700AEC8B0 /* utils */,
 				D60567A82F7FE00800AEC8B0 /* docs */,
 				D65C4B042F86B46C0008E048 /* tools */,
 				D65C4B052F86B56D0008E048 /* include */,
@@ -225,6 +222,7 @@
 				D6C1420D2F81E84A003BEB17 /* plots */,
 				D6D9C7FF2F80C7C300CE87B3 /* common */,
 				D6D9C8002F80C8A600CE87B3 /* ffn */,
+				D6E396A72F7D5902007F637C /* gemm */,
 				D6E396AF2F7D641D007F637C /* attn */,
 			);
 			name = SuperKittens;
@@ -273,10 +271,8 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				D6C142602F821CCF003BEB17 /* gemm.h in Sources */,
 				D6145EF32F7CDE7E00D54F75 /* main.cpp in Sources */,
 				D6E396A52F7CEACC007F637C /* MetalImpl.cpp in Sources */,
-				D60567A02F7FE00100AEC8B0 /* common.metal in Sources */,
 				D6BC3CA42F8546EF00DC6D4F /* utils.metal in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

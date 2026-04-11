@@ -14,7 +14,7 @@
 
 using namespace superkittens::mamba;
 
-
+constexpr float a_floor = 1e-5;
 
 
 // ── Mamba 2 Kernel Template ───────────────────────────────────────────────────
@@ -41,10 +41,11 @@ void mamba2_fwd(
 
     
     threadgroup float a_cumsum[CHUNK_SIZE];            // 256 b
+    threadgroup float cumsum_scratch[CHUNK_SIZE / 32];
     threadgroup half  Qs[CHUNK_SIZE * HEAD_DIM];       // 8 kb
     threadgroup half  Ks[CHUNK_SIZE * HEAD_DIM];
     threadgroup half  Vs[CHUNK_SIZE * HEAD_DIM];
-    threadgroup half kv_scratch[CHUNK_SIZE* HEAD_DIM]; // another 8kb
+    threadgroup half  kv_state[HEAD_DIM * HEAD_DIM];   // 8 kb (was register Tile; float regs still used for accum)
     
     
 
@@ -52,19 +53,13 @@ void mamba2_fwd(
                                     + head  * p.a_head
                                     + seq_offset;
 
-    if (lid < CHUNK_SIZE) {
-        float a_val = (seq_offset + lid < p.seq)
-                    ? A_chunk[lid]
-                    : 0.0f;
-
-        superkittens::tools::cumsum_simd<float>(a_val, lane_id);
-        a_cumsum[lid] = a_val;
-    }
+    if (lid < CHUNK_SIZE) a_cumsum[lid] = (seq_offset + lid < p.seq) ? A_chunk[lid] : 0.0f;
+    
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (lid >= 32 && lid < CHUNK_SIZE) {
-        a_cumsum[lid] += a_cumsum[31];
-    }
+                                                    
+    superkittens::tools::threadgroup_cumsum<float, CHUNK_SIZE>(
+        a_cumsum, cumsum_scratch, lid, lane_id, simd_id);
+    
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
    
@@ -72,9 +67,13 @@ void mamba2_fwd(
 
     
     superkittens::mma::Tile<2, 8> attn_block;
-    superkittens::mma::Tile<2, 8> kv_state;
     superkittens::mma::Tile<2, 8> o_reg;
-    
+
+    // Clear kv_state cooperatively (threadgroup half, 4096 halfs / 128 threads = 32 per thread)
+    for (uint i = lid; i < HEAD_DIM * HEAD_DIM; i += N_THREADS) {
+        kv_state[i] = half(0);
+    }
+
     // load up q into registers
     superkittens::mma::Tile<2, 8> q_reg;
     q_reg.load(Qs + row_base * HEAD_DIM, HEAD_DIM);
@@ -96,12 +95,11 @@ void mamba2_fwd(
         }
     }
     
-    // Store scaled Q back to threadgroup and kv_state to scratch
+    // Store scaled Q back to threadgroup; kv_state already lives in threadgroup memory
     q_reg.copy_to_half(Qs + row_base * HEAD_DIM, HEAD_DIM);
-    kv_state.copy_to_half(kv_scratch, HEAD_DIM);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    superkittens::mma::mm_AB<HEAD_DIM, 2, 8>(o_reg, Qs + row_base * HEAD_DIM, HEAD_DIM, kv_scratch, HEAD_DIM);
+    superkittens::mma::mm_AB<HEAD_DIM, 2, 8>(o_reg, Qs + row_base * HEAD_DIM, HEAD_DIM, kv_state, HEAD_DIM);
 
     attn_block.copy_to_half(Ks + row_base * CHUNK_SIZE, CHUNK_SIZE);
     threadgroup_barrier(mem_flags::mem_threadgroup);

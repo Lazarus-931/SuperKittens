@@ -30,6 +30,7 @@ kernel void fp16_2_gemm(
     uint  simd_id               [[simdgroup_index_in_threadgroup]],
     uint  simd_lane             [[thread_index_in_simdgroup]]
 ) {
+    /// compile time constants
     constexpr uint WM = BM / 32;
     constexpr uint WN = BN / 32;
     constexpr uint THREADS = WM * WN * 32;
