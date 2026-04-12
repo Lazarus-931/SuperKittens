@@ -38,9 +38,9 @@
 			isa = PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet;
 			buildPhase = D6145EC82F7CDE7E00D54F75 /* Sources */;
 			membershipExceptions = (
-				group/ops/global.h,
-				group/ops/math.h,
-				group/ops/memory.h,
+				ops/global.h,
+				ops/math.h,
+				ops/memory.h,
 			);
 		};
 		D6E396B72F7D6469007F637C /* Exceptions for "attn" folder in "Compile Sources" phase from "SuperKittens" target */ = {

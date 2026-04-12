@@ -17,11 +17,11 @@ using namespace superkittens::mamba;
 constexpr float a_floor = 1e-5;
 
 
-// ── Mamba 2 Kernel Template ───────────────────────────────────────────────────
+
 
 template<bool bi_directional>
 [[kernel, max_total_threads_per_threadgroup(N_THREADS)]]
-void mamba2_fwd(
+void mamba2_ssm(
     device const half* Q       [[buffer(0)]],   // [B, 1, N, D]
     device const half* K       [[buffer(1)]],   // [B, 1, N, D]
     device const half* V       [[buffer(2)]],   // [B, H, N, D]
@@ -95,7 +95,7 @@ void mamba2_fwd(
         }
     }
     
-    // Store scaled Q back to threadgroup; kv_state already lives in threadgroup memory
+    // Store scaled q back to threadgroup; kv_state already lives in threadgroup memory
     q_reg.copy_to_half(Qs + row_base * HEAD_DIM, HEAD_DIM);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -108,11 +108,12 @@ void mamba2_fwd(
     o_reg.store(O + (batch * p.o_batch + head * p.o_head + (seq_offset + row_base) * HEAD_DIM), HEAD_DIM);
     
     
+    
 }
 
 
 
-inline bool dispatch_mamba2(
+inline bool dispatch_ssm(
     int B, int H, int N, int D,
     thread const int* q_strides,
     thread const int* k_strides,
