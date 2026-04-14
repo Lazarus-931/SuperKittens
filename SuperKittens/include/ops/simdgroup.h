@@ -1,19 +1,21 @@
 //
-//  global.h
+//  simdgroup.h
 //  SuperKittens
 //
 //  By Alazar Manakelew
 //
 //  Cross-SIMD reductions and barrier helpers.
+//
 
-#ifndef SUPERKITTENS_OPS_GLOBAL_H
-#define SUPERKITTENS_OPS_GLOBAL_H
+#ifndef SUPERKITTENS_OPS_SIMDGROUP_H
+#define SUPERKITTENS_OPS_SIMDGROUP_H
 
 #include <metal_stdlib>
 using namespace metal;
 
 namespace superkittens {
 namespace ops {
+namespace simdgroup {
 
 inline float cross_simd_max(
     float val,
@@ -39,7 +41,8 @@ inline float cross_simd_sum(
     return scratch[0] + scratch[1] + scratch[2] + scratch[3];
 }
 
+} // namespace simdgroup
 } // namespace ops
 } // namespace superkittens
 
-#endif // SUPERKITTENS_OPS_GLOBAL_H
+#endif // SUPERKITTENS_OPS_SIMDGROUP_H

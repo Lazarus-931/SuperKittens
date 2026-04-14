@@ -10,7 +10,7 @@
 #define SUPERKITTENS_ATTN_OPS_H
 
 #include <metal_stdlib>
-#include "../../ops/global.h"
+#include "../../ops/simdgroup.h"
 #include "../../ops/math.h"
 
 using namespace metal;

@@ -20,9 +20,9 @@ using namespace metal;
 #include "kernels/tools/tile.h"
 
 // ── Group ops ────────────────────────────────────────────────
-#include "include/group/ops/convert.h"
-#include "include/group/ops/memory.h"
-#include "include/group/ops/math.h"
-#include "include/group/ops/global.h"
+#include "include/ops/convert.h"
+#include "include/ops/memory.h"
+#include "include/ops/math.h"
+#include "include/ops/simdgroup.h"
 
 #endif // SUPERKITTENS_MEOW_METAL

@@ -12,11 +12,7 @@
 using namespace metal;
 
 namespace superkittens {
-/**
- * @namespace convert
- *
- * @brief Conversion namespace, where the conversion tools live, used throught SK
- */
+namespace ops {
 namespace convert {
 
 
@@ -83,6 +79,7 @@ METAL_FUNC void copy(threadgroup Dst* dst, const threadgroup Src* src,
 }
 
 } // namespace convert
+} // namespace ops
 } // namespace superkittens
 
 #endif // SUPERKITTENS_OPS_CONVERT_H

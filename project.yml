@@ -1,0 +1,56 @@
+name: SuperKittens
+options:
+  createIntermediateGroups: true
+  groupSortPosition: top
+configs:
+  Debug: debug
+  Release: release
+fileGroups:
+  - README.md
+  - CLAUDE.md
+  - SuperKittens/docs
+  - SuperKittens/include
+  - SuperKittens/kernels
+  - SuperKittens/models
+  - SuperKittens/plots
+  - SuperKittens/attention_ref.h
+  - SuperKittens/benchmark.cpp
+  - SuperKittens/benchmark.h
+  - SuperKittens/meow.h
+  - SuperKittens/meow_metal.h
+  - traces
+  - metal-cpp
+targets:
+  SuperKittens:
+    type: tool
+    platform: macOS
+    deploymentTarget: "26.0"
+    sources:
+      - path: SuperKittens/main.cpp
+      - path: SuperKittens/MetalImpl.cpp
+      - path: SuperKittens/kernels/utils.metal
+    settings:
+      base:
+        PRODUCT_NAME: "$(TARGET_NAME)"
+        CLANG_CXX_LANGUAGE_STANDARD: gnu++20
+        HEADER_SEARCH_PATHS:
+          - "$(PROJECT_DIR)/metal-cpp"
+        OTHER_LDFLAGS:
+          - "-framework"
+          - "Metal"
+          - "-framework"
+          - "Foundation"
+          - "-framework"
+          - "QuartzCore"
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+schemes:
+  SuperKittens:
+    build:
+      targets:
+        SuperKittens: all
+    run:
+      config: Debug
+    archive:
+      config: Release

@@ -27,6 +27,7 @@ struct SSDChunkScanArgs {
 };
 
 #include "tools.h"
+#include "index.h"
 
 
 kernel void ssd_chunk_scan_fwd_kernel(
@@ -61,8 +62,8 @@ kernel void ssd_chunk_scan_fwd_kernel(
     for (uint idx = tid; idx < TILE * TILE; idx += THREADS) {
         uint m = idx / TILE;
         uint k = idx % TILE;
-        cbTile[idx] = half(cb[superkittens::tools::ssd_best_cb_index(args, pidB, pidC, pidH, m, k)]);
-        xTile[idx] = half(x[superkittens::tools::ssd_x_index(args, pidB, pidC, pidH, m, k)]);
+        cbTile[idx] = half(cb[superkittens::mamba::index::ssd_best_cb_index(args, pidB, pidC, pidH, m, k)]);
+        xTile[idx] = half(x[superkittens::mamba::index::ssd_x_index(args, pidB, pidC, pidH, m, k)]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -78,15 +79,15 @@ kernel void ssd_chunk_scan_fwd_kernel(
 
     for (uint ds = 0; ds < TILE; ds += 4) {
         for (uint lane = 0; lane < 4; ++lane) {
-            float c0 = C[superkittens::tools::ssd_c_index(args, pidB, pidC, pidH, rowBase + 0, ds + lane)];
-            float c1 = C[superkittens::tools::ssd_c_index(args, pidB, pidC, pidH, rowBase + 1, ds + lane)];
-            float c2 = C[superkittens::tools::ssd_c_index(args, pidB, pidC, pidH, rowBase + 2, ds + lane)];
-            float c3 = C[superkittens::tools::ssd_c_index(args, pidB, pidC, pidH, rowBase + 3, ds + lane)];
+            float c0 = C[superkittens::mamba::index::ssd_c_index(args, pidB, pidC, pidH, rowBase + 0, ds + lane)];
+            float c1 = C[superkittens::mamba::index::ssd_c_index(args, pidB, pidC, pidH, rowBase + 1, ds + lane)];
+            float c2 = C[superkittens::mamba::index::ssd_c_index(args, pidB, pidC, pidH, rowBase + 2, ds + lane)];
+            float c3 = C[superkittens::mamba::index::ssd_c_index(args, pidB, pidC, pidH, rowBase + 3, ds + lane)];
             float4 p = float4(
-                prev[superkittens::tools::ssd_prev_index(args, pidB, pidC, pidH, colBase + 0, ds + lane)],
-                prev[superkittens::tools::ssd_prev_index(args, pidB, pidC, pidH, colBase + 1, ds + lane)],
-                prev[superkittens::tools::ssd_prev_index(args, pidB, pidC, pidH, colBase + 2, ds + lane)],
-                prev[superkittens::tools::ssd_prev_index(args, pidB, pidC, pidH, colBase + 3, ds + lane)]
+                prev[superkittens::mamba::index::ssd_prev_index(args, pidB, pidC, pidH, colBase + 0, ds + lane)],
+                prev[superkittens::mamba::index::ssd_prev_index(args, pidB, pidC, pidH, colBase + 1, ds + lane)],
+                prev[superkittens::mamba::index::ssd_prev_index(args, pidB, pidC, pidH, colBase + 2, ds + lane)],
+                prev[superkittens::mamba::index::ssd_prev_index(args, pidB, pidC, pidH, colBase + 3, ds + lane)]
             );
             acc0 += c0 * p;
             acc1 += c1 * p;
@@ -95,10 +96,10 @@ kernel void ssd_chunk_scan_fwd_kernel(
         }
     }
 
-    float dA0 = dA[superkittens::tools::ssd_vec_index(args, pidB, pidC, pidH, rowBase + 0)];
-    float dA1 = dA[superkittens::tools::ssd_vec_index(args, pidB, pidC, pidH, rowBase + 1)];
-    float dA2 = dA[superkittens::tools::ssd_vec_index(args, pidB, pidC, pidH, rowBase + 2)];
-    float dA3 = dA[superkittens::tools::ssd_vec_index(args, pidB, pidC, pidH, rowBase + 3)];
+    float dA0 = dA[superkittens::mamba::index::ssd_vec_index(args, pidB, pidC, pidH, rowBase + 0)];
+    float dA1 = dA[superkittens::mamba::index::ssd_vec_index(args, pidB, pidC, pidH, rowBase + 1)];
+    float dA2 = dA[superkittens::mamba::index::ssd_vec_index(args, pidB, pidC, pidH, rowBase + 2)];
+    float dA3 = dA[superkittens::mamba::index::ssd_vec_index(args, pidB, pidC, pidH, rowBase + 3)];
     float scales[4] = {
         fast::exp(dA0),
         fast::exp(dA1),
@@ -117,8 +118,8 @@ kernel void ssd_chunk_scan_fwd_kernel(
             float(xTile[k * TILE + colBase + 2]),
             float(xTile[k * TILE + colBase + 3])
         );
-        float dAk = dA[superkittens::tools::ssd_vec_index(args, pidB, pidC, pidH, k)];
-        float dtk = dt[superkittens::tools::ssd_vec_index(args, pidB, pidC, pidH, k)];
+        float dAk = dA[superkittens::mamba::index::ssd_vec_index(args, pidB, pidC, pidH, k)];
+        float dtk = dt[superkittens::mamba::index::ssd_vec_index(args, pidB, pidC, pidH, k)];
         float decay0 = fast::exp(min(dA0 - dAk, 0.0f)) * dtk;
         float decay1 = fast::exp(min(dA1 - dAk, 0.0f)) * dtk;
         float decay2 = fast::exp(min(dA2 - dAk, 0.0f)) * dtk;
@@ -164,34 +165,34 @@ kernel void ssd_chunk_scan_fwd_kernel(
 
     if (args.hasZ != 0) {
         for (uint j = 0; j < 4; ++j) {
-            outX[superkittens::tools::ssd_out_index(args, pidB, pidC, pidH, rowBase + 0, colBase + j)] = acc0[j];
-            outX[superkittens::tools::ssd_out_index(args, pidB, pidC, pidH, rowBase + 1, colBase + j)] = acc1[j];
-            outX[superkittens::tools::ssd_out_index(args, pidB, pidC, pidH, rowBase + 2, colBase + j)] = acc2[j];
-            outX[superkittens::tools::ssd_out_index(args, pidB, pidC, pidH, rowBase + 3, colBase + j)] = acc3[j];
+            outX[superkittens::mamba::index::ssd_out_index(args, pidB, pidC, pidH, rowBase + 0, colBase + j)] = acc0[j];
+            outX[superkittens::mamba::index::ssd_out_index(args, pidB, pidC, pidH, rowBase + 1, colBase + j)] = acc1[j];
+            outX[superkittens::mamba::index::ssd_out_index(args, pidB, pidC, pidH, rowBase + 2, colBase + j)] = acc2[j];
+            outX[superkittens::mamba::index::ssd_out_index(args, pidB, pidC, pidH, rowBase + 3, colBase + j)] = acc3[j];
         }
         float4 z0 = float4(
-            z[superkittens::tools::ssd_x_index(args, pidB, pidC, pidH, rowBase + 0, colBase + 0)],
-            z[superkittens::tools::ssd_x_index(args, pidB, pidC, pidH, rowBase + 0, colBase + 1)],
-            z[superkittens::tools::ssd_x_index(args, pidB, pidC, pidH, rowBase + 0, colBase + 2)],
-            z[superkittens::tools::ssd_x_index(args, pidB, pidC, pidH, rowBase + 0, colBase + 3)]
+            z[superkittens::mamba::index::ssd_x_index(args, pidB, pidC, pidH, rowBase + 0, colBase + 0)],
+            z[superkittens::mamba::index::ssd_x_index(args, pidB, pidC, pidH, rowBase + 0, colBase + 1)],
+            z[superkittens::mamba::index::ssd_x_index(args, pidB, pidC, pidH, rowBase + 0, colBase + 2)],
+            z[superkittens::mamba::index::ssd_x_index(args, pidB, pidC, pidH, rowBase + 0, colBase + 3)]
         );
         float4 z1 = float4(
-            z[superkittens::tools::ssd_x_index(args, pidB, pidC, pidH, rowBase + 1, colBase + 0)],
-            z[superkittens::tools::ssd_x_index(args, pidB, pidC, pidH, rowBase + 1, colBase + 1)],
-            z[superkittens::tools::ssd_x_index(args, pidB, pidC, pidH, rowBase + 1, colBase + 2)],
-            z[superkittens::tools::ssd_x_index(args, pidB, pidC, pidH, rowBase + 1, colBase + 3)]
+            z[superkittens::mamba::index::ssd_x_index(args, pidB, pidC, pidH, rowBase + 1, colBase + 0)],
+            z[superkittens::mamba::index::ssd_x_index(args, pidB, pidC, pidH, rowBase + 1, colBase + 1)],
+            z[superkittens::mamba::index::ssd_x_index(args, pidB, pidC, pidH, rowBase + 1, colBase + 2)],
+            z[superkittens::mamba::index::ssd_x_index(args, pidB, pidC, pidH, rowBase + 1, colBase + 3)]
         );
         float4 z2 = float4(
-            z[superkittens::tools::ssd_x_index(args, pidB, pidC, pidH, rowBase + 2, colBase + 0)],
-            z[superkittens::tools::ssd_x_index(args, pidB, pidC, pidH, rowBase + 2, colBase + 1)],
-            z[superkittens::tools::ssd_x_index(args, pidB, pidC, pidH, rowBase + 2, colBase + 2)],
-            z[superkittens::tools::ssd_x_index(args, pidB, pidC, pidH, rowBase + 2, colBase + 3)]
+            z[superkittens::mamba::index::ssd_x_index(args, pidB, pidC, pidH, rowBase + 2, colBase + 0)],
+            z[superkittens::mamba::index::ssd_x_index(args, pidB, pidC, pidH, rowBase + 2, colBase + 1)],
+            z[superkittens::mamba::index::ssd_x_index(args, pidB, pidC, pidH, rowBase + 2, colBase + 2)],
+            z[superkittens::mamba::index::ssd_x_index(args, pidB, pidC, pidH, rowBase + 2, colBase + 3)]
         );
         float4 z3 = float4(
-            z[superkittens::tools::ssd_x_index(args, pidB, pidC, pidH, rowBase + 3, colBase + 0)],
-            z[superkittens::tools::ssd_x_index(args, pidB, pidC, pidH, rowBase + 3, colBase + 1)],
-            z[superkittens::tools::ssd_x_index(args, pidB, pidC, pidH, rowBase + 3, colBase + 2)],
-            z[superkittens::tools::ssd_x_index(args, pidB, pidC, pidH, rowBase + 3, colBase + 3)]
+            z[superkittens::mamba::index::ssd_x_index(args, pidB, pidC, pidH, rowBase + 3, colBase + 0)],
+            z[superkittens::mamba::index::ssd_x_index(args, pidB, pidC, pidH, rowBase + 3, colBase + 1)],
+            z[superkittens::mamba::index::ssd_x_index(args, pidB, pidC, pidH, rowBase + 3, colBase + 2)],
+            z[superkittens::mamba::index::ssd_x_index(args, pidB, pidC, pidH, rowBase + 3, colBase + 3)]
         );
         acc0 *= z0 / (1.0f + fast::exp(-z0));
         acc1 *= z1 / (1.0f + fast::exp(-z1));
@@ -200,10 +201,10 @@ kernel void ssd_chunk_scan_fwd_kernel(
     }
 
     for (uint j = 0; j < 4; ++j) {
-        out[superkittens::tools::ssd_out_index(args, pidB, pidC, pidH, rowBase + 0, colBase + j)] = acc0[j];
-        out[superkittens::tools::ssd_out_index(args, pidB, pidC, pidH, rowBase + 1, colBase + j)] = acc1[j];
-        out[superkittens::tools::ssd_out_index(args, pidB, pidC, pidH, rowBase + 2, colBase + j)] = acc2[j];
-        out[superkittens::tools::ssd_out_index(args, pidB, pidC, pidH, rowBase + 3, colBase + j)] = acc3[j];
+        out[superkittens::mamba::index::ssd_out_index(args, pidB, pidC, pidH, rowBase + 0, colBase + j)] = acc0[j];
+        out[superkittens::mamba::index::ssd_out_index(args, pidB, pidC, pidH, rowBase + 1, colBase + j)] = acc1[j];
+        out[superkittens::mamba::index::ssd_out_index(args, pidB, pidC, pidH, rowBase + 2, colBase + j)] = acc2[j];
+        out[superkittens::mamba::index::ssd_out_index(args, pidB, pidC, pidH, rowBase + 3, colBase + j)] = acc3[j];
     }
 }
 
