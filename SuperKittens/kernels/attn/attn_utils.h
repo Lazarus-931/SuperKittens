@@ -7,7 +7,7 @@
 #ifndef SUPERKITTENS_ATTN_UTILS_H
 #define SUPERKITTENS_ATTN_UTILS_H
 
-namespace superkittens {
+namespace meow {
 namespace attn {
 
 // Tile configuration for attention kernels
@@ -23,6 +23,6 @@ struct TileConfig {
 };
 
 } // namespace attn
-} // namespace superkittens
+} // namespace meow
 
 #endif // SUPERKITTENS_ATTN_UTILS_H

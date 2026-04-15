@@ -11,7 +11,7 @@
 
 #include "mamba_impl.h"
 
-namespace superkittens {
+namespace meow {
 namespace mamba {
 
 // Tensor layout: [batch, dim, seq] for u, delta, and out
@@ -106,6 +106,6 @@ inline BwdParams set_bwd_params(
 }
 
 } // namespace mamba
-} // namespace superkittens
+} // namespace meow
 
 #endif // SUPERKITTENS_MAMBA_HOST_H

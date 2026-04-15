@@ -11,7 +11,7 @@
 
 #include "base.h"
 
-namespace superkittens {
+namespace meow {
 namespace mma {
 
 // ── mm_AB: C[M×N] += A[M×K] × B[K×N] ───────────────────────
@@ -88,6 +88,6 @@ METAL_FUNC void mm_AtB(thread Tile<ROWS, COLS>& tile,
 }
 
 } // namespace mma
-} // namespace superkittens
+} // namespace meow
 
 #endif // SUPERKITTENS_MMA_OPS_H

@@ -12,7 +12,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-namespace superkittens {
+namespace meow {
 namespace ops {
 
 inline float fast_exp(float x) {
@@ -32,6 +32,6 @@ inline float sqrt(float x) {
 }
 
 } // namespace ops
-} // namespace superkittens
+} // namespace meow
 
 #endif // SUPERKITTENS_OPS_MATH_H

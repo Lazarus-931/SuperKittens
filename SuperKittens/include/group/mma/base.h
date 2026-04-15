@@ -13,7 +13,7 @@
 #include <metal_simdgroup_matrix>
 using namespace metal;
 
-namespace superkittens {
+namespace meow {
 namespace mma {
 
 // ── Register tile: ROWS×COLS grid of 8×8 accumulators ────────
@@ -99,6 +99,6 @@ struct Tile {
 };
 
 } // namespace mma
-} // namespace superkittens
+} // namespace meow
 
 #endif // SUPERKITTENS_MMA_BASE_H

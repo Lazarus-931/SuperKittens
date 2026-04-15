@@ -10,7 +10,7 @@
 #include "params.h"
 #include "types.h"
 
-using namespace superkittens;
+using namespace meow;
 using namespace metal;
 
 
@@ -19,7 +19,7 @@ kernel void attn_2048_128(
     device const half* K   [[buffer(1)]],
     device const half* V   [[buffer(2)]],
     device half* O         [[buffer(3)]],
-    constant superkittens::attn::Params& param [[buffer(4)]],
+    constant meow::attn::Params& param [[buffer(4)]],
     uint2 gid [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]],
     uint simd_id [[simdgroup_index_in_threadgroup]],
@@ -42,7 +42,7 @@ kernel void attn_2048_128(
     uint partner = simd_id ^ 1;
     uint col_group = simd_id % 2;
 
-    using namespace superkittens::tools;
+    using namespace meow::tools;
     short my_row = Frag::get_coord(lane_id).y;
 
 

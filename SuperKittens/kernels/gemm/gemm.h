@@ -4,7 +4,7 @@
 #include <cstdint>
 
 
-namespace superkittens;
+namespace meow;
 
 template < int BM, int BN, int BK, int Z, int Y, bool transpose>
 kernel void gemm(

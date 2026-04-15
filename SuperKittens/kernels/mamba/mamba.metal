@@ -7,7 +7,7 @@
 
 #include "mamba_impl.h"
 
-using namespace superkittens::mamba;
+using namespace meow::mamba;
 
 
 struct fwd_kernel_traits {

@@ -13,7 +13,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-namespace superkittens {
+namespace meow {
 namespace ops {
 namespace simdgroup {
 
@@ -43,6 +43,6 @@ inline float cross_simd_sum(
 
 } // namespace simdgroup
 } // namespace ops
-} // namespace superkittens
+} // namespace meow
 
 #endif // SUPERKITTENS_OPS_SIMDGROUP_H

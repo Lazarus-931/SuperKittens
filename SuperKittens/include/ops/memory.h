@@ -12,7 +12,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-namespace superkittens {
+namespace meow {
 namespace ops {
 
 // Load tile from device half* → threadgroup float*, with scale applied.
@@ -115,6 +115,6 @@ inline void store_tile_half4(
 
 
 } // namespace ops
-} // namespace superkittens
+} // namespace meow
 
 #endif // SUPERKITTENS_OPS_MEMORY_H

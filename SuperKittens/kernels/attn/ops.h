@@ -15,7 +15,7 @@
 
 using namespace metal;
 
-namespace superkittens {
+namespace meow {
 namespace attn {
 
 struct SoftmaxState {
@@ -49,7 +49,7 @@ inline float exp_and_sum(
     float tile_sum = 0.0f;
     for (uint i = lid; i < tile_size; i += num_threads) {
         uint idx = (i / 128) * stride + (i % 128);
-        float val = superkittens::ops::fast_exp(scores[idx] - row_max);
+        float val = meow::ops::fast_exp(scores[idx] - row_max);
         scores[idx] = val;
         tile_sum += val;
     }
@@ -80,11 +80,11 @@ inline void update_state(
 {
     float old_max = state.row_max;
     state.row_max = max(state.row_max, tile_max);
-    scale = superkittens::ops::fast_exp(old_max - state.row_max);
+    scale = meow::ops::fast_exp(old_max - state.row_max);
     state.row_sum = state.row_sum * scale + tile_sum;
 }
 
 } // namespace attn
-} // namespace superkittens
+} // namespace meow
 
 #endif // SUPERKITTENS_ATTN_OPS_H

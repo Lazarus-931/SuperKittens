@@ -10,7 +10,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-namespace superkittens {
+namespace meow {
 namespace ops {
 
 
@@ -22,7 +22,7 @@ namespace math {}
 namespace tiles {}
 
 } // namespace ops
-} // namespace superkittens
+} // namespace meow
 
 #include "convert.h"
 #include "simdgroup.h"

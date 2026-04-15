@@ -12,7 +12,7 @@
 
 
 
-using namespace superkittens::mamba;
+using namespace meow::mamba;
 
 constexpr float a_floor = 1e-5;
 
@@ -57,7 +57,7 @@ void mamba2_ssm(
     
     threadgroup_barrier(mem_flags::mem_threadgroup);
                                                     
-    superkittens::tools::threadgroup_cumsum<float, CHUNK_SIZE>(
+    meow::tools::threadgroup_cumsum<float, CHUNK_SIZE>(
         a_cumsum, cumsum_scratch, lid, lane_id, simd_id);
     
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -66,8 +66,8 @@ void mamba2_ssm(
     uint row_base = simd_id * 16;  // each SIMD with 16 rows
 
     
-    superkittens::mma::Tile<2, 8> attn_block;
-    superkittens::mma::Tile<2, 8> o_reg;
+    meow::mma::Tile<2, 8> attn_block;
+    meow::mma::Tile<2, 8> o_reg;
 
     // Clear kv_state cooperatively (threadgroup half, 4096 halfs / 128 threads = 32 per thread)
     for (uint i = lid; i < HEAD_DIM * HEAD_DIM; i += N_THREADS) {
@@ -75,13 +75,13 @@ void mamba2_ssm(
     }
 
     // load up q into registers
-    superkittens::mma::Tile<2, 8> q_reg;
+    meow::mma::Tile<2, 8> q_reg;
     q_reg.load(Qs + row_base * HEAD_DIM, HEAD_DIM);
 
    
     attn_block.clear();
-    superkittens::mma::mm_ABt<HEAD_DIM, 2, 8>(attn_block, Qs + row_base * HEAD_DIM, HEAD_DIM, Ks, HEAD_DIM);
-    superkittens::tools::apply_causal_decay(attn_block, a_cumsum, row_base, lane_id);
+    meow::mma::mm_ABt<HEAD_DIM, 2, 8>(attn_block, Qs + row_base * HEAD_DIM, HEAD_DIM, Ks, HEAD_DIM);
+    meow::tools::apply_causal_decay(attn_block, a_cumsum, row_base, lane_id);
 
     uint qid = lane_id / 4;
     uint local_row = (qid & 4) + (lane_id / 2) % 4;
@@ -99,11 +99,11 @@ void mamba2_ssm(
     q_reg.copy_to_half(Qs + row_base * HEAD_DIM, HEAD_DIM);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    superkittens::mma::mm_AB<HEAD_DIM, 2, 8>(o_reg, Qs + row_base * HEAD_DIM, HEAD_DIM, kv_state, HEAD_DIM);
+    meow::mma::mm_AB<HEAD_DIM, 2, 8>(o_reg, Qs + row_base * HEAD_DIM, HEAD_DIM, kv_state, HEAD_DIM);
 
     attn_block.copy_to_half(Ks + row_base * CHUNK_SIZE, CHUNK_SIZE);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    superkittens::mma::mm_AB<CHUNK_SIZE, 2, 8>(o_reg, Ks + row_base * CHUNK_SIZE, CHUNK_SIZE, Vs, HEAD_DIM);
+    meow::mma::mm_AB<CHUNK_SIZE, 2, 8>(o_reg, Ks + row_base * CHUNK_SIZE, CHUNK_SIZE, Vs, HEAD_DIM);
 
     o_reg.store(O + (batch * p.o_batch + head * p.o_head + (seq_offset + row_base) * HEAD_DIM), HEAD_DIM);
     
@@ -126,12 +126,12 @@ inline bool dispatch_ssm(
     int qkvo_shape[4] = { B, H, N, D };
     int ab_shape[3]   = { B, H, N };
 
-    if (!superkittens::tools::is_contiguous<4>(qkvo_shape, q_strides)) return false;
-    if (!superkittens::tools::is_contiguous<4>(qkvo_shape, k_strides)) return false;
-    if (!superkittens::tools::is_contiguous<4>(qkvo_shape, v_strides)) return false;
-    if (!superkittens::tools::is_contiguous<4>(qkvo_shape, o_strides)) return false;
-    if (!superkittens::tools::is_contiguous<3>(ab_shape,   a_strides)) return false;
-    if (!superkittens::tools::is_contiguous<3>(ab_shape,   b_strides)) return false;
+    if (!meow::tools::is_contiguous<4>(qkvo_shape, q_strides)) return false;
+    if (!meow::tools::is_contiguous<4>(qkvo_shape, k_strides)) return false;
+    if (!meow::tools::is_contiguous<4>(qkvo_shape, v_strides)) return false;
+    if (!meow::tools::is_contiguous<4>(qkvo_shape, o_strides)) return false;
+    if (!meow::tools::is_contiguous<3>(ab_shape,   a_strides)) return false;
+    if (!meow::tools::is_contiguous<3>(ab_shape,   b_strides)) return false;
 
     return true;
 }

@@ -10,7 +10,7 @@
 #include "tools/tile.h"
 
 using namespace metal;
-using namespace superkittens;
+using namespace meow;
 
 struct AutotuneConfig {
     uint seq;
@@ -62,7 +62,7 @@ kernel void autotune_attention(
     float rsum = 0.0f;
     simdgroup_float8x8 output_acc[8] = {};
 
-    using namespace superkittens::tools;
+    using namespace meow::tools;
     short my_row = Frag::get_coord(lane_id).y;
 
     for (uint t = 0; t < KEY_TILES; t++) {

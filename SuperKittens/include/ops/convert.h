@@ -11,7 +11,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-namespace superkittens {
+namespace meow {
 namespace ops {
 namespace convert {
 
@@ -80,6 +80,6 @@ METAL_FUNC void copy(threadgroup Dst* dst, const threadgroup Src* src,
 
 } // namespace convert
 } // namespace ops
-} // namespace superkittens
+} // namespace meow
 
 #endif // SUPERKITTENS_OPS_CONVERT_H

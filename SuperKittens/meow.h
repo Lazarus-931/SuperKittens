@@ -15,6 +15,6 @@
 #include "kernels/mamba/mamba_impl.h"
 #include "kernels/mamba/mamba_host.h"
 
-using namespace superkittens;
+using namespace meow;
 
 #endif // SUPERKITTENS_MEOW_H

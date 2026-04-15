@@ -11,7 +11,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-namespace superkittens {
+namespace meow {
 namespace mamba {
 namespace index {
 
@@ -45,6 +45,6 @@ METAL_FUNC static inline uint ssd_prev_index(constant SSDChunkScanArgs &args, ui
 
 } // namespace index
 } // namespace mamba
-} // namespace superkittens
+} // namespace meow
 
 #endif // SUPERKITTENS_MAMBA_INDEX_H

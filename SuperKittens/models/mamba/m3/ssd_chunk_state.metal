@@ -6,10 +6,10 @@
 //
 
 #include <metal_stdlib>
-#include "../../meow_metal.h"
-#include "mamba_impl.h"
+#include "../../../meow_metal.h"
+#include "../../../kernels/mamba/mamba_impl.h"
 
-using namespace superkittens::mamba;
+using namespace meow::mamba;
 
 
 // will be replaced by centralized struct

@@ -11,7 +11,7 @@
 #include <metal_stdlib>
 using namespace metal;
 
-namespace superkittens {
+namespace meow {
 namespace tools {
 
 ////////////////////////////////////////////////////////////////////////////////////////////
@@ -43,7 +43,7 @@ METAL_FUNC void cumsum_simd(thread T& val, uint lid) {
 //   thread owns (local_row, local_col) and (local_row, local_col + 1)
 
 template <int ROWS, int COLS>
-METAL_FUNC void apply_causal_decay(thread superkittens::mma::Tile<ROWS, COLS>& tile,
+METAL_FUNC void apply_causal_decay(thread meow::mma::Tile<ROWS, COLS>& tile,
                                     const threadgroup float* a_cumsum,
                                     uint row_base, uint lane_id) {
     uint qid = lane_id / 4;
@@ -118,7 +118,7 @@ METAL_FUNC void threadgroup_cumsum(
 }
 
 } // namespace tools
-} // namespace superkittens
+} // namespace meow
 
 
 

@@ -12,7 +12,7 @@
 #include <metal_simdgroup_matrix>
 using namespace metal;
 
-namespace superkittens {
+namespace meow {
 namespace tools {
 
 
@@ -220,7 +220,7 @@ struct Tile {
 };
 
 } // namespace tools
-} // namespace superkittens
+} // namespace meow
 
 /// ──────────────────────────────────────────────────────────
 /// Future improvements:

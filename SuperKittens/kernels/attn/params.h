@@ -7,7 +7,7 @@
 #ifndef SUPERKITTENS_ATTN_PARAMS_H
 #define SUPERKITTENS_ATTN_PARAMS_H
 
-namespace superkittens {
+namespace meow {
 namespace attn {
 
 struct Params {
@@ -19,6 +19,6 @@ struct Params {
 
 
 } // namespace attn
-} // namespace superkittens
+} // namespace meow
 
 #endif // SUPERKITTENS_ATTN_PARAMS_H

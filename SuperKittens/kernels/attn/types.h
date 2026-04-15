@@ -7,7 +7,7 @@
 #ifndef SUPERKITTENS_ATTN_UTILS_H
 #define SUPERKITTENS_ATTN_UTILS_H
 
-namespace superkittens {
+namespace meow {
 namespace attn {
 
 
@@ -30,6 +30,6 @@ struct A_2048_128_Config {
 
 
 } // namespace attn
-} // namespace superkittens
+} // namespace meow
 
 #endif // SUPERKITTENS_ATTN_UTILS_H

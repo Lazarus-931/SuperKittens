@@ -3,13 +3,14 @@
 	archiveVersion = 1;
 	classes = {
 	};
-	objectVersion = 70;
+	objectVersion = 63;
 	objects = {
 
 /* Begin PBXBuildFile section */
 		2CB4D815D51ABDDF69BE0A34 /* utils.metal in Sources */ = {isa = PBXBuildFile; fileRef = E1276D240A8DC50D8B7472B3 /* utils.metal */; };
 		304DF5CE9683B83FE5441A9F /* MetalImpl.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 3706CC4213A558631AB34D02 /* MetalImpl.cpp */; };
 		5D80E820B907EBE9FF5737F4 /* main.cpp in Sources */ = {isa = PBXBuildFile; fileRef = C6A9959F75F0C8F724216CBB /* main.cpp */; };
+		A1B2C3D4E5F60718293A4B5C /* mimo_fwd.metal in Sources */ = {isa = PBXBuildFile; fileRef = 044C6068BAE00C5D92FB44FA /* mimo_fwd.metal */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -65,6 +66,7 @@
 		228268832206802DF67198F4 /* MTLBuffer-8-1 */ = {isa = PBXFileReference; lastKnownFileType = text; path = "MTLBuffer-8-1"; sourceTree = "<group>"; };
 		22A804DDDB44BB0D2172C06D /* speedup.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = speedup.png; sourceTree = "<group>"; };
 		2305E785E12ABBB264CEC149 /* store0 */ = {isa = PBXFileReference; lastKnownFileType = file; path = store0; sourceTree = "<group>"; };
+		23073A7779A678FC697440B5 /* mamba3.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = mamba3.metal; sourceTree = "<group>"; };
 		23559390C28708591AE619CF /* MTLBuffer-20-0 */ = {isa = PBXFileReference; lastKnownFileType = text; path = "MTLBuffer-20-0"; sourceTree = "<group>"; };
 		2434D0F73155E6CFF4BB966B /* MTLBuffer-21-0 */ = {isa = PBXFileReference; lastKnownFileType = file; path = "MTLBuffer-21-0"; sourceTree = "<group>"; };
 		245DCD4C1BDC6EF8DE580441 /* MTLBuffer-21-1 */ = {isa = PBXFileReference; lastKnownFileType = text; path = "MTLBuffer-21-1"; sourceTree = "<group>"; };
@@ -144,6 +146,7 @@
 		5773EABCE55569F3C9178663 /* MTLBuffer-34-0 */ = {isa = PBXFileReference; lastKnownFileType = file; path = "MTLBuffer-34-0"; sourceTree = "<group>"; };
 		591A5CFAF389AAAA864B3DD7 /* MTLFXPrivate.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = MTLFXPrivate.hpp; sourceTree = "<group>"; };
 		5A227CDC05A4E557802E6E17 /* device-resources-0x970db4000 */ = {isa = PBXFileReference; lastKnownFileType = file; path = "device-resources-0x970db4000"; sourceTree = "<group>"; };
+		5A3C93BE854EF65D9807D4EB /* utils.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = utils.metal; sourceTree = "<group>"; };
 		5B121A60B6871FEB4AB5AF35 /* MTLFence.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = MTLFence.hpp; sourceTree = "<group>"; };
 		5C1602A66232EA0BD7C375AA /* MTLBuffer-21-2 */ = {isa = PBXFileReference; lastKnownFileType = text; path = "MTLBuffer-21-2"; sourceTree = "<group>"; };
 		5C6F43CEB1C7A8D518F5E951 /* index */ = {isa = PBXFileReference; lastKnownFileType = file; path = index; sourceTree = "<group>"; };
@@ -167,7 +170,7 @@
 		71963CAE07A5B85BC6ED36CF /* MTLCommandEncoder.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = MTLCommandEncoder.hpp; sourceTree = "<group>"; };
 		729B09F41063C350ABADEA39 /* capture */ = {isa = PBXFileReference; lastKnownFileType = file; path = capture; sourceTree = "<group>"; };
 		73398D888569A102328AAE24 /* MTLBuffer-8-0 */ = {isa = PBXFileReference; lastKnownFileType = text; path = "MTLBuffer-8-0"; sourceTree = "<group>"; };
-		7348BF2245EC3B463F67856C /* ssm.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = ssm.metal; sourceTree = "<group>"; };
+		7348BF2245EC3B463F67856C /* mamba2.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = mamba2.metal; sourceTree = "<group>"; };
 		73D059A8B4AF00C2D0FCAACD /* MTL4CommandBuffer.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = MTL4CommandBuffer.hpp; sourceTree = "<group>"; };
 		73D849FBE87A45A0624F6B7B /* NSLock.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = NSLock.hpp; sourceTree = "<group>"; };
 		73F3BFB153EEDF1A05E88DD4 /* MTLBuffer-35-2 */ = {isa = PBXFileReference; lastKnownFileType = text; path = "MTLBuffer-35-2"; sourceTree = "<group>"; };
@@ -218,6 +221,7 @@
 		9A4A8A2D35DE385AECA08E75 /* MTL4ComputeCommandEncoder.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = MTL4ComputeCommandEncoder.hpp; sourceTree = "<group>"; };
 		9AA6E958B0AB9540237500D8 /* accumilate.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = accumilate.h; sourceTree = "<group>"; };
 		9B9B4E9AF3C3493286C94FD5 /* MTL4ArgumentTable.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = MTL4ArgumentTable.hpp; sourceTree = "<group>"; };
+		9C0A4003EB6175E08A2214E7 /* baseline.py */ = {isa = PBXFileReference; lastKnownFileType = text.script.python; path = baseline.py; sourceTree = "<group>"; };
 		9C72E6ACA547034846AE573D /* MTLBuffer-8-0 */ = {isa = PBXFileReference; lastKnownFileType = file; path = "MTLBuffer-8-0"; sourceTree = "<group>"; };
 		9DB4BCBF3C95386B755B5F6A /* gemm.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = gemm.h; sourceTree = "<group>"; };
 		9E11B407E09DFC09F9296D94 /* MTLFunctionStitching.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = MTLFunctionStitching.hpp; sourceTree = "<group>"; };
@@ -268,8 +272,6 @@
 		D2E3FA24A0C02866A425433F /* LICENSE.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = LICENSE.txt; sourceTree = "<group>"; };
 		D4C16311A845B803611742D3 /* metadata */ = {isa = PBXFileReference; lastKnownFileType = file.bplist; path = metadata; sourceTree = "<group>"; };
 		D52B5ED76E2D31948490D7A4 /* common.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = common.metal; sourceTree = "<group>"; };
-		D653178E2F8E002000993577 /* full_fwd_.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = full_fwd_.metal; sourceTree = "<group>"; };
-		D653178F2F8E00AE00993577 /* utils.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = utils.metal; sourceTree = "<group>"; };
 		D6BED14F7B24A9583AAD1607 /* MTLBuffer-8-2 */ = {isa = PBXFileReference; lastKnownFileType = text; path = "MTLBuffer-8-2"; sourceTree = "<group>"; };
 		D6C705FC07A505CF99B88100 /* MTLAllocation.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = MTLAllocation.hpp; sourceTree = "<group>"; };
 		D6D01F691FFC7ABEC6AE26E7 /* MTLBuffer.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = MTLBuffer.hpp; sourceTree = "<group>"; };
@@ -329,10 +331,6 @@
 		FF6C3CCDE5CD86B0C18FAD13 /* MTL4MeshRenderPipeline.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = MTL4MeshRenderPipeline.hpp; sourceTree = "<group>"; };
 		FFC67F4F9D86E26E48DE8DAE /* MTLDynamicLibrary.hpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.h; path = MTLDynamicLibrary.hpp; sourceTree = "<group>"; };
 /* End PBXFileReference section */
-
-/* Begin PBXFileSystemSynchronizedRootGroup section */
-		D65317902F8E00C500993577 /* baseline */ = {isa = PBXFileSystemSynchronizedRootGroup; explicitFileTypes = {}; explicitFolders = (); path = baseline; sourceTree = "<group>"; };
-/* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXGroup section */
 		11C552B72E47B6CF5CCABAE2 /* torch */ = {
@@ -429,7 +427,7 @@
 			isa = PBXGroup;
 			children = (
 				230CBE0B1ECF2F5F037BF8CB /* baseline */,
-				7348BF2245EC3B463F67856C /* ssm.metal */,
+				7348BF2245EC3B463F67856C /* mamba2.metal */,
 			);
 			path = mamba2;
 			sourceTree = "<group>";
@@ -442,13 +440,22 @@
 			path = test;
 			sourceTree = "<group>";
 		};
-		50F9B65FBDC13A75BF3AD675 /* mamba */ = {
+		B0B0B0B0B0B0B0B0B0B0B0B0 /* m3 */ = {
 			isa = PBXGroup;
 			children = (
-				D653178F2F8E00AE00993577 /* utils.metal */,
 				4AE27A7B7238EAFCA19122CF /* ssd_chunk_output.metal */,
 				0CC9DC2AA7CC5004974EB117 /* ssd_chunk_scan.metal */,
 				EA0190EEDAC1FD477DB7ECDD /* ssd_chunk_state.metal */,
+				5A3C93BE854EF65D9807D4EB /* utils.metal */,
+				044C6068BAE00C5D92FB44FA /* mimo_fwd.metal */,
+			);
+			path = m3;
+			sourceTree = "<group>";
+		};
+		50F9B65FBDC13A75BF3AD675 /* mamba */ = {
+			isa = PBXGroup;
+			children = (
+				B0B0B0B0B0B0B0B0B0B0B0B0 /* m3 */,
 			);
 			path = mamba;
 			sourceTree = "<group>";
@@ -546,6 +553,14 @@
 				CB53CDE8617E2F171A633F1D /* MTLFXTemporalScaler.hpp */,
 			);
 			path = MetalFX;
+			sourceTree = "<group>";
+		};
+		805F10CFAF2A94FCE1AC032E /* baseline */ = {
+			isa = PBXGroup;
+			children = (
+				9C0A4003EB6175E08A2214E7 /* baseline.py */,
+			);
+			path = baseline;
 			sourceTree = "<group>";
 		};
 		81FE662143C4CA3F386E230A /* Foundation */ = {
@@ -898,9 +913,8 @@
 		E19C080F245C519C4754A857 /* mamba3 */ = {
 			isa = PBXGroup;
 			children = (
-				D65317902F8E00C500993577 /* baseline */,
-				D653178E2F8E002000993577 /* full_fwd_.metal */,
-				044C6068BAE00C5D92FB44FA /* mimo_fwd.metal */,
+				805F10CFAF2A94FCE1AC032E /* baseline */,
+				23073A7779A678FC697440B5 /* mamba3.metal */,
 			);
 			path = mamba3;
 			sourceTree = "<group>";
@@ -1016,6 +1030,7 @@
 				304DF5CE9683B83FE5441A9F /* MetalImpl.cpp in Sources */,
 				5D80E820B907EBE9FF5737F4 /* main.cpp in Sources */,
 				2CB4D815D51ABDDF69BE0A34 /* utils.metal in Sources */,
+				A1B2C3D4E5F60718293A4B5C /* mimo_fwd.metal in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -1026,6 +1041,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				MTL_LANGUAGE_REVISION = UseDeploymentTarget;
 				CODE_SIGNING_ALLOWED = NO;
 				CODE_SIGNING_REQUIRED = NO;
 				COMBINE_HIDPI_IMAGES = YES;
@@ -1170,6 +1186,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				MTL_LANGUAGE_REVISION = UseDeploymentTarget;
 				CODE_SIGNING_ALLOWED = NO;
 				CODE_SIGNING_REQUIRED = NO;
 				COMBINE_HIDPI_IMAGES = YES;

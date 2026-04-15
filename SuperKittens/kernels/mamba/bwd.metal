@@ -7,7 +7,7 @@
 
 #include "mamba_impl.h"
 
-using namespace superkittens::mamba;
+using namespace meow::mamba;
 
 template<typename T, int N_THREADS, int N_ITEMS, int N_ROWS,
          bool kIsEvenLen, bool kIsVariableB, bool kIsVariableC,

@@ -18,7 +18,7 @@ using stride_t = ulong;    // Metal: ulong = 64-bit unsigned
 using stride_t = uint64_t; // C++: uint64_t
 #endif
 
-namespace superkittens {
+namespace meow {
 namespace mamba {
 
 // ── Mamba-1 (sequential selective scan) ──────────────────────
@@ -78,6 +78,6 @@ struct Mamba2Params {
 };
 
 } // namespace mamba
-} // namespace superkittens
+} // namespace meow
 
 #endif // SUPERKITTENS_MAMBA_IMPL_H
