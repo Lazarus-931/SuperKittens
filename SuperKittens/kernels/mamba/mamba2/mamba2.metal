@@ -6,14 +6,14 @@
 //  Follows ThunderKittens' algorithm: cumsum → decay → intra-chunk attn → inter-chunk state.
 //
 
-#include "../../meow.h"
+#include "../../../meow.h"
 #include "../mamba_impl.h"
 
 
 
 using namespace meow::mamba;
 
-constexpr float a_floor = 1e-5;
+METAL_FUNC float a_floor() { return 1e-5f; }
 
 
 namespace meow::mamba::mamba2 {
@@ -134,3 +134,5 @@ inline bool dispatch_ssm(
 
     return true;
 }
+
+} // namespace meow::mamba::mamba2

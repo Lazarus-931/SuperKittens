@@ -13,8 +13,8 @@
 
 namespace meow::bench {
 
-struct results {
-    float median, min, max;
+struct BenchResult {
+    float median_ms, min_ms, max_ms;
     float gflops, gbps;
     int iters;
 };
@@ -76,7 +76,6 @@ inline float median(float* v, int n) {
 
 
 }
-
 
 
 

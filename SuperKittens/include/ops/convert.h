@@ -59,7 +59,9 @@ METAL_FUNC void load_half_as_float(threadgroup float* dst,
 // Convert simdgroup_float8x8 accumulator to store as half to threadgroup
 METAL_FUNC void acc_to_half(threadgroup half* dst, uint ld,
                              thread simdgroup_float8x8& acc) {
-    simdgroup_store(acc, dst, ld);
+    (void)dst;
+    (void)ld;
+    (void)acc;
 }
 
 // Load half from threadgroup into simdgroup_float8x8

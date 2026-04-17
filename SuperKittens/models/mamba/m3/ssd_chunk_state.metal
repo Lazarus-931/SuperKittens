@@ -68,13 +68,13 @@ kernel void chunk_cumsum_fwd_kernel(
     if (c0 < chunkLimit) {
         dt0 = dt[dtBase + c0 * args.nheads] + bias;
         if (args.useSoftplus != 0) dt0 = dt0 <= 20.0f ? log(1.0f + exp(dt0)) : dt0;
-        dt0 = metal::min(metal::max(dt0, args.dtMin), args.dtMax);
-        
-        
+        dt0 = metal::min(metal::max(dt0, float(args.dtMin)), float(args.dtMax));
+    }
+
     if (c1 < chunkLimit) {
         dt1 = dt[dtBase + c1 * args.nheads] + bias;
         if (args.useSoftplus != 0) dt1 = dt1 <= 20.0f ? log(1.0f + exp(dt1)) : dt1;
-        dt1 = metal::min(metal::max(dt1, args.dtMin), args.dtMax);
+        dt1 = metal::min(metal::max(dt1, float(args.dtMin)), float(args.dtMax));
     }
 
     dtOut[outBase + c0] = (c0 < chunkLimit) ? dt0 : 0.0f;

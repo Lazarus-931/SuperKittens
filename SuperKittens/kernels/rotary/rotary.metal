@@ -7,6 +7,18 @@
 
 #include "../../meow.h"
 
+struct RotaryQKArgs {
+    uint batch;
+    uint nheads;
+    uint mimo_dim;
+    uint headdim;
+    uint rotary_dim;
+    uint conjugate;
+    uint rotate_pairwise;
+    uint has_bias_q;
+    uint has_bias_k;
+};
+
 
 kernel void rotary_qk_best_kernel(
     device const float *q [[buffer(0)]],

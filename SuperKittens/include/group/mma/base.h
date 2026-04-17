@@ -49,9 +49,8 @@ struct Tile {
     METAL_FUNC void mul(const thread Tile& other) {
         for (int r = 0; r < ROWS; r++)
             for (int c = 0; c < COLS; c++) {
-                // Extract, multiply, write back via thread_elements
-                auto d = reinterpret_cast<thread float2&>(data[r][c].thread_elements());
-                auto o = reinterpret_cast<const thread float2&>(other.data[r][c].thread_elements());
+                thread float2& d = reinterpret_cast<thread float2&>(data[r][c].thread_elements());
+                const thread float2& o = reinterpret_cast<const thread float2&>(other.data[r][c].thread_elements());
                 d *= o;
             }
     }
@@ -60,7 +59,7 @@ struct Tile {
     METAL_FUNC void scale(float s) {
         for (int r = 0; r < ROWS; r++)
             for (int c = 0; c < COLS; c++) {
-                auto&\ d = reinterpret_cast<thread float2&>(data[r][c].thread_elements());
+                thread float2& d = reinterpret_cast<thread float2&>(data[r][c].thread_elements());
                 d *= s;
             }
     }
@@ -85,8 +84,8 @@ struct Tile {
     METAL_FUNC void copy(const thread Tile& src) {
         for (int r = 0; r < ROWS; r++)
             for (int c = 0; c < COLS; c++) {
-                auto d = reinterpret_cast<thread float2&>(data[r][c].thread_elements());
-                auto s = reinterpret_cast<const thread float2&>(src.data[r][c].thread_elements());
+                thread float2& d = reinterpret_cast<thread float2&>(data[r][c].thread_elements());
+                const thread float2& s = reinterpret_cast<const thread float2&>(src.data[r][c].thread_elements());
                 d = s;
             }
     }

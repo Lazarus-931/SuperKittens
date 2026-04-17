@@ -53,9 +53,7 @@ METAL_FUNC void mm_ABt(thread Tile<ROWS, COLS>& tile,
             simdgroup_load(a, src_a + r * 8 * lda + k * 8, lda);
             for (int c = 0; c < COLS; c++) {
                 simdgroup_half8x8 b;
-                // Load B[c*8 .. c*8+7][k*8 .. k*8+7] then transpose
-                simdgroup_load(b, src_b + c * 8 * ldb + k * 8, ldb);
-                simdgroup_matrix_transpose(b);
+                simdgroup_load(b, src_b + c * 8 * ldb + k * 8, ldb, ulong2(0, 0), true);
                 simdgroup_multiply_accumulate(tile.data[r][c], a, b, tile.data[r][c]);
             }
         }
@@ -75,9 +73,7 @@ METAL_FUNC void mm_AtB(thread Tile<ROWS, COLS>& tile,
     for (int m = 0; m < BM / 8; m++) {
         for (int r = 0; r < ROWS; r++) {
             simdgroup_half8x8 a;
-            // Load A[m*8..][r*8..] then transpose to get A^T[r*8..][m*8..]
-            simdgroup_load(a, src_a + m * 8 * lda + r * 8, lda);
-            simdgroup_matrix_transpose(a);
+            simdgroup_load(a, src_a + m * 8 * lda + r * 8, lda, ulong2(0, 0), true);
             for (int c = 0; c < COLS; c++) {
                 simdgroup_half8x8 b;
                 simdgroup_load(b, src_b + m * 8 * ldb + c * 8, ldb);
