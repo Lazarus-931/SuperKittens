@@ -13,7 +13,7 @@
 using namespace metal;
 
 namespace meow {
-namespace tools {
+namespace rt {
 
 
 /// simdgroup_8x8 is not accessible without simd_group, so like mlx, we choose to construct a abstract tile to allow direct access, and more importantly(a huge boost in perf!),
@@ -219,7 +219,7 @@ struct Tile {
     }
 };
 
-} // namespace tools
+} // namespace rt
 } // namespace meow
 
 /// ──────────────────────────────────────────────────────────

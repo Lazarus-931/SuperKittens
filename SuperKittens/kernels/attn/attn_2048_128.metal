@@ -6,7 +6,7 @@
 //  2×2 SIMD layout: 2 row groups × 2 col groups
 //  Q persistent; K/V share one buffer; BlockMMA for tiled GEMM
 
-#include "../../meow_metal.h"
+#include "../../meow.h"
 #include "params.h"
 #include "types.h"
 

@@ -6,8 +6,8 @@
 //  All operate on Tile<R,C> accumulators with threadgroup half sources.
 //
 
-#ifndef SUPERKITTENS_MMA_OPS_H
-#define SUPERKITTENS_MMA_OPS_H
+#ifndef MEOW_MMA_OPS_H
+#define MEOW_MMA_OPS_H
 
 #include "base.h"
 
@@ -90,4 +90,4 @@ METAL_FUNC void mm_AtB(thread Tile<ROWS, COLS>& tile,
 } // namespace mma
 } // namespace meow
 
-#endif // SUPERKITTENS_MMA_OPS_H
+#endif // MEOW_MMA_OPS_H

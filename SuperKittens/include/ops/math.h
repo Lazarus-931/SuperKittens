@@ -6,8 +6,8 @@
 //
 //  Fast math ops: exp, rsqrt, branchless select.
 
-#ifndef SUPERKITTENS_OPS_MATH_H
-#define SUPERKITTENS_OPS_MATH_H
+#ifndef MEOW_OPS_MATH_H
+#define MEOW_OPS_MATH_H
 
 #include <metal_stdlib>
 using namespace metal;
@@ -34,4 +34,4 @@ inline float sqrt(float x) {
 } // namespace ops
 } // namespace meow
 
-#endif // SUPERKITTENS_OPS_MATH_H
+#endif // MEOW_OPS_MATH_H

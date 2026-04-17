@@ -5,6 +5,7 @@
 //  Created by Alazar Manakelew on 4/6/26.
 //
 
+#include "../../meow.h"
 #include "mamba_impl.h"
 
 using namespace meow::mamba;
@@ -31,4 +32,5 @@ void ss_bwd_kernel(
     uint3 gid [[threadgroup_position_in_grid]],
     uint lid [[thread_index_in_threadgroup]])
 {
+    
 }

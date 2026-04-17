@@ -6,8 +6,7 @@
 //  Same logic as attn_2048_128 but reads strides/seq from config buffer.
 //  d=128 fixed (2×2 SIMD layout requires it).
 
-#include <metal_stdlib>
-#include "tools/tile.h"
+#include "../../meow.h"
 
 using namespace metal;
 using namespace meow;

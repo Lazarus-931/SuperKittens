@@ -6,8 +6,8 @@
 //
 //  Tile loaders: safe/unsafe, fused scale, coalesced write-back.
 
-#ifndef SUPERKITTENS_OPS_MEMORY_H
-#define SUPERKITTENS_OPS_MEMORY_H
+#ifndef MEOW_OPS_MEMORY_H
+#define MEOW_OPS_MEMORY_H
 
 #include <metal_stdlib>
 using namespace metal;
@@ -117,4 +117,4 @@ inline void store_tile_half4(
 } // namespace ops
 } // namespace meow
 
-#endif // SUPERKITTENS_OPS_MEMORY_H
+#endif // MEOW_OPS_MEMORY_H

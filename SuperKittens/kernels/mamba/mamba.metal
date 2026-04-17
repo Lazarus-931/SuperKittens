@@ -5,6 +5,7 @@
 //  Created by Alazar Manakelew on 4/6/26.
 //
 
+#include "../../meow.h"
 #include "mamba_impl.h"
 
 using namespace meow::mamba;

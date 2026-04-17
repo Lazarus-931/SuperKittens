@@ -5,8 +5,8 @@
 //  Type conversion utilities for threadgroup and register data.
 //
 
-#ifndef SUPERKITTENS_OPS_CONVERT_H
-#define SUPERKITTENS_OPS_CONVERT_H
+#ifndef MEOW_OPS_CONVERT_H
+#define MEOW_OPS_CONVERT_H
 
 #include <metal_stdlib>
 using namespace metal;
@@ -82,4 +82,4 @@ METAL_FUNC void copy(threadgroup Dst* dst, const threadgroup Src* src,
 } // namespace ops
 } // namespace meow
 
-#endif // SUPERKITTENS_OPS_CONVERT_H
+#endif // MEOW_OPS_CONVERT_H

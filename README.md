@@ -39,14 +39,11 @@ April 2026:
 
 
 
-### Todo
-- [ ] Full support for single M-series chip
-  - [ ] M1
-  - [ ] M2
-  - [ ] M3
-  - [ ] M4
-  - [ ] M5
-- [ ] Fp16 Support across GEMM for all chips
+### Benchmarking
+
+Kernels & their respetive benchmarks done
+
+[INSERT TABLE HERE, ROWS ARE KERNELS, CHIPS ARE COLS]
 
 ### What's coming
 

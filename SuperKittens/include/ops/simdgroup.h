@@ -7,8 +7,8 @@
 //  Cross-SIMD reductions and barrier helpers.
 //
 
-#ifndef SUPERKITTENS_OPS_SIMDGROUP_H
-#define SUPERKITTENS_OPS_SIMDGROUP_H
+#ifndef MEOW_OPS_SIMDGROUP_H
+#define MEOW_OPS_SIMDGROUP_H
 
 #include <metal_stdlib>
 using namespace metal;
@@ -45,4 +45,4 @@ inline float cross_simd_sum(
 } // namespace ops
 } // namespace meow
 
-#endif // SUPERKITTENS_OPS_SIMDGROUP_H
+#endif // MEOW_OPS_SIMDGROUP_H

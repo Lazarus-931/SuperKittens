@@ -6,8 +6,8 @@
 //  Everything builds on simdgroup_{half,float}8x8.
 //
 
-#ifndef SUPERKITTENS_MMA_BASE_H
-#define SUPERKITTENS_MMA_BASE_H
+#ifndef MEOW_MMA_BASE_H
+#define MEOW_MMA_BASE_H
 
 #include <metal_stdlib>
 #include <metal_simdgroup_matrix>
@@ -101,4 +101,4 @@ struct Tile {
 } // namespace mma
 } // namespace meow
 
-#endif // SUPERKITTENS_MMA_BASE_H
+#endif // MEOW_MMA_BASE_H

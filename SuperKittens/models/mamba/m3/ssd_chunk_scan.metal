@@ -9,7 +9,7 @@
  SSD chunk scan forward
  */
 
-#include "../../../meow_metal.h"
+#include "../../../meow.h"
 #include "../../../kernels/mamba/mamba_impl.h"
 
 using namespace meow::mamba;
@@ -26,7 +26,6 @@ struct SSDChunkScanArgs {
     uint hasZ;
 };
 
-#include "../../../kernels/mamba/tools.h"
 #include "../../../kernels/mamba/index.h"
 
 

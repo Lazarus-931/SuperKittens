@@ -6,6 +6,7 @@
 #//
 
 import mlx
+from benchmark.harness import harness
 
 # exp trapezoidal discretization
 

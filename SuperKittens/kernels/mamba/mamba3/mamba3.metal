@@ -311,6 +311,8 @@ struct mamba3_fwd {
         static void compute(threadgroup half* Qs, threadgroup half* Ks,
                             threadgroup half* Vs, threadgroup float* As,
                             threadgroup float* Bs,
+                            threadgroup half* angles,
+                            threadgroup float* angle_state,
                             threadgroup float* cumsum_scratch,
                             threadgroup float* local_decay,
                             threadgroup half* scratch,
@@ -321,6 +323,8 @@ struct mamba3_fwd {
 
             build_trap_scale(As, Bs, Bs, lid);
             apply_trapezoidal_scale(As, Bs, local_decay, lid);
+            def_rotary_angle(angles, As, angle_state, lid);
+            apply_rotary_qk(Qs, Ks, angles, lid);
 
             intra_chunk(Qs, Ks, Vs, As, scratch, simd_id, lane_id);
             inter_chunk(Qs, Ks, Vs, local_decay, kv_state, lid, simd_id, lane_id);
@@ -382,6 +386,47 @@ struct mamba3_fwd {
 
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
+        
+        
+        
+        static void intra_chunk(threadgroup half* Qs, threadgroup half* Ks,
+                                threadgroup half* Vs, threadgroup float* As,
+                                threadgroup half* scratch,
+                                uint simd_id, uint lane_id) {
+            enum : int {
+                TILE_ROWS = TILE_M / 8,
+                QK_COLS = CHUNK_SIZE / 8,
+                V_COLS = HEAD_DIM_V / 8,
+                FLAT_QK_DIM = HEAD_DIM_QK * MIMO_RANK
+            };
+
+            uint row_base = simd_id * TILE_M;
+
+            meow::mma::Tile<TILE_ROWS, QK_COLS> attn_block;
+            attn_block.clear();
+            meow::mma::mm_ABt<FLAT_QK_DIM, TILE_ROWS, QK_COLS>(
+                attn_block, Qs + row_base * FLAT_QK_DIM, FLAT_QK_DIM,
+                Ks, FLAT_QK_DIM);
+
+            meow::tools::apply_causal_decay(attn_block, As, row_base, lane_id);
+
+            attn_block.copy_to_half(scratch + row_base * CHUNK_SIZE, CHUNK_SIZE);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            meow::mma::Tile<TILE_ROWS, V_COLS> o_reg;
+            o_reg.clear();
+            meow::mma::mm_AB<CHUNK_SIZE, TILE_ROWS, V_COLS>(
+                o_reg, scratch + row_base * CHUNK_SIZE, CHUNK_SIZE,
+                Vs, HEAD_DIM_V);
+
+            o_reg.store(Vs + row_base * HEAD_DIM_V, HEAD_DIM_V);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        
+        
+        static void inter_chunk() {
+            
+        }
 
         static void compute(threadgroup float* As, threadgroup float* Bs,
                             threadgroup float* cumsum_scratch,
@@ -397,6 +442,12 @@ struct mamba3_fwd {
             
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
+        
+        
+        
+        
+        
+        
     };
 };
 

@@ -6,7 +6,7 @@
 //
 
 #include <metal_stdlib>
-#include "../../../meow_metal.h"
+#include "../../../meow.h"
 #include "../../../kernels/mamba/mamba_impl.h"
 
 using namespace meow::mamba;

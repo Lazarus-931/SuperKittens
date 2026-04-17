@@ -1,9 +1,8 @@
 //
 //  meow.h
-//  SuperKittens — master include header
+//  SuperKittens — unified master include
 //
-//  For .metal files:  #include "meow.metal"
-//  For .cpp files:    #include "meow.h"
+//  #include "meow.h" from .metal or .cpp — the right stuff gets pulled in.
 //
 //  Created by Alazar Manakelew on 4/1/26.
 //
@@ -11,9 +10,42 @@
 #ifndef SUPERKITTENS_MEOW_H
 #define SUPERKITTENS_MEOW_H
 
-// ── Host-side includes (C++ only) ────────────────────────────
+#ifdef __METAL_VERSION__
+// ═══════════════════════════════════════════════════════════════
+//  GPU side (Metal Shading Language)
+// ═══════════════════════════════════════════════════════════════
+
+#include <metal_stdlib>
+#include <metal_simdgroup_matrix>
+using namespace metal;
+
+// ── MMA primitives ───────────────────────────────────────────
+#include "include/group/mma/base.h"
+#include "include/group/mma/ops.h"
+
+// ── Tiles ────────────────────────────────────────────────────
+#include "kernels/tools/tile.h"
+
+// ── Ops ──────────────────────────────────────────────────────
+#include "include/ops/convert.h"
+#include "include/ops/memory.h"
+#include "include/ops/math.h"
+#include "include/ops/simdgroup.h"
+#include "include/ops/tools.h"
+
+#else
+// ═══════════════════════════════════════════════════════════════
+//  Host side (C++)
+// ═══════════════════════════════════════════════════════════════
+
+#include <Foundation/Foundation.hpp>
+#include <Metal/Metal.hpp>
+#include <QuartzCore/QuartzCore.hpp>
+
 #include "kernels/mamba/mamba_impl.h"
 #include "kernels/mamba/mamba_host.h"
+
+#endif // __METAL_VERSION__
 
 using namespace meow;
 
