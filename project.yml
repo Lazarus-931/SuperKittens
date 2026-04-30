@@ -8,17 +8,25 @@ configs:
 fileGroups:
   - README.md
   - CLAUDE.md
+  - roadmap.md
+  - project.yml
+  - pyproject.toml
+  - uv.lock
+  - .gitignore
+  - meow.png
   - SuperKittens/docs
   - SuperKittens/include
   - SuperKittens/kernels
   - SuperKittens/models
   - SuperKittens/plots
   - SuperKittens/attention_ref.h
+  - SuperKittens/benchmark
   - SuperKittens/benchmark.cpp
   - SuperKittens/benchmark.h
   - SuperKittens/meow.h
-  - SuperKittens/meow_metal.h
-  - traces
+  - assets
+  - bench
+  - scripts
   - metal-cpp
 targets:
   SuperKittens:

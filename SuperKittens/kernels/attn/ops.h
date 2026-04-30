@@ -4,14 +4,14 @@
 //
 //  By Alazar Manakelew
 //
-//  Online softmax update, score scaling, causal mask.
+//  Tile-based softmax, causal mask, and online state update.
 
 #ifndef SUPERKITTENS_ATTN_OPS_H
 #define SUPERKITTENS_ATTN_OPS_H
 
 #include <metal_stdlib>
-#include "../../ops/simdgroup.h"
-#include "../../ops/math.h"
+#include "../../include/ops/simdgroup.h"
+#include "../../include/ops/math.h"
 
 using namespace metal;
 
@@ -23,65 +23,96 @@ struct SoftmaxState {
     float row_sum;
 };
 
-// Scale scores + find tile_max in one pass over shared memory.
-inline float scale_and_max(
-    threadgroup float* scores, uint stride,
-    uint tile_size,
-    float rsqrt_d,
-    uint lid, uint num_threads)
-{
-    float tile_max = -INFINITY;
-    for (uint i = lid; i < tile_size; i += num_threads) {
-        uint idx = (i / 128) * stride + (i % 128);
-        scores[idx] *= rsqrt_d;
-        tile_max = max(tile_max, scores[idx]);
-    }
-    return tile_max;
-}
-
-// Apply exp(score - max) and accumulate sum in one pass.
-inline float exp_and_sum(
-    threadgroup float* scores, uint stride,
-    uint tile_size,
-    float row_max,
-    uint lid, uint num_threads)
-{
-    float tile_sum = 0.0f;
-    for (uint i = lid; i < tile_size; i += num_threads) {
-        uint idx = (i / 128) * stride + (i % 128);
-        float val = meow::ops::fast_exp(scores[idx] - row_max);
-        scores[idx] = val;
-        tile_sum += val;
-    }
-    return tile_sum;
-}
-
-// Apply causal mask: set scores where key_pos > query_pos to -inf.
+// Apply causal mask to a tile of scores in threadgroup memory.
+// Sets scores[row][col] = -INFINITY where key_pos > query_pos.
 inline void apply_causal_mask(
-    threadgroup float* scores, uint stride,
-    uint tileRow, uint tileCol,
-    uint lid, uint num_threads)
+    threadgroup float* scores,
+    uint stride,
+    uint row_start,
+    uint tile_col,
+    uint tile_m,
+    uint tile_n,
+    uint lid,
+    uint num_threads)
 {
-    for (uint i = lid; i < 16 * 128; i += num_threads) {
-        uint r = i / 128, c = i % 128;
-        uint query_pos = tileRow + r;
-        uint key_pos = tileCol + c;
+    for (uint i = lid; i < tile_m * tile_n; i += num_threads) {
+        uint r = i / tile_n;
+        uint c = i % tile_n;
+        uint query_pos = row_start + r;
+        uint key_pos = tile_col + c;
         if (key_pos > query_pos)
             scores[r * stride + c] = -INFINITY;
     }
 }
 
-// Update online softmax state with new tile stats.
-inline void update_state(
+// Scale scores by rsqrt_d and find the per-row max.
+// Each row's max is stored in row_maxes[row] (threadgroup float array, tile_m elements).
+inline void scale_and_find_row_max(
+    threadgroup float* scores,
+    uint stride,
+    uint tile_m,
+    uint tile_n,
+    float scale,
+    threadgroup float* row_maxes,
+    uint lid,
+    uint num_threads)
+{
+    for (uint i = lid; i < tile_m * tile_n; i += num_threads) {
+        uint r = i / tile_n;
+        uint c = i % tile_n;
+        uint idx = r * stride + c;
+        scores[idx] *= scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // One thread per row initializes max
+    if (lid < tile_m) {
+        float m = -INFINITY;
+        for (uint c = 0; c < tile_n; c++)
+            m = max(m, scores[lid * stride + c]);
+        row_maxes[lid] = m;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+// Apply exp(score - row_max) and compute per-row sum.
+// Stores exp values back into scores, sums into row_sums[row].
+inline void exp_and_sum_rows(
+    threadgroup float* scores,
+    uint stride,
+    uint tile_m,
+    uint tile_n,
+    threadgroup float* row_maxes,
+    threadgroup float* row_sums,
+    uint lid,
+    uint num_threads)
+{
+    if (lid < tile_m) {
+        float s = 0.0f;
+        float rmax = row_maxes[lid];
+        for (uint c = 0; c < tile_n; c++) {
+            uint idx = lid * stride + c;
+            float val = meow::ops::fast_exp(scores[idx] - rmax);
+            scores[idx] = val;
+            s += val;
+        }
+        row_sums[lid] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+// Update online softmax state with a new tile's statistics.
+// Returns the rescale factor to apply to previously accumulated output.
+inline float update_state(
     thread SoftmaxState& state,
     float tile_max,
-    float tile_sum,
-    thread float& scale)
+    float tile_sum)
 {
-    float old_max = state.row_max;
-    state.row_max = max(state.row_max, tile_max);
-    scale = meow::ops::fast_exp(old_max - state.row_max);
-    state.row_sum = state.row_sum * scale + tile_sum;
+    float new_max = max(state.row_max, tile_max);
+    float rescale = meow::ops::fast_exp(state.row_max - new_max);
+    state.row_sum = state.row_sum * rescale + tile_sum;
+    state.row_max = new_max;
+    return rescale;
 }
 
 } // namespace attn

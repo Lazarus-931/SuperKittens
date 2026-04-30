@@ -25,6 +25,16 @@ struct Tile {
     static_assert(ROWS > 0 && COLS > 0, "Tile dims must be positive");
     simdgroup_float8x8 data[ROWS][COLS];
 
+    METAL_FUNC static uint lane_row(uint lane_id) {
+        uint qid = lane_id / 4;
+        return (qid & 4) + ((lane_id / 2) % 4);
+    }
+
+    METAL_FUNC static uint lane_col(uint lane_id) {
+        uint qid = lane_id / 4;
+        return (qid & 2) * 2 + (lane_id % 2) * 2;
+    }
+
     METAL_FUNC void clear() {
         for (int r = 0; r < ROWS; r++)
             for (int c = 0; c < COLS; c++)
@@ -32,17 +42,33 @@ struct Tile {
     }
 
     // Store accumulator to threadgroup memory as half
-    METAL_FUNC void store(threadgroup half* dst, uint ld) const {
+    METAL_FUNC void store(threadgroup half* dst, uint ld) {
+        const uint lane_id = simd_prefix_exclusive_sum(uint(1));
+        const uint row = lane_row(lane_id);
+        const uint col = lane_col(lane_id);
         for (int r = 0; r < ROWS; r++)
-            for (int c = 0; c < COLS; c++)
-                simdgroup_store(data[r][c], dst + r * 8 * ld + c * 8, ld);
+            for (int c = 0; c < COLS; c++) {
+                thread simdgroup_float8x8& acc = data[r][c];
+                float2 elems = reinterpret_cast<thread float2&>(acc.thread_elements());
+                threadgroup half* base = dst + (r * 8 + row) * ld + c * 8 + col;
+                base[0] = half(elems.x);
+                base[1] = half(elems.y);
+            }
     }
 
     // Store accumulator to device memory as half
-    METAL_FUNC void store(device half* dst, uint ld) const {
+    METAL_FUNC void store(device half* dst, uint ld) {
+        const uint lane_id = simd_prefix_exclusive_sum(uint(1));
+        const uint row = lane_row(lane_id);
+        const uint col = lane_col(lane_id);
         for (int r = 0; r < ROWS; r++)
-            for (int c = 0; c < COLS; c++)
-                simdgroup_store(data[r][c], dst + r * 8 * ld + c * 8, ld);
+            for (int c = 0; c < COLS; c++) {
+                thread simdgroup_float8x8& acc = data[r][c];
+                float2 elems = reinterpret_cast<thread float2&>(acc.thread_elements());
+                device half* base = dst + (r * 8 + row) * ld + c * 8 + col;
+                base[0] = half(elems.x);
+                base[1] = half(elems.y);
+            }
     }
 
     // Element-wise multiply with another tile (e.g. decay mask)
@@ -65,7 +91,7 @@ struct Tile {
     }
 
     // Copy float32 acc → half in threadgroup (for feeding back into MMA as operand)
-    METAL_FUNC void copy_to_half(threadgroup half* dst, uint ld) const {
+    METAL_FUNC void copy_to_half(threadgroup half* dst, uint ld) {
         store(dst, ld);  // simdgroup_store already converts float→half
     }
 
@@ -91,7 +117,7 @@ struct Tile {
     }
     
     METAL_FUNC void copy_to_global(device half* dst, uint ld) const {
-        
+        // TODO: to be done
     }
 
 

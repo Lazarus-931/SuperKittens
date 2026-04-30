@@ -1,9 +1,10 @@
 //
-//  attn_causal.metal
+//  attn_noncausal.metal
 //  SuperKittens
 //
-//  Fused causal multi-head attention.
+//  Fused non-causal multi-head attention.
 //  Row-per-SIMD online softmax with cooperative K/V tile loading.
+//  Uses ops.h for SoftmaxState and math helpers.
 //
 
 #include <metal_stdlib>
@@ -19,7 +20,7 @@ enum : uint {
 };
 
 // Fast path: head_dim == 128, vectorized dot products.
-static inline void causal_mha_128(
+static inline void noncausal_mha_128(
     device const half* Q,
     device const half* K,
     device const half* V,
@@ -40,12 +41,12 @@ static inline void causal_mha_128(
     const float4 qv = float4(q_row[lane_id]);
     float4 out_vec = float4(0.0f);
 
-    for (uint tile_col = 0; tile_col <= row; tile_col += ATTN_KEY_TILE) {
+    for (uint tile_col = 0; tile_col < seq; tile_col += ATTN_KEY_TILE) {
         for (uint i = lid; i < ATTN_KEY_TILE * 32; i += ATTN_THREADS) {
             const uint local_row = i / 32;
             const uint local_col = i % 32;
             const uint global_col = tile_col + local_row;
-            if (global_col < seq && global_col <= row) {
+            if (global_col < seq) {
                 const device half4* k_row = reinterpret_cast<const device half4*>(
                     K + (size_t)global_col * 128);
                 const device half4* v_row = reinterpret_cast<const device half4*>(
@@ -59,7 +60,7 @@ static inline void causal_mha_128(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        const uint tile_limit = min(ATTN_KEY_TILE, row + 1 - tile_col);
+        const uint tile_limit = min(ATTN_KEY_TILE, seq - tile_col);
         for (uint local_col = 0; local_col < tile_limit; ++local_col) {
             const uint idx = local_col * 32 + lane_id;
             const float score = simd_sum(dot(qv, float4(k_tile[idx]))) * scale;
@@ -82,7 +83,7 @@ static inline void causal_mha_128(
 }
 
 // General path: arbitrary head_dim, scalar accumulation.
-static inline void causal_mha_generic(
+static inline void noncausal_mha_generic(
     device const half* Q,
     device const half* K,
     device const half* V,
@@ -102,7 +103,7 @@ static inline void causal_mha_generic(
     const uint out_col3 = lane_id + 96;
     const size_t q_base = (size_t)row * head_dim;
 
-    for (uint col = 0; col <= row; ++col) {
+    for (uint col = 0; col < seq; ++col) {
         const size_t k_base = (size_t)col * head_dim;
         float partial_dot = 0.0f;
         for (uint kk = lane_id; kk < head_dim; kk += 32)
@@ -130,9 +131,9 @@ static inline void causal_mha_generic(
     if (out_col3 < head_dim) O[q_base + out_col3] = half(out_vec.w * inv_sum);
 }
 
-[[host_name("mha_causal")]]
+[[host_name("mha_noncausal")]]
 [[kernel, max_total_threads_per_threadgroup(ATTN_THREADS)]]
-void mha_causal(
+void mha_noncausal(
     device const half* Q      [[buffer(0)]],
     device const half* K      [[buffer(1)]],
     device const half* V      [[buffer(2)]],
@@ -153,11 +154,11 @@ void mha_causal(
     threadgroup half4 v_tile[ATTN_KEY_TILE * 32];
 
     if (head_dim == 128) {
-        causal_mha_128(Q + off, K + off, V + off, O + off,
-                       seq, row, lane_id, lid, k_tile, v_tile);
+        noncausal_mha_128(Q + off, K + off, V + off, O + off,
+                          seq, row, lane_id, lid, k_tile, v_tile);
         return;
     }
 
-    causal_mha_generic(Q + off, K + off, V + off, O + off,
-                       seq, head_dim, row, lane_id);
+    noncausal_mha_generic(Q + off, K + off, V + off, O + off,
+                          seq, head_dim, row, lane_id);
 }

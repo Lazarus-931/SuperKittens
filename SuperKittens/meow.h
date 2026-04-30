@@ -26,12 +26,16 @@ using namespace metal;
 // ── Tiles ────────────────────────────────────────────────────
 #include "kernels/tools/tile.h"
 
-// ── Ops ──────────────────────────────────────────────────────
-#include "include/ops/convert.h"
-#include "include/ops/memory.h"
-#include "include/ops/math.h"
-#include "include/ops/simdgroup.h"
-#include "include/ops/tools.h"
+	// ── Ops ──────────────────────────────────────────────────────
+	#include "include/ops/convert.h"
+	#include "include/ops/memory.h"
+	#include "include/ops/math.h"
+	#include "include/ops/simdgroup.h"
+	#include "include/ops/tools.h"
+
+	// ── GEMM ─────────────────────────────────────────────────────
+	#include "kernels/gemm/gemm_impl.h"
+	#include "kernels/gemm/gemm.h"
 
 #else
 // ═══════════════════════════════════════════════════════════════
@@ -40,10 +44,13 @@ using namespace metal;
 
 #include <Foundation/Foundation.hpp>
 #include <Metal/Metal.hpp>
-#include <QuartzCore/QuartzCore.hpp>
+	#include <QuartzCore/QuartzCore.hpp>
 
-#include "kernels/mamba/mamba_impl.h"
-#include "kernels/mamba/mamba_host.h"
+	#include "kernels/gemm/gemm_impl.h"
+	#include "kernels/gemm/gemm.h"
+	#include "kernels/gemm/gemm_host.h"
+	#include "kernels/mamba/mamba_impl.h"
+	#include "kernels/mamba/mamba_host.h"
 
 #endif // __METAL_VERSION__
 

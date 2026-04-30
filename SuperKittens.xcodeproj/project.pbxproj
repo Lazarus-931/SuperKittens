@@ -20,6 +20,18 @@
 
 /* Begin PBXFileReference section */
 		D6145ECC2F7CDE7E00D54F75 /* SuperKittens */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = SuperKittens; sourceTree = BUILT_PRODUCTS_DIR; };
+		D6145ED62F7CDE7E00D54F75 /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
+		D6145ED72F7CDE7E00D54F75 /* CLAUDE.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = CLAUDE.md; sourceTree = "<group>"; };
+		D6145ED82F7CDE7E00D54F75 /* roadmap.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = roadmap.md; sourceTree = "<group>"; };
+		D6145ED92F7CDE7E00D54F75 /* project.yml */ = {isa = PBXFileReference; lastKnownFileType = text.yaml; path = project.yml; sourceTree = "<group>"; };
+		D6145EDA2F7CDE7E00D54F75 /* pyproject.toml */ = {isa = PBXFileReference; lastKnownFileType = text; path = pyproject.toml; sourceTree = "<group>"; };
+		D6145EDB2F7CDE7E00D54F75 /* uv.lock */ = {isa = PBXFileReference; lastKnownFileType = text; path = uv.lock; sourceTree = "<group>"; };
+		D6145EDC2F7CDE7E00D54F75 /* .gitignore */ = {isa = PBXFileReference; lastKnownFileType = text; path = .gitignore; sourceTree = "<group>"; };
+		D6145EDD2F7CDE7E00D54F75 /* meow.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = meow.png; sourceTree = "<group>"; };
+		D6145EDE2F7CDE7E00D54F75 /* assets */ = {isa = PBXFileReference; lastKnownFileType = folder; path = assets; sourceTree = "<group>"; };
+		D6145EDF2F7CDE7E00D54F75 /* bench */ = {isa = PBXFileReference; lastKnownFileType = folder; path = bench; sourceTree = "<group>"; };
+		D6145EE02F7CDE7E00D54F75 /* metal-cpp */ = {isa = PBXFileReference; lastKnownFileType = folder; path = "metal-cpp"; sourceTree = "<group>"; };
+		D6145EE12F7CDE7E00D54F75 /* scripts */ = {isa = PBXFileReference; lastKnownFileType = folder; path = scripts; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -44,6 +56,18 @@
 		D6145EC32F7CDE7E00D54F75 = {
 			isa = PBXGroup;
 			children = (
+				D6145ED62F7CDE7E00D54F75 /* README.md */,
+				D6145ED72F7CDE7E00D54F75 /* CLAUDE.md */,
+				D6145ED82F7CDE7E00D54F75 /* roadmap.md */,
+				D6145ED92F7CDE7E00D54F75 /* project.yml */,
+				D6145EDA2F7CDE7E00D54F75 /* pyproject.toml */,
+				D6145EDB2F7CDE7E00D54F75 /* uv.lock */,
+				D6145EDC2F7CDE7E00D54F75 /* .gitignore */,
+				D6145EDD2F7CDE7E00D54F75 /* meow.png */,
+				D6145EDE2F7CDE7E00D54F75 /* assets */,
+				D6145EDF2F7CDE7E00D54F75 /* bench */,
+				D6145EE02F7CDE7E00D54F75 /* metal-cpp */,
+				D6145EE12F7CDE7E00D54F75 /* scripts */,
 				D6145ECE2F7CDE7E00D54F75 /* SuperKittens */,
 				D6145ECD2F7CDE7E00D54F75 /* Products */,
 			);

@@ -17,8 +17,9 @@ struct mamba3_fwd {
         CHUNK_SIZE = CHUNK,
         HEAD_DIM_QK = HD_QK,
         HEAD_DIM_V = HD_V,
-        N_THREADS = 256,
-        TILE_M = 16
+        TILE_M = 8,
+        N_SIMDS = CHUNK_SIZE / TILE_M,
+        N_THREADS = N_SIMDS * 32,
     };
     
     
@@ -31,8 +32,7 @@ struct mamba3_fwd {
             A_SIZE = CHUNK_SIZE,
             B_SIZE = CHUNK_SIZE,
             ANGLE_SIZE = CHUNK_SIZE * (HEAD_DIM_QK / 2),
-            CUMSUM_SCRATCH_SIZE = CHUNK_SIZE / 32,
-            DECAY_SIZE = CHUNK_SIZE
+            CUMSUM_SCRATCH_SIZE = CHUNK_SIZE / 32
         };
     };
 
@@ -65,9 +65,9 @@ struct mamba3_fwd {
             Bs[i] = B_trap[cs.b_offset + i];
         }
 
-        for (uint i = lid; i < shared_layout::ANGLE_SIZE; i += N_THREADS) {
+        for (uint i = lid; i < shared_layout::ANGLE_SIZE; i += N_THREADS)
             angles[i] = angle[cs.angle_offset + i];
-        }
+
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -87,17 +87,6 @@ struct mamba3_fwd {
         
         threadgroup_barrier(mem_flags::mem_threadgroup);
         
-    }
-    
-    static void apply_trapezoidal_scale(threadgroup float* A,
-                                        threadgroup float* B_scale,
-                                        threadgroup float* local_decay,
-                                        uint lid) {
-        for (uint i = lid; i < CHUNK_SIZE; i += N_THREADS) {
-            local_decay[i] = fast::exp(A[i]) * B_scale[i];
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     
     /// 2. helper funcs related to m3 specific rotary embedding
@@ -198,15 +187,134 @@ struct mamba3_fwd {
     }
 
     template<int QK_DIM>
-    static void inter_chunk_impl(threadgroup half* Qs, threadgroup half* Ks,
-                                 threadgroup half* Vs, threadgroup float* local_decay,
+    static void state_update_impl(threadgroup half* Ks,
+                                  threadgroup half* Vs, threadgroup float* As,
+                                  threadgroup float* Bs,
+                                  threadgroup half* kv_state,
+                                  uint lid, uint simd_id) {
+        enum : int {
+            QK_COLS = QK_DIM / 8,
+            V_COLS = HEAD_DIM_V / 8,
+            STATE_SIZE = QK_DIM * HEAD_DIM_V
+        };
+
+        if (simd_id == 0) {
+            float chunk_decay = metal::fast::exp(As[CHUNK_SIZE - 1]) * Bs[CHUNK_SIZE - 1];
+            for (uint i = lid; i < STATE_SIZE; i += 32) {
+                kv_state[i] = half(float(kv_state[i]) * chunk_decay);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (simd_id == 0) {
+            meow::mma::Tile<QK_COLS, V_COLS> state_update;
+            state_update.clear();
+            meow::mma::mm_AtB<CHUNK_SIZE, QK_COLS, V_COLS>(
+                state_update, Ks, QK_DIM, Vs, HEAD_DIM_V);
+            meow::mma::Tile<QK_COLS, V_COLS> existing;
+            existing.load(kv_state, HEAD_DIM_V);
+            for (int r = 0; r < QK_COLS; r++) {
+                for (int c = 0; c < V_COLS; c++) {
+                    auto d = reinterpret_cast<thread float2&>(
+                        state_update.data[r][c].thread_elements());
+                    auto e = reinterpret_cast<thread float2&>(
+                        existing.data[r][c].thread_elements());
+                    d += e;
+                }
+            }
+            state_update.store(kv_state, HEAD_DIM_V);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    template<int QK_DIM>
+    static void state_update_scalar_impl(threadgroup half* Ks,
+                                         threadgroup half* Vs,
+                                         threadgroup float* As,
+                                         threadgroup float* Bs,
+                                         threadgroup half* kv_state,
+                                         uint lid) {
+        const float chunk_decay = metal::fast::exp(As[CHUNK_SIZE - 1]) * Bs[CHUNK_SIZE - 1];
+        const uint state_size = QK_DIM * HEAD_DIM_V;
+        for (uint idx = lid; idx < state_size; idx += N_THREADS) {
+            const uint i = idx / HEAD_DIM_V;
+            const uint j = idx % HEAD_DIM_V;
+            float acc = float(kv_state[idx]) * chunk_decay;
+            for (uint t = 0; t < CHUNK_SIZE; ++t) {
+                acc += float(Ks[t * QK_DIM + i]) * float(Vs[t * HEAD_DIM_V + j]);
+            }
+            kv_state[idx] = half(acc);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    template<int QK_DIM>
+    static void output_scalar_impl(device const half* V,
+                                   const thread int& v_offset,
+                                   threadgroup half* Qs,
+                                   threadgroup half* Ks,
+                                   threadgroup half* Vs,
+                                   threadgroup float* As,
+                                   threadgroup float* Bs,
+                                   threadgroup half* kv_state,
+                                   uint lid) {
+        const uint out_size = CHUNK_SIZE * HEAD_DIM_V;
+        for (uint idx = lid; idx < out_size; idx += N_THREADS) {
+            const uint row = idx / HEAD_DIM_V;
+            const uint j = idx % HEAD_DIM_V;
+
+            float intra = 0.0f;
+            for (uint cc = 0; cc <= row; ++cc) {
+                float score = 0.0f;
+                for (uint i = 0; i < QK_DIM; ++i) {
+                    score += float(Qs[row * QK_DIM + i]) * float(Ks[cc * QK_DIM + i]);
+                }
+                intra += score * metal::fast::exp(As[row] - As[cc]) * float(V[v_offset + cc * HEAD_DIM_V + j]);
+            }
+
+            float inter = 0.0f;
+            for (uint i = 0; i < QK_DIM; ++i) {
+                inter += float(Qs[row * QK_DIM + i]) * float(kv_state[i * HEAD_DIM_V + j]);
+            }
+
+            const float q_decay = metal::fast::exp(As[row]) * Bs[row];
+            Vs[idx] = half(intra + q_decay * inter);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    template<int QK_DIM>
+    static void inter_chunk_scalar_add_impl(threadgroup half* Qs,
+                                            threadgroup half* Vs,
+                                            threadgroup float* As,
+                                            threadgroup float* Bs,
+                                            threadgroup half* kv_state,
+                                            uint lid) {
+        const uint out_size = CHUNK_SIZE * HEAD_DIM_V;
+        for (uint idx = lid; idx < out_size; idx += N_THREADS) {
+            const uint row = idx / HEAD_DIM_V;
+            const uint j = idx % HEAD_DIM_V;
+            float inter = 0.0f;
+            for (uint i = 0; i < QK_DIM; ++i) {
+                inter += float(Qs[row * QK_DIM + i]) * float(kv_state[i * HEAD_DIM_V + j]);
+            }
+
+            const float q_decay = metal::fast::exp(As[row]) * Bs[row];
+            Vs[idx] = half(float(Vs[idx]) + q_decay * inter);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    template<int QK_DIM>
+    static void inter_chunk_impl(threadgroup half* Qs,
+                                 threadgroup half* Vs, threadgroup float* As,
+                                 threadgroup float* Bs,
                                  threadgroup half* kv_state,
-                                 uint lid, uint simd_id, uint lane_id) {
+                                 uint simd_id, uint lane_id) {
         enum : int {
             TILE_ROWS = TILE_M / 8,
             V_COLS = HEAD_DIM_V / 8,
-            QK_COLS = QK_DIM / 8,
-            STATE_SIZE = QK_DIM * HEAD_DIM_V
+            QK_COLS = QK_DIM / 8
         };
 
         uint row_base = simd_id * TILE_M;
@@ -218,7 +326,7 @@ struct mamba3_fwd {
 
         for (int r = 0; r < TILE_ROWS; r++) {
             uint abs_row = row_base + r * 8 + local_row;
-            float decay = local_decay[abs_row];
+            float decay = metal::fast::exp(As[abs_row]) * Bs[abs_row];
             for (int c = 0; c < QK_COLS; c++) {
                 auto d = reinterpret_cast<thread float2&>(
                     q_reg.data[r][c].thread_elements());
@@ -248,32 +356,6 @@ struct mamba3_fwd {
         }
 
         inter_out.store(Vs + row_base * HEAD_DIM_V, HEAD_DIM_V);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        if (simd_id == 0) {
-            float chunk_decay = local_decay[CHUNK_SIZE - 1];
-            for (uint i = lid; i < STATE_SIZE; i += 32) {
-                kv_state[i] = half(float(kv_state[i]) * chunk_decay);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            meow::mma::Tile<QK_COLS, V_COLS> state_update;
-            state_update.clear();
-            meow::mma::mm_AtB<CHUNK_SIZE, QK_COLS, V_COLS>(
-                state_update, Ks, QK_DIM, Vs, HEAD_DIM_V);
-            meow::mma::Tile<QK_COLS, V_COLS> existing;
-            existing.load(kv_state, HEAD_DIM_V);
-            for (int r = 0; r < QK_COLS; r++) {
-                for (int c = 0; c < V_COLS; c++) {
-                    auto d = reinterpret_cast<thread float2&>(
-                        state_update.data[r][c].thread_elements());
-                    auto e = reinterpret_cast<thread float2&>(
-                        existing.data[r][c].thread_elements());
-                    d += e;
-                }
-            }
-            state_update.store(kv_state, HEAD_DIM_V);
-        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     
@@ -327,21 +409,32 @@ struct mamba3_fwd {
                 Qs, Ks, Vs, As, scratch, simd_id, lane_id);
         }
 
-        static void inter_chunk(threadgroup half* Qs, threadgroup half* Ks,
-                                threadgroup half* Vs, threadgroup float* local_decay,
-                                threadgroup half* kv_state,
-                                uint lid, uint simd_id, uint lane_id) {
-            mamba3_fwd::template inter_chunk_impl<HEAD_DIM_QK>(
-                Qs, Ks, Vs, local_decay, kv_state, lid, simd_id, lane_id);
+        static void state_update(threadgroup half* Ks,
+                                 threadgroup half* Vs, threadgroup float* As,
+                                 threadgroup float* Bs,
+                                 threadgroup half* kv_state,
+                                 uint lid, uint simd_id) {
+            mamba3_fwd::template state_update_impl<HEAD_DIM_QK>(
+                Ks, Vs, As, Bs, kv_state, lid, simd_id);
         }
 
-        static void compute(threadgroup half* Qs, threadgroup half* Ks,
+        static void inter_chunk(threadgroup half* Qs,
+                                threadgroup half* Vs, threadgroup float* As,
+                                threadgroup float* Bs,
+                                threadgroup half* kv_state,
+                                uint simd_id, uint lane_id) {
+            mamba3_fwd::template inter_chunk_impl<HEAD_DIM_QK>(
+                Qs, Vs, As, Bs, kv_state, simd_id, lane_id);
+        }
+
+        static void compute(device const half* V,
+                            const thread state& st,
+                            threadgroup half* Qs, threadgroup half* Ks,
                             threadgroup half* Vs, threadgroup float* As,
                             threadgroup float* Bs,
                             threadgroup half* angles,
                             threadgroup float* angle_state,
                             threadgroup float* cumsum_scratch,
-                            threadgroup float* local_decay,
                             threadgroup half* scratch,
                             threadgroup half* kv_state,
                             uint lid, uint simd_id, uint lane_id) {
@@ -349,12 +442,13 @@ struct mamba3_fwd {
                 As, cumsum_scratch, lid, lane_id, simd_id);
 
             build_trap_scale(As, Bs, Bs, lid);
-            apply_trapezoidal_scale(As, Bs, local_decay, lid);
             def_rotary_angle(angles, As, angle_state, lid);
             apply_rotary_qk(Qs, Ks, angles, lid);
 
-            intra_chunk(Qs, Ks, Vs, As, scratch, simd_id, lane_id);
-            inter_chunk(Qs, Ks, Vs, local_decay, kv_state, lid, simd_id, lane_id);
+            mamba3_fwd::template state_update_scalar_impl<HEAD_DIM_QK>(
+                Ks, Vs, As, Bs, kv_state, lid);
+            mamba3_fwd::template output_scalar_impl<HEAD_DIM_QK>(
+                V, st.v_offset, Qs, Ks, Vs, As, Bs, kv_state, lid);
         }
 
         // writeback output
@@ -425,12 +519,22 @@ struct mamba3_fwd {
         }
         
         
-        static void inter_chunk(threadgroup half* Qs, threadgroup half* Ks,
-                                threadgroup half* Vs, threadgroup float* local_decay,
+        static void state_update(threadgroup half* Ks,
+                                 threadgroup half* Vs, threadgroup float* As,
+                                 threadgroup float* Bs,
+                                 threadgroup half* kv_state,
+                                 uint lid, uint simd_id) {
+            mamba3_fwd::template state_update_impl<HEAD_DIM_QK * MIMO_RANK>(
+                Ks, Vs, As, Bs, kv_state, lid, simd_id);
+        }
+
+        static void inter_chunk(threadgroup half* Qs,
+                                threadgroup half* Vs, threadgroup float* As,
+                                threadgroup float* Bs,
                                 threadgroup half* kv_state,
-                                uint lid, uint simd_id, uint lane_id) {
+                                uint simd_id, uint lane_id) {
             mamba3_fwd::template inter_chunk_impl<HEAD_DIM_QK * MIMO_RANK>(
-                Qs, Ks, Vs, local_decay, kv_state, lid, simd_id, lane_id);
+                Qs, Vs, As, Bs, kv_state, simd_id, lane_id);
         }
 
         static void compute(threadgroup half* Qs, threadgroup half* Ks,
@@ -439,7 +543,6 @@ struct mamba3_fwd {
                             threadgroup half* angles,
                             threadgroup float* angle_state,
                             threadgroup float* cumsum_scratch,
-                            threadgroup float* local_decay,
                             threadgroup half* scratch,
                             threadgroup half* kv_state,
                             uint lid, uint simd_id, uint lane_id) {
@@ -447,13 +550,19 @@ struct mamba3_fwd {
                 As, cumsum_scratch, lid, lane_id, simd_id);
 
             build_trap_scale(As, Bs, Bs, lid);
-            apply_trapezoidal_scale(As, Bs, local_decay, lid);
             def_rotary_angle(angles, As, angle_state, lid);
             mamba3_fwd::template apply_rotary_qk_impl<MIMO_RANK>(
                 Qs, Ks, angles, lid);
 
+            state_update(Ks, Vs, As, Bs, kv_state, lid, simd_id);
             intra_chunk(Qs, Ks, Vs, As, scratch, simd_id, lane_id);
-            inter_chunk(Qs, Ks, Vs, local_decay, kv_state, lid, simd_id, lane_id);
+            inter_chunk(Qs, Vs, As, Bs, kv_state, simd_id, lane_id);
+        }
+
+        static void finish(device half* O, const thread state& st,
+                           threadgroup half* Vs, uint lid) {
+            for (uint i = lid; i < layout::V_SIZE; i += N_THREADS)
+                O[st.o_offset + i] = Vs[i];
         }
         
         
@@ -463,5 +572,140 @@ struct mamba3_fwd {
         
     };
 };
+
+struct Mamba3FwdArgs {
+    uint batch;
+    uint nheads;
+    uint seq_len;
+    uint n_chunks;
+};
+
+template<int CHUNK, int HD_QK, int HD_V>
+[[kernel, max_total_threads_per_threadgroup(256)]]
+void mamba3_siso_fwd_kernel(
+    device const half* Q [[buffer(0)]],
+    device const half* K [[buffer(1)]],
+    device const half* V [[buffer(2)]],
+    device const float* A [[buffer(3)]],
+    device const float* B_trap [[buffer(4)]],
+    device const half* angle [[buffer(5)]],
+    device half* O [[buffer(6)]],
+    constant Mamba3FwdArgs& args [[buffer(7)]],
+    uint3 gid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]],
+    uint lane_id [[thread_index_in_simdgroup]]
+) {
+    if (gid.x >= args.batch || gid.y >= args.nheads) return;
+
+    using op = mamba3_fwd<CHUNK, HD_QK, HD_V>;
+
+    threadgroup float As[op::shared_layout::A_SIZE];
+    threadgroup float Bs[op::shared_layout::B_SIZE];
+    threadgroup half angles[op::shared_layout::ANGLE_SIZE];
+    threadgroup float cumsum_scratch[op::shared_layout::CUMSUM_SCRATCH_SIZE];
+    threadgroup float angle_state[HD_QK / 2];
+    threadgroup half Qs[op::siso::layout::Q_SIZE];
+    threadgroup half Ks[op::siso::layout::K_SIZE];
+    threadgroup half Vs[op::siso::layout::V_SIZE];
+    threadgroup half scratch[CHUNK * CHUNK];
+    threadgroup half kv_state[HD_QK * HD_V];
+
+    for (uint i = lid; i < HD_QK / 2; i += op::N_THREADS) angle_state[i] = 0.0f;
+    for (uint i = lid; i < HD_QK * HD_V; i += op::N_THREADS) kv_state[i] = half(0);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Loop over chunks sequentially so kv_state accumulates across the sequence
+    for (uint chunk_idx = 0; chunk_idx < args.n_chunks; chunk_idx++) {
+        uint3 chunk_gid = uint3(gid.x, gid.y, chunk_idx);
+
+        typename op::common_state cs;
+        typename op::siso::state st;
+        op::setup_common(cs, chunk_gid, args.seq_len, args.nheads);
+        op::siso::setup(st, cs, args.seq_len, args.nheads);
+        op::load_common(A, B_trap, angle, cs, As, Bs, angles, lid);
+        op::siso::load(Q, K, V, st, Qs, Ks, Vs, lid);
+        op::siso::compute(V, st, Qs, Ks, Vs, As, Bs, angles, angle_state,
+                          cumsum_scratch, scratch, kv_state,
+                          lid, simd_id, lane_id);
+        op::siso::finish(O, st, Vs, lid);
+    }
+}
+
+template<int CHUNK, int HD_QK, int HD_V, int RANK, int DIM>
+[[kernel, max_total_threads_per_threadgroup(256)]]
+void mamba3_mimo_fwd_kernel(
+    device const half* Q [[buffer(0)]],
+    device const half* K [[buffer(1)]],
+    device const half* V [[buffer(2)]],
+    device const float* A [[buffer(3)]],
+    device const float* B_trap [[buffer(4)]],
+    device const half* angle [[buffer(5)]],
+    device half* O [[buffer(6)]],
+    constant Mamba3FwdArgs& args [[buffer(7)]],
+    uint3 gid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]],
+    uint lane_id [[thread_index_in_simdgroup]]
+) {
+    if (gid.x >= args.batch || gid.y >= args.nheads) return;
+
+    using op = mamba3_fwd<CHUNK, HD_QK, HD_V>;
+    using variant = typename op::template mimo<RANK, DIM>;
+
+    threadgroup float As[op::shared_layout::A_SIZE];
+    threadgroup float Bs[op::shared_layout::B_SIZE];
+    threadgroup half angles[op::shared_layout::ANGLE_SIZE];
+    threadgroup float cumsum_scratch[op::shared_layout::CUMSUM_SCRATCH_SIZE];
+    threadgroup float angle_state[HD_QK / 2];
+    threadgroup half Qs[variant::layout::Q_SIZE];
+    threadgroup half Ks[variant::layout::K_SIZE];
+    threadgroup half Vs[variant::layout::V_SIZE];
+    threadgroup half scratch[CHUNK * CHUNK];
+    threadgroup half kv_state[HD_QK * RANK * HD_V];
+
+    for (uint i = lid; i < HD_QK / 2; i += op::N_THREADS) angle_state[i] = 0.0f;
+    for (uint i = lid; i < HD_QK * RANK * HD_V; i += op::N_THREADS) kv_state[i] = half(0);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint chunk_idx = 0; chunk_idx < args.n_chunks; chunk_idx++) {
+        uint3 chunk_gid = uint3(gid.x, gid.y, chunk_idx);
+
+        typename op::common_state cs;
+        typename variant::state st;
+        op::setup_common(cs, chunk_gid, args.seq_len, args.nheads);
+        variant::setup(st, cs, args.seq_len, args.nheads);
+        op::load_common(A, B_trap, angle, cs, As, Bs, angles, lid);
+        variant::load(Q, K, V, st, Qs, Ks, Vs, lid);
+        variant::compute(Qs, Ks, Vs, As, Bs, angles, angle_state,
+                         cumsum_scratch, scratch, kv_state,
+                         lid, simd_id, lane_id);
+        variant::finish(O, st, Vs, lid);
+    }
+}
+
+template [[host_name("mamba3_siso_fwd_64_64_64")]]
+[[kernel]]
+void mamba3_siso_fwd_kernel<64, 64, 64>(
+    device const half*, device const half*, device const half*,
+    device const float*, device const float*, device const half*,
+    device half*, constant Mamba3FwdArgs&,
+    uint3, uint, uint, uint);
+
+template [[host_name("mamba3_siso_fwd_32_64_64")]]
+[[kernel]]
+void mamba3_siso_fwd_kernel<32, 64, 64>(
+    device const half*, device const half*, device const half*,
+    device const float*, device const float*, device const half*,
+    device half*, constant Mamba3FwdArgs&,
+    uint3, uint, uint, uint);
+
+template [[host_name("mamba3_mimo_fwd_32_64_64_r2")]]
+[[kernel]]
+void mamba3_mimo_fwd_kernel<32, 64, 64, 2, 64>(
+    device const half*, device const half*, device const half*,
+    device const float*, device const float*, device const half*,
+    device half*, constant Mamba3FwdArgs&,
+    uint3, uint, uint, uint);
 
 } // namespace meow::mamba::mamba3

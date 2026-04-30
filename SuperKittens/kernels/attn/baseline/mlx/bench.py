@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-import mlx.core as mx, time, sys
+import sys
+import time
+
+import mlx.core as mx
+
+from attention import fast_attention
 
 seq = int(sys.argv[1]) if len(sys.argv) > 1 else 2048
 d = int(sys.argv[2]) if len(sys.argv) > 2 else 128
@@ -11,13 +16,13 @@ V = mx.random.normal((1, 1, seq, d)).astype(mx.float16)
 mx.eval(Q, K, V)
 
 for _ in range(5):
-    O = mx.fast.scaled_dot_product_attention(Q, K, V, scale=1.0/d**0.5)
+    O = fast_attention(Q, K, V)
     mx.eval(O)
 
 times = []
 for _ in range(iters):
     t0 = time.perf_counter()
-    O = mx.fast.scaled_dot_product_attention(Q, K, V, scale=1.0/d**0.5)
+    O = fast_attention(Q, K, V)
     mx.eval(O)
     times.append((time.perf_counter() - t0) * 1e6)
 

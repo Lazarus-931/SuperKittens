@@ -40,6 +40,20 @@ METAL_FUNC void cumsum_simd(thread T& val, uint lid) {
     val += (lid >= 16) ? n : T(0);
 }
 
+template <typename T>
+METAL_FUNC void reverse_cumsum_simd(thread T& val, uint lid) {
+    T n = simd_shuffle_down(val, 1);
+    val += (lid + 1 < 32) ? n : T(0);
+    n = simd_shuffle_down(val, 2);
+    val += (lid + 2 < 32) ? n : T(0);
+    n = simd_shuffle_down(val, 4);
+    val += (lid + 4 < 32) ? n : T(0);
+    n = simd_shuffle_down(val, 8);
+    val += (lid + 8 < 32) ? n : T(0);
+    n = simd_shuffle_down(val, 16);
+    val += (lid + 16 < 32) ? n : T(0);
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////
 /// Causal Decay — applies exp(cumsum[row] - cumsum[col]) * causal mask to an MMA Tile
 ////////////////////////////////////////////////////////////////////////////////////////////
@@ -82,6 +96,29 @@ METAL_FUNC bool is_contiguous(const thread int* shape, const thread int* strides
     return true;
 }
 
+////////////////////////////////////////////////////////////////////////////////////////////
+/// SIMD-based threadgroup cumsum helper
+////////////////////////////////////////////////////////////////////////////////////////////
+///
+
+METAL_FUNC float min(float lhs, float rhs) {
+    return (lhs < rhs) ? lhs : rhs;
+}
+
+METAL_FUNC float max(float lhs, float rhs) {
+    return (lhs > rhs) ? lhs : rhs;
+}
+
+METAL_FUNC float clamp(float val, float min_val, float max_val) {
+    if (val < min_val) {
+        return min_val;
+    } else if (val > max_val) {
+        return max_val;
+    } else {
+        return val;
+    }
+}
+
 
 ////////////////////////////////////////////////////////////////////////////////////////////
 /// SIMD-based threadgroup cumsum helper
@@ -120,6 +157,36 @@ METAL_FUNC void threadgroup_cumsum(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
+template <typename T, int N>
+METAL_FUNC void threadgroup_reverse_cumsum(
+    threadgroup T* data,
+    threadgroup T* simd_totals,
+    uint lid, uint lane_id, uint simd_id)
+{
+    static_assert(N % 32 == 0, "N must be a multiple of SIMD width (32)");
+    constexpr int N_SIMDS = N / 32;
+
+    if (lid < N) {
+        T val = data[lid];
+        reverse_cumsum_simd<T>(val, lane_id);
+        data[lid] = val;
+        if (lane_id == 0) simd_totals[simd_id] = val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_id == 0 && lane_id < N_SIMDS) {
+        T t = simd_totals[lane_id];
+        reverse_cumsum_simd<T>(t, lane_id);
+        simd_totals[lane_id] = t;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid < N && simd_id + 1 < N_SIMDS) {
+        data[lid] += simd_totals[simd_id + 1];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
 } // namespace tools
 } // namespace meow
 
@@ -127,4 +194,3 @@ METAL_FUNC void threadgroup_cumsum(
 
 
 #endif // MEOW_OPS_TOOLS_H
-

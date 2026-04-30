@@ -15,6 +15,50 @@ using namespace metal;
 namespace meow {
 namespace ops {
 
+inline float4 load_half4(
+    device const half* src,
+    uint base)
+{
+    return float4(float(src[base + 0]),
+                  float(src[base + 1]),
+                  float(src[base + 2]),
+                  float(src[base + 3]));
+}
+
+inline float4 load_half4_or_zero(
+    device const half* src,
+    uint base,
+    uint valid)
+{
+    return float4(valid > 0 ? float(src[base + 0]) : 0.0f,
+                  valid > 1 ? float(src[base + 1]) : 0.0f,
+                  valid > 2 ? float(src[base + 2]) : 0.0f,
+                  valid > 3 ? float(src[base + 3]) : 0.0f);
+}
+
+inline void store_half4(
+    device half* dst,
+    uint base,
+    float4 val)
+{
+    dst[base + 0] = half(val.x);
+    dst[base + 1] = half(val.y);
+    dst[base + 2] = half(val.z);
+    dst[base + 3] = half(val.w);
+}
+
+inline void store_half4_masked(
+    device half* dst,
+    uint base,
+    float4 val,
+    uint valid)
+{
+    if (valid > 0) dst[base + 0] = half(val.x);
+    if (valid > 1) dst[base + 1] = half(val.y);
+    if (valid > 2) dst[base + 2] = half(val.z);
+    if (valid > 3) dst[base + 3] = half(val.w);
+}
+
 // Load tile from device half* → threadgroup float*, with scale applied.
 // Use for Q tiles where rsqrt_d is baked into the load.
 inline void load_tile_scaled(
