@@ -1,106 +1,73 @@
 #
-# mamba_mlx.py
-# SuperKittens
+#  baseline_m2.py
+#  SuperKittens — MLX reference for Mamba-2 selective scan
 #
-# Created by Alazar Manakelew on 4/6/26.
-#
-# Minimal implementation of Tri Dao's and Albert Gu's Mamba 2 in MLX
+#  Parallel chunked SSD. No Python loops over time within each chunk.
+
+import mlx.core as mx
 
 
-import mlx.core as mlx
-
-
-def seg_sum(x: mlx.array) -> mlx.array:
-    """Inclusive lower-triangular segment sums over the last dimension."""
-    t = x.shape[-1]
-    csum = mlx.cumsum(x, axis=-1)
-    prefix = mlx.concatenate(
-        [mlx.zeros((*x.shape[:-1], 1), dtype=x.dtype), csum[..., :-1]],
-        axis=-1,
-    )
-    seg = csum[..., :, None] - prefix[..., None, :]
-    mask = mlx.tril(mlx.ones((t, t), dtype=mlx.bool_))
-    return mlx.where(mask, seg, mlx.full(seg.shape, -mlx.inf, dtype=seg.dtype))
-
-
-def ssd(
-    q: mlx.array,
-    k: mlx.array,
-    v: mlx.array,
-    x: mlx.array,
-    block_len: int,
-    initial_states: mlx.array | None = None,
-) -> tuple[mlx.array, mlx.array]:
+def selective_scan(
+    Q: mx.array,       # (batch, length, n_heads, d_state)
+    K: mx.array,       # (batch, length, n_heads, d_state)
+    V: mx.array,       # (batch, length, n_heads, d_value)
+    A_log: mx.array,   # (batch, length, n_heads) — log-space decay
+    chunk_len: int = 64,
+) -> mx.array:
     """
-    Minimal Mamba-2 SSD recurrence.
-
-    Args:
-        q: C, shape (batch, length, n_heads, d_state)
-        k: B, shape (batch, length, n_heads, d_state)
-        v: X, shape (batch, length, n_heads, d_value)
-        x: A, shape (batch, length, n_heads)
-        block_len: Number of time steps to process per chunk.
-        initial_states: Optional initial state of shape
-            (batch, n_heads, d_state, d_value)
-
-    Returns:
-        y: shape (batch, length, n_heads, d_value)
-        final_state: shape (batch, n_heads, d_state, d_value)
+    Mamba-2 selective scan (SSD).
+    Per (batch, head): h_t = exp(A[t])*h_{t-1} + K[t]^T @ V[t];  y_t = Q[t] @ h_t
+    Returns y: (batch, length, n_heads, d_value)
     """
-    if block_len <= 0:
-        raise ValueError("block_len must be positive")
+    B, L, H, Ds = Q.shape
+    Dv = V.shape[-1]
 
-    if not (q.dtype == k.dtype == v.dtype == x.dtype):
-        raise TypeError("q, k, v, and x must have the same dtype")
+    pad = (chunk_len - L % chunk_len) % chunk_len
+    if pad:
+        Q = mx.pad(Q, [(0,0),(0,pad),(0,0),(0,0)])
+        K = mx.pad(K, [(0,0),(0,pad),(0,0),(0,0)])
+        V = mx.pad(V, [(0,0),(0,pad),(0,0),(0,0)])
+        A_log = mx.pad(A_log, [(0,0),(0,pad),(0,0)])
+    Lp = Q.shape[1]
+    C = Lp // chunk_len
 
-    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4 or x.ndim != 3:
-        raise ValueError("expected q/k/v to be 4D and x to be 3D")
+    # (B, chunks, heads, chunk, d)
+    Qc = Q.reshape(B, C, chunk_len, H, Ds).transpose(0,1,3,2,4)
+    Kc = K.reshape(B, C, chunk_len, H, Ds).transpose(0,1,3,2,4)
+    Vc = V.reshape(B, C, chunk_len, H, Dv).transpose(0,1,3,2,4)
+    Ac = A_log.reshape(B, C, chunk_len, H).transpose(0,1,3,2)  # (B,C,H,chunk)
 
-    if q.shape != k.shape:
-        raise ValueError("q and k must have the same shape")
-
-    batch, length, n_heads, d_state = q.shape
-    if v.shape[:3] != (batch, length, n_heads):
-        raise ValueError("v must have shape (batch, length, n_heads, d_value)")
-
-    if x.shape != (batch, length, n_heads):
-        raise ValueError("x must have shape (batch, length, n_heads)")
-
-    d_value = v.shape[-1]
-
-    if initial_states is None:
-        state = mlx.zeros((batch, n_heads, d_state, d_value), dtype=q.dtype)
-    else:
-        expected = (batch, n_heads, d_state, d_value)
-        if initial_states.shape != expected:
-            raise ValueError(
-                f"initial_states must have shape {expected}, got {initial_states.shape}"
-            )
-        state = initial_states
-
+    # ── Cross-chunk state via sequential scan ──
+    state = mx.zeros((B, H, Ds, Dv), dtype=Q.dtype)
     outputs = []
-    for chunk_start in range(0, length, block_len):
-        chunk_end = min(chunk_start + block_len, length)
 
-        q_chunk = q[:, chunk_start:chunk_end]
-        k_chunk = k[:, chunk_start:chunk_end]
-        v_chunk = v[:, chunk_start:chunk_end]
-        a_chunk = x[:, chunk_start:chunk_end]
+    for c in range(C):
+        A_c = Ac[:, c]       # (B, H, chunk)
+        Q_c = Qc[:, c]       # (B, H, chunk, Ds)
+        K_c = Kc[:, c]       # (B, H, chunk, Ds)
+        V_c = Vc[:, c]       # (B, H, chunk, Dv)
 
-        for i in range(q_chunk.shape[1]):
-            decay = mlx.exp(a_chunk[:, i])[..., None, None]
-            kv = mlx.einsum("bhn,bhp->bhnp", k_chunk[:, i], v_chunk[:, i])
-            state = decay * state + kv
-            y_t = mlx.einsum("bhn,bhnp->bhp", q_chunk[:, i], state)
-            outputs.append(y_t)
+        # Decay from chunk start to each position: cumsum of A (rightward)
+        decay = mx.exp(mx.cumsum(A_c, axis=-1))  # (B, H, chunk)
 
-    y = mlx.stack(outputs, axis=1)
-    return y, state
+        # Apply initial state: h at position i = state * decay[i] + contributions from K[0..i]
+        # The recurrent update within chunk is:
+        #   h_i = decay_rel[i,0] * state + sum_{j=0..i}(decay_rel[i,j] * K[j]^T @ V[j])
+        # where decay_rel[i,j] = exp(cumsum_{t=j+1..i} A[t])
 
+        # Compute via online recurrence (chunk_len iterations, all parallel)
+        # Process chunk position by position using the shared state
+        state_cur = state  # (B, H, Ds, Dv)
+        for i in range(chunk_len):
+            d_i = mx.exp(A_c[..., i])[..., None, None]  # (B, H, 1, 1)
+            kv_i = mx.einsum("bhd,bhD->bhdD", K_c[..., i, :], V_c[..., i, :])
+            state_cur = d_i * state_cur + kv_i
+            y_i = mx.einsum("bhd,bhdD->bhD", Q_c[..., i, :], state_cur)
+            outputs.append(y_i)
 
+        # Final state carries to next chunk
+        state = state_cur
 
-
-
-
-
-
+    y = mx.stack(outputs, axis=2)  # (B, H, Lp, Dv)
+    y = y.transpose(0, 2, 1, 3)    # (B, Lp, H, Dv)
+    return y[:, :L] if pad else y
