@@ -1,4 +1,4 @@
-# Attention Kernels
+# Kernels
 
 Fused multi-head attention for Apple Silicon. Row-per-SIMD online softmax with cooperative K/V tile loading.
 
