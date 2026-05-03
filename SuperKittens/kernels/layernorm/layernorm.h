@@ -1,6 +1,6 @@
 //
 //  layernorm.h
-//  SuperKittens — host-side layernorm dispatch
+//  SuperKittens — host-side norm dispatch
 //
 //  By Alazar Manakelew
 
@@ -8,18 +8,21 @@
 #define SUPERKITTENS_LAYERNORM_H
 
 namespace meow {
-namespace layernorm {
+namespace norm {
 
-struct Params {
+struct LayerNormParams {
     unsigned int rows;
     unsigned int d;
     float eps = 1e-5f;
 };
 
-// Grid: (1, (rows + 3) / 4, 1), 128 threads.
-// Buffers: x, gamma, beta, y, rows, d, eps (7 buffers).
+// Kernels (all 128 threads, grid (1, ceil_div(rows, 4), 1)):
+//   layernorm           — y = (x - mean) * rsqrt(var+eps) * gamma + beta     [7 bufs]
+//   layernorm_residual  — y = layernorm(x + res, gamma, beta)                 [8 bufs]
+//   rmsnorm             — y = x * rsqrt(sumSq/d + eps) * gamma                [6 bufs]
+//   rmsnorm_residual    — y = rmsnorm(x + res, gamma)                         [7 bufs]
 
-} // namespace layernorm
+} // namespace norm
 } // namespace meow
 
 #endif // SUPERKITTENS_LAYERNORM_H
