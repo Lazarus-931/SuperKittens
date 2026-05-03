@@ -14,7 +14,7 @@ Writing deep learning metal kernels should be easy; this library aims to do such
 
 Bridging the gap between bleeding intelligence and consumer hardware!
 
-list it MEOW! - **Maxamizing effficient operation's** per **Watt**
+This is superkitty, and she loves to MEOW! - **Maxamizing effficient operation's** per **Watt**
 
 It is:
 
