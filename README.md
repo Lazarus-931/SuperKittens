@@ -3,7 +3,7 @@
 
 <div align="center">
     <img src="meow.png" height=350 alt="ThunderKittens logo" style="margin-bottom:px"/><br/>
-    <em>SuperKittens: This is SuperKitty, and she loves to MEOW(**Maxamizing effficient operation's** per **Watt**), inspired by <a href="https://github.com/HazyResearch/ThunderKittens">ThunderKittens</a></em><br/><br/>
+    <em> This is SuperKitty, and she loves to MEOW <strong> (Maxamizing Effficient Operation's per Watt)</strong>, inspired by <a href="https://github.com/HazyResearch/ThunderKittens">ThunderKittens</a></em><br/><br/>
 </div>
 
 
