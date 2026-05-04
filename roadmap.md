@@ -107,8 +107,8 @@ Training comes first because it forces the stack to support the full graph:
 
 ### Immediate Priorities
 
-1. Mamba-3 MIMO forward
-2. Mamba-3 MIMO backward
+1. Mamba-3 MIMO forward - DONE
+2. Mamba-3 MIMO backward - ALMOST DONE
 3. stabilize Mamba training paths across SISO and MIMO
 4. add norm kernels
 5. add loss kernels

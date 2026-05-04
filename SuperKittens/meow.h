@@ -35,8 +35,7 @@ using namespace metal;
 
 	// ── GEMM ─────────────────────────────────────────────────────
 	#include "kernels/gemm/gemm_impl.h"
-	#include "kernels/gemm/gemm.h"
-
+	
 #else
 // ═══════════════════════════════════════════════════════════════
 //  Host side (C++)
@@ -47,8 +46,7 @@ using namespace metal;
 	#include <QuartzCore/QuartzCore.hpp>
 
 	#include "kernels/gemm/gemm_impl.h"
-	#include "kernels/gemm/gemm.h"
-	#include "kernels/gemm/gemm_host.h"
+		#include "kernels/gemm/gemm_host.h"
 	#include "kernels/mamba/mamba_impl.h"
 	#include "kernels/mamba/mamba_host.h"
 

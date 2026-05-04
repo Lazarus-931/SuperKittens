@@ -28,10 +28,9 @@
 		D6145EDB2F7CDE7E00D54F75 /* uv.lock */ = {isa = PBXFileReference; lastKnownFileType = text; path = uv.lock; sourceTree = "<group>"; };
 		D6145EDC2F7CDE7E00D54F75 /* .gitignore */ = {isa = PBXFileReference; lastKnownFileType = text; path = .gitignore; sourceTree = "<group>"; };
 		D6145EDD2F7CDE7E00D54F75 /* meow.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = meow.png; sourceTree = "<group>"; };
-		D6145EDE2F7CDE7E00D54F75 /* assets */ = {isa = PBXFileReference; lastKnownFileType = folder; path = assets; sourceTree = "<group>"; };
 		D6145EDF2F7CDE7E00D54F75 /* bench */ = {isa = PBXFileReference; lastKnownFileType = folder; path = bench; sourceTree = "<group>"; };
 		D6145EE02F7CDE7E00D54F75 /* metal-cpp */ = {isa = PBXFileReference; lastKnownFileType = folder; path = "metal-cpp"; sourceTree = "<group>"; };
-		D6145EE12F7CDE7E00D54F75 /* scripts */ = {isa = PBXFileReference; lastKnownFileType = folder; path = scripts; sourceTree = "<group>"; };
+		D6145EE22F7CDE7E00D54F75 /* bench_attn.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = bench_attn.cpp; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -64,10 +63,9 @@
 				D6145EDB2F7CDE7E00D54F75 /* uv.lock */,
 				D6145EDC2F7CDE7E00D54F75 /* .gitignore */,
 				D6145EDD2F7CDE7E00D54F75 /* meow.png */,
-				D6145EDE2F7CDE7E00D54F75 /* assets */,
 				D6145EDF2F7CDE7E00D54F75 /* bench */,
 				D6145EE02F7CDE7E00D54F75 /* metal-cpp */,
-				D6145EE12F7CDE7E00D54F75 /* scripts */,
+				D6145EE22F7CDE7E00D54F75 /* bench_attn.cpp */,
 				D6145ECE2F7CDE7E00D54F75 /* SuperKittens */,
 				D6145ECD2F7CDE7E00D54F75 /* Products */,
 			);
