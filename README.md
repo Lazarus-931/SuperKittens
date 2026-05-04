@@ -10,6 +10,8 @@
 
 ## Why?
 
+Consumer hardware, especially apple silicon is immenstly power dense and underutilized with today's open source infrence/training supporitng libraries. SK is here to change that. 
+
 Writing deep learning metal kernels should be easy; this library aims to do such that, without sacrificing performance for abstraction, it delivers the fastest compute (not theoretical), so you can sqeeze out maximum perf! It is .metal, headers and .c, and was developed with easy use in mind. It has an assortment of metal kernels so your chips don't starve!
 
 Bridging the gap between bleeding intelligence and consumer hardware!
