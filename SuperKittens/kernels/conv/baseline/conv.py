@@ -2,7 +2,7 @@
 import time, statistics
 import mlx.core as mx
 
-def bench_conv2d(H=56, W=56, C_in=64, C_out=64, K=3, iters=20):
+def conv2d(H=56, W=56, C_in=64, C_out=64, K=3, iters=20):
     N = 1
     # MLX uses NHWC: input (N,H,W,C), weight (C_out, KH, KW, C_in)
     x = mx.random.normal(shape=(N, H, W, C_in)).astype(mx.float16)
