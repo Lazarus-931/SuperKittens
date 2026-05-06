@@ -3,7 +3,6 @@
 //
 //  d=64:  32 SIMDs × 32 lanes = 1024 threads; Bc=64; float2/lane; K+V 2×8 KB
 //  d=128:  4 SIMDs × 32 lanes =  128 threads; Bc=32; float4/lane; K+V 2×8 KB
-//  v5: unroll hints + full-tile no-bounds-check load path
 //
 
 #include <metal_stdlib>

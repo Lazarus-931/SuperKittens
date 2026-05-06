@@ -1,132 +1,132 @@
 """
-Mamba-2 full block — MLX reference.
+Mamba-2 — MLX reference.
 
 Architecture:
   in_proj → split(z, xBC) → conv1d + SiLU → split(x, B, C)
-  → dt = softplus(proj(x)) → selective_scan → gate(silu(z)) → out_proj
-
-Calls ssm.selective_scan for the SSM recurrence.
+  → dt = softplus(proj(x)) → selective_scan → gate(silu(z)) → out_proj + skip
 """
 
 import mlx.core as mx
 from ssm import selective_scan
 
 
-def mamba2_block(
-    x: mx.array,                   # (B, L, D)
-    in_proj_w: mx.array,           # (D, 2*E + 2*H*N)
-    out_proj_w: mx.array,          # (E, D)
-    conv_weight: mx.array,         # (E, 4) depthwise conv, kernel=4
-    conv_bias: mx.array | None,    # (E,)
-    A_log: mx.array,               # (H, N) state transition
-    D: mx.array,                   # (E,) skip connection
-    dt_proj_w: mx.array,           # (E//H, 1) per-head dt projection
-    dt_bias: mx.array | None,      # (H,) dt bias
-    norm_weight: mx.array | None,  # (E,) optional RMSNorm
-) -> mx.array:
-    B, L, D_model = x.shape
-    E = out_proj_w.shape[0]
-    H = A_log.shape[0]
-    N = A_log.shape[1]
-    head_dim = E // H
+class Mamba2:
+    """Single Mamba-2 block. All weights as named mlx arrays."""
 
-    # ── 1. in_proj ──
-    proj = x @ in_proj_w                       # (B, L, 2*E + 2*H*N)
-    z    = proj[..., :E]                        # gate
-    xBC  = proj[..., E:]                        # conv + SSM input
+    def __init__(self, *,
+                 d_model:  int = 128,
+                 expand:   int = 64,
+                 d_state:  int = 64,
+                 n_heads:  int = 2,
+                 conv_kernel: int = 4):
+        self.D    = d_model
+        self.E    = expand
+        self.N    = d_state
+        self.H    = n_heads
+        self.K    = conv_kernel
+        self.head_dim = expand // n_heads
+        self.proj_dim = 2 * expand + 2 * n_heads * d_state
 
-    # ── 2. Split xBC → x (SSM input), B, C ──
-    x_raw = xBC[..., :E]                        # (B, L, E) SSM input
-    B_c   = xBC[..., E:E+H*N]                   # (B, L, H*N)
-    C_c   = xBC[..., E+H*N:]                    # (B, L, H*N)
+        
+        self.in_proj:  mx.array = None   # (D, proj_dim)
+        self.out_proj: mx.array = None   # (E, D)
+        self.conv_w:   mx.array = None   # (E, K) depthwise
+        self.conv_b:   mx.array = None   # (E,)
+        self.A_log:    mx.array = None   # (H, N) state transition
+        self.D_skip:   mx.array = None   # (E,) skip connection
+        self.dt_proj:  mx.array = None   # (head_dim, 1) per-head dt
+        self.dt_bias:  mx.array = None   # (H,) dt bias
+        self.norm_w:   mx.array = None   # (E,) optional RMSNorm
 
-    # ── 3. Depthwise causal conv1d on x only + SiLU ──
-    d_conv = conv_weight.shape[1]
-    x_conv = mx.zeros_like(x_raw)
-    for k in range(d_conv):
-        shifted = mx.pad(x_raw, [(0, 0), (k, 0), (0, 0)])[:, :L]
-        x_conv = x_conv + shifted * conv_weight[None, None, :, k]
-    if conv_bias is not None:
-        x_conv = x_conv + conv_bias[None, None, :]
-    x_bc = x_conv * mx.sigmoid(x_conv)           # SiLU
+  
 
-    B_arr = B_c.reshape(B, L, H, N)             # (B, L, H, N)
-    C_arr = C_c.reshape(B, L, H, N)             # (B, L, H, N)
-    x_arr = x_bc.reshape(B, L, H, head_dim)     # (B, L, H, head_dim)
+    def from_random(self):
+        D, E, N, H, K = self.D, self.E, self.N, self.H, self.K
+        hd = self.head_dim
+        self.in_proj  = mx.random.normal((D, self.proj_dim), dtype=mx.float16) * 0.02
+        self.out_proj = mx.random.normal((E, D), dtype=mx.float16) * 0.02
+        self.conv_w   = mx.random.normal((E, K), dtype=mx.float16) * 0.1
+        self.conv_b   = mx.random.normal((E,), dtype=mx.float16) * 0.01
+        self.A_log    = mx.random.normal((H, N), dtype=mx.float32) * 0.01
+        self.D_skip   = mx.ones((E,), dtype=mx.float16) * 0.5
+        self.dt_proj  = mx.random.normal((hd, 1), dtype=mx.float16) * 0.1
+        self.dt_bias  = mx.random.normal((H,), dtype=mx.float16) * 0.01
+        self.norm_w   = mx.ones((E,), dtype=mx.float16)
+        return self
 
-    # ── 4. dt = softplus(linear(x) + bias) ──
-    dt_raw = (x_arr @ dt_proj_w).squeeze(-1)    # (B, L, H)
-    if dt_bias is not None:
-        dt_raw = dt_raw + dt_bias[None, None, :]
-    dt = mx.log(1.0 + mx.exp(dt_raw))           # softplus
+   
 
-    # ── 5. Selective scan via ssm.py ──
-    # Mapping: Q=C (output), K=B (input), V=x (values)
-    # A_log for ssm: per-head dt * mean(A_log)
-    A_effective = dt * A_log[None, None, :, :].mean(axis=-1)  # (B, L, H)
-    ssm_out = selective_scan(C_arr, B_arr, x_arr, A_effective)  # (B, L, H, head_dim)
+    def _in_proj(self, x: mx.array) -> tuple:
+        """x: (B, L, D) → z(E), xBC(E + 2*H*N)"""
+        proj = x @ self.in_proj
+        return proj[..., :self.E], proj[..., self.E:]
 
-    # ── 6. Gate: silu(z) * ssm_out ──
-    z_h = z.reshape(B, L, H, head_dim)
-    gated = ssm_out * (z_h * mx.sigmoid(z_h))
+    def _conv1d(self, xBC: mx.array) -> tuple:
+        """Causal conv1d + SiLU on x portion. Returns x(E), B_arr(B,L,H,N), C_arr(B,L,H,N)."""
+        B, L, _ = xBC.shape
+        E, K, H, N = self.E, self.K, self.H, self.N
+        hd = self.head_dim
 
-    # ── 7. Optional RMSNorm ──
-    if norm_weight is not None:
-        gated_flat = gated.reshape(B, L, E)
-        rrms = mx.rsqrt((gated_flat ** 2).mean(axis=-1, keepdims=True) + 1e-6)
-        gated_flat = gated_flat * rrms * norm_weight[None, None, :]
-        gated = gated_flat.reshape(B, L, H, head_dim)
+        x_raw = xBC[..., :E]
+        B_c   = xBC[..., E:E+H*N]
+        C_c   = xBC[..., E+H*N:]
 
-    # ── 8. out_proj + skip ──
-    gated_flat = gated.reshape(B, L, E)
-    out = gated_flat @ out_proj_w                   # (B, L, D)
+   
+        x_conv = mx.zeros_like(x_raw)
+        for k in range(K):
+            shifted = mx.pad(x_raw, [(0,0), (k,0), (0,0)])[:, :L]
+            x_conv = x_conv + shifted * self.conv_w[None, None, :, k]
+        if self.conv_b is not None:
+            x_conv = x_conv + self.conv_b[None, None, :]
+        x_silu = x_conv * mx.sigmoid(x_conv)
 
-    # D skip connection: D is (E,) → reshape to (H, head_dim)
-    D_h = D.reshape(H, head_dim)                      # (H, head_dim)
-    skip = x_arr * D_h[None, None, :, :]              # broadcast over B,L
-    skip_flat = skip.reshape(B, L, E)
-    out = out + skip_flat @ out_proj_w
+        return (x_silu.reshape(B, L, H, hd),
+                B_c.reshape(B, L, H, N),
+                C_c.reshape(B, L, H, N))
 
-    return out
+    def _dt(self, x_arr: mx.array) -> mx.array:
+        """dt = softplus(linear(x) + bias) → (B, L, H)"""
+        dt_raw = (x_arr @ self.dt_proj).squeeze(-1)
+        if self.dt_bias is not None:
+            dt_raw = dt_raw + self.dt_bias[None, None, :]
+        return mx.log(1.0 + mx.exp(dt_raw))
 
+    def _ssm(self, C_arr, B_arr, x_arr, dt):
+        A_eff = dt * self.A_log[None, None, :, :].mean(axis=-1)
+        return selective_scan(C_arr, B_arr, x_arr, A_eff)
 
-def bench_block(L=128, D=128, E=64, H=2, N=64, iters=20):
-    """Quick smoke test for the full block."""
-    B = 1
-    head_dim = E // H  # = 32
+    def _gate(self, z, ssm_out):
+        B, L, _ = z.shape
+        H, hd = self.H, self.head_dim
+        z_h = z.reshape(B, L, H, hd)
+        gated = ssm_out * (z_h * mx.sigmoid(z_h))
+        return gated.reshape(B, L, self.E)
 
-    x = mx.random.normal((B, L, D), dtype=mx.float16) * 0.5
-    in_proj_w  = mx.random.normal((D, 2*E + 2*H*N), dtype=mx.float16) * 0.02
-    out_proj_w = mx.random.normal((E, D), dtype=mx.float16) * 0.02
-    conv_w     = mx.random.normal((E, 4), dtype=mx.float16) * 0.1
-    conv_b     = mx.random.normal((E,), dtype=mx.float16) * 0.01
-    A_log      = mx.random.normal((H, N), dtype=mx.float32) * 0.01
-    D_skip     = mx.ones((E,), dtype=mx.float16) * 0.5
-    dt_proj_w  = mx.random.normal((head_dim, 1), dtype=mx.float16) * 0.1
-    dt_b       = mx.random.normal((H,), dtype=mx.float16) * 0.01
-    norm_w     = mx.ones((E,), dtype=mx.float16)
-    mx.eval(x, in_proj_w, out_proj_w, conv_w, conv_b, A_log, D_skip, dt_proj_w, dt_b, norm_w)
+    def _out_proj(self, gated, x_arr):
+        out = gated @ self.out_proj
+        D_h = self.D_skip.reshape(self.H, self.head_dim)
+        skip = (x_arr * D_h[None, None, :, :]).reshape(x_arr.shape[0], x_arr.shape[1], self.E)
+        return out + skip @ self.out_proj
 
-    for _ in range(5):
-        mx.eval(mamba2_block(x, in_proj_w, out_proj_w, conv_w, conv_b,
-                             A_log, D_skip, dt_proj_w, dt_b, norm_w))
+    
 
-    mx.synchronize()
-    import time, statistics
-    times = []
-    for _ in range(iters):
-        mx.synchronize()
-        t0 = time.perf_counter()
-        mx.eval(mamba2_block(x, in_proj_w, out_proj_w, conv_w, conv_b,
-                             A_log, D_skip, dt_proj_w, dt_b, norm_w))
-        mx.synchronize()
-        t1 = time.perf_counter()
-        times.append((t1 - t0) * 1e3)
+    def forward(self, x: mx.array) -> mx.array:
+        """x: (B, L, D) → output: (B, L, D)"""
+        z, xBC = self._in_proj(x)
+        x_arr, B_arr, C_arr = self._conv1d(xBC)
+        dt = self._dt(x_arr)
+        ssm_out = self._ssm(C_arr, B_arr, x_arr, dt)
+        gated = self._gate(z, ssm_out)
+        # optional
+        if self.norm_w is not None:
+            rrms = mx.rsqrt((gated ** 2).mean(axis=-1, keepdims=True) + 1e-6)
+            gated = gated * rrms * self.norm_w[None, None, :]
+        return self._out_proj(gated, x_arr)
 
-    med = statistics.median(times)
-    print(f"MLX Mamba-2 full block: L={L} D={D} E={E} H={H} N={N}")
-    print(f"  median={med:.3f}ms")
-    return med
-
-if __name__ == "__main__":
-    bench_block()
+    @property
+    def param_count(self) -> int:
+        return (self.D * self.proj_dim +
+                self.E * self.D +
+                self.E * self.K + self.E +
+                self.H * self.N +
+                self.E + self.head_dim + self.H + self.E)

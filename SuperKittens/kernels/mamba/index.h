@@ -15,8 +15,12 @@ namespace meow {
 namespace mamba {
 namespace index {
 
-METAL_FUNC static inline uint ssd_best_cb_index(constant SSDChunkScanArgs &args, uint b, uint c, uint h, uint m, uint k) {
+METAL_FUNC static inline uint ssd_cb_index(constant SSDChunkScanArgs &args, uint b, uint c, uint h, uint m, uint k) {
     return (((((b * args.nChunks + c) * args.heads + h) * args.chunkSize + m) * args.chunkSize) + k);
+}
+
+METAL_FUNC static inline uint ssd_best_cb_index(constant SSDChunkScanArgs &args, uint b, uint c, uint h, uint m, uint k) {
+    return ssd_cb_index(args, b, c, h, m, k);
 }
 
 METAL_FUNC static inline uint ssd_x_index(constant SSDChunkScanArgs &args, uint b, uint c, uint h, uint m, uint n) {
@@ -29,10 +33,6 @@ METAL_FUNC static inline uint ssd_out_index(constant SSDChunkScanArgs &args, uin
 
 METAL_FUNC static inline uint ssd_vec_index(constant SSDChunkScanArgs &args, uint b, uint c, uint h, uint m) {
     return (((b * args.nChunks + c) * args.heads + h) * args.chunkSize + m);
-}
-
-METAL_FUNC static inline uint ssd_cb_index(constant SSDChunkScanArgs &args, uint b, uint c, uint h, uint m, uint k) {
-    return (((((b * args.nChunks + c) * args.heads + h) * args.chunkSize + m) * args.chunkSize) + k);
 }
 
 METAL_FUNC static inline uint ssd_c_index(constant SSDChunkScanArgs &args, uint b, uint c, uint h, uint m, uint ds) {

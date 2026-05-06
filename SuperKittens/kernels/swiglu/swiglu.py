@@ -20,6 +20,6 @@ def swiglu(x: np.ndarray, out: np.ndarray | None = None) -> np.ndarray:
     if out is None: out = np.empty((rows, d2//2), dtype=np.float16)
     x,out = map(np.ascontiguousarray, (x,out))
     lib = _load()
-    ret = lib.sk_swiglu(x.ctypes.data, out.ctypes.data, rows, d2)
+    ret = lib.sk_swiglu(x.ctypes.data, out.ctypes.data, rows, d2 // 2)
     if ret: raise RuntimeError(f"sk_swiglu failed: {ret}")
     return out

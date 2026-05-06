@@ -44,13 +44,6 @@ using namespace metal;
 /// - SK_BOUNDS_CHECK: safe load with bounds (for edge tiles at seq/dim boundaries)
 /////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Exp
-#define EXP(x) \
-    
-
-/// Exponential-Trapezoidal
-
-#define EXPONENTIAL_TRAPEZOIDAL_BETA(dela, a, value) \
-(1 - value) * metal::exp
+#define EXP(x) metal::fast::exp(x)
 
 #endif // SUPERKITTENS_UTILS_H

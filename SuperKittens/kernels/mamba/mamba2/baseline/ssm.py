@@ -2,7 +2,7 @@
 #  baseline_m2.py
 #  SuperKittens — MLX reference for Mamba-2 selective scan
 #
-#  Parallel chunked SSD. No Python loops over time within each chunk.
+
 
 import mlx.core as mx
 
@@ -47,16 +47,8 @@ def selective_scan(
         K_c = Kc[:, c]       # (B, H, chunk, Ds)
         V_c = Vc[:, c]       # (B, H, chunk, Dv)
 
-        # Decay from chunk start to each position: cumsum of A (rightward)
         decay = mx.exp(mx.cumsum(A_c, axis=-1))  # (B, H, chunk)
 
-        # Apply initial state: h at position i = state * decay[i] + contributions from K[0..i]
-        # The recurrent update within chunk is:
-        #   h_i = decay_rel[i,0] * state + sum_{j=0..i}(decay_rel[i,j] * K[j]^T @ V[j])
-        # where decay_rel[i,j] = exp(cumsum_{t=j+1..i} A[t])
-
-        # Compute via online recurrence (chunk_len iterations, all parallel)
-        # Process chunk position by position using the shared state
         state_cur = state  # (B, H, Ds, Dv)
         for i in range(chunk_len):
             d_i = mx.exp(A_c[..., i])[..., None, None]  # (B, H, 1, 1)

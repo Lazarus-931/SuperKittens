@@ -11,9 +11,8 @@ using namespace metal;
 
 enum : uint { THREADS = 128, ROWS_PER_GRP = 4 };
 
-inline float silu(float x) {
-    return x / (1.0f + metal::fast::exp(-x));
-}
+inline float  silu(float  x) { return x / (1.0f + metal::fast::exp(-x)); }
+inline float4 silu(float4 x) { return x / (1.0f + metal::fast::exp(-x)); }
 
 [[host_name("fused_swiglu")]]
 [[kernel, max_total_threads_per_threadgroup(THREADS)]]
@@ -37,13 +36,7 @@ void fused_swiglu(
     const uint n4 = d / 4;
 
     for (uint k = lane; k < n4; k += 32) {
-        float4 g = float4(x4[k]);
-        float4 u = float4(u4[k]);
-        g.x = silu(g.x) * u.x;
-        g.y = silu(g.y) * u.y;
-        g.z = silu(g.z) * u.z;
-        g.w = silu(g.w) * u.w;
-        y4[k] = half4(g);
+        y4[k] = half4(silu(float4(x4[k])) * float4(u4[k]));
     }
 
     for (uint k = n4 * 4 + lane; k < d; k += 32) {

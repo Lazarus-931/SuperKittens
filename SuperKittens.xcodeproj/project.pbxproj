@@ -28,18 +28,46 @@
 		D6145EDC2F7CDE7E00D54F75 /* .gitignore */ = {isa = PBXFileReference; lastKnownFileType = text; path = .gitignore; sourceTree = "<group>"; };
 		D6145EDD2F7CDE7E00D54F75 /* meow.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = meow.png; sourceTree = "<group>"; };
 		D6145EE02F7CDE7E00D54F75 /* metal-cpp */ = {isa = PBXFileReference; lastKnownFileType = folder; path = "metal-cpp"; sourceTree = "<group>"; };
-		D6145EE22F7CDE7E00D54F75 /* bench_attn.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = bench_attn.cpp; sourceTree = "<group>"; };
 /* End PBXFileReference section */
+
+/* Begin PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet section */
+		D6A66C602FAB8FB70010886D /* Exceptions for "SuperKittens" folder in "Compile Sources" phase from "SuperKittens" target */ = {
+			isa = PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet;
+			buildPhase = D6145EC82F7CDE7E00D54F75 /* Sources */;
+			membershipExceptions = (
+				attention_ref.h,
+				benchmark.h,
+				include/group/mma/base.h,
+				include/group/mma/ops.h,
+				include/ops/convert.h,
+				include/ops/math.h,
+				include/ops/memory.h,
+				include/ops/simdgroup.h,
+				include/ops/tools.h,
+				inference/paws/ANALYSIS.md,
+				inference/paws/DESIGN.md,
+				inference/paws/paws.h,
+				kernels/activation/baseline/activation.h,
+				kernels/utils/rmsnorm/rmsnorm.h,
+				meow.h,
+				models/README.md,
+				sk/compiler/budget.h,
+				sk/compiler/layout.h,
+				sk/compiler/runtime/jit.h,
+				sk/src/cpp/feature.h,
+				sk/src/cpp/mma.h,
+				sk/src/cpp/tile.h,
+			);
+		};
+/* End PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		D6145ECE2F7CDE7E00D54F75 /* SuperKittens */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				D6A66C602FAB8FB70010886D /* Exceptions for "SuperKittens" folder in "Compile Sources" phase from "SuperKittens" target */,
+			);
 			path = SuperKittens;
-			sourceTree = "<group>";
-		};
-		DEAD00012F00000100000001 /* inference */ = {
-			isa = PBXFileSystemSynchronizedRootGroup;
-			path = inference;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -66,9 +94,7 @@
 				D6145EDC2F7CDE7E00D54F75 /* .gitignore */,
 				D6145EDD2F7CDE7E00D54F75 /* meow.png */,
 				D6145EE02F7CDE7E00D54F75 /* metal-cpp */,
-				D6145EE22F7CDE7E00D54F75 /* bench_attn.cpp */,
 				D6145ECE2F7CDE7E00D54F75 /* SuperKittens */,
-				DEAD00012F00000100000001 /* inference */,
 				D6145ECD2F7CDE7E00D54F75 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -98,7 +124,6 @@
 			);
 			fileSystemSynchronizedGroups = (
 				D6145ECE2F7CDE7E00D54F75 /* SuperKittens */,
-				DEAD00012F00000100000001 /* inference */,
 			);
 			name = SuperKittens;
 			packageProductDependencies = (

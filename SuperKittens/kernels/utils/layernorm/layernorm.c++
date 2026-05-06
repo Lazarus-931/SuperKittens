@@ -51,16 +51,25 @@ static int dispatch(const char* name,
 
     uint32_t gy = (rows + 3) / 4;
 
+    bool is_ln = (b != nullptr);  // layernorm has beta, rmsnorm doesn't
+
     auto* cmd = g_q->commandBuffer();
     auto* enc = cmd->computeCommandEncoder();
     enc->setComputePipelineState(pso);
     enc->setBuffer(bX,    0, 0);
     enc->setBuffer(bW,    0, 1);
-    enc->setBuffer(bB ? bB : bW, 0, 2);  // beta or dummy (unused by rmsnorm but buffer slot exists)
-    enc->setBuffer(bY,    0, 3);
-    enc->setBuffer(bRows, 0, 4);
-    enc->setBuffer(bD,    0, 5);
-    enc->setBuffer(bEps,  0, 6);
+    if (is_ln) {
+        enc->setBuffer(bB,    0, 2);  // beta
+        enc->setBuffer(bY,    0, 3);  // y
+        enc->setBuffer(bRows, 0, 4);
+        enc->setBuffer(bD,    0, 5);
+        enc->setBuffer(bEps,  0, 6);
+    } else {
+        enc->setBuffer(bY,    0, 2);  // y (no beta for rmsnorm)
+        enc->setBuffer(bRows, 0, 3);
+        enc->setBuffer(bD,    0, 4);
+        enc->setBuffer(bEps,  0, 5);
+    }
     enc->dispatchThreadgroups(MTL::Size(1, gy, 1), MTL::Size(128, 1, 1));
     enc->endEncoding();
     cmd->commit();

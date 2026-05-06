@@ -1,27 +1,52 @@
-#!/usr/bin/env python3
-"""MLX layernorm baseline."""
-import sys, time, math
+"""LayerNorm + RMSNorm MLX benchmark."""
+import sys, time, statistics
+from pathlib import Path
 import mlx.core as mx
 
-rows  = int(sys.argv[1]) if len(sys.argv) > 1 else 2048
-d     = int(sys.argv[2]) if len(sys.argv) > 2 else 128
-iters = int(sys.argv[3]) if len(sys.argv) > 3 else 20
+BASELINE = Path(__file__).resolve().parents[3] / "kernels" / "utils" / "layernorm" / "baseline"
+sys.path.insert(0, str(BASELINE))
+from layernorm import layernorm, rmsnorm
 
-x = mx.random.normal((rows, d)).astype(mx.float16)
-gamma = mx.random.normal((d,)).astype(mx.float16)
-beta = mx.random.normal((d,)).astype(mx.float16)
-mx.eval(x, gamma, beta)
 
-def run():
-    y = mx.fast.layer_norm(x, gamma, beta, 1e-5)
-    mx.eval(y)
+def bench(fn, args=(), iters=20):
+    for _ in range(5):
+        mx.eval(fn(*args))
+    mx.synchronize()
+    times = []
+    for _ in range(iters):
+        mx.synchronize()
+        t0 = time.perf_counter()
+        mx.eval(fn(*args))
+        mx.synchronize()
+        t1 = time.perf_counter()
+        times.append((t1 - t0) * 1e6)
+    return statistics.median(times)
 
-for _ in range(5): run()
-times = []
-for _ in range(iters):
-    t0 = time.perf_counter()
-    run()
-    times.append((time.perf_counter() - t0) * 1e6)
-times.sort()
-us = times[len(times) // 2]
-print(f"{us:.0f}")
+
+def main():
+    print("=" * 55)
+    print("LayerNorm / RMSNorm — MLX Baseline")
+    print("=" * 55)
+
+    shapes = [(512, 1024), (1024, 2048), (2048, 4096), (4096, 4096)]
+    print(f"\n{'op':>12}  {'shape':>12}  {'us':>8}  {'GB/s':>8}")
+    for r, d in shapes:
+        x = mx.random.normal((r, d), dtype=mx.float16) * 0.5
+        w = mx.random.normal((d,), dtype=mx.float16)
+        b = mx.random.normal((d,), dtype=mx.float16)
+        mx.eval(x, w, b)
+        us = bench(layernorm, (x, w, b))
+        bw = (2 * r * d * 2) / (us * 1e3)
+        print(f"  {'layernorm':>12}  {r:>5}x{d:<5}  {us:>8.1f}  {bw:>8.1f}")
+
+    for r, d in shapes:
+        x = mx.random.normal((r, d), dtype=mx.float16) * 0.5
+        w = mx.random.normal((d,), dtype=mx.float16)
+        mx.eval(x, w)
+        us = bench(rmsnorm, (x, w))
+        bw = (2 * r * d * 2) / (us * 1e3)
+        print(f"  {'rmsnorm':>12}  {r:>5}x{d:<5}  {us:>8.1f}  {bw:>8.1f}")
+
+
+if __name__ == "__main__":
+    main()

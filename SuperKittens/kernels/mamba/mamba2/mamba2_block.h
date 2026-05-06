@@ -35,7 +35,7 @@ struct BlockParams {
 
 // Dispatch full Mamba-2 block on a single command buffer.
 // Caller provides all pre-allocated buffers and weights.
-// Returns immediately after commit — caller must waitUntilCompleted.
+
 inline void dispatch_block(
     MTL::CommandBuffer* cmd,
     MTL::ComputePipelineState* gemm,
