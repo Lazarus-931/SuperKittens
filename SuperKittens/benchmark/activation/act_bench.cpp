@@ -80,8 +80,9 @@ int main(int argc, const char* argv[]) {
         {512,  4096}, {1024, 4096}, {2048, 4096},
     };
 
-    // THREADS=128, ROWS_PER_GROUP=4
-    constexpr uint32_t ROWS_PER_TG = 4;
+    // ROWS_PER_TG = maxTotalThreads / 32 (1 row per SIMD group)
+    // M1/M2: 128 threads → 4 rows. M3/M4: 256 threads → 8 rows.
+    uint32_t ROWS_PER_TG = 4;  // default, overwritten per-kernel
 
     printf("%-6s  %6s %6s  %8s  %8s  %8s\n", "kernel", "rows", "cols", "us", "GB/s", "l2_rel");
     printf("%-6s  %6s %6s  %8s  %8s  %8s\n", "------", "------", "------",
@@ -93,6 +94,7 @@ int main(int argc, const char* argv[]) {
         auto* fn = lib->newFunction(NS::String::string(act.name, NS::UTF8StringEncoding));
         if (!fn) { printf("%s: kernel not found\n", act.name); continue; }
         auto* pso = dev->newComputePipelineState(fn, &err); fn->release();
+        ROWS_PER_TG = pso->maxTotalThreadsPerThreadgroup() / 32;  // 1 row/SIMD
 
         for (auto& cfg : cfgs) {
             size_t n = (size_t)cfg.rows * cfg.cols;

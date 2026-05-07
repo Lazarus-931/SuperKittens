@@ -44,8 +44,6 @@
 				include/ops/memory.h,
 				include/ops/simdgroup.h,
 				include/ops/tools.h,
-				inference/paws/ANALYSIS.md,
-				inference/paws/DESIGN.md,
 				inference/paws/paws.h,
 				kernels/activation/baseline/activation.h,
 				kernels/utils/rmsnorm/rmsnorm.h,

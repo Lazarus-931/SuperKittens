@@ -2,6 +2,6 @@
 #define SK_ATTN_H
 #include <cstdint>
 extern "C" {
-int sk_attn(void* Q, void* K, void* V, void* O, uint32_t seq, uint32_t head_dim, uint32_t nheads, int causal);
+int sk_attn(void* Q, void* K, void* V, void* O, uint32_t seq, uint32_t head_dim, uint32_t nheads, uint32_t n_kv_heads, int causal);
 }
 #endif

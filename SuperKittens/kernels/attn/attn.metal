@@ -22,6 +22,7 @@ void fa_d64(
     device half*       O   [[buffer(3)]],
     constant uint&   seq   [[buffer(4)]],
     constant uint& nheads  [[buffer(5)]],
+    constant uint& n_kv_heads [[buffer(6)]],
     uint3 gid  [[threadgroup_position_in_grid]],
     uint  lid  [[thread_index_in_threadgroup]],
     uint  simd [[simdgroup_index_in_threadgroup]],
@@ -34,14 +35,16 @@ void fa_d64(
     const uint q_row = gid.y * Br + simd;
     if (q_row >= seq) return;
 
-    const size_t off = (size_t)(batch * nheads + head) * seq * D;
+    const uint kv_head = head * n_kv_heads / nheads;
+    const size_t q_off  = (size_t)(batch * nheads + head) * seq * D;
+    const size_t kv_off = (size_t)(batch * n_kv_heads + kv_head) * seq * D;
 
     threadgroup half2 k_smem[Bc * D2];  // 8 KB
     threadgroup half2 v_smem[Bc * D2];  // 8 KB
 
     const float scale = 1.0f / sqrt(float(D));
     const float2 q_reg = float2(
-        reinterpret_cast<const device half2*>(Q + off + (size_t)q_row * D)[lane]) * scale;
+        reinterpret_cast<const device half2*>(Q + q_off + (size_t)q_row * D)[lane]) * scale;
 
     float m = -INFINITY, s = 0.0f;
     float2 acc = float2(0.0f);
@@ -59,10 +62,10 @@ void fa_d64(
             const uint i0 = lid, i1 = lid + NT;
             const uint r0 = i0 >> 5, d0 = i0 & 31, col0 = c0 + r0;
             const uint r1 = i1 >> 5, d1 = i1 & 31, col1 = c0 + r1;
-            k_smem[i0] = reinterpret_cast<const device half2*>(K + off + (size_t)col0 * D)[d0];
-            v_smem[i0] = reinterpret_cast<const device half2*>(V + off + (size_t)col0 * D)[d0];
-            k_smem[i1] = reinterpret_cast<const device half2*>(K + off + (size_t)col1 * D)[d1];
-            v_smem[i1] = reinterpret_cast<const device half2*>(V + off + (size_t)col1 * D)[d1];
+            k_smem[i0] = reinterpret_cast<const device half2*>(K + kv_off + (size_t)col0 * D)[d0];
+            v_smem[i0] = reinterpret_cast<const device half2*>(V + kv_off + (size_t)col0 * D)[d0];
+            k_smem[i1] = reinterpret_cast<const device half2*>(K + kv_off + (size_t)col1 * D)[d1];
+            v_smem[i1] = reinterpret_cast<const device half2*>(V + kv_off + (size_t)col1 * D)[d1];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -92,8 +95,8 @@ void fa_d64(
         for (uint i = lid; i < Bc * D2; i += NT) {
             const uint r = i >> 5, d = i & 31, col = c0 + r;
             if (col < seq) {
-                k_smem[i] = reinterpret_cast<const device half2*>(K + off + (size_t)col * D)[d];
-                v_smem[i] = reinterpret_cast<const device half2*>(V + off + (size_t)col * D)[d];
+                k_smem[i] = reinterpret_cast<const device half2*>(K + kv_off + (size_t)col * D)[d];
+                v_smem[i] = reinterpret_cast<const device half2*>(V + kv_off + (size_t)col * D)[d];
             } else {
                 k_smem[i] = half2(0.0h);
                 v_smem[i] = half2(0.0h);
@@ -130,7 +133,7 @@ void fa_d64(
     }
 
     const float inv_s = s > 0.0f ? 1.0f / s : 0.0f;
-    reinterpret_cast<device half2*>(O + off + (size_t)q_row * D)[lane] = half2(acc * inv_s);
+    reinterpret_cast<device half2*>(O + q_off + (size_t)q_row * D)[lane] = half2(acc * inv_s);
 }
 
 // ─── d=128 ────────────────────────────────────────────────────────────────────
@@ -146,6 +149,7 @@ void fa_d128(
     constant uint&    seq     [[buffer(4)]],
     constant uint& head_dim   [[buffer(5)]],   // unused; kept for attn.h ABI
     constant uint&   nheads   [[buffer(6)]],
+    constant uint& n_kv_heads [[buffer(7)]],
     uint3 gid  [[threadgroup_position_in_grid]],
     uint  lid  [[thread_index_in_threadgroup]],
     uint  simd [[simdgroup_index_in_threadgroup]],
@@ -158,14 +162,16 @@ void fa_d128(
     const uint q_row = gid.y * Br + simd;
     if (q_row >= seq) return;
 
-    const size_t off = (size_t)(batch * nheads + head) * seq * D;
+    const uint kv_head = head * n_kv_heads / nheads;
+    const size_t q_off  = (size_t)(batch * nheads + head) * seq * D;
+    const size_t kv_off = (size_t)(batch * n_kv_heads + kv_head) * seq * D;
 
     threadgroup half4 k_smem[Bc * D4];  // 8 KB
     threadgroup half4 v_smem[Bc * D4];  // 8 KB
 
     const float scale = 1.0f / sqrt(float(D));
     const float4 q_reg = float4(
-        reinterpret_cast<const device half4*>(Q + off + (size_t)q_row * D)[lane]) * scale;
+        reinterpret_cast<const device half4*>(Q + q_off + (size_t)q_row * D)[lane]) * scale;
 
     float m = -INFINITY, s = 0.0f;
     float4 acc = float4(0.0f);
@@ -181,8 +187,8 @@ void fa_d128(
         [[clang::unroll(8)]]
         for (uint i = lid; i < Bc * D4; i += NT) {
             const uint r = i / D4, d = i % D4, col = c0 + r;
-            k_smem[i] = reinterpret_cast<const device half4*>(K + off + (size_t)col * D)[d];
-            v_smem[i] = reinterpret_cast<const device half4*>(V + off + (size_t)col * D)[d];
+            k_smem[i] = reinterpret_cast<const device half4*>(K + kv_off + (size_t)col * D)[d];
+            v_smem[i] = reinterpret_cast<const device half4*>(V + kv_off + (size_t)col * D)[d];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -211,8 +217,8 @@ void fa_d128(
         for (uint i = lid; i < Bc * D4; i += NT) {
             const uint r = i / D4, d = i % D4, col = c0 + r;
             if (col < seq) {
-                k_smem[i] = reinterpret_cast<const device half4*>(K + off + (size_t)col * D)[d];
-                v_smem[i] = reinterpret_cast<const device half4*>(V + off + (size_t)col * D)[d];
+                k_smem[i] = reinterpret_cast<const device half4*>(K + kv_off + (size_t)col * D)[d];
+                v_smem[i] = reinterpret_cast<const device half4*>(V + kv_off + (size_t)col * D)[d];
             } else {
                 k_smem[i] = half4(0.0h);
                 v_smem[i] = half4(0.0h);
@@ -249,7 +255,7 @@ void fa_d128(
     }
 
     const float inv_s = s > 0.0f ? 1.0f / s : 0.0f;
-    reinterpret_cast<device half4*>(O + off + (size_t)q_row * D)[lane] = half4(acc * inv_s);
+    reinterpret_cast<device half4*>(O + q_off + (size_t)q_row * D)[lane] = half4(acc * inv_s);
 }
 
 // ─── instantiations ───────────────────────────────────────────────────────────
@@ -257,21 +263,21 @@ void fa_d128(
 template [[host_name("fa_causal_64")]]
 [[kernel]] void fa_d64<true>(
     device const half*, device const half*, device const half*, device half*,
-    constant uint&, constant uint&, uint3, uint, uint, uint);
+    constant uint&, constant uint&, constant uint&, uint3, uint, uint, uint);
 
 template [[host_name("fa_noncausal_64")]]
 [[kernel]] void fa_d64<false>(
     device const half*, device const half*, device const half*, device half*,
-    constant uint&, constant uint&, uint3, uint, uint, uint);
+    constant uint&, constant uint&, constant uint&, uint3, uint, uint, uint);
 
 template [[host_name("mha_causal")]]
 [[kernel]] void fa_d128<true>(
     device const half*, device const half*, device const half*, device half*,
-    constant uint&, constant uint&, constant uint&, uint3, uint, uint, uint);
+    constant uint&, constant uint&, constant uint&, constant uint&, uint3, uint, uint, uint);
 
 template [[host_name("mha_noncausal")]]
 [[kernel]] void fa_d128<false>(
     device const half*, device const half*, device const half*, device half*,
-    constant uint&, constant uint&, constant uint&, uint3, uint, uint, uint);
+    constant uint&, constant uint&, constant uint&, constant uint&, uint3, uint, uint, uint);
 
 } // namespace meow::attn

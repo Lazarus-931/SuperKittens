@@ -41,6 +41,24 @@ April 2026:
 
 
 
+## Quickstart
+
+```bash
+git clone https://github.com/Lazarus-931/SuperKittens.git
+cd SuperKittens
+./build.sh                          # compiles Metal kernels → build/libsk.metallib + libsk.dylib
+```
+
+```python
+import numpy as np
+from sk.src.py import activation
+
+x = np.random.randn(512, 1024).astype(np.float16)
+y = activation.gelu(x)              # dispatches Metal kernel via ctypes → libsk.dylib
+```
+
+Requires: macOS, Xcode 16+ (or Command Line Tools), `xcrun metal`.
+
 ### Benchmarking
 
 Kernels & their respetive benchmarks done
