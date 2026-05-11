@@ -1,13 +1,4 @@
-//
 //  split_packed.metal — generic packed-tensor split.
-//
-//  src: (T, A+B) fp16  →  outA: (T, A) fp16  +  outB: (T, B) fp16.
-//
-//  Used by DeepSeek MLA to split kv_a_packed = [c_kv | k_pe] after KV-down
-//  GEMM. Generic enough for any model that packs multiple tensors and
-//  needs them as separate buffers downstream (e.g. mixture-of-experts
-//  router heads, fused projections that need post-split norm).
-//
 
 #include <metal_stdlib>
 using namespace metal;

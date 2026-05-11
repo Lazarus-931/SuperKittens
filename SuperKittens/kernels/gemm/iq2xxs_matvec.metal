@@ -1,12 +1,4 @@
 // SuperKittens IQ2_XXS matvec (fp16 activations, fp16 output).
-// Simplified port of ds4 kernel_mul_mv_iq2_xxs_f32_impl.
-//
-// Layout per row of W (D weights):
-//   nb = D / 256 blocks, each block:
-//     half  d;          // super-scale
-//     ushort qs[32];    // 8 sub-blocks of 4 ushorts (= 2 uint32: g, s)
-//
-// One TG per output element (row n of W), 32 threads (1 simdgroup).
 
 #include <metal_stdlib>
 using namespace metal;

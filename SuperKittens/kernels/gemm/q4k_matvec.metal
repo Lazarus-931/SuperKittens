@@ -1,6 +1,4 @@
 // fp16 activation x Q4_K weight matvec.
-// One threadgroup (1 simdgroup = 32 threads) computes one output element y[r].
-// Derived (simplified) from ds4 kernel_mul_mv_q4_K_f32_impl.
 
 #include <metal_stdlib>
 using namespace metal;

@@ -1,6 +1,4 @@
-//
 //  swiglu_pair.c++ — host launcher for fused MoE swiglu pair.
-//
 
 #include "swiglu_pair.h"
 #include "../runtime_bindings.h"

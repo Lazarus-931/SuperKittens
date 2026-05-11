@@ -1,7 +1,4 @@
-//
 //  launcher.h — single C ABI for Qwen3-32B (dense) inference.
-//  Mirrors models/deepseek/launcher.h, simpler (no MoE, no MLA).
-//
 
 #ifndef SK_QWEN_LAUNCHER_H
 #define SK_QWEN_LAUNCHER_H

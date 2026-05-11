@@ -1,6 +1,4 @@
-//
 //  kv_up_pair.c++ — host launcher for the dual K-up/V-up matmul fusion.
-//
 
 #include "kv_up_pair.h"
 #include "../runtime_bindings.h"

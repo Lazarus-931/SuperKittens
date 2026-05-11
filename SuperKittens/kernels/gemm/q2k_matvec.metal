@@ -1,8 +1,4 @@
 // Self-contained Q2_K matvec for SuperKittens.
-// x [D] fp16, W [N, D] Q2_K-packed (row-major in D, D % 256 == 0), y [N] fp16.
-// One threadgroup (32 threads = 1 simdgroup) per output row.
-// Derived from ds4 kernel_mul_mv_q2_K_f32_impl, simplified for fp16 activations,
-// no multi-row interleaving, no function constants, no MoE.
 
 #include <metal_stdlib>
 using namespace metal;

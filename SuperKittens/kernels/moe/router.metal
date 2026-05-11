@@ -1,14 +1,4 @@
-//
 //  router_v2.metal — MoE router with simdgroup-parallel dot product.
-//
-//  v1: 128 threads, each thread fully computes one expert's logit (serial dot
-//      over D). Wastes lane parallelism on the dot.
-//
-//  v2: One simdgroup (32 lanes) per expert. Lanes cooperatively dot via half4
-//      strided loads + simd_sum. N_SG simdgroups per TG cover N_SG experts at a
-//      time; loop if N_expert > N_SG. Softmax + top-K stay sequential on lane 0
-//      (N is small).
-//
 
 #include <metal_stdlib>
 using namespace metal;

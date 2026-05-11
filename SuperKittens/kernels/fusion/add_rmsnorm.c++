@@ -1,6 +1,4 @@
-//
 //  add_rmsnorm.c++ — host launcher for fused residual-add + RMSNorm.
-//
 
 #include "add_rmsnorm.h"
 #include "../runtime_bindings.h"

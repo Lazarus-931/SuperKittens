@@ -1,10 +1,4 @@
-//
 //  cast.metal — fp16 ↔ fp32 element-wise casts.
-//
-//  Needed in the DS4 path because dsv4_rope_tail_f32 and flash_attn_ext_vec
-//  consume/emit fp32, while the surrounding GEMMs are fp16. These trivial
-//  kernels bridge the gap until we write fp16 variants of those ds4 kernels.
-//
 
 #include <metal_stdlib>
 using namespace metal;

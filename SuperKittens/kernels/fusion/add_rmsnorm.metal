@@ -1,35 +1,4 @@
-//
 //  add_rmsnorm.metal v2 — fused (y = x + delta) + RMSNorm(y) → y_norm
-//
-//  Design: 1 TG (128 threads = 4 simdgroups) per row, recompute pattern.
-//  - Pass 1: all 128 threads stride over D in half4 chunks computing
-//    sumSq(x+δ). Per-simd simd_sum, then 4-element TG reduction across
-//    the four simdgroups via TG memory.
-//  - Pass 2: re-add x+δ (hot in L2), write y and y_norm in one walk.
-//
-//  Why this is fast:
-//  - Small T shapes (T=1) get a full TG of 128 threads on one row → 4×
-//    more parallelism than v1's 32 threads/row.
-//  - No y staging → near-zero TG memory → max occupancy on M-series.
-//  - Pass-2 reads of x,δ hit L2 (warm from pass 1).
-//
-//  HBM accounting per row:
-//    pass1: read x, read δ
-//    pass2: read x(L2), read δ(L2), read γ, write y, write y_norm
-//  HBM-effective: ~5 D-passes (the L2 reads are nearly free), vs unfused 7.
-//
-//  Layout:
-//    0: x      (rows, n)  fp16
-//    1: delta  (rows, n)  fp16
-//    2: gamma  (n,)       fp16
-//    3: y      (rows, n)  fp16   out
-//    4: y_norm (rows, n)  fp16   out
-//    5: rows   uint
-//    6: n      uint
-//    7: eps    float
-//
-//  Grid: (1, rows, 1). TG: 128 threads.
-//
 
 #include <metal_stdlib>
 using namespace metal;

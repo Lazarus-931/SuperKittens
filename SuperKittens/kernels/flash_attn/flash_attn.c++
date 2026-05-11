@@ -1,10 +1,4 @@
-//
 //  flash_attn.c++ — host launcher for ds4's kernel_flash_attn_ext_vec_*.
-//
-//  Resolves the PSO with MTL::FunctionConstantValues (the kernel's behavioral
-//  toggles like has_mask are compile-time function constants, not setBytes).
-//  Mirrors the 192-byte ds4_metal_args_flash_attn_ext_vec POD 1:1.
-//
 
 #include "flash_attn.h"
 #include "../runtime_bindings.h"
@@ -18,12 +12,12 @@ namespace {
 #pragma pack(push, 8)
 struct ArgsFAVec {
     int32_t  ne01, ne02, ne03;
-    char     _p1[4];                 // align u64 to 8
+    char     _p1[4];
     uint64_t nb01, nb02, nb03;
     int32_t  ne11, ne_12_2, ne_12_3, ns10;
     uint64_t nb11, nb12, nb13;
     int32_t  ns20;
-    char     _p2[4];                 // align u64 to 8
+    char     _p2[4];
     uint64_t nb21, nb22, nb23;
     int32_t  ne31, ne32, ne33;
     char     _p3[4];
@@ -83,7 +77,6 @@ extern "C" int sk_flash_attn_ext_vec(
     fn->release();
     if (!pso) return -3;
 
-    // ── Buffers (Q is fp32, K/V are fp16, mask is fp16, O is fp32) ──
     const size_t qb   = (size_t)B * H    * S_q  * D_k * sizeof(float);
     const size_t kb   = (size_t)B * H_kv * S_kv * D_k * sizeof(uint16_t);
     const size_t vb   = (size_t)B * H_kv * S_kv * D_v * sizeof(uint16_t);
@@ -100,7 +93,6 @@ extern "C" int sk_flash_attn_ext_vec(
     std::memcpy(bV->contents(), V, vb);
     if (bM) std::memcpy(bM->contents(), mask, mb);
 
-    // ── Args struct ──
     ArgsFAVec a{};
     a.ne01 = (int32_t)S_q;       a.ne02 = (int32_t)H;       a.ne03 = (int32_t)B;
     a.nb01 = (uint64_t)D_k * sizeof(float);
@@ -110,18 +102,17 @@ extern "C" int sk_flash_attn_ext_vec(
     a.nb11 = (uint64_t)D_k * sizeof(uint16_t);
     a.nb12 = a.nb11 * S_kv;
     a.nb13 = a.nb12 * H_kv;
-    a.ns10 = (int32_t)a.nb11;          // K row-stride (bytes), per ds4 convention
+    a.ns10 = (int32_t)a.nb11;
     a.nb21 = (uint64_t)D_v * sizeof(uint16_t);
     a.nb22 = a.nb21 * S_kv;
     a.nb23 = a.nb22 * H_kv;
-    a.ns20 = (int32_t)a.nb21;          // V row-stride (bytes)
+    a.ns20 = (int32_t)a.nb21;
     a.ne31 = has_mask ? (int32_t)S_q : 0;
     a.ne32 = has_mask ? 1 : 0;
     a.ne33 = has_mask ? 1 : 0;
     a.nb31 = has_mask ? (uint64_t)S_kv * sizeof(uint16_t) : 0;
     a.nb32 = has_mask ? a.nb31 * S_q : 0;
     a.nb33 = has_mask ? a.nb32 : 0;
-    // Output is (B, S, H, D) — ne1, ne2, ne3 are H, S, B.
     a.ne1 = (int32_t)H; a.ne2 = (int32_t)S_q; a.ne3 = (int32_t)B;
     a.scale = scale;
     a.max_bias = 0.f; a.m0 = 1.f; a.m1 = 1.f;
@@ -135,17 +126,13 @@ extern "C" int sk_flash_attn_ext_vec(
     enc->setBuffer(bQ,         0, 1);
     enc->setBuffer(bK,         0, 2);
     enc->setBuffer(bV,         0, 3);
-    enc->setBuffer(bM ? bM : bQ, 0, 4);   // mask  — unused if !has_mask
-    enc->setBuffer(bQ,         0, 5);     // sinks — unused
-    enc->setBuffer(bQ,         0, 6);     // pad   — unused
-    enc->setBuffer(bO,         0, 7);     // dst
+    enc->setBuffer(bM ? bM : bQ, 0, 4);
+    enc->setBuffer(bQ,         0, 5);
+    enc->setBuffer(bQ,         0, 6);
+    enc->setBuffer(bO,         0, 7);
 
-    // Threadgroup memory for shmem_f16 (Q tile + reductions). Allocate enough
-    // for the largest dk we currently instantiate (512 → ~24 KB worth);
-    // 32 KB is the M2 per-tg limit.
     enc->setThreadgroupMemoryLength(32 * 1024, 0);
 
-    // Grid: (S_q, H, B * NWG). Threads: 32 * NSG.
     enc->dispatchThreadgroups(
         MTL::Size(S_q, H, (NS::UInteger)B * nwg),
         MTL::Size(32u * nsg, 1, 1));

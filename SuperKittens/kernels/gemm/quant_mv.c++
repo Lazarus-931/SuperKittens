@@ -1,6 +1,4 @@
-//
 //  quant_mv.c++ — launchers for Q2_K and Q4_K fp16-activation matvecs.
-//
 
 #include "quant_mv.h"
 #include "../runtime_bindings.h"
@@ -15,10 +13,9 @@ struct QMvArgs {
 };
 #pragma pack(pop)
 
-// Per-block weight sizes (bytes / 256-weight block).
 static constexpr size_t Q2K_BLOCK_BYTES    = 84;
 static constexpr size_t Q4K_BLOCK_BYTES    = 144;
-static constexpr size_t IQ2XXS_BLOCK_BYTES = 66;  // half d + ushort qs[32]
+static constexpr size_t IQ2XXS_BLOCK_BYTES = 66;
 
 static int dispatch_quant_mv(const char* pso_name,
                              size_t block_bytes,

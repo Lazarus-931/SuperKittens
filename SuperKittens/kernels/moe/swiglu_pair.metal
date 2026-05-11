@@ -1,27 +1,4 @@
-//
 //  swiglu_pair.metal — fused MoE swiglu-pair matvec (gate + up + SiLU + mul).
-//
-//  For each (token, expert_slot), routes through expert E = exp_ids[t, slot]
-//  and computes:
-//      g = x[t]   @ W_gate[E]     // (D,) · (D, N_int) → (N_int,)
-//      u = x[t]   @ W_up[E]
-//      out[t, slot] = silu(g) * u
-//
-//  Inspired by ds4's `moe_mul_mv_id_iq2_xxs_pair_swiglu`. This is the fp16,
-//  unquantized variant; same fusion shape. Decode-friendly (T=1) but works
-//  for arbitrary T.
-//
-//  Layout:
-//    x       : (T, D)                 fp16
-//    W_gate  : (E, N_int, D)          fp16, row-major in D
-//    W_up    : (E, N_int, D)          fp16
-//    exp_ids : (T, top_k)             int32
-//    out     : (T, top_k, N_int)      fp16
-//
-//  Tile: 256 threads, 8 simdgroups. Each TG handles 16 output cols of N_int
-//  for one (token, slot). x[token] is staged into threadgroup memory in
-//  X_BLOCK chunks; D may be larger than X_BLOCK (chunked accumulation).
-//
 
 #include <metal_stdlib>
 using namespace metal;

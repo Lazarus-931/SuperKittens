@@ -1,10 +1,4 @@
-//
 //  launcher.c++ — DeepSeek V4 Flash inference launcher.
-//
-//  Allocates device buffers, resolves PSOs (including the function constants
-//  for flash_attn_ext_vec), wires them into the deepseek_model.h dispatcher,
-//  and exposes the sk_deepseek_* C ABI. Mirrors gemma4/launcher.c++.
-//
 
 #include "launcher.h"
 #include "deepseek_model.h"

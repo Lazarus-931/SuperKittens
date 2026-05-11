@@ -1,19 +1,4 @@
-//
 //  moe_ffn.h — fused MoE FFN block for DeepSeek-style layers.
-//
-//  Input:  x [T, D]        (post-attn residual)
-//  Output: out [T, D]      (x + sum_slot route_w · expert_FFN(x))
-//
-//  Pipeline (3 dispatches):
-//     1. moe_router        x → top_idx [T, K], top_score [T, K]
-//     2. moe_swiglu_pair   x, W_gate, W_up, top_idx → hidden [T, K, N_int]
-//     3. moe_down_scatter  hidden, W_down, top_idx, top_score, x → out [T, D]
-//
-//  The router-softmax weights flow through as the routing scale baked into
-//  step 3. Caller pre-allocates all buffers and resolves PSOs.
-//
-//  Header-only. Mirrors the gemma4_model.h dispatch pattern.
-//
 
 #ifndef SUPERKITTENS_DEEPSEEK_MOE_FFN_H
 #define SUPERKITTENS_DEEPSEEK_MOE_FFN_H

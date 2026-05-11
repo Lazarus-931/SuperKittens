@@ -1,36 +1,4 @@
-//
 //  qwen_model.h — Qwen3-32B (dense) dispatch orchestrator.
-//
-//  Architecture (per https://huggingface.co/Qwen/Qwen3-32B/blob/main/config.json):
-//    n_layers     = 64
-//    d_model      = 5120
-//    n_heads      = 64        (Q)
-//    n_kv_heads   = 8         (GQA, ratio 8:1)
-//    head_dim     = 128
-//    n_int        = 27392     (SwiGLU intermediate; ~5.35× d_model)
-//    vocab_size   = 151,936
-//    max_pos      = 32768 native; 131072 with YaRN
-//    rope_theta   = 1_000_000
-//    rms_eps      = 1e-6
-//
-//  Per-layer dispatch (uniform attention, no SWA, no MoE):
-//     1.  pre-attn RMSNorm                            ← rmsnorm
-//     2.  QKV-pack GEMM                               ← gemm_fp16 (M=1 → gemv fast-path)
-//     3.  Two-step split: qkv_packed → q_pack | kv_pack → k_tmp | v_tmp   ← split_packed × 2
-//     4.  Per-head Q-norm + K-norm (Qwen3-specific)   ← rmsnorm × 2 on reshape
-//     5.  RoPE on Q and K (Qwen3 split-half, θ=1e6)   ← rope_qk
-//     6.  KV cache write                              ← kv_cache_write
-//     7.  Flash attention (GQA-aware, d=128)          ← mha_causal
-//     8.  O-projection GEMM                           ← gemm_fp16
-//     9.  Fused residual + pre-MLP RMSNorm            ← add_rmsnorm
-//    10.  Dense SwiGLU MLP                            ← gated_mlp
-//    11.  Final residual add                          ← add_f16
-//
-//  Mirrors models/gemma/gemma4/gemma4_model.h structure; simpler — no SWA/global
-//  split, no MoE, no MLA. Adds two pieces gemma4 doesn't have: per-head Q-norm
-//  and K-norm (Qwen3-specific quirk vs Qwen2/Gemma) and a generic qkv_packed
-//  split via the kernels/ops/split/split_packed.metal helper.
-//
 
 #ifndef SUPERKITTENS_QWEN_MODEL_H
 #define SUPERKITTENS_QWEN_MODEL_H

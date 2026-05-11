@@ -1,20 +1,4 @@
-//
 //  down_scatter_v2.metal — vectorized + tiled fused MoE down-proj.
-//
-//  v2 strategy:
-//    - Tile N_int into CHUNK=512-half blocks (128 half4).
-//    - For each tile: cooperatively stage hidden[t, 0..top_k-1, tile] into
-//      threadgroup memory (top_k * CHUNK halves; <= 16KB at top_k=16).
-//    - Each simdgroup processes 2 output dims × top_k slots, dotting against
-//      the tg-cached hidden chunk and the per-(eid, d) W_down chunk read from
-//      device. half4 vector loads + simd_sum reduction.
-//    - Accumulate across tiles in registers; final residual+store at end.
-//
-//  Win over v1:
-//    - 4× fewer load issues via half4.
-//    - hidden read from device once per TG (vs COLS_PER_TG=16 times).
-//    - exp_ids / route_w cached in tgmem.
-//
 
 #include <metal_stdlib>
 using namespace metal;

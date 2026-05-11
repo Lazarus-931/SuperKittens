@@ -1,7 +1,4 @@
-//
 //  down_scatter_q2k.c++ — host launcher for Q2_K-quantized fused MoE down +
-//  routing-weight scale + residual add.
-//
 
 #include "down_scatter_q2k.h"
 #include "../runtime_bindings.h"

@@ -1,14 +1,4 @@
-//
 //  causal_mask.metal — fill a (q_seq, kv_len) fp16 causal mask in-place.
-//
-//  Used by flash_attn paths that take an explicit additive mask (ds4-style).
-//  Entries below or on the right-aligned diagonal are 0 (no penalty); entries
-//  above are fp16 -inf (-65504), which suppresses them after softmax.
-//
-//  For a prefill batch of S_q new tokens whose first query is at logical
-//  position q_offset, the mask cell mask[i, j] is unmasked iff
-//      j <= q_offset + i      (j indexes K positions over [0, kv_len)).
-//
 
 #include <metal_stdlib>
 using namespace metal;

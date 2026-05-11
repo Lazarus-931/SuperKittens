@@ -1,20 +1,4 @@
 // moe_swiglu_pair_iq2xxs.metal — fused MoE swiglu-pair matvec with IQ2_XXS
-// quantized expert weights (gate + up).
-//
-// For each (token t, slot s), expert E = exp_ids[t, s], compute:
-//     g = x[t] @ dequant(W_gate[E])     // (D,) · (D, N_int) → (N_int,)
-//     u = x[t] @ dequant(W_up[E])
-//     out[t, s, n] = silu(g[n]) * u[n]
-//
-// Layout:
-//   x       : (T, D)                                 fp16
-//   W_gate  : (E, N_int, D/256) block_iq2_xxs        IQ2_XXS, 66 B / 256-wt block
-//   W_up    : (E, N_int, D/256) block_iq2_xxs
-//   exp_ids : (T, top_k)                             int32
-//   out     : (T, top_k, N_int)                      fp16
-//
-// Grid: (ceil(N_int / COLS_PER_TG), T*top_k, 1). TG: 256 threads / 8 simdgroups.
-// Each simdgroup processes COLS_PER_SG=2 output cols; uses simd_sum for reduction.
 
 #include <metal_stdlib>
 using namespace metal;

@@ -1,47 +1,14 @@
-//
-//  deepseek_model.h — DeepSeek V4 Flash dispatch orchestrator.
-//
-//  Mirrors gemma4_model.h structure: dispatch_layer + dispatch_model,
-//  header-only. Implements the MLA (Multi-head Latent Attention) form of
-//  attention used by DeepSeek V2/V3/V4: Q and KV are projected through a
-//  low-rank latent space, only the latent + the RoPE-rotated K positional
-//  half are stored in the KV cache. This is what lets DS4 hit 1M context.
-//
-//  What this header implements (using existing wired kernels):
-//    1. pre-attn RMSNorm                        ← rmsnorm
-//    2. Q-down  (x → q_a, low-rank)             ← gemm_fp16
-//    3. RMSNorm on q_a                           ← rmsnorm
-//    4. Q-up    (q_a → q, full per-head)        ← gemm_fp16
-//    5. KV-down (x → kv_a packed [c_kv | k_pe]) ← gemm_fp16
-//    6. RMSNorm on c_kv                         ← rmsnorm
-//    7. p-RoPE on k_pe (pos-encoded half of K)  ← kernel_dsv4_rope_tail_f32
-//    8. p-RoPE on Q's pe-half                    ← kernel_dsv4_rope_tail_f32
-//    9. Cache write: c_kv + k_pe → cache         ← kv_cache_write
-//   10. K-up    (c_kv → k_no_pe per-head)       ← gemm_fp16   [TODO inside attn]
-//   11. V-up    (c_kv → v per-head)             ← gemm_fp16   [TODO inside attn]
-//   12. Flash attention                          ← kernel_flash_attn_ext_vec_*
-//   13. Output projection + residual            ← gemm_fp16 + add
-//   14. pre-mlp RMSNorm                         ← rmsnorm
-//   15. Shared expert (always-on dense FFN)     ← gated_mlp
-//   16. Routed expert MoE FFN                   ← moe_ffn (router + swiglu_pair + down_scatter)
-//
-//  The routed-expert path is fully wired. Steps 10–12 (K/V-up + flash_attn)
-//  are stubbed: PSOs are loaded but the args struct + dispatch are pending
-//  the flash_attn_ext_vec launcher. dispatch_attn marks them as `// TODO:`
-//  and lays out the buffer plumbing.
-//
+// DeepSeek V4 Flash orchestrator. MLA attention + MoE FFN.
 
 #ifndef SUPERKITTENS_DEEPSEEK_MODEL_H
 #define SUPERKITTENS_DEEPSEEK_MODEL_H
 
 #include <Metal/Metal.hpp>
 #include <cstdint>
-
-#include "../../kernels/moe/moe_ffn.h"
 #include <cmath>
 
-// Pull math into the deepseek namespace cleanly so the inline FA scale stays
-// readable. `std::sqrt` works since we include <cmath>.
+#include "../../kernels/moe/moe_ffn.h"
+
 namespace meow { namespace deepseek {
 inline float metal_sqrt_safe(float x) { return std::sqrt(x); }
 }}
@@ -49,38 +16,29 @@ inline float metal_sqrt_safe(float x) { return std::sqrt(x); }
 namespace meow {
 namespace deepseek {
 
-// ─────────────────────────────────────────────────────────────────────
-//  Layer level
-// ─────────────────────────────────────────────────────────────────────
-
 struct LayerParams {
-    // Shape (DS4 V4 Flash typical numbers as defaults)
     uint32_t batch          = 1;
     uint32_t seq            = 1;
-
     uint32_t d_model        = 7168;
     uint32_t n_heads        = 128;
-    uint32_t qk_nope_dim    = 128;        // K's non-rotated half
-    uint32_t qk_rope_dim    = 64;         // K's RoPE-rotated half (also Q's)
-    uint32_t v_head_dim     = 128;        // V's head dim (≠ K's full dim in MLA)
-    // dk = qk_nope_dim + qk_rope_dim;    derived
+    uint32_t qk_nope_dim    = 128;
+    uint32_t qk_rope_dim    = 64;
+    uint32_t v_head_dim     = 128;
     uint32_t q_lora_rank    = 1536;
-    uint32_t kv_lora_rank   = 512;        // compressed KV dim — what gets cached
-    uint32_t n_int          = 2048;       // per-routed-expert FFN intermediate
-    uint32_t shared_n_int   = 2048;       // shared expert FFN intermediate
+    uint32_t kv_lora_rank   = 512;
+    uint32_t n_int          = 2048;
+    uint32_t shared_n_int   = 2048;
     uint32_t n_expert       = 256;
     uint32_t top_k          = 8;
     float    eps            = 1e-6f;
     MoeQuant moe_quant      = MoeQuant::FP16;
 
-    // Per-call (varies per layer + decode position)
     uint32_t layer_idx      = 0;
     uint32_t kv_buf_start   = 0;
     uint32_t kv_len         = 1;
     uint32_t cache_size     = 8192;
     uint32_t write_pos      = 0;
 
-    // RoPE
     int32_t  rope_n_ctx_orig = 4096;
     float    rope_freq_base  = 10000.f;
     float    rope_freq_scale = 1.f;
@@ -92,82 +50,74 @@ struct LayerParams {
 
 struct LayerPSOs {
     MTL::ComputePipelineState* rmsnorm;
-    MTL::ComputePipelineState* gemm;                  // SK fp16 GEMM
-    MTL::ComputePipelineState* rope_tail;             // kernel_dsv4_rope_tail_f32
-    MTL::ComputePipelineState* flash_attn_vec;        // kernel_flash_attn_ext_vec_*
-    MTL::ComputePipelineState* cast_h2f;              // fp16 → fp32 elt-wise
-    MTL::ComputePipelineState* cast_f2h;              // fp32 → fp16 elt-wise
-    MTL::ComputePipelineState* causal_mask_fill;      // per-forward mask gen
-    MTL::ComputePipelineState* kv_up_pair;            // fused MLA K-up + V-up
-    MTL::ComputePipelineState* split_packed;              // splits kv_a_packed → c_kv + k_pe
+    MTL::ComputePipelineState* gemm;
+    MTL::ComputePipelineState* rope_tail;
+    MTL::ComputePipelineState* flash_attn_vec;
+    MTL::ComputePipelineState* cast_h2f;
+    MTL::ComputePipelineState* cast_f2h;
+    MTL::ComputePipelineState* causal_mask_fill;
+    MTL::ComputePipelineState* kv_up_pair;
+    MTL::ComputePipelineState* split_packed;
     MTL::ComputePipelineState* kv_cache_write;
     MTL::ComputePipelineState* add;
-    MTL::ComputePipelineState* add_rmsnorm;           // fused residual+RMSNorm
-    MTL::ComputePipelineState* gated_mlp;             // shared expert path
+    MTL::ComputePipelineState* add_rmsnorm;
+    MTL::ComputePipelineState* gated_mlp;
 
     MoeFfnPSOs moe;
 };
 
 struct LayerBuffers {
-    // Per-token stream
     MTL::Buffer* x;
 
-    // ── MLA weights (per-layer concatenated) ──
-    MTL::Buffer* w_pre_attn_norm;     // (n_layers, d_model)
-    MTL::Buffer* w_q_a;               // (n_layers, d_model, q_lora_rank)
-    MTL::Buffer* w_q_a_norm;          // (n_layers, q_lora_rank) — γ for the post-down norm
-    MTL::Buffer* w_q_b;               // (n_layers, q_lora_rank, n_heads*(qk_nope_dim+qk_rope_dim))
-    MTL::Buffer* w_kv_a;              // (n_layers, d_model, kv_lora_rank + qk_rope_dim)
-    MTL::Buffer* w_kv_a_norm;         // (n_layers, kv_lora_rank)
-    MTL::Buffer* w_kv_b;              // (n_layers, kv_lora_rank, n_heads*(qk_nope_dim + v_head_dim))
-    MTL::Buffer* w_o;                 // (n_layers, n_heads*v_head_dim, d_model)
-    MTL::Buffer* w_pre_mlp_norm;      // (n_layers, d_model)
+    MTL::Buffer* w_pre_attn_norm;
+    MTL::Buffer* w_q_a;
+    MTL::Buffer* w_q_a_norm;
+    MTL::Buffer* w_q_b;
+    MTL::Buffer* w_kv_a;
+    MTL::Buffer* w_kv_a_norm;
+    MTL::Buffer* w_kv_b;
+    MTL::Buffer* w_o;
+    MTL::Buffer* w_pre_mlp_norm;
 
-    // Shared expert weights
-    MTL::Buffer* w_shared_gate;       // (n_layers, d_model, shared_n_int)
-    MTL::Buffer* w_shared_up;         // (n_layers, d_model, shared_n_int)
-    MTL::Buffer* w_shared_down;       // (n_layers, shared_n_int, d_model)
+    MTL::Buffer* w_shared_gate;
+    MTL::Buffer* w_shared_up;
+    MTL::Buffer* w_shared_down;
 
-    // Routed-expert weights (per-expert; layer-strided)
-    MTL::Buffer* w_router;            // (n_layers, d_model, n_expert)
-    MTL::Buffer* w_gate;              // (n_layers, n_expert, n_int, d_model)
-    MTL::Buffer* w_up;                // same
-    MTL::Buffer* w_down;              // (n_layers, n_expert, d_model, n_int)
+    MTL::Buffer* w_router;
+    MTL::Buffer* w_gate;
+    MTL::Buffer* w_up;
+    MTL::Buffer* w_down;
 
-    // Position buffer for RoPE
     MTL::Buffer* rope_pos;
 
-    // ── KV cache (compressed: c_kv + k_pe stored separately) ──
-    MTL::Buffer* c_kv_cache;          // (cache_size, kv_lora_rank)         — compressed
-    MTL::Buffer* k_pe_cache;          // (cache_size, qk_rope_dim)          — RoPE'd K-positional
+    MTL::Buffer* c_kv_cache;
+    MTL::Buffer* k_pe_cache;
 
-    // Scratch (reused across layers)
     MTL::Buffer* x_norm;
-    MTL::Buffer* q_a;                 // (T, q_lora_rank) post-down, post-norm
-    MTL::Buffer* q_packed;            // (T, n_heads * (qk_nope_dim + qk_rope_dim)) fp16
-    MTL::Buffer* q_packed_f32;        // same shape, fp32 — RoPE + flash_attn input
-    MTL::Buffer* k_pe_f32;            // (T, qk_rope_dim) fp32 — RoPE input/output
-    MTL::Buffer* attn_out_f32;        // (T, n_heads, v_head_dim) fp32 — flash_attn output
-    MTL::Buffer* causal_mask;         // (seq_max, cache_max) fp16 — regenerated per forward
-    MTL::Buffer* kv_a_packed;         // (T, kv_lora_rank + qk_rope_dim)
-    MTL::Buffer* c_kv;                // (T, kv_lora_rank)  — post-split, post-norm
-    MTL::Buffer* k_pe;                // (T, qk_rope_dim)   — post-split, post-RoPE
-    MTL::Buffer* k_no_pe;             // (T, n_heads, qk_nope_dim) — K-up output
-    MTL::Buffer* v;                   // (T, n_heads, v_head_dim)
-    MTL::Buffer* attn_out;            // (T, n_heads, v_head_dim)
-    MTL::Buffer* o_proj;              // (T, d_model)
-    MTL::Buffer* y_attn;              // (T, d_model) — post-attn residual
+    MTL::Buffer* q_a;
+    MTL::Buffer* q_packed;
+    MTL::Buffer* q_packed_f32;
+    MTL::Buffer* k_pe_f32;
+    MTL::Buffer* attn_out_f32;
+    MTL::Buffer* causal_mask;
+    MTL::Buffer* kv_a_packed;
+    MTL::Buffer* c_kv;
+    MTL::Buffer* k_pe;
+    MTL::Buffer* k_no_pe;
+    MTL::Buffer* v;
+    MTL::Buffer* attn_out;
+    MTL::Buffer* o_proj;
+    MTL::Buffer* y_attn;
 
-    MTL::Buffer* m_in;                // pre-MoE-norm
-    MTL::Buffer* shared_mid;          // (T, shared_n_int)
-    MTL::Buffer* shared_out;          // (T, d_model)
+    MTL::Buffer* m_in;
+    MTL::Buffer* shared_mid;
+    MTL::Buffer* shared_out;
     MTL::Buffer* moe_top_idx;
     MTL::Buffer* moe_top_score;
     MTL::Buffer* moe_hidden;
-    MTL::Buffer* y_out;               // (T, d_model) — final layer output
+    MTL::Buffer* y_out;
 };
 
-// Helper: encode a single fp16 GEMM (NN, no bias).
 inline void encode_gemm(
     MTL::CommandBuffer* cmd, MTL::ComputePipelineState* pso,
     MTL::Buffer* A, size_t off_A,
@@ -193,7 +143,6 @@ inline void encode_gemm(
     enc->endEncoding();
 }
 
-// Element-wise cast. Used to bridge fp16 GEMMs ↔ fp32 RoPE/flash_attn.
 inline void encode_cast(
     MTL::CommandBuffer* cmd, MTL::ComputePipelineState* pso,
     MTL::Buffer* src, MTL::Buffer* dst, uint32_t n)
@@ -226,7 +175,6 @@ inline void encode_rmsnorm(
     enc->endEncoding();
 }
 
-// ─── MLA attention: skeleton with all GEMMs wired ───────────────────
 inline void dispatch_attn(
     MTL::CommandBuffer*  cmd,
     const LayerPSOs&     P,
@@ -237,7 +185,6 @@ inline void dispatch_attn(
     const uint32_t L   = p.layer_idx;
     const uint32_t dk  = p.qk_nope_dim + p.qk_rope_dim;
 
-    // Per-layer byte offsets (fp16 = 2 bytes/scalar).
     const size_t off_norm        = (size_t)L * p.d_model * 2;
     const size_t off_w_q_a       = (size_t)L * p.d_model * p.q_lora_rank * 2;
     const size_t off_w_q_a_norm  = (size_t)L * p.q_lora_rank * 2;
@@ -246,27 +193,21 @@ inline void dispatch_attn(
     const size_t off_w_kv_a_norm = (size_t)L * p.kv_lora_rank * 2;
     const size_t off_w_o         = (size_t)L * p.n_heads * p.v_head_dim * p.d_model * 2;
 
-    // 1. Pre-attn RMSNorm
     encode_rmsnorm(cmd, P.rmsnorm, B.x, B.w_pre_attn_norm, off_norm,
                    B.x_norm, T, p.d_model, p.eps);
 
-    // 2. Q-down: x_norm (T, d_model) @ W_q_a (d_model, q_lora_rank) → q_a (T, q_lora_rank)
     encode_gemm(cmd, P.gemm, B.x_norm, 0, B.w_q_a, off_w_q_a, B.q_a,
                 T, p.q_lora_rank, p.d_model);
 
-    // 3. RMSNorm on q_a (in-place stash).
     encode_rmsnorm(cmd, P.rmsnorm, B.q_a, B.w_q_a_norm, off_w_q_a_norm,
                    B.q_a, T, p.q_lora_rank, p.eps);
 
-    // 4. Q-up: q_a (T, q_lora_rank) @ W_q_b → q_packed (T, n_heads * dk)
     encode_gemm(cmd, P.gemm, B.q_a, 0, B.w_q_b, off_w_q_b, B.q_packed,
                 T, p.n_heads * dk, p.q_lora_rank);
 
-    // 5. KV-down: x_norm @ W_kv_a → kv_a_packed (T, kv_lora_rank + qk_rope_dim)
     encode_gemm(cmd, P.gemm, B.x_norm, 0, B.w_kv_a, off_w_kv_a, B.kv_a_packed,
                 T, p.kv_lora_rank + p.qk_rope_dim, p.d_model);
 
-    // 6a. Split kv_a_packed → c_kv (T, kv_lora_rank) + k_pe (T, qk_rope_dim).
     {
         auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(P.split_packed);
@@ -281,25 +222,9 @@ inline void dispatch_attn(
         enc->endEncoding();
     }
 
-    // 6b. RMSNorm c_kv in-place against w_kv_a_norm.
     encode_rmsnorm(cmd, P.rmsnorm, B.c_kv, B.w_kv_a_norm, off_w_kv_a_norm,
                    B.c_kv, T, p.kv_lora_rank, p.eps);
 
-    // 7+8. p-RoPE on Q and K positional halves.
-    //
-    //   Q layout: q_packed (T, n_heads, dk) where dk = qk_nope_dim + qk_rope_dim.
-    //             RoPE rotates the trailing qk_rope_dim per head; ne00 = dk,
-    //             ne01 = T, ne02 = n_heads, ne03 = batch.
-    //   K layout: k_pe (T, qk_rope_dim) — entire row IS the RoPE'd half.
-    //             We rotate it as if ne00 = qk_rope_dim and n_dims = qk_rope_dim
-    //             (rotate everything; no pass-through prefix).
-    //
-    // NOTE: dsv4_rope_tail_f32 expects float32 input. Q/K here are fp16. This
-    //       is the one remaining type-mismatch in the dispatch — a fp16 variant
-    //       of dsv4_rope_tail (or a half→float convert + RoPE + float→half) is
-    //       the next concrete fix. We dispatch with the kernel as-is; output
-    //       buffer alignment is correct, just dtype will be reinterpreted —
-    //       caller must arrange for fp32 buffers or layer in a convert.
     {
         // Pack args for Q.
         // Mirror the ArgsRopeTail layout from rope_tail.c++.
@@ -377,7 +302,6 @@ inline void dispatch_attn(
                     T * p.qk_rope_dim);
     }
 
-    // 9. Cache write: append c_kv + k_pe to the layer's compressed cache.
     {
         auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(P.kv_cache_write);
@@ -398,15 +322,6 @@ inline void dispatch_attn(
         enc->endEncoding();
     }
 
-    // 10+11. K-up + V-up — fused via kv_up_pair (decode-optimized, T=1 wins
-    //        ~1.2× over two separate GEMMs). At prefill (T≥2) it currently
-    //        loses; caller can detect T>1 and fall back to two encode_gemm
-    //        calls. For now we always use the fused path — DS4 decode is
-    //        the dominant scenario.
-    //
-    //        w_kv_b layout: [kv_lora_rank, n_heads*qk_nope_dim + n_heads*v_head_dim].
-    //        W_k_up occupies the first (R * n_heads*qk_nope_dim) elts,
-    //        W_v_up occupies the next (R * n_heads*v_head_dim).
     {
         const uint32_t k_out = p.n_heads * p.qk_nope_dim;
         const uint32_t v_out = p.n_heads * p.v_head_dim;
@@ -438,12 +353,6 @@ inline void dispatch_attn(
         enc->endEncoding();
     }
 
-    // 12. Flash attention. Q is (T, n_heads, dk). K = [k_no_pe | k_pe] full.
-    //     V = v (full). All bytes from current step; cached K/V handled by
-    //     the kv_cache_write step above. The PSO must be resolved by the
-    //     caller with function constants set: has_mask=true (causal mask
-    //     bound at slot 4), has_sinks/has_bias/has_scap/has_kvpad=false,
-    //     nsg=4, nwg=1, ns10=dk*sizeof(half), ns20=v_head_dim*sizeof(half).
     {
         #pragma pack(push, 8)
         struct ArgsFAVec {
@@ -527,17 +436,10 @@ inline void dispatch_attn(
                     T * p.n_heads * p.v_head_dim);
     }
 
-    // 13. Output projection. Residual is folded into the next op
-    //     (fused add_rmsnorm in dispatch_layer below — saves one HBM
-    //     round-trip of d_model).
     encode_gemm(cmd, P.gemm, B.attn_out, 0, B.w_o, off_w_o, B.o_proj,
                 T, p.d_model, p.n_heads * p.v_head_dim);
 }
 
-// ─── Shared expert (always-on dense FFN) ────────────────────────────
-// DS4 routes top_k experts AND adds the output of one always-on shared
-// expert. We compute the shared expert via the existing fused gated_mlp
-// kernel and stash its output for the down_scatter step to combine.
 inline void dispatch_shared_expert(
     MTL::CommandBuffer*  cmd,
     const LayerPSOs&     P,
@@ -569,7 +471,6 @@ inline void dispatch_shared_expert(
     enc->endEncoding();
 }
 
-// ─── Full layer ─────────────────────────────────────────────────────
 inline void dispatch_layer(
     MTL::CommandBuffer*  cmd,
     const LayerPSOs&     P,
@@ -582,8 +483,6 @@ inline void dispatch_layer(
     const uint32_t L = p.layer_idx;
     const size_t   off_norm = (size_t)L * p.d_model * 2;
 
-    // Fused: y_attn = x + o_proj;  m_in = RMSNorm(y_attn, w_pre_mlp_norm).
-    // Replaces two kernels (add_f16 + rmsnorm) with one — 1.57–2.34× faster.
     {
         auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(P.add_rmsnorm);
@@ -599,13 +498,8 @@ inline void dispatch_layer(
         enc->endEncoding();
     }
 
-    // Shared expert runs in parallel with router dispatch. Its output is
-    // added inside down_scatter as part of the residual term.
     dispatch_shared_expert(cmd, P, B, p);
 
-    // MoE FFN: router → swiglu_pair → down_scatter (residual baked in).
-    // We pass shared_out + y_attn as the "residual" so down_scatter writes
-    // y_out = y_attn + shared_out + sum_routed.
     {
         auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(P.add);
@@ -636,9 +530,6 @@ inline void dispatch_layer(
     dispatch_moe_ffn(cmd, P.moe, MB, mp);
 }
 
-// ─────────────────────────────────────────────────────────────────────
-//  Model level
-// ─────────────────────────────────────────────────────────────────────
 
 struct ModelParams {
     uint32_t batch          = 1;
@@ -661,7 +552,6 @@ struct ModelParams {
     float    eps            = 1e-6f;
     uint32_t current_pos    = 0;
 
-    // RoPE
     int32_t  rope_n_ctx_orig = 4096;
     float    rope_freq_base  = 10000.f;
     float    rope_freq_scale = 1.f;
@@ -712,7 +602,6 @@ struct ModelBuffers {
     MTL::Buffer* logits;
     MTL::Buffer* rope_pos;
 
-    // Layer scratch
     MTL::Buffer* x_norm;
     MTL::Buffer* q_a;
     MTL::Buffer* q_packed;
@@ -745,7 +634,6 @@ inline void dispatch_model(
 {
     const uint32_t T = M.batch * M.seq;
 
-    // A. Embedding lookup → x_a
     {
         auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(P.embedding_lookup);
@@ -761,7 +649,6 @@ inline void dispatch_model(
         enc->endEncoding();
     }
 
-    // B. Layer stack (ping-pong x_a ↔ x_b).
     MTL::Buffer* cur = B.x_a;
     MTL::Buffer* nxt = B.x_b;
 
@@ -851,11 +738,9 @@ inline void dispatch_model(
         MTL::Buffer* tmp = cur; cur = nxt; nxt = tmp;
     }
 
-    // C. Final RMSNorm
     encode_rmsnorm(cmd, P.layer.rmsnorm, cur, W.w_final_norm, 0,
                    nxt, T, M.d_model, M.eps);
 
-    // D. LM-head GEMM (tied with input embedding, so transB=1 against w_embed).
     {
         auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(P.layer.gemm);
@@ -878,7 +763,6 @@ inline void dispatch_model(
         enc->endEncoding();
     }
 
-    // E. Argmax → output_id
     {
         auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(P.argmax);

@@ -1,15 +1,4 @@
-//
 //  kv_up_pair_v2.metal — Tile-MMA fused MLA K-up / V-up (fp16).
-//
-//  Strategy: one threadgroup produces a BM×BN tile of k_no_pe AND a
-//  BM×BN tile of v at matching (m, n) coords. The A tile (c_kv[BM][BK])
-//  is loaded into shmem once per K-iter and consumed by TWO MMA passes
-//  (one against W_k_up, one against W_v_up). This saves ~1× c_kv HBM
-//  read vs two independent GEMMs.
-//
-//  Reuse: a single Bs tile is reloaded between K and V MMA passes to
-//  keep threadgroup memory small (better occupancy).
-//
 
 #include <metal_stdlib>
 #include <metal_simdgroup_matrix>

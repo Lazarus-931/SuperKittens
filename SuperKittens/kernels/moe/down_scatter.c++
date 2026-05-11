@@ -1,6 +1,4 @@
-//
 //  down_scatter.c++ — host launcher for fused MoE down + scatter + residual.
-//
 
 #include "down_scatter.h"
 #include "../runtime_bindings.h"

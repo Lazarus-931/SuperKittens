@@ -1,10 +1,4 @@
-//
 //  launcher.h — single C ABI for DeepSeek V4 Flash inference.
-//
-//  Mirrors gemma4/launcher.h structure. create / load_weights / forward /
-//  reset / destroy. Weights passed in as flat fp16 numpy arrays from Python;
-//  layout documented per-field below.
-//
 
 #ifndef SK_DEEPSEEK_LAUNCHER_H
 #define SK_DEEPSEEK_LAUNCHER_H

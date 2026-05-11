@@ -1,9 +1,4 @@
-//
 //  rope_tail.c++ — host launcher for DS4's kernel_dsv4_rope_tail_f32.
-//
-//  ds4 wires this with a packed POD args struct (ds4_metal_args_dsv4_rope_tail).
-//  We mirror the layout 1:1 — bit-exact with what ds4_metal.m emits.
-//
 
 #include "rope_tail.h"
 #include "../runtime_bindings.h"

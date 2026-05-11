@@ -1,11 +1,4 @@
-//
 //  ds4_preamble.h — preamble for the ds4-sourced kernels under deepseek/kernels/.
-//
-//  Mirrors the prelude that ds4 prepends in ds4_metal.m::ds4_metal_full_source
-//  before concatenating the per-kernel sources. We `-include` this from the
-//  build script so the kernel files (copied verbatim from antirez/ds4) compile
-//  cleanly under SK's standalone xcrun metal flow.
-//
 
 #ifndef SK_DS4_PREAMBLE_H
 #define SK_DS4_PREAMBLE_H
@@ -42,10 +35,6 @@ struct block_q8_0 {
     int8_t qs[QK8_0];
 };
 
-// Cross-file structs and function constants normally defined in dense.metal.
-// dsv4_hc.metal and moe.metal reference these; the ds4 build sees them via
-// single-string source concatenation. Hoisted here so they're visible to all
-// deepseek kernels under SK's per-file compile.
 struct ds4_metal_args_mul_mv {
     int   ne00;
     int   ne01;

@@ -1,7 +1,4 @@
-//
 //  swiglu_pair_iq2xxs.c++ — host launcher for the IQ2_XXS-quantized
-//  fused MoE swiglu pair.
-//
 
 #include "swiglu_pair_iq2xxs.h"
 #include "../runtime_bindings.h"

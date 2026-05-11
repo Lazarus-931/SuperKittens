@@ -1,21 +1,4 @@
 // moe_down_scatter_q2k.metal — Q2_K-packed version of moe_down_scatter.
-//
-// Layout / semantics:
-//   hidden    : (T, top_k, N_int)               half      (row-major)
-//   W_down    : (E, D, N_int/256) block_q2_K    bytes     (per-expert pointer indirection)
-//   exp_ids   : (T, top_k)                      int32
-//   route_w   : (T, top_k)                      half
-//   residual  : (T, D)                          half
-//   out       : (T, D)                          half      = residual + Σ rw · ⟨h, W⟩
-//
-// Grid: (ceil(D / COLS_PER_TG), T, 1). TG: 256 threads / 8 simdgroups.
-// Each simdgroup handles COLS_PER_SG=2 output dims. For each output dim it loops
-// over top_k slots and accumulates the Q2_K dequant·dot from q2k_matvec.metal.
-//
-// We do NOT tile hidden into tgmem here: a single simdgroup reads hidden directly
-// from device, lane-strided. Hidden re-reads across the 8 simdgroups of one TG
-// will cache-hit (8 SGs × 2 cols share the same top_k×N_int activation block).
-// Memory traffic is dominated by W_down (Q2_K bytes), which is the whole point.
 
 #include <metal_stdlib>
 using namespace metal;

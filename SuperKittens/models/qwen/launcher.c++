@@ -1,15 +1,4 @@
-//
 //  launcher.c++ — Qwen3-32B (dense) inference launcher.
-//
-//  Allocates buffers, resolves PSOs, wires them into qwen_model.h::dispatch_model.
-//  Mirrors models/deepseek/launcher.c++ but simpler — no MoE, no MLA, no quant
-//  routing on routed-experts.
-//
-//  Audit (temp/qwen/) confirmed: zero Qwen-specific kernels needed; every op
-//  composes from existing SK kernels. Per-head Q/K RMSNorm (a Qwen3 quirk that
-//  Qwen2 didn't have) is handled by reusing the standard `rmsnorm` kernel on a
-//  reshaped (T·n_heads, head_dim) view.
-//
 
 #include "launcher.h"
 #include "qwen_model.h"
