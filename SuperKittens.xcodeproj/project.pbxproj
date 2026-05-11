@@ -35,8 +35,6 @@
 			isa = PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet;
 			buildPhase = D6145EC82F7CDE7E00D54F75 /* Sources */;
 			membershipExceptions = (
-				attention_ref.h,
-				benchmark.h,
 				include/group/mma/base.h,
 				include/group/mma/ops.h,
 				include/ops/convert.h,
@@ -44,17 +42,9 @@
 				include/ops/memory.h,
 				include/ops/simdgroup.h,
 				include/ops/tools.h,
-				inference/paws/paws.h,
 				kernels/activation/baseline/activation.h,
 				kernels/utils/rmsnorm/rmsnorm.h,
-				meow.h,
 				models/README.md,
-				sk/compiler/budget.h,
-				sk/compiler/layout.h,
-				sk/compiler/runtime/jit.h,
-				sk/src/cpp/feature.h,
-				sk/src/cpp/mma.h,
-				sk/src/cpp/tile.h,
 			);
 		};
 /* End PBXFileSystemSynchronizedGroupBuildPhaseMembershipExceptionSet section */
@@ -298,6 +288,10 @@
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
 				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/metal-cpp";
+				LIBRARY_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/SuperKittens/sk",
+				);
 				OTHER_LDFLAGS = (
 					"-framework",
 					Metal,
@@ -319,6 +313,10 @@
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
 				HEADER_SEARCH_PATHS = "$(PROJECT_DIR)/metal-cpp";
+				LIBRARY_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/SuperKittens/sk",
+				);
 				OTHER_LDFLAGS = (
 					"-framework",
 					Metal,

@@ -7,26 +7,37 @@ set -e
 BUILD_DIR="build"
 SK_DIR="SuperKittens"
 KERNELS_DIR="$SK_DIR/kernels"
+MODELS_DIR="$SK_DIR/models"
 
 mkdir -p "$BUILD_DIR"
 
 echo "=== compiling Metal kernels ==="
 AIR_FILES=()
 while IFS= read -r -d '' metal_file; do
-    rel="${metal_file#$KERNELS_DIR/}"
+    # Flatten path → unique .air name (strip leading SuperKittens/ for brevity).
+    rel="${metal_file#$SK_DIR/}"
     air="$BUILD_DIR/$(echo "$rel" | tr '/' '_' | sed 's/\.metal$//').air"
     echo "  $rel"
+    # ds4-sourced deepseek kernels need a preamble (using namespace metal; +
+    # macros + block_q8_0 struct). ds4 prepends this in its single-string
+    # source assembly; we get the same effect via -include.
+    EXTRA=()
+    if [[ "$metal_file" == *"models/deepseek/kernels/"* || \
+          "$metal_file" == *"kernels/flash_attn/"* ]]; then
+        EXTRA+=("-include" "$SK_DIR/models/deepseek/kernels/ds4_preamble.h")
+    fi
     if xcrun -sdk macosx metal -std=metal3.1 -O3 \
         -I "$SK_DIR/sk/src/cpp" -I "$SK_DIR/sk/compiler" -I "$SK_DIR/include" \
+        "${EXTRA[@]}" \
         -c "$metal_file" -o "$air" 2>/dev/null; then
         AIR_FILES+=("$air")
     else
         echo "    ⚠ compile failed — skipping"
     fi
-done < <(find "$KERNELS_DIR" -name "*.metal" \
+done < <(find "$KERNELS_DIR" "$MODELS_DIR" -name "*.metal" \
     -not -path "*/paged_attn/*" \
     -not -path "*/utils/rmsnorm/*" \
-    -print0)
+    -print0 2>/dev/null)
 
 echo "=== linking metallib ==="
 xcrun -sdk macosx metallib "${AIR_FILES[@]}" -o "$BUILD_DIR/libsk.metallib"
@@ -42,7 +53,10 @@ clang++ -std=gnu++20 -O3 -arch arm64 \
 
 OBJ_FILES=("$BUILD_DIR/metal_impl.o")
 while IFS= read -r -d '' cpp_file; do
-    obj="$BUILD_DIR/$(basename "$cpp_file" .c++).o"
+    # Flatten path → unique .o name (so models/{deepseek,qwen}/launcher.c++
+    # don't collide). Mirrors the .air naming rule above.
+    rel="${cpp_file#$SK_DIR/}"
+    obj="$BUILD_DIR/$(echo "$rel" | tr '/' '_' | sed 's/\.c++$//').o"
     echo "  $cpp_file"
     if clang++ -std=gnu++20 -O3 -arch arm64 -I metal-cpp \
         -c "$cpp_file" -o "$obj" 2>/dev/null; then
@@ -50,9 +64,9 @@ while IFS= read -r -d '' cpp_file; do
     else
         echo "    ⚠ failed — skipping"
     fi
-done < <(find "$KERNELS_DIR" "SuperKittens/inference" -name "*.c++" \
+done < <(find "$KERNELS_DIR" "$MODELS_DIR" "SuperKittens/inference" -name "*.c++" \
     -not -path "*/paged_attn/*" -not -path "*/utils/rmsnorm/*" -not -name "metal_impl.cpp" \
-    -print0)
+    -print0 2>/dev/null)
 
 echo "=== linking dylib ==="
 clang++ -std=gnu++20 -arch arm64 \
