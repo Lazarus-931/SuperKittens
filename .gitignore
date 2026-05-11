@@ -35,3 +35,5 @@ tmp/
 # Misc
 .rightnow/
 yarr/
+.pytest_cache/
+temp/
