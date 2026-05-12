@@ -261,15 +261,18 @@ inline void dispatch_layer(
         enc->setBuffer(B.v_cache,  0, 2);
         enc->setBuffer(B.attn_out, 0, 3);
         const uint32_t kv_len = p.kv_len;
+        const uint32_t cache_stride = p.cache_size;
         enc->setBytes(&p.seq,         4, 4);
         enc->setBytes(&p.n_heads,     4, 5);
         enc->setBytes(&p.n_kv_heads,  4, 6);
         enc->setBytes(&kv_len,        4, 7);
-        // mha_causal dispatch: see kernels/attn/attn.metal — grid (n_heads,
-        // ceil(seq/4), batch), TG 128.
+        enc->setBytes(&cache_stride,  4, 8);
+        // mha_causal dispatch: GQA-aware. Grid (n_kv_heads, ceil(seq/2), batch),
+        // TG Hg*2*32 where Hg = n_heads/n_kv_heads.
+        const uint32_t Hg_attn = p.n_heads / p.n_kv_heads;
         enc->dispatchThreadgroups(
-            MTL::Size(p.n_heads, (p.seq + 3) / 4, p.batch),
-            MTL::Size(128, 1, 1));
+            MTL::Size(p.n_kv_heads, (p.seq + 1) / 2, p.batch),
+            MTL::Size(Hg_attn * 2 * 32, 1, 1));
         enc->endEncoding();
     }
 

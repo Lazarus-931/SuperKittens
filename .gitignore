@@ -1,5 +1,6 @@
 # Xcode
 build/
+SuperKittens/model_weights/
 DerivedData/
 *.xcodeproj/xcuserdata/
 *.xcworkspace/xcuserdata/

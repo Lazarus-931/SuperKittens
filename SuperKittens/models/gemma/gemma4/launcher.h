@@ -73,6 +73,8 @@ int sk_gemma4_forward(sk_gemma4_handle* h,
 // stale data is shadowed once new K/V is written over it).
 void sk_gemma4_reset(sk_gemma4_handle* h);
 
+int sk_gemma4_get_last_logits(sk_gemma4_handle* h, void* out_fp16);
+
 void sk_gemma4_destroy(sk_gemma4_handle* h);
 
 #ifdef __cplusplus

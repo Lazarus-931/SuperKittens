@@ -23,7 +23,14 @@ int sk_rope(void* Q, void* K, void* cos, void* sin,
     enc->setBytes(&seq, sizeof(uint32_t), 4);
     enc->setBytes(&head_dim, sizeof(uint32_t), 5);
     enc->setBytes(&n_heads, sizeof(uint32_t), 6);
-    enc->dispatchThreadgroups(MTL::Size(n_heads, 1, 1), MTL::Size(1024, 1, 1));
+    uint32_t hd4 = head_dim / 8;
+    if (hd4 == 0) hd4 = 1;
+    uint32_t rows_per_tg = 256 / hd4;
+    if (rows_per_tg < 1) rows_per_tg = 1;
+    if (rows_per_tg > seq) rows_per_tg = seq;
+    uint32_t row_blks = (seq + rows_per_tg - 1) / rows_per_tg;
+    enc->dispatchThreadgroups(MTL::Size(n_heads, row_blks, 1),
+                              MTL::Size(hd4, rows_per_tg, 1));
     enc->endEncoding(); cmd->commit(); cmd->waitUntilCompleted();
     memcpy(Q, bQ->contents(), bytes); memcpy(K, bK->contents(), bytes);
 

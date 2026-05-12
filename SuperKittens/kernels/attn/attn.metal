@@ -136,63 +136,72 @@ void fa_d64(
     reinterpret_cast<device half2*>(O + q_off + (size_t)q_row * D)[lane] = half2(acc * inv_s);
 }
 
-// ─── d=128 ────────────────────────────────────────────────────────────────────
-// 128 threads, Br=4, Bc=32. Lane i → elems [i*4, i*4+3]. TG: 2×8 KB.
+// ─── d=128, GQA-aware ─────────────────────────────────────────────────────────
+// Grid: (n_kv_heads, ceil(seq/Br), batch). TG threads: Hg*Br*32 where
+// Hg = n_heads/n_kv_heads, Br=2. All Hg sibling Q-heads in one kv-group share
+// a single K/V tile load per Bc=64 column block (8x KV-bandwidth saving on
+// Qwen 64:8). TG smem: 2 × 64 × 32 × 8 B = 32 KB.
 
 template<bool Causal>
-[[kernel, max_total_threads_per_threadgroup(128)]]
+[[kernel, max_total_threads_per_threadgroup(1024)]]
 void fa_d128(
-    device const half* Q      [[buffer(0)]],
-    device const half* K      [[buffer(1)]],
-    device const half* V      [[buffer(2)]],
-    device half*       O      [[buffer(3)]],
-    constant uint&    seq     [[buffer(4)]],
-    constant uint& head_dim   [[buffer(5)]],   // unused; kept for attn.h ABI
-    constant uint&   nheads   [[buffer(6)]],
-    constant uint& n_kv_heads [[buffer(7)]],
+    device const half* Q          [[buffer(0)]],
+    device const half* K          [[buffer(1)]],
+    device const half* V          [[buffer(2)]],
+    device half*       O          [[buffer(3)]],
+    constant uint&    seq         [[buffer(4)]],
+    constant uint&   nheads       [[buffer(5)]],
+    constant uint& n_kv_heads     [[buffer(6)]],
+    constant uint& kv_len         [[buffer(7)]],
+    constant uint& cache_stride   [[buffer(8)]],
     uint3 gid  [[threadgroup_position_in_grid]],
     uint  lid  [[thread_index_in_threadgroup]],
     uint  simd [[simdgroup_index_in_threadgroup]],
     uint  lane [[thread_index_in_simdgroup]])
 {
-    constexpr uint D = 128, D4 = D / 4, Bc = 32, Br = 4, NT = 128;
+    constexpr uint D = 128, D4 = D / 4, Bc = 64, Br = 2;
 
-    const uint head = gid.x, batch = gid.z;
-    if (head >= nheads) return;
-    const uint q_row = gid.y * Br + simd;
-    if (q_row >= seq) return;
+    const uint kv_head = gid.x;
+    const uint batch   = gid.z;
+    const uint Hg      = nheads / n_kv_heads;
+    const uint NT      = Hg * Br * 32u;
 
-    const uint kv_head = head * n_kv_heads / nheads;
-    const size_t q_off  = (size_t)(batch * nheads + head) * seq * D;
-    const size_t kv_off = (size_t)(batch * n_kv_heads + kv_head) * seq * D;
+    const uint q_head_local = simd / Br;
+    const uint r            = simd - q_head_local * Br;
+    const uint head         = kv_head * Hg + q_head_local;
+    const uint q_row        = gid.y * Br + r;
+    const bool active       = (q_row < seq) && (head < nheads) && (kv_head < n_kv_heads);
 
-    threadgroup half4 k_smem[Bc * D4];  // 8 KB
-    threadgroup half4 v_smem[Bc * D4];  // 8 KB
+    const size_t q_off  = (size_t)(batch * nheads     + head)    * seq          * D;
+    const size_t kv_off = (size_t)(batch * n_kv_heads + kv_head) * cache_stride * D;
+
+    threadgroup half4 k_smem[Bc * D4];
+    threadgroup half4 v_smem[Bc * D4];
 
     const float scale = 1.0f / sqrt(float(D));
-    const float4 q_reg = float4(
-        reinterpret_cast<const device half4*>(Q + q_off + (size_t)q_row * D)[lane]) * scale;
+    float4 q_reg = float4(0.0f);
+    if (active) {
+        q_reg = float4(
+            reinterpret_cast<const device half4*>(Q + q_off + (size_t)q_row * D)[lane]) * scale;
+    }
 
     float m = -INFINITY, s = 0.0f;
     float4 acc = float4(0.0f);
 
-    const uint full_tiles = Causal ? (q_row + 1u) / Bc : seq / Bc;
-    const uint partial_lim = Causal ? (q_row + 1u) - full_tiles * Bc
-                                    : seq - full_tiles * Bc;
+    const uint q_pos = kv_len - seq + q_row;
+    const uint total_lim = Causal ? q_pos + 1u : kv_len;
+    const uint full_tiles = total_lim / Bc;
+    const uint partial_lim = total_lim - full_tiles * Bc;
 
-    // ── full tiles (lim=Bc=32, 16 pairs exactly) ────────────────────
     for (uint t = 0; t < full_tiles; ++t) {
         const uint c0 = t * Bc;
-        // NT=128, Bc*D4=1024 → 8 iters/thread; no bounds check needed
-        [[clang::unroll(8)]]
         for (uint i = lid; i < Bc * D4; i += NT) {
-            const uint r = i / D4, d = i % D4, col = c0 + r;
-            k_smem[i] = reinterpret_cast<const device half4*>(K + kv_off + (size_t)col * D)[d];
-            v_smem[i] = reinterpret_cast<const device half4*>(V + kv_off + (size_t)col * D)[d];
+            const uint rr = i / D4, dd = i % D4, col = c0 + rr;
+            k_smem[i] = reinterpret_cast<const device half4*>(K + kv_off + (size_t)col * D)[dd];
+            v_smem[i] = reinterpret_cast<const device half4*>(V + kv_off + (size_t)col * D)[dd];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        [[clang::unroll(4)]]
         for (uint j = 0; j < Bc; j += 2) {
             half4 k0 = k_smem[j * D4 + lane], k1 = k_smem[(j+1) * D4 + lane];
             float s0 = simd_sum(dot(q_reg, float4(k0)));
@@ -211,14 +220,13 @@ void fa_d128(
         threadgroup_barrier(mem_flags::mem_none);
     }
 
-    // ── partial tile (if any) ────────────────────────────────────────
     if (partial_lim > 0) {
         const uint c0 = full_tiles * Bc;
         for (uint i = lid; i < Bc * D4; i += NT) {
-            const uint r = i / D4, d = i % D4, col = c0 + r;
-            if (col < seq) {
-                k_smem[i] = reinterpret_cast<const device half4*>(K + kv_off + (size_t)col * D)[d];
-                v_smem[i] = reinterpret_cast<const device half4*>(V + kv_off + (size_t)col * D)[d];
+            const uint rr = i / D4, dd = i % D4, col = c0 + rr;
+            if (col < total_lim) {
+                k_smem[i] = reinterpret_cast<const device half4*>(K + kv_off + (size_t)col * D)[dd];
+                v_smem[i] = reinterpret_cast<const device half4*>(V + kv_off + (size_t)col * D)[dd];
             } else {
                 k_smem[i] = half4(0.0h);
                 v_smem[i] = half4(0.0h);
@@ -254,8 +262,10 @@ void fa_d128(
         threadgroup_barrier(mem_flags::mem_none);
     }
 
-    const float inv_s = s > 0.0f ? 1.0f / s : 0.0f;
-    reinterpret_cast<device half4*>(O + q_off + (size_t)q_row * D)[lane] = half4(acc * inv_s);
+    if (active) {
+        const float inv_s = s > 0.0f ? 1.0f / s : 0.0f;
+        reinterpret_cast<device half4*>(O + q_off + (size_t)q_row * D)[lane] = half4(acc * inv_s);
+    }
 }
 
 // ─── instantiations ───────────────────────────────────────────────────────────
@@ -273,11 +283,13 @@ template [[host_name("fa_noncausal_64")]]
 template [[host_name("mha_causal")]]
 [[kernel]] void fa_d128<true>(
     device const half*, device const half*, device const half*, device half*,
-    constant uint&, constant uint&, constant uint&, constant uint&, uint3, uint, uint, uint);
+    constant uint&, constant uint&, constant uint&, constant uint&, constant uint&,
+    uint3, uint, uint, uint);
 
 template [[host_name("mha_noncausal")]]
 [[kernel]] void fa_d128<false>(
     device const half*, device const half*, device const half*, device half*,
-    constant uint&, constant uint&, constant uint&, constant uint&, uint3, uint, uint, uint);
+    constant uint&, constant uint&, constant uint&, constant uint&, constant uint&,
+    uint3, uint, uint, uint);
 
 } // namespace meow::attn
