@@ -57,7 +57,33 @@ x = np.random.randn(512, 1024).astype(np.float16)
 y = activation.gelu(x)              # dispatches Metal kernel via ctypes → libsk.dylib
 ```
 
-Requires: macOS, Xcode 16+ (or Command Line Tools), `xcrun metal`.
+### Prerequisites
+
+You need the Metal toolchain (`metal`, `metallib`). **Command Line Tools alone are not enough** — they ship `metal` but not `metallib`. Two options:
+
+- **Full Xcode (App Store)** — install Xcode, then:
+  ```bash
+  sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+  sudo xcodebuild -license accept
+  ```
+
+- **Metal toolchain only** (smaller, requires Xcode already installed to invoke `xcodebuild`):
+  ```bash
+  xcodebuild -downloadComponent MetalToolchain
+  ```
+
+Verify:
+```bash
+xcrun -f metallib    # should print a path
+xcrun -f metal
+```
+
+Python (3.10+, Homebrew recommended):
+```bash
+python3 -m venv ~/sk-venv
+source ~/sk-venv/bin/activate
+pip install -U "huggingface_hub[cli]" numpy sentencepiece tokenizers
+```
 
 ### Benchmarking
 

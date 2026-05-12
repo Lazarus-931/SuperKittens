@@ -1,0 +1,76 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Select Xcode toolchain
+        run: |
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          xcrun -f metallib
+          xcodebuild -version
+          clang --version
+
+      - name: Build libsk
+        run: |
+          chmod +x ./build.sh
+          ./build.sh
+
+      - name: Verify build artifacts
+        run: |
+          set -euo pipefail
+          test -f build/libsk.dylib   || { echo "missing build/libsk.dylib"; exit 1; }
+          test -f build/libsk.metallib || { echo "missing build/libsk.metallib"; exit 1; }
+          file build/libsk.dylib
+          file build/libsk.metallib
+
+      - name: Package tarball
+        id: pkg
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          TARBALL="superkittens-${GITHUB_REF_NAME}-darwin-arm64.tar.gz"
+          tar czf "dist/${TARBALL}" -C build libsk.dylib libsk.metallib
+          shasum -a 256 "dist/${TARBALL}" | awk '{print $1"  "FILENAME_BASE}' FILENAME_BASE="${TARBALL}" > "dist/${TARBALL}.sha256"
+          cat "dist/${TARBALL}.sha256"
+          echo "tarball=dist/${TARBALL}" >> "$GITHUB_OUTPUT"
+          echo "sha256=dist/${TARBALL}.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Determine release channel
+        id: channel
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [[ "$TAG" == *-rc* || "$TAG" == *-beta* ]]; then
+            echo "draft=true" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "draft=false" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: SuperKittens ${{ github.ref_name }}
+          draft: ${{ steps.channel.outputs.draft }}
+          prerelease: ${{ steps.channel.outputs.prerelease }}
+          fail_on_unmatched_files: true
+          files: |
+            ${{ steps.pkg.outputs.tarball }}
+            ${{ steps.pkg.outputs.sha256 }}

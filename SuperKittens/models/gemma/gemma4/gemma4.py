@@ -1,8 +1,16 @@
 """gemma4.py — ctypes wrapper around the Gemma 4 launcher (libsk.dylib)."""
-import ctypes, os
+import ctypes, os, json
 import numpy as np
 from pathlib import Path
 from dataclasses import dataclass
+
+
+_VARIANT_TO_DIR = {
+    "e2b": "gemma-4-E2B-it",
+    "e4b": "gemma-4-E4B-it",
+    "26b": "gemma-4-26B-it",
+    "31b": "gemma-4-31B-it",
+}
 
 
 class _Config(ctypes.Structure):
@@ -64,6 +72,17 @@ def _load():
 
     _lib.sk_gemma4_destroy.argtypes = [ctypes.c_void_p]
     _lib.sk_gemma4_destroy.restype  = None
+
+    _lib.sk_gemma4_load_safetensors.argtypes       = [ctypes.c_void_p, ctypes.c_char_p]
+    _lib.sk_gemma4_load_safetensors.restype        = ctypes.c_int
+    _lib.sk_gemma4_load_safetensors_index.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    _lib.sk_gemma4_load_safetensors_index.restype  = ctypes.c_int
+    _lib.sk_gemma4_set_rope_tables.argtypes        = [ctypes.c_void_p,
+                                                      ctypes.c_void_p, ctypes.c_void_p,
+                                                      ctypes.c_void_p, ctypes.c_void_p]
+    _lib.sk_gemma4_set_rope_tables.restype         = ctypes.c_int
+    _lib.sk_gemma4_get_last_logits.argtypes        = [ctypes.c_void_p, ctypes.c_void_p]
+    _lib.sk_gemma4_get_last_logits.restype         = ctypes.c_int
     return _lib
 
 
@@ -86,6 +105,14 @@ class Gemma4Config:
     batch: int = 1
     seq_max: int = 8192
     cache_max: int = 8192
+
+
+def _bake_rope(cache_max: int, head_dim: int, theta: float):
+    half = head_dim // 2
+    inv_freq = 1.0 / (theta ** (np.arange(0, half, dtype=np.float64) / half))
+    pos = np.arange(cache_max, dtype=np.float64)
+    angles = np.outer(pos, inv_freq)
+    return np.cos(angles).astype(np.float16), np.sin(angles).astype(np.float16)
 
 
 def _preset(name: str) -> Gemma4Config:
@@ -142,7 +169,9 @@ class Gemma4:
         self._h = lib.sk_gemma4_create(ctypes.byref(self._cstruct))
         if not self._h:
             raise RuntimeError("sk_gemma4_create failed")
-        self._w_keep = None  # keep np arrays alive while loaded
+        self._w_keep = None
+        self._rope_keep = None
+        self.tokenizer = None
 
     def load_weights(self, **arrays: np.ndarray):
         """Pass each weight as a contiguous fp16 numpy array, keyed by field name
@@ -182,17 +211,144 @@ class Gemma4:
             raise RuntimeError(f"sk_gemma4_forward failed: {ret}")
         return out
 
-    def generate(self, input_ids: np.ndarray, max_new_tokens: int) -> list:
-        """Greedy generation: prefill once, then decode-step. Single batch."""
-        self.reset()
-        toks = list(self.forward(input_ids))  # prefill returns argmax of last
-        last = int(toks[0])
-        out = [last]
-        for _ in range(max_new_tokens - 1):
-            nxt = self.forward(np.array([last], dtype=np.int32))
-            last = int(nxt[0])
-            out.append(last)
+    def last_logits(self) -> np.ndarray:
+        out = np.empty((self.cfg.vocab_size,), dtype=np.float16)
+        rc = _load().sk_gemma4_get_last_logits(self._h, out.ctypes.data)
+        if rc:
+            raise RuntimeError(f"sk_gemma4_get_last_logits failed: {rc}")
         return out
+
+    def _sample(self, logits: np.ndarray, temperature: float, top_p: float,
+                top_k: int | None, rng: np.random.Generator) -> int:
+        if temperature <= 0.0:
+            return int(np.argmax(logits))
+        x = logits.astype(np.float32) / temperature
+        x -= x.max()
+        p = np.exp(x); p /= p.sum()
+        if top_k is not None and top_k > 0 and top_k < p.size:
+            idx = np.argpartition(p, -top_k)[-top_k:]
+            mask = np.zeros_like(p); mask[idx] = p[idx]
+            p = mask / mask.sum()
+        if 0.0 < top_p < 1.0:
+            order = np.argsort(p)[::-1]
+            ps = p[order]
+            cum = np.cumsum(ps)
+            cutoff = np.searchsorted(cum, top_p) + 1
+            keep = order[:cutoff]
+            mask = np.zeros_like(p); mask[keep] = p[keep]
+            p = mask / mask.sum()
+        return int(rng.choice(p.size, p=p))
+
+    def generate(self, input_ids, *, max_new_tokens: int = 64,
+                 temperature: float = 0.0, top_p: float = 1.0,
+                 top_k: int | None = None, eos_id: int | None = None,
+                 seed: int = 0) -> list:
+        rng = np.random.default_rng(seed)
+        ids = np.asarray(input_ids, dtype=np.int32).reshape(-1)
+        self.reset()
+        argmax_first = self.forward(ids)
+        if temperature <= 0.0 and (top_p >= 1.0 or top_p <= 0.0) and not top_k:
+            first = int(argmax_first[0])
+        else:
+            first = self._sample(self.last_logits(), temperature, top_p, top_k, rng)
+        out = [first]
+        if eos_id is not None and first == eos_id:
+            return out
+        last = first
+        for _ in range(max_new_tokens - 1):
+            arg = self.forward(np.array([last], dtype=np.int32))
+            if temperature <= 0.0 and (top_p >= 1.0 or top_p <= 0.0) and not top_k:
+                last = int(arg[0])
+            else:
+                last = self._sample(self.last_logits(), temperature, top_p, top_k, rng)
+            out.append(last)
+            if eos_id is not None and last == eos_id:
+                break
+        return out
+
+    def chat(self, prompt: str, **gen_kwargs) -> str:
+        if not getattr(self, "tokenizer", None):
+            raise RuntimeError("no tokenizer attached. use from_pretrained or set .tokenizer")
+        ids = self.tokenizer.encode(prompt)
+        eos = gen_kwargs.pop("eos_id", getattr(self.tokenizer, "eos_id", None))
+        out_ids = self.generate(np.array(ids, dtype=np.int32), eos_id=eos, **gen_kwargs)
+        return self.tokenizer.decode(out_ids)
+
+    def set_rope_tables(self, cos_local, sin_local, cos_global, sin_global):
+        cl = np.ascontiguousarray(cos_local, dtype=np.float16)
+        sl = np.ascontiguousarray(sin_local, dtype=np.float16)
+        cg = np.ascontiguousarray(cos_global, dtype=np.float16)
+        sg = np.ascontiguousarray(sin_global, dtype=np.float16)
+        self._rope_keep = (cl, sl, cg, sg)
+        rc = _load().sk_gemma4_set_rope_tables(
+            self._h, cl.ctypes.data, sl.ctypes.data, cg.ctypes.data, sg.ctypes.data)
+        if rc:
+            raise RuntimeError(f"sk_gemma4_set_rope_tables failed: {rc}")
+
+    @classmethod
+    def from_pretrained(cls, name: str, **cfg_overrides):
+        if name in _VARIANT_TO_DIR:
+            dir_name = _VARIANT_TO_DIR[name]
+            variant = name
+        else:
+            dir_name = name
+            variant = next((v for v, d in _VARIANT_TO_DIR.items() if d == name), "e4b")
+
+        root = Path(__file__).resolve().parents[4] / "SuperKittens" / "model_weights" / dir_name
+        if not root.exists():
+            raise FileNotFoundError(
+                f"{root} not found. Run: ./SuperKittens/models/gemma/gemma4/download.sh {variant}")
+
+        cfg_path = root / "config.json"
+        if not cfg_path.exists():
+            raise FileNotFoundError(f"missing {cfg_path}")
+        hf = json.loads(cfg_path.read_text())
+        text_cfg = hf.get("text_config", hf)
+        cfg = _preset(variant)
+        cfg.n_layers          = int(text_cfg.get("num_hidden_layers", cfg.n_layers))
+        cfg.d_model           = int(text_cfg.get("hidden_size", cfg.d_model))
+        cfg.n_int             = int(text_cfg.get("intermediate_size", cfg.n_int))
+        cfg.n_heads           = int(text_cfg.get("num_attention_heads", cfg.n_heads))
+        nkv                   = int(text_cfg.get("num_key_value_heads", cfg.n_kv_heads_local))
+        cfg.n_kv_heads_local  = nkv
+        cfg.n_kv_heads_global = nkv
+        cfg.head_dim_local    = int(text_cfg.get("head_dim", cfg.head_dim_local))
+        cfg.head_dim_global   = int(text_cfg.get("head_dim", cfg.head_dim_global))
+        cfg.window            = int(text_cfg.get("sliding_window", cfg.window))
+        cfg.vocab_size        = int(text_cfg.get("vocab_size", cfg.vocab_size))
+        cfg.eps               = float(text_cfg.get("rms_norm_eps", cfg.eps))
+        rope_theta_global     = float(text_cfg.get("rope_theta", 1_000_000.0))
+        rope_theta_local      = float(text_cfg.get("rope_local_base_freq", 10_000.0))
+        for k, v in cfg_overrides.items():
+            setattr(cfg, k, v)
+
+        m = cls(cfg)
+
+        idx = root / "model.safetensors.index.json"
+        single = root / "model.safetensors"
+        if idx.exists():
+            rc = _load().sk_gemma4_load_safetensors_index(m._h, str(idx).encode())
+        elif single.exists():
+            rc = _load().sk_gemma4_load_safetensors(m._h, str(single).encode())
+        else:
+            raise FileNotFoundError(f"no safetensors in {root}")
+        if rc: raise RuntimeError(f"load failed: {rc}")
+
+        cos_l, sin_l = _bake_rope(cfg.cache_max, cfg.head_dim_local,  rope_theta_local)
+        cos_g, sin_g = _bake_rope(cfg.cache_max, cfg.head_dim_global, rope_theta_global)
+        m.set_rope_tables(cos_l, sin_l, cos_g, sin_g)
+
+        sp_path = root / "tokenizer.model"
+        if sp_path.exists():
+            try:
+                from SuperKittens.models.load.tokenizer import Tokenizer
+                m.tokenizer = Tokenizer.from_sentencepiece(str(sp_path))
+            except Exception as e:
+                print(f"[gemma4] tokenizer attach failed: {e}")
+                m.tokenizer = None
+        else:
+            m.tokenizer = None
+        return m
 
     def close(self):
         if self._h:

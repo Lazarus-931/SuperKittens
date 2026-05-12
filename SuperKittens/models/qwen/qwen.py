@@ -75,6 +75,8 @@ def _load():
     _lib.sk_qwen_reset.restype          = None
     _lib.sk_qwen_destroy.argtypes       = [ctypes.c_void_p]
     _lib.sk_qwen_destroy.restype        = None
+    _lib.sk_qwen_load_safetensors.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+    _lib.sk_qwen_load_safetensors.restype  = ctypes.c_int
     return _lib
 
 
