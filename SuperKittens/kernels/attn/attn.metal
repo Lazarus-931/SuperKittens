@@ -1,17 +1,10 @@
-//
-//  attn.metal — unified flash attention, d=64 and d=128, Apple Silicon
-//
-//  d=64:  32 SIMDs × 32 lanes = 1024 threads; Bc=64; float2/lane; K+V 2×8 KB
-//  d=128:  4 SIMDs × 32 lanes =  128 threads; Bc=32; float4/lane; K+V 2×8 KB
-//
+// attn.metal — flash attention, d=64 and d=128 (GQA-aware).
 
 #include <metal_stdlib>
 using namespace metal;
 
 namespace meow::attn {
 
-// ─── d=64 ─────────────────────────────────────────────────────────────────────
-// 1024 threads, Br=32, Bc=64. Lane i → elems [i*2, i*2+1]. TG: 2×8 KB.
 
 template<bool Causal>
 [[kernel, max_total_threads_per_threadgroup(1024)]]
@@ -49,15 +42,12 @@ void fa_d64(
     float m = -INFINITY, s = 0.0f;
     float2 acc = float2(0.0f);
 
-    // Full tiles: lim=Bc (compile-time), no bounds check in load
     const uint full_tiles = Causal ? (q_row + 1u) / Bc : seq / Bc;
     const uint partial_lim = Causal ? (q_row + 1u) - full_tiles * Bc
                                     : seq - full_tiles * Bc;
 
-    // ── full tiles ──────────────────────────────────────────────────
     for (uint t = 0; t < full_tiles; ++t) {
         const uint c0 = t * Bc;
-        // Manually unrolled load (NT=1024, Bc*D2=2048 → exactly 2 iters/thread)
         {
             const uint i0 = lid, i1 = lid + NT;
             const uint r0 = i0 >> 5, d0 = i0 & 31, col0 = c0 + r0;
@@ -69,7 +59,6 @@ void fa_d64(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Paired inner loop, lim=Bc=64 → 32 pairs exactly, no tail
         [[clang::unroll(4)]]
         for (uint j = 0; j < Bc; j += 2) {
             half2 k0 = k_smem[j * D2 + lane], k1 = k_smem[(j+1) * D2 + lane];
@@ -89,7 +78,6 @@ void fa_d64(
         threadgroup_barrier(mem_flags::mem_none);
     }
 
-    // ── partial tile (if any) ────────────────────────────────────────
     if (partial_lim > 0) {
         const uint c0 = full_tiles * Bc;
         for (uint i = lid; i < Bc * D2; i += NT) {
@@ -136,11 +124,7 @@ void fa_d64(
     reinterpret_cast<device half2*>(O + q_off + (size_t)q_row * D)[lane] = half2(acc * inv_s);
 }
 
-// ─── d=128, GQA-aware ─────────────────────────────────────────────────────────
-// Grid: (n_kv_heads, ceil(seq/Br), batch). TG threads: Hg*Br*32 where
-// Hg = n_heads/n_kv_heads, Br=2. All Hg sibling Q-heads in one kv-group share
-// a single K/V tile load per Bc=64 column block (8x KV-bandwidth saving on
-// Qwen 64:8). TG smem: 2 × 64 × 32 × 8 B = 32 KB.
+// GQA: Hg = n_heads/n_kv_heads sibling Q-heads share one K/V tile per group.
 
 template<bool Causal>
 [[kernel, max_total_threads_per_threadgroup(1024)]]
@@ -268,7 +252,6 @@ void fa_d128(
     }
 }
 
-// ─── instantiations ───────────────────────────────────────────────────────────
 
 template [[host_name("fa_causal_64")]]
 [[kernel]] void fa_d64<true>(

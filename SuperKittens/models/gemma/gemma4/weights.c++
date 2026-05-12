@@ -154,8 +154,6 @@ extern "C" int sk_gemma4_load_from_store(sk_gemma4_handle* hp, sk::WeightStore* 
         if (!copy_partial(h->weights.gamma_k, gamma_off, store,
                           layer_key(L, "self_attn.k_norm.weight"), hd * fp16)) return -25;
 
-        // o_proj: HF (d_model, n_heads*head_dim) -> (n_heads*head_dim, d_model).
-        // Written contiguous at layer offset; unused tail of slab stays zero.
         if (!copy_transpose_fp16(h->weights.w_out, o_off, store,
                                  layer_key(L, "self_attn.o_proj.weight"), Nq, dm)) return -26;
 
@@ -166,8 +164,6 @@ extern "C" int sk_gemma4_load_from_store(sk_gemma4_handle* hp, sk::WeightStore* 
         if (!copy_transpose_fp16(h->weights.w_down, down_off, store,
                                  layer_key(L, "mlp.down_proj.weight"), ni, dm)) return -29;
 
-        // QKV: HF q/k/v_proj each (rows, d_model). Pack transposed into one
-        // (d_model, qkvN) contiguous block at this layer's slab offset.
         auto* q_v = store->get(layer_key(L, "self_attn.q_proj.weight"));
         auto* k_v = store->get(layer_key(L, "self_attn.k_proj.weight"));
         auto* v_v = store->get(layer_key(L, "self_attn.v_proj.weight"));
@@ -196,8 +192,6 @@ extern "C" int sk_gemma4_load_from_store(sk_gemma4_handle* hp, sk::WeightStore* 
         (void)w_out_base;
     }
 
-    // cos_local/sin_local/cos_global/sin_global are precomputed host-side
-    // and are not loaded from safetensors. Buffers remain zero-initialized.
     return 0;
 }
 

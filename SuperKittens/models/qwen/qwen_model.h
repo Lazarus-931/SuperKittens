@@ -1,4 +1,4 @@
-//  qwen_model.h — Qwen3-32B (dense) dispatch orchestrator.
+// Qwen3 (dense) dispatch orchestrator.
 
 #ifndef SUPERKITTENS_QWEN_MODEL_H
 #define SUPERKITTENS_QWEN_MODEL_H
@@ -9,10 +9,7 @@
 namespace meow {
 namespace qwen {
 
-// ─── Layer level ─────────────────────────────────────────────────────
-
 struct LayerParams {
-    // Shape
     uint32_t batch        = 1;
     uint32_t seq          = 1;
     uint32_t d_model      = 5120;
@@ -22,14 +19,12 @@ struct LayerParams {
     uint32_t n_int        = 27392;
     float    eps          = 1e-6f;
 
-    // Per-call (vary per layer + decode position)
     uint32_t layer_idx    = 0;
     uint32_t kv_buf_start = 0;
     uint32_t kv_len       = 1;
     uint32_t cache_size   = 32768;
     uint32_t write_pos    = 0;
 
-    // RoPE (Qwen3: θ = 1,000,000; YaRN-corrected cos/sin tables baked host-side)
     float    rope_freq_base   = 1000000.f;
     int32_t  rope_n_ctx_orig  = 32768;
     float    rope_freq_scale  = 1.f;
@@ -86,7 +81,6 @@ struct LayerBuffers {
     MTL::Buffer* y_out;
 };
 
-// ─── Inline encode helpers (mirror gemma4_model.h pattern) ───────────
 
 inline void encode_gemm(
     MTL::CommandBuffer* cmd, MTL::ComputePipelineState* pso,
@@ -149,14 +143,6 @@ inline void encode_split(
     enc->endEncoding();
 }
 
-// rope_qk: in-place rotation on the Q OR K buffer. Existing kernel takes
-// (out_q, out_k, pos, cos, sin, T, n_heads, head_dim). For Qwen3 we already
-// have separate Q and K buffers post-split, so we call it twice — once with
-// the Q buffer aliased to both q and k arg slots (degenerate "rotate Q only"
-// pattern), then with K. This matches `kernels/rotary/rotary.metal::rope_qk`.
-//
-// NOTE: cos/sin tables come from caller-side YaRN-corrected bake (no kernel
-// change needed; Qwen3 uses split-half rotation == what rope_qk already does).
 inline void encode_rope_qk_inplace(
     MTL::CommandBuffer* cmd, MTL::ComputePipelineState* pso,
     MTL::Buffer* x, MTL::Buffer* pos,
@@ -165,8 +151,6 @@ inline void encode_rope_qk_inplace(
 {
     auto* enc = cmd->computeCommandEncoder();
     enc->setComputePipelineState(pso);
-    // Standard rope_qk signature: (q, k, cos, sin, seq, head_dim, n_heads).
-    // Pass x as both q and k slots — the kernel processes each independently.
     enc->setBuffer(x,       0, 0);
     enc->setBuffer(x,       0, 1);
     enc->setBuffer(cos_tbl, 0, 2);
@@ -178,7 +162,6 @@ inline void encode_rope_qk_inplace(
     enc->endEncoding();
 }
 
-// ─── Single layer dispatch ───────────────────────────────────────────
 inline void dispatch_layer(
     MTL::CommandBuffer*  cmd,
     const LayerPSOs&     P,
