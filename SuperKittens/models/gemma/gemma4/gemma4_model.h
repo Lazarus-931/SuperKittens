@@ -217,25 +217,54 @@ inline void dispatch_layer(
                                 : (uint32_t)(p.head_dim * 0.25f);
             enc->setComputePipelineState(P.rope_partial);
             enc->setBuffer(B.q_norm, 0, 0);
-            enc->setBuffer(B.k_tmp,  0, 1);
+            enc->setBuffer(B.q_norm, 0, 1);
             enc->setBuffer(B.cos,    0, 2);
             enc->setBuffer(B.sin,    0, 3);
             enc->setBytes(&p.seq,      4, 4);
             enc->setBytes(&p.head_dim, 4, 5);
             enc->setBytes(&p.n_heads,  4, 6);
             enc->setBytes(&rot_dims,   4, 7);
+            enc->setBytes(&p.write_pos,4, 8);
             enc->dispatchThreadgroups(MTL::Size(p.n_heads, 1, 1),
                                       MTL::Size(1024, 1, 1));
-        } else {
-            enc->setComputePipelineState(P.rope);
-            enc->setBuffer(B.q_norm, 0, 0);
+            enc->endEncoding();
+            enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(P.rope_partial);
+            enc->setBuffer(B.k_tmp,  0, 0);
             enc->setBuffer(B.k_tmp,  0, 1);
             enc->setBuffer(B.cos,    0, 2);
             enc->setBuffer(B.sin,    0, 3);
             enc->setBytes(&p.seq,      4, 4);
             enc->setBytes(&p.head_dim, 4, 5);
+            enc->setBytes(&p.n_kv_heads,4, 6);
+            enc->setBytes(&rot_dims,   4, 7);
+            enc->setBytes(&p.write_pos,4, 8);
+            enc->dispatchThreadgroups(MTL::Size(p.n_kv_heads, 1, 1),
+                                      MTL::Size(1024, 1, 1));
+        } else {
+            enc->setComputePipelineState(P.rope);
+            enc->setBuffer(B.q_norm, 0, 0);
+            enc->setBuffer(B.q_norm, 0, 1);
+            enc->setBuffer(B.cos,    0, 2);
+            enc->setBuffer(B.sin,    0, 3);
+            enc->setBytes(&p.seq,      4, 4);
+            enc->setBytes(&p.head_dim, 4, 5);
             enc->setBytes(&p.n_heads,  4, 6);
+            enc->setBytes(&p.write_pos,4, 7);
             enc->dispatchThreadgroups(MTL::Size(p.n_heads, 1, 1),
+                                      MTL::Size(1024, 1, 1));
+            enc->endEncoding();
+            enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(P.rope);
+            enc->setBuffer(B.k_tmp,  0, 0);
+            enc->setBuffer(B.k_tmp,  0, 1);
+            enc->setBuffer(B.cos,    0, 2);
+            enc->setBuffer(B.sin,    0, 3);
+            enc->setBytes(&p.seq,      4, 4);
+            enc->setBytes(&p.head_dim, 4, 5);
+            enc->setBytes(&p.n_kv_heads,4, 6);
+            enc->setBytes(&p.write_pos,4, 7);
+            enc->dispatchThreadgroups(MTL::Size(p.n_kv_heads, 1, 1),
                                       MTL::Size(1024, 1, 1));
         }
         enc->endEncoding();

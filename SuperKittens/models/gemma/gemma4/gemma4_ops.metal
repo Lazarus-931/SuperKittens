@@ -58,6 +58,7 @@ void gemma4_rope_qk_partial(
     constant uint& head_dim [[buffer(5)]],
     constant uint& n_heads  [[buffer(6)]],
     constant uint& rot_dims [[buffer(7)]],
+    constant uint& write_pos [[buffer(8)]],
     uint3 gid [[threadgroup_position_in_grid]],
     uint3 tid [[thread_position_in_threadgroup]],
     uint3 tpg [[threads_per_threadgroup]])
@@ -77,7 +78,7 @@ void gemma4_rope_qk_partial(
 
     const size_t head_off = (size_t)head * seq * head_dim;
     const size_t qk_off = head_off + (size_t)row * head_dim;
-    const size_t cs_off = (size_t)row * hd + i;
+    const size_t cs_off = (size_t)(write_pos + row) * hd + i;
 
     float4 q_lo = float4(*reinterpret_cast<device half4*>(Q + qk_off + i));
     float4 q_hi = float4(*reinterpret_cast<device half4*>(Q + qk_off + i + hd));

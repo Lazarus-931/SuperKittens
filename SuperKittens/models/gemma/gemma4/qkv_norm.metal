@@ -85,15 +85,15 @@ void gemma4_qkv_norm(
     // (t, head_in_kind, tid) row-major.
     if (slot < q_end) {
         const uint head = slot;
-        size_t out_off = ((size_t)t * n_heads + head) * head_dim + tid;
+        size_t out_off = ((size_t)head * T + t) * head_dim + tid;
         q_out[out_off] = half(y);
     } else if (slot < k_end) {
         const uint head = slot - q_end;
-        size_t out_off = ((size_t)t * n_kv_heads + head) * head_dim + tid;
+        size_t out_off = ((size_t)head * T + t) * head_dim + tid;
         k_out[out_off] = half(y);
     } else {
         const uint head = slot - k_end;
-        size_t out_off = ((size_t)t * n_kv_heads + head) * head_dim + tid;
+        size_t out_off = ((size_t)head * T + t) * head_dim + tid;
         v_out[out_off] = half(y);
     }
 }

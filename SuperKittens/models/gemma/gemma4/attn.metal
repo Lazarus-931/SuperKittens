@@ -28,8 +28,9 @@ void gemma4_attn_local_d256(
     if (head >= nheads) return;
 
     const uint kv_head = head * n_kv_heads / nheads;
-    const size_t q_off  = (size_t)(batch * nheads     + head)    * q_seq      * D;
-    const size_t kv_off = (size_t)(batch * n_kv_heads + kv_head) * cache_size * D;
+    const size_t q_off   = (size_t)(batch * nheads     + head)    * q_seq      * D;
+    const size_t kv_off  = (size_t)(batch * n_kv_heads + kv_head) * cache_size * D;
+    const size_t o_base  = (size_t)batch * q_seq * nheads * D + (size_t)head * D;
 
     threadgroup half4 k_smem[Bc * D4];
     threadgroup half4 v_smem[Bc * D4];
@@ -167,8 +168,8 @@ void gemma4_attn_local_d256(
                 ah += w * ahi;
             }
             const float inv_s = sg > 0.0f ? 1.0f / sg : 0.0f;
-            reinterpret_cast<device half4*>(O + q_off)[lane]      = half4(al * inv_s);
-            reinterpret_cast<device half4*>(O + q_off)[lane + 32] = half4(ah * inv_s);
+            reinterpret_cast<device half4*>(O + o_base)[lane]      = half4(al * inv_s);
+            reinterpret_cast<device half4*>(O + o_base)[lane + 32] = half4(ah * inv_s);
         }
         return;
     }
@@ -269,8 +270,11 @@ void gemma4_attn_local_d256(
     }
 
     const float inv_s = s > 0.0f ? 1.0f / s : 0.0f;
-    reinterpret_cast<device half4*>(O + q_off + (size_t)q_row * D)[lane]      = half4(acc_lo * inv_s);
-    reinterpret_cast<device half4*>(O + q_off + (size_t)q_row * D)[lane + 32] = half4(acc_hi * inv_s);
+    {
+        const size_t o_w = o_base + (size_t)q_row * nheads * D;
+        reinterpret_cast<device half4*>(O + o_w)[lane]      = half4(acc_lo * inv_s);
+        reinterpret_cast<device half4*>(O + o_w)[lane + 32] = half4(acc_hi * inv_s);
+    }
 }
 
 
@@ -298,8 +302,9 @@ void gemma4_attn_global_d512(
     if (head >= nheads) return;
 
     const uint kv_head = head * n_kv_heads / nheads;
-    const size_t q_off  = (size_t)(batch * nheads     + head)    * q_seq      * D;
-    const size_t kv_off = (size_t)(batch * n_kv_heads + kv_head) * cache_size * D;
+    const size_t q_off   = (size_t)(batch * nheads     + head)    * q_seq      * D;
+    const size_t kv_off  = (size_t)(batch * n_kv_heads + kv_head) * cache_size * D;
+    const size_t o_base  = (size_t)batch * q_seq * nheads * D + (size_t)head * D;
 
     threadgroup half4 k_smem[Bc * D4];   // 8 KB
     threadgroup half4 v_smem[Bc * D4];   // 8 KB
@@ -428,7 +433,7 @@ void gemma4_attn_global_d512(
             }
             const float inv_s = sg > 0.0f ? 1.0f / sg : 0.0f;
             for (uint c = 0; c < 4; ++c) {
-                reinterpret_cast<device half4*>(O + q_off)[lane + c * 32] = half4(ao[c] * inv_s);
+                reinterpret_cast<device half4*>(O + o_base)[lane + c * 32] = half4(ao[c] * inv_s);
             }
         }
         return;
@@ -538,10 +543,12 @@ void gemma4_attn_global_d512(
     }
 
     const float inv_s = s > 0.0f ? 1.0f / s : 0.0f;
-    [[clang::unroll]]
-    for (uint c = 0; c < 4; ++c) {
-        reinterpret_cast<device half4*>(O + q_off + (size_t)q_row * D)[lane + c * 32] =
-            half4(acc[c] * inv_s);
+    {
+        const size_t o_w = o_base + (size_t)q_row * nheads * D;
+        [[clang::unroll]]
+        for (uint c = 0; c < 4; ++c) {
+            reinterpret_cast<device half4*>(O + o_w)[lane + c * 32] = half4(acc[c] * inv_s);
+        }
     }
 }
 
