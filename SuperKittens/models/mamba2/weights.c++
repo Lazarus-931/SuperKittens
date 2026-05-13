@@ -70,21 +70,23 @@ bool copy_into(MTL::Buffer* dst, size_t dst_off, sk::WeightStore* store,
 {
     auto* v = store->get(name);
     if (!v) { std::fprintf(stderr, "mamba2 weights: missing '%s'\n", name.c_str()); return false; }
-    if (v->nbytes != expect_bytes) {
-        std::fprintf(stderr, "mamba2 weights: size mismatch '%s' got %zu expect %zu\n",
-                     name.c_str(), v->nbytes, expect_bytes);
+    const size_t nelem = expect_bytes / 2;
+    size_t src_elem = (v->dtype == sk::Dtype::F32) ? 4
+                    : (v->dtype == sk::Dtype::BF16 || v->dtype == sk::Dtype::F16) ? 2 : 0;
+    if (src_elem == 0 || v->nbytes != nelem * src_elem) {
+        std::fprintf(stderr, "mamba2 weights: size mismatch '%s' got %zu expect %zu (dtype=%d)\n",
+                     name.c_str(), v->nbytes, nelem * src_elem, (int)v->dtype);
         return false;
     }
     char* out = (char*)dst->contents() + dst_off;
     if (v->dtype == sk::Dtype::BF16) {
         const uint16_t* s = (const uint16_t*)v->data;
         uint16_t* d = (uint16_t*)out;
-        for (size_t i = 0; i < expect_bytes / 2; ++i) d[i] = bf16_to_fp16(s[i]);
+        for (size_t i = 0; i < nelem; ++i) d[i] = bf16_to_fp16(s[i]);
     } else if (v->dtype == sk::Dtype::F32) {
-        // not expected here; fallback narrow
         const float* s = (const float*)v->data;
         uint16_t* d = (uint16_t*)out;
-        for (size_t i = 0; i < expect_bytes / 2; ++i) d[i] = fp32_to_fp16(s[i]);
+        for (size_t i = 0; i < nelem; ++i) d[i] = fp32_to_fp16(s[i]);
     } else {
         std::memcpy(out, v->data, expect_bytes);
     }
@@ -97,20 +99,23 @@ bool copy_transpose_fp16(MTL::Buffer* dst, size_t dst_off, sk::WeightStore* stor
 {
     auto* v = store->get(name);
     if (!v) { std::fprintf(stderr, "mamba2 weights: missing '%s'\n", name.c_str()); return false; }
-    if (v->nbytes != out_rows * out_cols * 2) {
-        std::fprintf(stderr, "mamba2 weights: tx size mismatch '%s' got %zu expect %zu\n",
-                     name.c_str(), v->nbytes, out_rows * out_cols * 2);
+    const size_t nelem = out_rows * out_cols;
+    size_t src_elem = (v->dtype == sk::Dtype::F32) ? 4
+                    : (v->dtype == sk::Dtype::BF16 || v->dtype == sk::Dtype::F16) ? 2 : 0;
+    if (src_elem == 0 || v->nbytes != nelem * src_elem) {
+        std::fprintf(stderr, "mamba2 weights: tx size mismatch '%s' got %zu expect %zu (dtype=%d)\n",
+                     name.c_str(), v->nbytes, nelem * src_elem, (int)v->dtype);
         return false;
     }
-    const uint16_t* src = (const uint16_t*)v->data;
     uint16_t* d = (uint16_t*)((char*)dst->contents() + dst_off);
-    const bool is_bf16 = (v->dtype == sk::Dtype::BF16);
-    for (size_t i = 0; i < out_rows; ++i) {
-        for (size_t j = 0; j < out_cols; ++j) {
-            uint16_t s = src[j * out_rows + i];
-            d[i * out_cols + j] = is_bf16 ? bf16_to_fp16(s) : s;
-        }
-    }
+    auto at = [&](size_t idx) -> uint16_t {
+        if (v->dtype == sk::Dtype::F32)  return fp32_to_fp16(((const float*)v->data)[idx]);
+        if (v->dtype == sk::Dtype::BF16) return bf16_to_fp16(((const uint16_t*)v->data)[idx]);
+        return ((const uint16_t*)v->data)[idx];
+    };
+    for (size_t i = 0; i < out_rows; ++i)
+        for (size_t j = 0; j < out_cols; ++j)
+            d[i * out_cols + j] = at(j * out_rows + i);
     return true;
 }
 
@@ -122,23 +127,23 @@ bool copy_conv1d(MTL::Buffer* dst, size_t dst_off, sk::WeightStore* store,
 {
     auto* v = store->get(name);
     if (!v) { std::fprintf(stderr, "mamba2 weights: missing '%s'\n", name.c_str()); return false; }
-    if (v->nbytes != C_in * K * 2) {
-        std::fprintf(stderr, "mamba2 weights: conv size mismatch '%s' got %zu expect %zu\n",
-                     name.c_str(), v->nbytes, C_in * K * 2);
+    const size_t nelem = C_in * K;
+    size_t src_elem = (v->dtype == sk::Dtype::F32) ? 4
+                    : (v->dtype == sk::Dtype::BF16 || v->dtype == sk::Dtype::F16) ? 2 : 0;
+    if (src_elem == 0 || v->nbytes != nelem * src_elem) {
+        std::fprintf(stderr, "mamba2 weights: conv size mismatch '%s' got %zu expect %zu (dtype=%d)\n",
+                     name.c_str(), v->nbytes, nelem * src_elem, (int)v->dtype);
         return false;
     }
-    const uint16_t* src = (const uint16_t*)v->data;
     uint16_t* d = (uint16_t*)((char*)dst->contents() + dst_off);
-    const bool is_bf16 = (v->dtype == sk::Dtype::BF16);
-    // src laid out as (C_in, K); kernel expects (C_in, K) too — pass through.
-    // (Earlier the code transposed to (K, C_in), but conv1d_silu reads
-    // weight[c*K + k] which is the (C_in, K) channel-major form.)
-    for (size_t c = 0; c < C_in; ++c) {
-        for (size_t k = 0; k < K; ++k) {
-            uint16_t s = src[c * K + k];
-            d[c * K + k] = is_bf16 ? bf16_to_fp16(s) : s;
-        }
-    }
+    auto at = [&](size_t idx) -> uint16_t {
+        if (v->dtype == sk::Dtype::F32)  return fp32_to_fp16(((const float*)v->data)[idx]);
+        if (v->dtype == sk::Dtype::BF16) return bf16_to_fp16(((const uint16_t*)v->data)[idx]);
+        return ((const uint16_t*)v->data)[idx];
+    };
+    for (size_t c = 0; c < C_in; ++c)
+        for (size_t k = 0; k < K; ++k)
+            d[c * K + k] = at(c * K + k);
     return true;
 }
 
