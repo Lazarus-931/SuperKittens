@@ -86,4 +86,27 @@ SK GPU output differs from the numpy reproduction by max-abs=0.46, concentrated 
 - Bisect by feeding SK's `ple_gate_out` into the numpy probe (`temp/gemma4_validate/probe8.py`) to isolate which of the two GEMMs is the offending kernel.
 - As a sanity check, swap `P.gemm_fp32_out` to `P.gemm` in `dispatch_ple_inject` step 3 to see if accuracy moves.
 
-Probes: `temp/gemma4_validate/probe{5..8}.py` on derek (gitignored).
+Probes: `temp/gemma4_validate/probe{5..11}.py` on derek (gitignored).
+
+## L0.out bisection result (2026-05-13, derek, probe9/10/11)
+
+After adding `L0.ple_gate_out`, `L0.ple_gated`, `L0.ple_proj_back` dump taps:
+
+| Stage | Kernel | Result vs fp64 numpy reference |
+|---|---|---|
+| 1 — gate GEMM | `gemma4_gemm_bf16` | **OK** — max=0.0038, matches HF `L0.per_layer_input_gate` |
+| 2 — gate act  | `gemma4_ple_gate_act` | **WRONG** — sk_gated vs `gelu(gate)*ple_slice_L0`: max=5.16, mean=0.13 |
+| 3 — proj GEMM | `gemma4_gemm_bf16_fp32_out` | **OK given inputs** — `sk_proj == sk_gated @ W_proj.T` bit-exactly |
+
+So the L0.out=0.46 error originates entirely in step 2 (`gemma4_ple_gate_act`).
+
+Probe11 shows the effective per-element multiplier SK applies (= sk_gated / gelu(gate))
+does not match `per_layer_inputs[L=0]` for any layer L=0..5 — closest is L=0 with
+mean abs diff ~0.47, so it is **not** a layer-index off-by-one. Root cause is one of:
+
+1. `gemma4_ple_context_mix` writes `per_layer_inputs` in a different layout than the
+   `(T, n_layers, PLE_dim)` that `gemma4_ple_gate_act` assumes.
+2. Stride/shape miscount in `gemma4_ple_gate_act` (`ple_off = (t*n_layers + L)*P`).
+
+Next probe: add `L0.per_layer_inputs` dump tap so we can compare SK's actual ple-slice
+against the HF/numpy reference directly.
