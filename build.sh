@@ -59,10 +59,11 @@ while IFS= read -r -d '' cpp_file; do
     obj="$BUILD_DIR/$(echo "$rel" | tr '/' '_' | sed 's/\.c++$//').o"
     echo "  $cpp_file"
     if clang++ -std=gnu++20 -O3 -arch arm64 -I metal-cpp \
-        -c "$cpp_file" -o "$obj" 2>/dev/null; then
+        -c "$cpp_file" -o "$obj"; then
         OBJ_FILES+=("$obj")
     else
-        echo "    ⚠ failed — skipping"
+        echo "    ✗ COMPILE FAILED: $cpp_file"
+        exit 1
     fi
 done < <(find "$KERNELS_DIR" "$MODELS_DIR" "SuperKittens/inference" -name "*.c++" \
     -not -path "*/paged_attn/*" -not -path "*/utils/rmsnorm/*" -not -name "metal_impl.cpp" \

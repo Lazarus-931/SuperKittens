@@ -1,5 +1,5 @@
 """gemma4.py — ctypes wrapper around the Gemma 4 launcher (libsk.dylib)."""
-import ctypes, os, json
+import ctypes, os, json, warnings
 import numpy as np
 from pathlib import Path
 from dataclasses import dataclass
@@ -30,8 +30,12 @@ class _Config(ctypes.Structure):
         ("window",             ctypes.c_uint32),
         ("prope_p_pairs",      ctypes.c_uint32),
         ("vocab_size",         ctypes.c_uint32),
+        ("ple_dim",            ctypes.c_uint32),
         ("has_ple",            ctypes.c_int),
         ("eps",                ctypes.c_float),
+        ("final_logit_softcap", ctypes.c_float),
+        ("use_double_wide_mlp",  ctypes.c_uint32),
+        ("num_kv_shared_layers", ctypes.c_uint32),
     ]
 
 
@@ -96,12 +100,20 @@ class Gemma4Config:
     n_kv_heads_local: int
     n_kv_heads_global: int
     head_dim_local: int = 256
-    head_dim_global: int = 512
+    head_dim_global: int = 256
     window: int = 4096
     prope_p_pairs: int = 64
     vocab_size: int = 262144
     has_ple: bool = False
+    ple_dim: int = 256
     eps: float = 1e-6
+    rope_theta_global: float = 1_000_000.0
+    rope_theta_local: float = 10_000.0
+    final_logit_softcap: float = 0.0
+    partial_rotary_factor_full: float = 0.25
+    num_kv_shared_layers: int = 0
+    use_double_wide_mlp: bool = False
+    layer_types: tuple = ()
     batch: int = 1
     seq_max: int = 8192
     cache_max: int = 8192
@@ -118,17 +130,21 @@ def _bake_rope(cache_max: int, head_dim: int, theta: float):
 def _preset(name: str) -> Gemma4Config:
     n = name.lower()
     if n in ("e2b",):
-        return Gemma4Config(n_layers=35, local_period=6, d_model=1536, n_int=6144,
-                            n_heads=4, n_kv_heads_local=4, n_kv_heads_global=1,
-                            window=4096, has_ple=True)
+        return Gemma4Config(n_layers=35, local_period=5, d_model=1536, n_int=6144,
+                            n_heads=8, n_kv_heads_local=1, n_kv_heads_global=1,
+                            head_dim_local=256, head_dim_global=512,
+                            vocab_size=262144, window=4096, has_ple=True, ple_dim=256)
     if n in ("e4b",):
-        return Gemma4Config(n_layers=35, local_period=6, d_model=2048, n_int=8192,
-                            n_heads=8, n_kv_heads_local=8, n_kv_heads_global=2,
-                            window=4096, has_ple=True)
+        return Gemma4Config(n_layers=35, local_period=6, d_model=2560, n_int=10240,
+                            n_heads=8, n_kv_heads_local=2, n_kv_heads_global=2,
+                            head_dim_local=256, head_dim_global=256,
+                            vocab_size=262144, window=4096, has_ple=True, ple_dim=256)
+    # TODO: verify against real config
     if n in ("26b", "26b-a4b"):
         return Gemma4Config(n_layers=60, local_period=6, d_model=4608, n_int=12288,
                             n_heads=16, n_kv_heads_local=16, n_kv_heads_global=4,
                             window=1024, has_ple=False)
+    # TODO: verify against real config
     if n in ("31b",):
         return Gemma4Config(n_layers=60, local_period=6, d_model=21504, n_int=86016,
                             n_heads=32, n_kv_heads_local=32, n_kv_heads_global=16,
@@ -153,8 +169,12 @@ def _to_cstruct(c: Gemma4Config) -> _Config:
     cs.window             = c.window
     cs.prope_p_pairs      = c.prope_p_pairs
     cs.vocab_size         = c.vocab_size
+    cs.ple_dim            = c.ple_dim
     cs.has_ple            = 1 if c.has_ple else 0
     cs.eps                = c.eps
+    cs.final_logit_softcap = float(c.final_logit_softcap)
+    cs.use_double_wide_mlp  = 1 if c.use_double_wide_mlp else 0
+    cs.num_kv_shared_layers = int(c.num_kv_shared_layers)
     return cs
 
 
@@ -274,6 +294,35 @@ class Gemma4:
         out_ids = self.generate(np.array(ids, dtype=np.int32), eos_id=eos, **gen_kwargs)
         return self.tokenizer.decode(out_ids)
 
+    def attach_ple_table(self, ple_table: np.ndarray):
+        """Hold reference to the (vocab_size, ple_dim) PLE lookup table for per-token gather."""
+        self._ple_table = np.ascontiguousarray(ple_table, dtype=np.float16)
+
+    def set_ple_table_for_input(self, input_ids):
+        """Gather per-token PLE rows from the attached PLE table and upload via C entry.
+
+        If the C entry isn't compiled in yet, warn and return without failing.
+        """
+        if not getattr(self.cfg, "has_ple", False):
+            return
+        tbl = getattr(self, "_ple_table", None)
+        if tbl is None:
+            warnings.warn("[gemma4] set_ple_table_for_input: no PLE table attached; call attach_ple_table() first")
+            return
+        ids = np.ascontiguousarray(np.asarray(input_ids, dtype=np.int64).reshape(-1))
+        gathered = np.ascontiguousarray(tbl[ids], dtype=np.float16)
+        self._ple_input_keep = gathered
+        lib = _load()
+        fn = getattr(lib, "sk_gemma4_set_ple_input", None)
+        if fn is None:
+            warnings.warn("[gemma4] sk_gemma4_set_ple_input not present in libsk; PLE per-token upload skipped (orchestrator agent owns it)")
+            return
+        fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32]
+        fn.restype = ctypes.c_int
+        rc = fn(self._h, gathered.ctypes.data, ctypes.c_uint32(ids.size))
+        if rc:
+            raise RuntimeError(f"sk_gemma4_set_ple_input failed: {rc}")
+
     def set_rope_tables(self, cos_local, sin_local, cos_global, sin_global):
         cl = np.ascontiguousarray(cos_local, dtype=np.float16)
         sl = np.ascontiguousarray(sin_local, dtype=np.float16)
@@ -286,7 +335,9 @@ class Gemma4:
             raise RuntimeError(f"sk_gemma4_set_rope_tables failed: {rc}")
 
     @classmethod
-    def from_pretrained(cls, name: str, **cfg_overrides):
+    def from_pretrained(cls, variant: str = "e2b", name: str | None = None, **cfg_overrides):
+        if name is None:
+            name = variant
         if name in _VARIANT_TO_DIR:
             dir_name = _VARIANT_TO_DIR[name]
             variant = name
@@ -303,22 +354,40 @@ class Gemma4:
         if not cfg_path.exists():
             raise FileNotFoundError(f"missing {cfg_path}")
         hf = json.loads(cfg_path.read_text())
-        text_cfg = hf.get("text_config", hf)
+        text_cfg = hf.get("text_config", {}) if isinstance(hf.get("text_config"), dict) else {}
+        def _get(key, default):
+            if key in text_cfg: return text_cfg[key]
+            if key in hf: return hf[key]
+            return default
         cfg = _preset(variant)
-        cfg.n_layers          = int(text_cfg.get("num_hidden_layers", cfg.n_layers))
-        cfg.d_model           = int(text_cfg.get("hidden_size", cfg.d_model))
-        cfg.n_int             = int(text_cfg.get("intermediate_size", cfg.n_int))
-        cfg.n_heads           = int(text_cfg.get("num_attention_heads", cfg.n_heads))
-        nkv                   = int(text_cfg.get("num_key_value_heads", cfg.n_kv_heads_local))
+        cfg.n_layers          = int(_get("num_hidden_layers", cfg.n_layers))
+        cfg.d_model           = int(_get("hidden_size", cfg.d_model))
+        cfg.n_int             = int(_get("intermediate_size", cfg.n_int))
+        cfg.n_heads           = int(_get("num_attention_heads", cfg.n_heads))
+        nkv                   = int(_get("num_key_value_heads", cfg.n_kv_heads_local))
         cfg.n_kv_heads_local  = nkv
         cfg.n_kv_heads_global = nkv
-        cfg.head_dim_local    = int(text_cfg.get("head_dim", cfg.head_dim_local))
-        cfg.head_dim_global   = int(text_cfg.get("head_dim", cfg.head_dim_global))
-        cfg.window            = int(text_cfg.get("sliding_window", cfg.window))
-        cfg.vocab_size        = int(text_cfg.get("vocab_size", cfg.vocab_size))
-        cfg.eps               = float(text_cfg.get("rms_norm_eps", cfg.eps))
-        rope_theta_global     = float(text_cfg.get("rope_theta", 1_000_000.0))
-        rope_theta_local      = float(text_cfg.get("rope_local_base_freq", 10_000.0))
+        cfg.head_dim_local    = int(_get("head_dim", cfg.head_dim_local))
+        cfg.head_dim_global   = int(_get("global_head_dim", cfg.head_dim_global))
+        cfg.ple_dim           = int(_get("hidden_size_per_layer_input", cfg.ple_dim))
+        cfg.window            = int(_get("sliding_window", cfg.window))
+        cfg.vocab_size        = int(_get("vocab_size", cfg.vocab_size))
+        cfg.eps               = float(_get("rms_norm_eps", cfg.eps))
+        cfg.rope_theta_global = float(_get("rope_theta", cfg.rope_theta_global))
+        cfg.rope_theta_local  = float(_get("rope_local_base_freq",
+                                _get("rope_local_theta",
+                                _get("rope_theta_local", cfg.rope_theta_local))))
+        cfg.final_logit_softcap = float(_get("final_logit_softcapping", 0.0) or 0.0)
+        cfg.num_kv_shared_layers = int(_get("num_kv_shared_layers", 0))
+        cfg.use_double_wide_mlp  = bool(_get("use_double_wide_mlp", False))
+        lt = _get("layer_types", None)
+        if isinstance(lt, list) and lt:
+            cfg.layer_types = tuple(lt)
+        rp = _get("rope_parameters", {})
+        if isinstance(rp, dict):
+            full = rp.get("full_attention", {})
+            if isinstance(full, dict) and "partial_rotary_factor" in full:
+                cfg.partial_rotary_factor_full = float(full["partial_rotary_factor"])
         for k, v in cfg_overrides.items():
             setattr(cfg, k, v)
 
@@ -334,20 +403,28 @@ class Gemma4:
             raise FileNotFoundError(f"no safetensors in {root}")
         if rc: raise RuntimeError(f"load failed: {rc}")
 
-        cos_l, sin_l = _bake_rope(cfg.cache_max, cfg.head_dim_local,  rope_theta_local)
-        cos_g, sin_g = _bake_rope(cfg.cache_max, cfg.head_dim_global, rope_theta_global)
+        cos_l, sin_l = _bake_rope(cfg.cache_max, cfg.head_dim_local,  cfg.rope_theta_local)
+        cos_g, sin_g = _bake_rope(cfg.cache_max, cfg.head_dim_global, cfg.rope_theta_global)
         m.set_rope_tables(cos_l, sin_l, cos_g, sin_g)
 
+        m.tokenizer = None
+        try:
+            from SuperKittens.models.load.tokenizer import Tokenizer
+        except Exception as e:
+            print(f"[gemma4] tokenizer module unavailable: {e}")
+            return m
         sp_path = root / "tokenizer.model"
+        json_path = root / "tokenizer.json"
         if sp_path.exists():
             try:
-                from SuperKittens.models.load.tokenizer import Tokenizer
                 m.tokenizer = Tokenizer.from_sentencepiece(str(sp_path))
             except Exception as e:
-                print(f"[gemma4] tokenizer attach failed: {e}")
-                m.tokenizer = None
-        else:
-            m.tokenizer = None
+                print(f"[gemma4] sentencepiece attach failed: {e}")
+        if m.tokenizer is None and json_path.exists():
+            try:
+                m.tokenizer = Tokenizer.from_hf_json(str(json_path), family="gemma")
+            except Exception as e:
+                print(f"[gemma4] hf-json attach failed: {e}")
         return m
 
     def close(self):

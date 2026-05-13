@@ -21,6 +21,11 @@ struct Handle {
     ModelBuffers bufs;
 
     std::vector<LayerCache> layer_caches; // owned MTL::Buffer pairs
+
+    std::vector<uint32_t> n_int_per_layer;
+    std::vector<size_t>   mlp_gate_off_e;
+    std::vector<size_t>   mlp_down_off_e;
+    std::vector<int32_t>  kv_source_layer;
 };
 
 static MTL::Buffer* alloc_zero(MTL::Device* dev, size_t bytes) {
@@ -35,22 +40,41 @@ static bool resolve_psos(ModelPSOs& P) {
     P.layer.qkv_norm       = sk::bindings_pso("gemma4_qkv_norm");
     P.layer.rope           = sk::bindings_pso("rope_qk");
     P.layer.prope          = sk::bindings_pso("gemma4_prope_qk");
+    P.layer.rope_partial   = sk::bindings_pso("gemma4_rope_qk_partial");
     P.layer.attn_local     = sk::bindings_pso("gemma4_attn_local_d256");
     P.layer.attn_global    = sk::bindings_pso("gemma4_attn_global_d512");
     P.layer.gated_mlp_gelu = sk::bindings_pso("gated_mlp_gelu");
     P.layer.add            = sk::bindings_pso("add_f16");
     P.layer.add_rmsnorm    = sk::bindings_pso("add_rmsnorm");
     P.layer.kv_cache_write = sk::bindings_pso("kv_cache_write");
+    P.layer.ple_gate_act   = sk::bindings_pso("gemma4_ple_gate_act");
+    P.layer.ple_inject     = sk::bindings_pso("gemma4_ple_inject");
     P.embedding_lookup     = sk::bindings_pso("embedding_lookup");
-    P.ple_add              = sk::bindings_pso("gemma4_ple_add");
+    P.ple_lookup           = sk::bindings_pso("gemma4_ple_lookup");
     P.argmax               = sk::bindings_pso("argmax");
+    P.logit_softcap        = sk::bindings_pso("gemma4_logit_softcap");
 
-    return P.layer.rmsnorm    && P.layer.gemm     && P.layer.qkv_norm
-        && P.layer.rope       && P.layer.prope    && P.layer.attn_local
-        && P.layer.attn_global && P.layer.gated_mlp_gelu && P.layer.add
-        && P.layer.add_rmsnorm
-        && P.layer.kv_cache_write
-        && P.embedding_lookup && P.ple_add        && P.argmax;
+    #define _CK(x) if (!(x)) return false;
+    _CK(P.layer.rmsnorm);
+    _CK(P.layer.gemm);
+    _CK(P.layer.qkv_norm);
+    _CK(P.layer.rope);
+    _CK(P.layer.prope);
+    _CK(P.layer.rope_partial);
+    _CK(P.layer.attn_local);
+    _CK(P.layer.attn_global);
+    _CK(P.layer.gated_mlp_gelu);
+    _CK(P.layer.add);
+    _CK(P.layer.add_rmsnorm);
+    _CK(P.layer.kv_cache_write);
+    _CK(P.layer.ple_gate_act);
+    _CK(P.layer.ple_inject);
+    _CK(P.embedding_lookup);
+    _CK(P.ple_lookup);
+    _CK(P.argmax);
+    _CK(P.logit_softcap);
+    #undef _CK
+    return true;
 }
 
 }}  // namespace meow::gemma4
@@ -71,6 +95,45 @@ extern "C" sk_gemma4_handle* sk_gemma4_create(const sk_gemma4_config* cfg) {
 
     using namespace meow::gemma4;
 
+    // Pre-compute per-layer tables.
+    const uint32_t nL = cfg->n_layers;
+    const uint32_t first_kv_shared = (cfg->num_kv_shared_layers >= nL)
+                                     ? 0u
+                                     : (nL - cfg->num_kv_shared_layers);
+    h->n_int_per_layer.resize(nL);
+    h->mlp_gate_off_e.resize(nL);
+    h->mlp_down_off_e.resize(nL);
+    h->kv_source_layer.assign(nL, -1);
+    {
+        size_t cum_gate = 0, cum_down = 0;
+        for (uint32_t L = 0; L < nL; ++L) {
+            const bool is_shared = (cfg->num_kv_shared_layers > 0) && (L >= first_kv_shared);
+            const uint32_t mul   = (cfg->use_double_wide_mlp && is_shared) ? 2u : 1u;
+            h->n_int_per_layer[L] = cfg->n_int * mul;
+            h->mlp_gate_off_e[L]  = cum_gate;
+            h->mlp_down_off_e[L]  = cum_down;
+            cum_gate += (size_t)cfg->d_model * h->n_int_per_layer[L];
+            cum_down += (size_t)h->n_int_per_layer[L] * cfg->d_model;
+        }
+    }
+    // Determine kv_source_layer using same layer-type rule as elsewhere
+    // (local_period: last layer of each window is global). For each shared
+    // layer L, find the latest non-shared layer < first_kv_shared with the
+    // same layer-type.
+    auto is_global_l = [&](uint32_t L) -> bool {
+        return (L % cfg->local_period) == (cfg->local_period - 1);
+    };
+    if (cfg->num_kv_shared_layers > 0 && first_kv_shared > 0) {
+        for (uint32_t L = first_kv_shared; L < nL; ++L) {
+            const bool want_global = is_global_l(L);
+            int32_t src = -1;
+            for (int32_t s = (int32_t)first_kv_shared - 1; s >= 0; --s) {
+                if (is_global_l((uint32_t)s) == want_global) { src = s; break; }
+            }
+            h->kv_source_layer[L] = src;
+        }
+    }
+
     const uint32_t T_max          = cfg->batch * cfg->seq_max;
     const size_t   x_bytes        = (size_t)T_max * cfg->d_model * 2;
     const size_t   logits_bytes   = (size_t)T_max * cfg->vocab_size * 2;
@@ -89,30 +152,47 @@ extern "C" sk_gemma4_handle* sk_gemma4_create(const sk_gemma4_config* cfg) {
     // Weight buffers — sized for the slab layout dispatch_layer expects
     // (uniform per-layer stride using head_dim_max / n_kv_max).
     h->weights.w_embed         = alloc_zero(dev, (size_t)cfg->vocab_size * cfg->d_model * 2);
-    h->weights.w_ple           = cfg->has_ple
-                                  ? alloc_zero(dev, (size_t)cfg->n_layers * cfg->vocab_size * cfg->d_model * 2)
+    h->weights.w_ple_table     = cfg->has_ple
+                                  ? alloc_zero(dev, (size_t)cfg->vocab_size * cfg->n_layers * cfg->ple_dim * 2)
+                                  : nullptr;
+    h->weights.w_per_layer_input_gate      = cfg->has_ple
+                                  ? alloc_zero(dev, (size_t)cfg->n_layers * cfg->ple_dim * cfg->d_model * 2)
+                                  : nullptr;
+    h->weights.w_per_layer_projection      = cfg->has_ple
+                                  ? alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * cfg->ple_dim * 2)
+                                  : nullptr;
+    h->weights.w_layer_scalar              = cfg->has_ple
+                                  ? alloc_zero(dev, (size_t)cfg->n_layers * sizeof(float))
+                                  : nullptr;
+    h->weights.w_post_per_layer_input_norm = cfg->has_ple
+                                  ? alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * 2)
                                   : nullptr;
     h->weights.w_pre_attn_norm = alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * 2);
     h->weights.w_post_attn_norm= alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * 2);
-    h->weights.w_pre_mlp_norm  = alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * 2);
-    h->weights.w_post_mlp_norm = alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * 2);
+    h->weights.w_pre_feedforward_layernorm  = alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * 2);
+    h->weights.w_post_feedforward_layernorm = alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * 2);
     h->weights.w_final_norm    = alloc_zero(dev, (size_t)cfg->d_model * 2);
     h->weights.w_qkv           = alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model
                                                   * qkv_slots_max * hd_max * 2);
     h->weights.w_out           = alloc_zero(dev, (size_t)cfg->n_layers * cfg->n_heads * hd_max * cfg->d_model * 2);
     h->weights.gamma_q         = alloc_zero(dev, (size_t)cfg->n_layers * hd_max * 2);
     h->weights.gamma_k         = alloc_zero(dev, (size_t)cfg->n_layers * hd_max * 2);
-    h->weights.w_gate          = alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * cfg->n_int * 2);
-    h->weights.w_up            = alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * cfg->n_int * 2);
-    h->weights.w_down          = alloc_zero(dev, (size_t)cfg->n_layers * cfg->n_int * cfg->d_model * 2);
+    {
+        size_t total_gate_e = h->mlp_gate_off_e.back() + (size_t)cfg->d_model * h->n_int_per_layer.back();
+        size_t total_down_e = h->mlp_down_off_e.back() + (size_t)h->n_int_per_layer.back() * cfg->d_model;
+        h->weights.w_gate = alloc_zero(dev, total_gate_e * 2);
+        h->weights.w_up   = alloc_zero(dev, total_gate_e * 2);
+        h->weights.w_down = alloc_zero(dev, total_down_e * 2);
+    }
     h->weights.cos_local       = alloc_zero(dev, (size_t)cfg->cache_max * (cfg->head_dim_local / 2) * 2);
     h->weights.sin_local       = alloc_zero(dev, (size_t)cfg->cache_max * (cfg->head_dim_local / 2) * 2);
     h->weights.cos_global      = alloc_zero(dev, (size_t)cfg->cache_max * (cfg->head_dim_global / 2) * 2);
     h->weights.sin_global      = alloc_zero(dev, (size_t)cfg->cache_max * (cfg->head_dim_global / 2) * 2);
 
     // Per-layer K/V cache buffers (sized per layer-type).
-    h->layer_caches.resize(cfg->n_layers);
+    h->layer_caches.assign(cfg->n_layers, LayerCache{nullptr, nullptr});
     for (uint32_t L = 0; L < cfg->n_layers; ++L) {
+        if (h->kv_source_layer[L] >= 0) continue; // shared: alias source below
         const bool is_global = ((L % cfg->local_period) == (cfg->local_period - 1));
         const uint32_t n_kv  = is_global ? cfg->n_kv_heads_global : cfg->n_kv_heads_local;
         const uint32_t hd    = is_global ? cfg->head_dim_global   : cfg->head_dim_local;
@@ -120,6 +200,12 @@ extern "C" sk_gemma4_handle* sk_gemma4_create(const sk_gemma4_config* cfg) {
         const size_t kv_bytes = (size_t)cfg->batch * n_kv * csize * hd * 2;
         h->layer_caches[L].k = alloc_zero(dev, kv_bytes);
         h->layer_caches[L].v = alloc_zero(dev, kv_bytes);
+    }
+    for (uint32_t L = 0; L < cfg->n_layers; ++L) {
+        if (h->kv_source_layer[L] >= 0) {
+            uint32_t s = (uint32_t)h->kv_source_layer[L];
+            h->layer_caches[L] = h->layer_caches[s];
+        }
     }
     h->weights.layer_caches = h->layer_caches.data();
 
@@ -141,6 +227,18 @@ extern "C" sk_gemma4_handle* sk_gemma4_create(const sk_gemma4_config* cfg) {
     h->bufs.m_out      = alloc_zero(dev, x_bytes);
     h->bufs.y_out      = alloc_zero(dev, x_bytes);
 
+    if (cfg->has_ple) {
+        h->bufs.per_layer_inputs = alloc_zero(dev, (size_t)T_max * cfg->n_layers * cfg->ple_dim * 2);
+        h->bufs.ple_gate_out     = alloc_zero(dev, (size_t)T_max * cfg->ple_dim * 2);
+        h->bufs.ple_gated        = alloc_zero(dev, (size_t)T_max * cfg->ple_dim * 2);
+        h->bufs.ple_proj_back    = alloc_zero(dev, x_bytes);
+    } else {
+        h->bufs.per_layer_inputs = nullptr;
+        h->bufs.ple_gate_out     = nullptr;
+        h->bufs.ple_gated        = nullptr;
+        h->bufs.ple_proj_back    = nullptr;
+    }
+
     return reinterpret_cast<sk_gemma4_handle*>(h);
 }
 
@@ -153,11 +251,17 @@ extern "C" int sk_gemma4_load_weights(sk_gemma4_handle* hp, const sk_gemma4_weig
     };
 
     cp(h->weights.w_embed,         w->w_embed);
-    if (h->cfg.has_ple) cp(h->weights.w_ple, w->w_ple);
+    if (h->cfg.has_ple) {
+        cp(h->weights.w_ple_table,                 w->w_ple_table);
+        cp(h->weights.w_per_layer_input_gate,      w->w_per_layer_input_gate);
+        cp(h->weights.w_per_layer_projection,      w->w_per_layer_projection);
+        cp(h->weights.w_layer_scalar,              w->w_layer_scalar);
+        cp(h->weights.w_post_per_layer_input_norm, w->w_post_per_layer_input_norm);
+    }
     cp(h->weights.w_pre_attn_norm, w->w_pre_attn_norm);
     cp(h->weights.w_post_attn_norm,w->w_post_attn_norm);
-    cp(h->weights.w_pre_mlp_norm,  w->w_pre_mlp_norm);
-    cp(h->weights.w_post_mlp_norm, w->w_post_mlp_norm);
+    cp(h->weights.w_pre_feedforward_layernorm,  w->w_pre_feedforward_layernorm);
+    cp(h->weights.w_post_feedforward_layernorm, w->w_post_feedforward_layernorm);
     cp(h->weights.w_final_norm,    w->w_final_norm);
     cp(h->weights.w_qkv,           w->w_qkv);
     cp(h->weights.w_out,           w->w_out);
@@ -210,9 +314,15 @@ extern "C" int sk_gemma4_forward(sk_gemma4_handle* hp,
     mp.cache_max          = h->cfg.cache_max;
     mp.prope_p_pairs      = h->cfg.prope_p_pairs;
     mp.vocab_size         = h->cfg.vocab_size;
+    mp.ple_dim            = h->cfg.ple_dim;
     mp.has_ple            = (h->cfg.has_ple != 0);
     mp.eps                = h->cfg.eps;
+    mp.final_logit_softcap = h->cfg.final_logit_softcap;
     mp.current_pos        = h->current_pos;
+    mp.n_int_per_layer    = h->n_int_per_layer.data();
+    mp.mlp_gate_off_e     = h->mlp_gate_off_e.data();
+    mp.mlp_down_off_e     = h->mlp_down_off_e.data();
+    mp.kv_source_layer    = h->kv_source_layer.data();
 
     auto* cmd = q->commandBuffer();
     meow::gemma4::dispatch_model(cmd, h->psos, h->weights, h->bufs, mp);
@@ -244,9 +354,14 @@ extern "C" void sk_gemma4_destroy(sk_gemma4_handle* hp) {
     auto* h = reinterpret_cast<meow::gemma4::Handle*>(hp);
 
     auto rel = [](MTL::Buffer* b) { if (b) b->release(); };
-    rel(h->weights.w_embed); rel(h->weights.w_ple);
+    rel(h->weights.w_embed); rel(h->weights.w_ple_table);
+    rel(h->weights.w_per_layer_input_gate);
+    rel(h->weights.w_per_layer_projection);
+    rel(h->weights.w_layer_scalar);
+    rel(h->weights.w_post_per_layer_input_norm);
     rel(h->weights.w_pre_attn_norm); rel(h->weights.w_post_attn_norm);
-    rel(h->weights.w_pre_mlp_norm);  rel(h->weights.w_post_mlp_norm);
+    rel(h->weights.w_pre_feedforward_layernorm);
+    rel(h->weights.w_post_feedforward_layernorm);
     rel(h->weights.w_final_norm);
     rel(h->weights.w_qkv); rel(h->weights.w_out);
     rel(h->weights.gamma_q); rel(h->weights.gamma_k);
@@ -254,7 +369,11 @@ extern "C" void sk_gemma4_destroy(sk_gemma4_handle* hp) {
     rel(h->weights.cos_local); rel(h->weights.sin_local);
     rel(h->weights.cos_global); rel(h->weights.sin_global);
 
-    for (auto& lc : h->layer_caches) { rel(lc.k); rel(lc.v); }
+    for (uint32_t L = 0; L < h->layer_caches.size(); ++L) {
+        if (L < h->kv_source_layer.size() && h->kv_source_layer[L] >= 0) continue;
+        rel(h->layer_caches[L].k);
+        rel(h->layer_caches[L].v);
+    }
 
     rel(h->bufs.input_ids); rel(h->bufs.output_id);
     rel(h->bufs.x_a); rel(h->bufs.x_b); rel(h->bufs.logits);
@@ -262,6 +381,8 @@ extern "C" void sk_gemma4_destroy(sk_gemma4_handle* hp) {
     rel(h->bufs.q_norm); rel(h->bufs.k_tmp); rel(h->bufs.v_tmp);
     rel(h->bufs.attn_out); rel(h->bufs.o_proj); rel(h->bufs.y_attn);
     rel(h->bufs.m_in); rel(h->bufs.m_out); rel(h->bufs.y_out);
+    rel(h->bufs.per_layer_inputs); rel(h->bufs.ple_gate_out);
+    rel(h->bufs.ple_gated); rel(h->bufs.ple_proj_back);
 
     delete h;
 }

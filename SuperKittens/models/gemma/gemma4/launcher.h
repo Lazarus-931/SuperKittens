@@ -33,17 +33,25 @@ typedef struct {
     uint32_t window;
     uint32_t prope_p_pairs;
     uint32_t vocab_size;
+    uint32_t ple_dim;
     int      has_ple;
     float    eps;
+    float    final_logit_softcap;
+    uint32_t use_double_wide_mlp;
+    uint32_t num_kv_shared_layers;
 } sk_gemma4_config;
 
 typedef struct {
     const void* w_embed;
-    const void* w_ple;
+    const void* w_ple_table;
+    const void* w_per_layer_input_gate;
+    const void* w_per_layer_projection;
+    const void* w_layer_scalar;
+    const void* w_post_per_layer_input_norm;
     const void* w_pre_attn_norm;
     const void* w_post_attn_norm;
-    const void* w_pre_mlp_norm;
-    const void* w_post_mlp_norm;
+    const void* w_pre_feedforward_layernorm;
+    const void* w_post_feedforward_layernorm;
     const void* w_final_norm;
     const void* w_qkv;
     const void* w_out;

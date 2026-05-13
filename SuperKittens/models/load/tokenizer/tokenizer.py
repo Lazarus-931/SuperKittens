@@ -64,24 +64,21 @@ class Tokenizer:
 
         bos_id = eos_id = pad_id = unk_id = None
         specials = set()
-        # Qwen3 uses ChatML
-        for name in ("<|endoftext|>", "<|im_end|>"):
+        eos_candidates = ("<|im_end|>", "<end_of_turn>", "<eos>", "<|endoftext|>")
+        bos_candidates = ("<|im_start|>", "<start_of_turn>", "<bos>", "<|startoftext|>", "<s>")
+        pad_candidates = ("<pad>", "<|pad|>", "<|endoftext|>")
+        for name in eos_candidates:
             tid = hf.token_to_id(name)
             if tid is not None:
-                eos_id = tid
-                specials.add(tid)
-                break
-        for name in ("<|im_start|>", "<|startoftext|>", "<s>"):
+                eos_id = tid; specials.add(tid); break
+        for name in bos_candidates:
             tid = hf.token_to_id(name)
             if tid is not None:
-                bos_id = tid
-                specials.add(tid)
-                break
-        for name in ("<|endoftext|>", "<pad>", "<|pad|>"):
+                bos_id = tid; specials.add(tid); break
+        for name in pad_candidates:
             tid = hf.token_to_id(name)
             if tid is not None:
-                pad_id = tid
-                break
+                pad_id = tid; break
         tid = hf.token_to_id("<unk>")
         if tid is not None:
             unk_id = tid
