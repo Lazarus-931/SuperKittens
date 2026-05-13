@@ -20,7 +20,7 @@ extern "C" {
 static inline sk_gemma4_config gemma4_e4b_config(void) {
     sk_gemma4_config c;
     c.batch              = 1;
-    c.seq_max            = 8192;
+    c.seq_max            = 256;       // see e2b.h: scratch-buffer size dominates per-dispatch overhead
     c.cache_max          = 8192;
     c.n_layers           = 35;
     c.local_period       = 6;

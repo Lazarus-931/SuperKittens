@@ -121,7 +121,7 @@ class Gemma4Config:
     use_double_wide_mlp: bool = False
     layer_types: tuple = ()
     batch: int = 1
-    seq_max: int = 8192
+    seq_max: int = 256       # prefill cap; sized for scratch buffers (per-dispatch overhead scales with bound buffer size on Apple GPUs)
     cache_max: int = 8192
 
 
