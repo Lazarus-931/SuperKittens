@@ -33,6 +33,7 @@ class _Config(ctypes.Structure):
         ("rope_beta_fast",     ctypes.c_float),
         ("rope_beta_slow",     ctypes.c_float),
         ("eps",                ctypes.c_float),
+        ("tie_word_embeddings", ctypes.c_uint32),
     ]
 
 
@@ -103,6 +104,7 @@ class Config:
     batch: int = 1
     seq_max: int = 8192
     cache_max: int = 32768
+    tie_word_embeddings: int = 1  # Qwen3-0.6B and 32B share tied embeddings; set 0 for untied variants
 
     @classmethod
     def preset(cls, name: str) -> "Config":
