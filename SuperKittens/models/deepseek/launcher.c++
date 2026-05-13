@@ -71,6 +71,8 @@ static bool resolve_psos(ModelPSOs& P, uint32_t dk, uint32_t dv) {
     P.layer.rmsnorm        = sk::bindings_pso("rmsnorm");
     P.layer.gemm           = sk::bindings_pso("gemm_fp16");
     P.layer.rope_tail      = sk::bindings_pso("kernel_dsv4_rope_tail_f32");
+    P.layer.rope_interleave = sk::bindings_pso("rope_interleave_f32");
+    P.layer.router_v3      = sk::bindings_pso("moe_router_v3");
     P.layer.kv_cache_write = sk::bindings_pso("kv_cache_write");
     P.layer.add            = sk::bindings_pso("add_f16");
     P.layer.add_rmsnorm    = sk::bindings_pso("add_rmsnorm");
@@ -97,6 +99,8 @@ static bool resolve_psos(ModelPSOs& P, uint32_t dk, uint32_t dv) {
     _CK("rmsnorm",        P.layer.rmsnorm);
     _CK("gemm_fp16",      P.layer.gemm);
     _CK("rope_tail",      P.layer.rope_tail);
+    _CK("rope_interleave_f32", P.layer.rope_interleave);
+    _CK("moe_router_v3",  P.layer.router_v3);
     _CK("kv_cache_write", P.layer.kv_cache_write);
     _CK("add_f16",        P.layer.add);
     _CK("add_rmsnorm",    P.layer.add_rmsnorm);
@@ -144,6 +148,8 @@ extern "C" sk_deepseek_handle* sk_deepseek_create(const sk_deepseek_config* cfg)
 
     // Weight buffers
     h->weights.w_embed         = alloc_zero(dev, (size_t)cfg->vocab_size * cfg->d_model * 2);
+    // Patch F: separate buffer for lm_head. Loader aliases (sets to w_embed) for tied case.
+    h->weights.w_lm_head       = alloc_zero(dev, (size_t)cfg->vocab_size * cfg->d_model * 2);
     h->weights.w_pre_attn_norm = alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * 2);
     h->weights.w_q_a           = alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * cfg->q_lora_rank * 2);
     h->weights.w_q_a_norm      = alloc_zero(dev, (size_t)cfg->n_layers * cfg->q_lora_rank * 2);
@@ -161,6 +167,9 @@ extern "C" sk_deepseek_handle* sk_deepseek_create(const sk_deepseek_config* cfg)
     h->weights.w_shared_down = alloc_zero(dev, (size_t)cfg->n_layers * cfg->shared_n_int * cfg->d_model * 2);
 
     h->weights.w_router = alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * cfg->n_expert * 2);
+    // Patch G: per-layer e_score_correction_bias (fp32). Allocated unconditionally;
+    // loader leaves zeros for V2-Lite, kernel ignores when has_bias=0.
+    h->weights.router_bias = alloc_zero(dev, (size_t)cfg->n_layers * cfg->n_expert * 4);
     // Routed-expert weights. INT2_DS4 layout (ds4 production):
     //   W_gate/W_up: (E, N_int, D / 256) block_iq2_xxs   →  66 bytes / 256 weights
     //   W_down     : (E, D, N_int / 256) block_q2_K      →  84 bytes / 256 weights
@@ -243,6 +252,13 @@ extern "C" int sk_deepseek_load_weights(sk_deepseek_handle* hp,
         if (dst && src) std::memcpy(dst->contents(), src, dst->length());
     };
     cp(h->weights.w_embed,         w->w_embed);
+    if (w->w_lm_head) {
+        cp(h->weights.w_lm_head,   w->w_lm_head);
+    } else {
+        // Tied case: release the unused lm_head allocation and alias to embed.
+        if (h->weights.w_lm_head) h->weights.w_lm_head->release();
+        h->weights.w_lm_head = h->weights.w_embed;
+    }
     cp(h->weights.w_pre_attn_norm, w->w_pre_attn_norm);
     cp(h->weights.w_q_a,           w->w_q_a);
     cp(h->weights.w_q_a_norm,      w->w_q_a_norm);
@@ -257,6 +273,7 @@ extern "C" int sk_deepseek_load_weights(sk_deepseek_handle* hp,
     cp(h->weights.w_shared_up,     w->w_shared_up);
     cp(h->weights.w_shared_down,   w->w_shared_down);
     cp(h->weights.w_router,        w->w_router);
+    if (w->router_bias) cp(h->weights.router_bias, w->router_bias);
     cp(h->weights.w_gate,          w->w_gate);
     cp(h->weights.w_up,            w->w_up);
     cp(h->weights.w_down,          w->w_down);
@@ -314,6 +331,16 @@ extern "C" int sk_deepseek_forward(sk_deepseek_handle* hp,
     mp.rope_attn_factor = h->cfg.rope_attn_factor;
     mp.rope_beta_fast  = h->cfg.rope_beta_fast;
     mp.rope_beta_slow  = h->cfg.rope_beta_slow;
+    mp.has_q_lora            = (h->cfg.has_q_lora != 0);
+    mp.router_has_bias       = (h->cfg.router_has_bias != 0);
+    mp.rope_interleave       = (h->cfg.rope_interleave != 0);
+    mp.norm_topk_prob        = (h->cfg.norm_topk_prob != 0);
+    mp.n_group               = h->cfg.n_group;
+    mp.topk_group            = h->cfg.topk_group;
+    mp.routed_scaling        = h->cfg.routed_scaling_factor;
+    mp.mscale_all_dim        = h->cfg.mscale_all_dim;
+    mp.rope_scaling_factor   = h->cfg.rope_scaling_factor;
+    mp.first_k_dense_replace = h->cfg.first_k_dense_replace;
 
     auto* cmd = q->commandBuffer();
     meow::deepseek::dispatch_model(cmd, h->psos, h->weights, h->bufs, mp);
@@ -333,7 +360,11 @@ extern "C" void sk_deepseek_destroy(sk_deepseek_handle* hp) {
     auto* h = reinterpret_cast<meow::deepseek::Handle*>(hp);
     auto rel = [](MTL::Buffer* b) { if (b) b->release(); };
 
-    rel(h->weights.w_embed); rel(h->weights.w_pre_attn_norm);
+    rel(h->weights.w_embed);
+    if (h->weights.w_lm_head && h->weights.w_lm_head != h->weights.w_embed)
+        rel(h->weights.w_lm_head);
+    rel(h->weights.router_bias);
+    rel(h->weights.w_pre_attn_norm);
     rel(h->weights.w_q_a); rel(h->weights.w_q_a_norm); rel(h->weights.w_q_b);
     rel(h->weights.w_kv_a); rel(h->weights.w_kv_a_norm); rel(h->weights.w_kv_b);
     rel(h->weights.w_o); rel(h->weights.w_pre_mlp_norm); rel(h->weights.w_final_norm);

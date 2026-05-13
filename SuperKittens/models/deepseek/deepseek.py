@@ -58,17 +58,29 @@ class _Config(ctypes.Structure):
         ("rope_beta_fast",     ctypes.c_float),
         ("rope_beta_slow",     ctypes.c_float),
         ("eps",                ctypes.c_float),
+        # V3 additions — order MUST match sk_deepseek_config in launcher.h.
+        ("has_q_lora",             ctypes.c_uint32),
+        ("router_has_bias",        ctypes.c_uint32),
+        ("rope_interleave",        ctypes.c_uint32),
+        ("norm_topk_prob",         ctypes.c_uint32),
+        ("n_group",                ctypes.c_uint32),
+        ("topk_group",             ctypes.c_uint32),
+        ("routed_scaling_factor",  ctypes.c_float),
+        ("mscale_all_dim",         ctypes.c_float),
+        ("rope_scaling_factor",    ctypes.c_float),
+        ("first_k_dense_replace",  ctypes.c_uint32),
     ]
 
 
 _WEIGHT_FIELDS = (
-    "w_embed",
+    "w_embed", "w_lm_head",
     "w_pre_attn_norm",
     "w_q_a", "w_q_a_norm", "w_q_b",
     "w_kv_a", "w_kv_a_norm", "w_kv_b",
     "w_o", "w_pre_mlp_norm", "w_final_norm",
     "w_shared_gate", "w_shared_up", "w_shared_down",
-    "w_router", "w_gate", "w_up", "w_down",
+    "w_router", "router_bias",
+    "w_gate", "w_up", "w_down",
 )
 
 
@@ -132,6 +144,18 @@ class Config:
     cache_max: int = 8192
     # 0 = fp16 routed-expert weights; 1 = INT2_DS4 (IQ2_XXS up/gate, Q2_K down).
     moe_quant: int = 0
+
+    # V3 additions.
+    has_q_lora: int            = 1
+    router_has_bias: int       = 1
+    rope_interleave: int       = 1
+    norm_topk_prob: int        = 1
+    n_group: int               = 8
+    topk_group: int            = 4
+    routed_scaling_factor: float = 2.5
+    mscale_all_dim: float      = 1.0
+    rope_scaling_factor: float = 40.0
+    first_k_dense_replace: int = 3
 
     @classmethod
     def preset(cls, name: str) -> "Config":

@@ -46,12 +46,33 @@ struct LayerParams {
     float    rope_attn_factor = 1.f;
     float    rope_beta_fast  = 32.f;
     float    rope_beta_slow  = 1.f;
+
+    // V3/V4 additions (patch A). modeling_deepseek_v3.py refs in comments.
+    bool     has_q_lora        = true;     // V2-Lite: false (config.q_lora_rank is None)
+    bool     is_moe_layer      = true;     // false for L < first_k_dense_replace
+    bool     rope_interleave   = true;     // V3: true (apply_rotary_pos_emb_interleave, modeling:444)
+    float    yarn_mscale       = 1.0f;     // pre-squared; attn scale *= mscale^2 (modeling:412-414)
+    uint32_t n_group           = 8;        // 0 disables grouping (V2-Lite)
+    uint32_t topk_group        = 4;
+    float    routed_scaling    = 2.5f;     // V2-Lite: 1.0
+    bool     norm_topk_prob    = true;     // V2-Lite: false
+    bool     router_has_bias   = true;     // V2-Lite: false (no e_score_correction_bias)
+    uint32_t first_k_dense_replace = 3;    // V3: 3 dense layers, V2-Lite: 1
 };
+
+// V3 YaRN mscale: mscale = 0.1 * mscale_all_dim * log(factor) + 1
+// (modeling_deepseek_v3.py:364-368). Returns 1.0 for factor <= 1.
+inline float ds_compute_yarn_mscale(float factor, float mscale_all_dim) {
+    if (factor <= 1.0f) return 1.0f;
+    return 0.1f * mscale_all_dim * std::log(factor) + 1.0f;
+}
 
 struct LayerPSOs {
     MTL::ComputePipelineState* rmsnorm;
     MTL::ComputePipelineState* gemm;
     MTL::ComputePipelineState* rope_tail;
+    MTL::ComputePipelineState* rope_interleave;   // V3 GPT-J-style pair RoPE
+    MTL::ComputePipelineState* router_v3;          // V3 sigmoid+bias+group+topk router
     MTL::ComputePipelineState* flash_attn_vec;
     MTL::ComputePipelineState* cast_h2f;
     MTL::ComputePipelineState* cast_f2h;
@@ -84,6 +105,7 @@ struct LayerBuffers {
     MTL::Buffer* w_shared_down;
 
     MTL::Buffer* w_router;
+    MTL::Buffer* router_bias;   // V3 e_score_correction_bias (fp32, per layer, len n_expert). May be null on V2.
     MTL::Buffer* w_gate;
     MTL::Buffer* w_up;
     MTL::Buffer* w_down;
@@ -196,14 +218,20 @@ inline void dispatch_attn(
     encode_rmsnorm(cmd, P.rmsnorm, B.x, B.w_pre_attn_norm, off_norm,
                    B.x_norm, T, p.d_model, p.eps);
 
-    encode_gemm(cmd, P.gemm, B.x_norm, 0, B.w_q_a, off_w_q_a, B.q_a,
-                T, p.q_lora_rank, p.d_model);
-
-    encode_rmsnorm(cmd, P.rmsnorm, B.q_a, B.w_q_a_norm, off_w_q_a_norm,
-                   B.q_a, T, p.q_lora_rank, p.eps);
-
-    encode_gemm(cmd, P.gemm, B.q_a, 0, B.w_q_b, off_w_q_b, B.q_packed,
-                T, p.n_heads * dk, p.q_lora_rank);
+    if (p.has_q_lora) {
+        encode_gemm(cmd, P.gemm, B.x_norm, 0, B.w_q_a, off_w_q_a, B.q_a,
+                    T, p.q_lora_rank, p.d_model);
+        encode_rmsnorm(cmd, P.rmsnorm, B.q_a, B.w_q_a_norm, off_w_q_a_norm,
+                       B.q_a, T, p.q_lora_rank, p.eps);
+        encode_gemm(cmd, P.gemm, B.q_a, 0, B.w_q_b, off_w_q_b, B.q_packed,
+                    T, p.n_heads * dk, p.q_lora_rank);
+    } else {
+        // Patch H: V2-Lite has no q_lora; q_proj is a single dense (d_model -> n_heads*dk).
+        // Loader writes the q_proj weight directly into w_q_b (configuration_deepseek_v2:q_lora_rank=None).
+        const size_t off_w_q_proj = (size_t)L * p.d_model * p.n_heads * dk * 2;
+        encode_gemm(cmd, P.gemm, B.x_norm, 0, B.w_q_b, off_w_q_proj, B.q_packed,
+                    T, p.n_heads * dk, p.d_model);
+    }
 
     encode_gemm(cmd, P.gemm, B.x_norm, 0, B.w_kv_a, off_w_kv_a, B.kv_a_packed,
                 T, p.kv_lora_rank + p.qk_rope_dim, p.d_model);
@@ -260,13 +288,46 @@ inline void dispatch_attn(
         encode_cast(cmd, P.cast_h2f, B.q_packed, B.q_packed_f32,
                     T * p.n_heads * dk);
 
+        // Patch C: V3 uses interleaved (pair) RoPE on the rotated half of Q.
+        // modeling_deepseek_v3.py:apply_rotary_pos_emb_interleave (~:444).
+        // V2 path: rope_tail (NeoX/half-split mode=2).
+        struct alignas(8) ArgsRopeInterleave {
+            int32_t  ne00, ne01, ne02, ne03;
+            uint64_t nb01, nb02, nb03;
+            int32_t  n_dims;
+            int32_t  n_ctx_orig;
+            float    freq_base, freq_scale, ext_factor, attn_factor;
+            float    beta_fast, beta_slow, mscale;
+        };
         auto* enc = cmd->computeCommandEncoder();
-        enc->setComputePipelineState(P.rope_tail);
-        enc->setBytes(&aq, sizeof(aq), 0);
-        enc->setBuffer(B.q_packed_f32, 0, 1);   // src0 fp32
-        enc->setBuffer(B.rope_pos,     0, 2);   // src1 = positions
-        enc->setBuffer(B.q_packed_f32, 0, 3);   // src2 unused
-        enc->setBuffer(B.q_packed_f32, 0, 4);   // dst fp32 (in-place)
+        if (p.rope_interleave) {
+            ArgsRopeInterleave iq{};
+            iq.ne00 = dk; iq.ne01 = p.seq; iq.ne02 = p.n_heads; iq.ne03 = p.batch;
+            iq.nb01 = sizeof(float) * dk;
+            iq.nb02 = iq.nb01 * p.seq;
+            iq.nb03 = iq.nb02 * p.n_heads;
+            iq.n_dims     = (int32_t)p.qk_rope_dim;
+            iq.n_ctx_orig = p.rope_n_ctx_orig;
+            iq.freq_base  = p.rope_freq_base;
+            iq.freq_scale = p.rope_freq_scale;
+            iq.ext_factor = p.rope_ext_factor;
+            iq.attn_factor = p.rope_attn_factor;
+            iq.beta_fast  = p.rope_beta_fast;
+            iq.beta_slow  = p.rope_beta_slow;
+            iq.mscale     = 1.0f;
+            enc->setComputePipelineState(P.rope_interleave);
+            enc->setBytes(&iq, sizeof(iq), 0);
+            enc->setBuffer(B.q_packed_f32, 0, 1);
+            enc->setBuffer(B.rope_pos,     0, 2);
+            enc->setBuffer(B.q_packed_f32, 0, 4);
+        } else {
+            enc->setComputePipelineState(P.rope_tail);
+            enc->setBytes(&aq, sizeof(aq), 0);
+            enc->setBuffer(B.q_packed_f32, 0, 1);
+            enc->setBuffer(B.rope_pos,     0, 2);
+            enc->setBuffer(B.q_packed_f32, 0, 3);
+            enc->setBuffer(B.q_packed_f32, 0, 4);
+        }
         enc->dispatchThreadgroups(MTL::Size(p.seq, p.n_heads, p.batch),
                                   MTL::Size(256, 1, 1));
         enc->endEncoding();
@@ -288,12 +349,35 @@ inline void dispatch_attn(
                     T * p.qk_rope_dim);
 
         auto* enc2 = cmd->computeCommandEncoder();
-        enc2->setComputePipelineState(P.rope_tail);
-        enc2->setBytes(&ak, sizeof(ak), 0);
-        enc2->setBuffer(B.k_pe_f32, 0, 1);
-        enc2->setBuffer(B.rope_pos, 0, 2);
-        enc2->setBuffer(B.k_pe_f32, 0, 3);
-        enc2->setBuffer(B.k_pe_f32, 0, 4);
+        if (p.rope_interleave) {
+            ArgsRopeInterleave ik{};
+            ik.ne00 = p.qk_rope_dim;
+            ik.ne01 = p.seq * p.batch; ik.ne02 = 1; ik.ne03 = 1;
+            ik.nb01 = sizeof(float) * p.qk_rope_dim;
+            ik.nb02 = ik.nb01 * ik.ne01;
+            ik.nb03 = ik.nb02;
+            ik.n_dims     = (int32_t)p.qk_rope_dim;
+            ik.n_ctx_orig = p.rope_n_ctx_orig;
+            ik.freq_base  = p.rope_freq_base;
+            ik.freq_scale = p.rope_freq_scale;
+            ik.ext_factor = p.rope_ext_factor;
+            ik.attn_factor = p.rope_attn_factor;
+            ik.beta_fast  = p.rope_beta_fast;
+            ik.beta_slow  = p.rope_beta_slow;
+            ik.mscale     = 1.0f;
+            enc2->setComputePipelineState(P.rope_interleave);
+            enc2->setBytes(&ik, sizeof(ik), 0);
+            enc2->setBuffer(B.k_pe_f32, 0, 1);
+            enc2->setBuffer(B.rope_pos, 0, 2);
+            enc2->setBuffer(B.k_pe_f32, 0, 4);
+        } else {
+            enc2->setComputePipelineState(P.rope_tail);
+            enc2->setBytes(&ak, sizeof(ak), 0);
+            enc2->setBuffer(B.k_pe_f32, 0, 1);
+            enc2->setBuffer(B.rope_pos, 0, 2);
+            enc2->setBuffer(B.k_pe_f32, 0, 3);
+            enc2->setBuffer(B.k_pe_f32, 0, 4);
+        }
         enc2->dispatchThreadgroups(MTL::Size(p.seq * p.batch, 1, 1),
                                    MTL::Size(256, 1, 1));
         enc2->endEncoding();
@@ -391,7 +475,8 @@ inline void dispatch_attn(
         a.nb32 = a.nb31 * p.seq;
         a.nb33 = a.nb32;
         a.ne1 = (int32_t)p.n_heads; a.ne2 = (int32_t)p.seq; a.ne3 = (int32_t)p.batch;
-        a.scale = 1.f / metal_sqrt_safe((float)dk);
+        // Patch B: YaRN mscale applied to attention scale (modeling_deepseek_v3.py:412-414).
+        a.scale = (1.f / metal_sqrt_safe((float)dk)) * p.yarn_mscale * p.yarn_mscale;
         a.max_bias = 0.f; a.m0 = 1.f; a.m1 = 1.f;
         a.n_head_log2 = 0; a.logit_softcap = 0.f;
 
@@ -514,6 +599,30 @@ inline void dispatch_layer(
         enc->endEncoding();
     }
 
+    // Patch E: layers 0..first_k_dense_replace-1 use plain dense MLP (no MoE).
+    // The shared-expert dispatch above already computed dense MLP into
+    // shared_out (loader puts dense gate/up/down into w_shared_* with width
+    // config.intermediate_size). Skip MoE; emit y_out = shared_out.
+    // configuration_deepseek_v3.py:90 first_k_dense_replace=3.
+    if (!p.is_moe_layer) {
+        auto* enc = cmd->computeCommandEncoder();
+        enc->setComputePipelineState(P.add);
+        // Zero-add trick: y_out = shared_out + 0; reuse shared_out buffer slot 0,1.
+        // Simpler: a single copy via add(shared_out, shared_out, y_out) / 2 is wrong.
+        // Use add of shared_out and shared_out then divide? No — emit
+        // y_out = shared_out via memcpy-equivalent: bind shared_out twice to add
+        // then halve? No. The add kernel signature is (a, b, out, n) so we use
+        // a single add encoding with B.shared_out as one input and a zero buffer
+        // would be cleaner. Instead, just chain: enc->setBuffer copies via
+        // add(y_attn=0?). Cleanest: use blitCommandEncoder for the copy.
+        enc->endEncoding();
+        auto* blit = cmd->blitCommandEncoder();
+        blit->copyFromBuffer(B.shared_out, 0, B.y_out, 0,
+                             (size_t)T * p.d_model * 2);
+        blit->endEncoding();
+        return;
+    }
+
     MoeFfnBuffers MB{};
     MB.x         = B.m_in;            // routing input (post-norm)
     MB.w_router  = B.w_router;
@@ -527,7 +636,77 @@ inline void dispatch_layer(
     MB.out       = B.y_out;
 
     MoeFfnParams mp{T, p.d_model, p.n_int, p.n_expert, p.top_k, p.moe_quant};
-    dispatch_moe_ffn(cmd, P.moe, MB, mp);
+
+    // Patch G: V3 sigmoid+bias+group router. Replace MoE's first stage.
+    // modeling_deepseek_v3.py:214-237. V2-Lite falls back via runtime flag.
+    {
+        struct RouterV3Args {
+            uint32_t T, D, N, K, n_group, topk_group;
+            float    routed_scaling;
+            uint32_t norm_topk_prob, has_bias;
+        };
+        RouterV3Args ra{};
+        ra.T = T; ra.D = p.d_model; ra.N = p.n_expert; ra.K = p.top_k;
+        ra.n_group = p.n_group; ra.topk_group = p.topk_group;
+        ra.routed_scaling = p.routed_scaling;
+        ra.norm_topk_prob = p.norm_topk_prob ? 1u : 0u;
+        ra.has_bias       = (p.router_has_bias && B.router_bias) ? 1u : 0u;
+        auto* enc = cmd->computeCommandEncoder();
+        enc->setComputePipelineState(P.router_v3);
+        enc->setBuffer(B.m_in,        0, 0);
+        enc->setBuffer(B.w_router,    0, 1);
+        // Bias may be null on V2; the kernel checks has_bias before reading.
+        // Metal requires a bound buffer though, so reuse w_router if absent.
+        enc->setBuffer(B.router_bias ? B.router_bias : B.w_router, 0, 2);
+        enc->setBuffer(B.moe_top_idx,   0, 3);
+        enc->setBuffer(B.moe_top_score, 0, 4);
+        enc->setBytes(&ra, sizeof(ra), 5);
+        enc->dispatchThreadgroups(MTL::Size(T, 1, 1), MTL::Size(256, 1, 1));
+        enc->endEncoding();
+    }
+    // Now encode the remaining two MoE stages (swiglu_pair + down_scatter)
+    // by emitting them inline (moe_ffn.h has them together with its router).
+    {
+        auto* enc = cmd->computeCommandEncoder();
+        auto* pso = (mp.quant == MoeQuant::INT2_DS4) ? P.moe.swiglu_pair_iq2xxs
+                                                    : P.moe.swiglu_pair;
+        enc->setComputePipelineState(pso);
+        enc->setBuffer(MB.x,        0, 0);
+        enc->setBuffer(MB.w_gate,   0, 1);
+        enc->setBuffer(MB.w_up,     0, 2);
+        enc->setBuffer(MB.top_idx,  0, 3);
+        enc->setBuffer(MB.hidden,   0, 4);
+        enc->setBytes(&mp.T,        4, 5);
+        enc->setBytes(&mp.top_k,    4, 6);
+        enc->setBytes(&mp.D,        4, 7);
+        enc->setBytes(&mp.n_int,    4, 8);
+        const uint32_t COLS_PER_TG = 16;
+        enc->dispatchThreadgroups(
+            MTL::Size((mp.n_int + COLS_PER_TG - 1) / COLS_PER_TG, mp.T * mp.top_k, 1),
+            MTL::Size(256, 1, 1));
+        enc->endEncoding();
+    }
+    {
+        auto* enc = cmd->computeCommandEncoder();
+        auto* pso = (mp.quant == MoeQuant::INT2_DS4) ? P.moe.down_scatter_q2k
+                                                    : P.moe.down_scatter;
+        enc->setComputePipelineState(pso);
+        enc->setBuffer(MB.hidden,    0, 0);
+        enc->setBuffer(MB.w_down,    0, 1);
+        enc->setBuffer(MB.top_idx,   0, 2);
+        enc->setBuffer(MB.top_score, 0, 3);
+        enc->setBuffer(MB.residual ? MB.residual : MB.x, 0, 4);
+        enc->setBuffer(MB.out,       0, 5);
+        enc->setBytes(&mp.T,         4, 6);
+        enc->setBytes(&mp.top_k,     4, 7);
+        enc->setBytes(&mp.D,         4, 8);
+        enc->setBytes(&mp.n_int,     4, 9);
+        const uint32_t COLS_PER_TG = 16;
+        enc->dispatchThreadgroups(
+            MTL::Size((mp.D + COLS_PER_TG - 1) / COLS_PER_TG, mp.T, 1),
+            MTL::Size(256, 1, 1));
+        enc->endEncoding();
+    }
 }
 
 
@@ -559,6 +738,18 @@ struct ModelParams {
     float    rope_attn_factor = 1.f;
     float    rope_beta_fast  = 32.f;
     float    rope_beta_slow  = 1.f;
+
+    // V3 additions.
+    bool     has_q_lora              = true;
+    bool     router_has_bias         = true;
+    bool     rope_interleave         = true;
+    bool     norm_topk_prob          = true;
+    uint32_t n_group                 = 8;
+    uint32_t topk_group              = 4;
+    float    routed_scaling          = 2.5f;
+    float    mscale_all_dim          = 1.0f;
+    float    rope_scaling_factor     = 1.0f;
+    uint32_t first_k_dense_replace   = 3;
 };
 
 struct ModelPSOs {
@@ -574,6 +765,7 @@ struct LayerCache {
 
 struct ModelWeights {
     MTL::Buffer* w_embed;
+    MTL::Buffer* w_lm_head;            // patch F: untied LM head; loader may alias to w_embed.
     MTL::Buffer* w_pre_attn_norm;
     MTL::Buffer* w_q_a;
     MTL::Buffer* w_q_a_norm;
@@ -588,6 +780,7 @@ struct ModelWeights {
     MTL::Buffer* w_shared_up;
     MTL::Buffer* w_shared_down;
     MTL::Buffer* w_router;
+    MTL::Buffer* router_bias;          // patch G: per-layer e_score_correction_bias concatenated (n_layers * n_expert fp32). May be null on V2.
     MTL::Buffer* w_gate;
     MTL::Buffer* w_up;
     MTL::Buffer* w_down;
@@ -687,6 +880,17 @@ inline void dispatch_model(
         lp.rope_attn_factor = M.rope_attn_factor;
         lp.rope_beta_fast  = M.rope_beta_fast;
         lp.rope_beta_slow  = M.rope_beta_slow;
+        // V3 plumbing.
+        lp.has_q_lora      = M.has_q_lora;
+        lp.is_moe_layer    = (L >= M.first_k_dense_replace);
+        lp.rope_interleave = M.rope_interleave;
+        lp.yarn_mscale     = ds_compute_yarn_mscale(M.rope_scaling_factor, M.mscale_all_dim);
+        lp.n_group         = M.n_group;
+        lp.topk_group      = M.topk_group;
+        lp.routed_scaling  = M.routed_scaling;
+        lp.norm_topk_prob  = M.norm_topk_prob;
+        lp.router_has_bias = M.router_has_bias;
+        lp.first_k_dense_replace = M.first_k_dense_replace;
 
         LayerBuffers lb{};
         lb.x = cur;
@@ -703,6 +907,7 @@ inline void dispatch_model(
         lb.w_shared_up     = W.w_shared_up;
         lb.w_shared_down   = W.w_shared_down;
         lb.w_router        = W.w_router;
+        lb.router_bias     = W.router_bias;
         lb.w_gate          = W.w_gate;
         lb.w_up            = W.w_up;
         lb.w_down          = W.w_down;
@@ -750,7 +955,8 @@ inline void dispatch_model(
         uint32_t ldA = K_v, ldB = K_v, ldC = N_v;
         int transA = 0, transB = 1, has_bias = 0;
         enc->setBuffer(nxt,        0, 0);
-        enc->setBuffer(W.w_embed,  0, 1);
+        // Patch F: untied LM head; loader aliases w_lm_head -> w_embed for V2-tied case.
+        enc->setBuffer(W.w_lm_head ? W.w_lm_head : W.w_embed, 0, 1);
         enc->setBuffer(B.logits,   0, 2);
         enc->setBytes(&M_v,      4, 3); enc->setBytes(&N_v,      4, 4);
         enc->setBytes(&K_v,      4, 5); enc->setBytes(&ldA,      4, 6);
