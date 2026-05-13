@@ -35,9 +35,10 @@ _VARIANT_TO_GGUF = {
 }
 
 
-def _from_pretrained(spec: str = "qwen3-0.6b", quant: str | None = None,
+def _from_pretrained(variant: str = "qwen3-0.6b", quant: str | None = None,
                      snapshot: str | None = None, gguf_path: str | None = None,
                      **cfg_overrides) -> Qwen:
+    spec = variant
     dir_name = _VARIANT_TO_DIR.get(spec.lower(), "Qwen3-0.6B")
     sk_root = Path(__file__).resolve().parents[3]
     snap = Path(snapshot) if snapshot else (sk_root / "SuperKittens" / "model_weights" / dir_name)
@@ -95,7 +96,7 @@ class _QwenFactory:
 from SuperKittens.api import register
 for _spec in ("qwen3-0.6b",):
     try:
-        register(_spec, _QwenFactory, spec=_spec)
+        register(_spec, _QwenFactory, variant=_spec)
     except ValueError:
         pass
 
