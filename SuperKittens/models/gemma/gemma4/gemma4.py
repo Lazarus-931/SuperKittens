@@ -260,11 +260,17 @@ class Gemma4:
         elif name == "L1.qkv_pre_norm":
             qkvN = (self.cfg.n_heads + 2 * self.cfg.n_kv_heads_local) * self.cfg.head_dim_local
             out = np.empty((qkvN,), dtype=np.uint16)
+        elif name in ("L0.ple_gate_out", "L0.ple_gated"):
+            out = np.empty((self.cfg.ple_dim,), dtype=np.uint16)
+        elif name == "L0.ple_proj_back":
+            out = np.empty((2 * self.cfg.d_model,), dtype=np.uint16)
         else:
             out = np.empty((self.cfg.d_model,), dtype=np.uint16)
         rc = _load().sk_gemma4_dump_layer(self._h, name.encode(), out.ctypes.data)
         if rc:
             raise RuntimeError(f"sk_gemma4_dump_layer({name!r}) failed: {rc}")
+        if name == "L0.ple_proj_back":
+            return out.view(np.float32).astype(np.float32)
         # Interpret as bf16 -> fp32 -> fp16 for downstream consumers.
         u32 = out.astype(np.uint32) << 16
         f32 = u32.view(np.float32)

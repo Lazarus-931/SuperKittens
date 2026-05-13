@@ -1053,6 +1053,44 @@ inline void dispatch_model(
             pb.ple_gated                  = B.ple_gated;
             pb.ple_proj_back              = B.ple_proj_back;
             dispatch_ple_inject(cmd, P.layer, pb, lp, M.n_layers);
+
+            // DUMP L0 PLE probes (ple_gate_out, ple_gated bf16; ple_proj_back fp32).
+            if (M.dump_enabled && B.dump_stash && L == 0) {
+                const size_t per_dm = (size_t)(2 + 4 * M.n_layers) * M.d_model;
+                const size_t hd_max = (M.head_dim_local > M.head_dim_global)
+                                      ? M.head_dim_local : M.head_dim_global;
+                const size_t n_kv_max = (M.n_kv_heads_local > M.n_kv_heads_global)
+                                        ? M.n_kv_heads_local : M.n_kv_heads_global;
+                const size_t base_extra   = per_dm + M.vocab_size;
+                const size_t l0_extra     = (size_t)3 * M.n_heads * hd_max
+                                          + (size_t)2 * n_kv_max * hd_max;
+                const size_t qkv_slots_max= M.n_heads + 2u * n_kv_max;
+                const size_t off_pre_ple  = base_extra + l0_extra + qkv_slots_max * hd_max;
+                const size_t off_ple_gate = off_pre_ple  + M.d_model;
+                const size_t off_ple_gated= off_ple_gate + M.ple_dim;
+                const size_t off_ple_proj = off_ple_gated+ M.ple_dim;
+                {
+                    auto* blit = cmd->blitCommandEncoder();
+                    const size_t rb = (size_t)M.ple_dim * 2;
+                    blit->copyFromBuffer(B.ple_gate_out, (size_t)(T - 1) * rb,
+                                         B.dump_stash,   off_ple_gate * 2, rb);
+                    blit->endEncoding();
+                }
+                {
+                    auto* blit = cmd->blitCommandEncoder();
+                    const size_t rb = (size_t)M.ple_dim * 2;
+                    blit->copyFromBuffer(B.ple_gated, (size_t)(T - 1) * rb,
+                                         B.dump_stash, off_ple_gated * 2, rb);
+                    blit->endEncoding();
+                }
+                {
+                    auto* blit = cmd->blitCommandEncoder();
+                    const size_t rb = (size_t)M.d_model * 4; // fp32
+                    blit->copyFromBuffer(B.ple_proj_back, (size_t)(T - 1) * rb,
+                                         B.dump_stash,    off_ple_proj * 2, rb);
+                    blit->endEncoding();
+                }
+            }
         }
 
         // DUMP L{L}.out: layer output residual stream (post-PLE if any).
