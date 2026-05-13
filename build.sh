@@ -14,13 +14,11 @@ mkdir -p "$BUILD_DIR"
 echo "=== compiling Metal kernels ==="
 AIR_FILES=()
 while IFS= read -r -d '' metal_file; do
-    # Flatten path → unique .air name (strip leading SuperKittens/ for brevity).
     rel="${metal_file#$SK_DIR/}"
     air="$BUILD_DIR/$(echo "$rel" | tr '/' '_' | sed 's/\.metal$//').air"
     echo "  $rel"
-    # ds4-sourced deepseek kernels need a preamble (using namespace metal; +
-    # macros + block_q8_0 struct). ds4 prepends this in its single-string
-    # source assembly; we get the same effect via -include.
+    # ds4 assembles its kernel sources as a single string with a shared preamble;
+    # mirror that via -include so the same files compile standalone.
     EXTRA=()
     if [[ "$metal_file" == *"models/deepseek/kernels/"* || \
           "$metal_file" == *"kernels/flash_attn/"* ]]; then
@@ -44,7 +42,7 @@ xcrun -sdk macosx metallib "${AIR_FILES[@]}" -o "$BUILD_DIR/libsk.metallib"
 echo "  → build/libsk.metallib"
 
 echo "=== compiling C dispatchers ==="
-# metal_impl.cpp defines metal-cpp private symbols ONCE
+# metal-cpp private symbols must be defined exactly once across the dylib.
 IMPL_STUB="$KERNELS_DIR/metal_impl.cpp"
 echo "  $IMPL_STUB (metal-cpp impls)"
 clang++ -std=gnu++20 -O3 -arch arm64 \
@@ -53,8 +51,7 @@ clang++ -std=gnu++20 -O3 -arch arm64 \
 
 OBJ_FILES=("$BUILD_DIR/metal_impl.o")
 while IFS= read -r -d '' cpp_file; do
-    # Flatten path → unique .o name (so models/{deepseek,qwen}/launcher.c++
-    # don't collide). Mirrors the .air naming rule above.
+    # Flatten so models/{deepseek,qwen}/launcher.c++ don't produce colliding .o names.
     rel="${cpp_file#$SK_DIR/}"
     obj="$BUILD_DIR/$(echo "$rel" | tr '/' '_' | sed 's/\.c++$//').o"
     echo "  $cpp_file"
