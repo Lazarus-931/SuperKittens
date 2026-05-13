@@ -20,6 +20,10 @@ struct Handle {
     std::vector<LayerCache> layer_caches;
     std::vector<MTL::Buffer*> k_caches;
     std::vector<MTL::Buffer*> v_caches;
+
+    uint32_t layers_run     = 0;
+    int32_t  capture_layer  = -1;
+    uint32_t last_seq       = 0;  // seq used at most recent forward (for get_capture sizing)
 };
 
 static MTL::Buffer* alloc_zero(MTL::Device* dev, size_t bytes) {
@@ -31,6 +35,10 @@ static MTL::Buffer* alloc_zero(MTL::Device* dev, size_t bytes) {
 static bool resolve_psos(ModelPSOs& P) {
     P.layer.rmsnorm        = sk::bindings_pso("rmsnorm");
     P.layer.gemm           = sk::bindings_pso("gemm_fp16");
+    P.layer.gemv_m1        = sk::bindings_pso("gemv_fp16_m1");
+    P.layer.gemv_swiglu_m1 = sk::bindings_pso("gemv_swiglu_fp16_m1");
+    P.layer.gemv_t_m1      = sk::bindings_pso("gemv_t_fp16_m1");
+    P.layer.q8_0_matvec    = sk::bindings_pso("q8_0_matvec");  // optional; nullptr OK
     P.layer.split_packed   = sk::bindings_pso("split_packed");
     P.layer.rope_qk        = sk::bindings_pso("qwen_rope_qk");
     P.layer.attn           = sk::bindings_pso("mha_causal");
@@ -38,12 +46,16 @@ static bool resolve_psos(ModelPSOs& P) {
     P.layer.add            = sk::bindings_pso("add_f16");
     P.layer.add_rmsnorm    = sk::bindings_pso("add_rmsnorm");
     P.layer.gated_mlp      = sk::bindings_pso("gated_mlp");
+    P.layer.silu_mul       = sk::bindings_pso("silu_mul_f16");
+    P.layer.t_seq_to_head  = sk::bindings_pso("transpose_seq_to_head_f16");
+    P.layer.t_head_to_seq  = sk::bindings_pso("transpose_head_to_seq_f16");
     P.embedding_lookup     = sk::bindings_pso("embedding_lookup");
     P.argmax               = sk::bindings_pso("argmax");
 
     #define _CK(name, val) if (!(val)) { std::fprintf(stderr, "qwen launcher: missing PSO " name "\n"); return false; }
     _CK("rmsnorm",          P.layer.rmsnorm);
     _CK("gemm_fp16",        P.layer.gemm);
+    _CK("gemv_fp16_m1",     P.layer.gemv_m1);
     _CK("split_packed",     P.layer.split_packed);
     _CK("rope_qk",          P.layer.rope_qk);
     _CK("mha_causal",       P.layer.attn);
@@ -51,6 +63,9 @@ static bool resolve_psos(ModelPSOs& P) {
     _CK("add_f16",          P.layer.add);
     _CK("add_rmsnorm",      P.layer.add_rmsnorm);
     _CK("gated_mlp",        P.layer.gated_mlp);
+    _CK("silu_mul_f16",     P.layer.silu_mul);
+    _CK("t_seq_to_head",    P.layer.t_seq_to_head);
+    _CK("t_head_to_seq",    P.layer.t_head_to_seq);
     _CK("embedding_lookup", P.embedding_lookup);
     _CK("argmax",           P.argmax);
     #undef _CK
@@ -85,6 +100,8 @@ extern "C" sk_qwen_handle* sk_qwen_create(const sk_qwen_config* cfg) {
     h->weights.w_gate          = alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * cfg->n_int * 2);
     h->weights.w_up            = alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * cfg->n_int * 2);
     h->weights.w_down          = alloc_zero(dev, (size_t)cfg->n_layers * cfg->n_int * cfg->d_model * 2);
+    h->weights.w_lm_head       = cfg->tie_word_embeddings ? nullptr
+                                  : alloc_zero(dev, (size_t)cfg->vocab_size * cfg->d_model * 2);
 
     // Per-layer K, V caches (full cache; GQA → n_kv_heads not n_heads)
     h->layer_caches.resize(cfg->n_layers);
@@ -120,8 +137,35 @@ extern "C" sk_qwen_handle* sk_qwen_create(const sk_qwen_config* cfg) {
     h->bufs.y_attn     = alloc_zero(dev, (size_t)T_max * cfg->d_model * 2);
     h->bufs.m_in       = alloc_zero(dev, (size_t)T_max * cfg->d_model * 2);
     h->bufs.mlp_out    = alloc_zero(dev, (size_t)T_max * cfg->d_model * 2);
+    h->bufs.capture    = alloc_zero(dev, (size_t)T_max * cfg->d_model * 2);
+    h->bufs.gate_buf   = alloc_zero(dev, (size_t)T_max * cfg->n_int * 2);
+    h->bufs.up_buf     = alloc_zero(dev, (size_t)T_max * cfg->n_int * 2);
+    h->bufs.q_th       = alloc_zero(dev, (size_t)T_max * cfg->n_heads    * hd * 2);
+    h->bufs.k_th       = alloc_zero(dev, (size_t)T_max * cfg->n_kv_heads * hd * 2);
+    h->bufs.v_th       = alloc_zero(dev, (size_t)T_max * cfg->n_kv_heads * hd * 2);
+    h->bufs.attn_out_seq = alloc_zero(dev, (size_t)T_max * cfg->n_heads  * hd * 2);
 
     return reinterpret_cast<sk_qwen_handle*>(h);
+}
+
+extern "C" int sk_qwen_set_layers_run(sk_qwen_handle* hp, uint32_t n) {
+    if (!hp) return -1;
+    reinterpret_cast<meow::qwen::Handle*>(hp)->layers_run = n;
+    return 0;
+}
+extern "C" int sk_qwen_set_capture_layer(sk_qwen_handle* hp, int32_t layer) {
+    if (!hp) return -1;
+    reinterpret_cast<meow::qwen::Handle*>(hp)->capture_layer = layer;
+    return 0;
+}
+extern "C" int sk_qwen_get_capture(sk_qwen_handle* hp, void* out_fp16) {
+    if (!hp || !out_fp16) return -1;
+    auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
+    // Copy only the captured slice (last_seq * d_model fp16), not the whole T_max buffer.
+    const size_t bytes = (size_t)h->last_seq * h->cfg.d_model * 2;
+    if (bytes == 0) return -2;
+    std::memcpy(out_fp16, h->bufs.capture->contents(), bytes);
+    return 0;
 }
 
 extern "C" int sk_qwen_load_weights(sk_qwen_handle* hp, const sk_qwen_weights* w) {
@@ -141,6 +185,7 @@ extern "C" int sk_qwen_load_weights(sk_qwen_handle* hp, const sk_qwen_weights* w
     cp(h->weights.w_gate,          w->w_gate);
     cp(h->weights.w_up,            w->w_up);
     cp(h->weights.w_down,          w->w_down);
+    if (h->weights.w_lm_head && w->w_lm_head) cp(h->weights.w_lm_head, w->w_lm_head);
     return 0;
 }
 
@@ -186,6 +231,9 @@ extern "C" int sk_qwen_forward(sk_qwen_handle* hp,
     mp.rope_attn_factor = h->cfg.rope_attn_factor;
     mp.rope_beta_fast  = h->cfg.rope_beta_fast;
     mp.rope_beta_slow  = h->cfg.rope_beta_slow;
+    mp.layers_run      = h->layers_run;
+    mp.capture_layer   = h->capture_layer;
+    h->last_seq        = seq;
 
     auto* cmd = q->commandBuffer();
     meow::qwen::dispatch_model(cmd, h->psos, h->weights, h->bufs, mp);
@@ -229,6 +277,7 @@ extern "C" void sk_qwen_destroy(sk_qwen_handle* hp) {
     rel(h->weights.w_qkv); rel(h->weights.w_q_norm); rel(h->weights.w_k_norm); rel(h->weights.w_o);
     rel(h->weights.w_pre_mlp_norm); rel(h->weights.w_final_norm);
     rel(h->weights.w_gate); rel(h->weights.w_up); rel(h->weights.w_down);
+    rel(h->weights.w_lm_head);
     for (auto* b : h->k_caches) rel(b);
     for (auto* b : h->v_caches) rel(b);
     rel(h->bufs.input_ids); rel(h->bufs.output_id);
@@ -237,6 +286,8 @@ extern "C" void sk_qwen_destroy(sk_qwen_handle* hp) {
     rel(h->bufs.x_norm); rel(h->bufs.qkv_packed); rel(h->bufs.q);
     rel(h->bufs.kv_pack); rel(h->bufs.k_tmp); rel(h->bufs.v_tmp);
     rel(h->bufs.attn_out); rel(h->bufs.o_proj); rel(h->bufs.y_attn);
-    rel(h->bufs.m_in); rel(h->bufs.mlp_out);
+    rel(h->bufs.m_in); rel(h->bufs.mlp_out); rel(h->bufs.capture);
+    rel(h->bufs.gate_buf); rel(h->bufs.up_buf);
+    rel(h->bufs.q_th); rel(h->bufs.k_th); rel(h->bufs.v_th); rel(h->bufs.attn_out_seq);
     delete h;
 }
