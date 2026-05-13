@@ -1,98 +1,144 @@
-"""mamba2.py — ctypes bindings for Mamba-2 kernels."""
-import ctypes, os, numpy as np
+"""SuperKittens Mamba 2 Python wrapper.
+
+Mirrors `SuperKittens/models/qwen/qwen.py`. Currently only handles weight load
+and metadata; `forward` is wired through the C ABI but raises NotImplementedError
+until the SSD kernel rewrite lands (see `models/mamba2/STATUS.md`).
+"""
+
+from __future__ import annotations
+
+import ctypes
+import json
+import os
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
-_lib = None
-def _load():
-    global _lib
-    if _lib is not None: return _lib
-    dylib = os.environ.get("SK_DYLIB", str(Path(__file__).resolve().parents[3] / "build" / "libsk.dylib"))
-    _lib = ctypes.CDLL(dylib)
 
-    _lib.sk_mamba2_ssd.argtypes = [ctypes.c_void_p]*5 + [ctypes.c_uint32]*5
-    _lib.sk_mamba2_ssd.restype = ctypes.c_int
+@dataclass
+class Mamba2Config:
+    batch: int = 1
+    seq_max: int = 2048
+    n_layers: int = 24
+    d_model: int = 768
+    intermediate: int = 1536       # E = expand * d_model
+    n_heads: int = 24              # H
+    head_dim: int = 64             # P
+    state_size: int = 128          # N
+    n_groups: int = 1              # G
+    conv_kernel: int = 4
+    chunk_size: int = 256
+    vocab_size: int = 50288
+    rms_eps: float = 1e-5
+    time_step_min: float = 0.001
+    time_step_max: float = 0.1
+    tie_word_embeddings: int = 1
 
-    _lib.sk_mamba2_ssd_state.argtypes = [ctypes.c_void_p]*7 + [ctypes.c_uint32]*5
-    _lib.sk_mamba2_ssd_state.restype = ctypes.c_int
+    @classmethod
+    def from_hf_json(cls, path: str | os.PathLike) -> "Mamba2Config":
+        j = json.loads(Path(path).read_text())
+        return cls(
+            n_layers=j["num_hidden_layers"],
+            d_model=j["hidden_size"],
+            intermediate=j.get("intermediate_size", j["hidden_size"] * j.get("expand", 2)),
+            n_heads=j["num_heads"],
+            head_dim=j["head_dim"],
+            state_size=j["state_size"],
+            n_groups=j.get("n_groups", 1),
+            conv_kernel=j.get("conv_kernel", 4),
+            chunk_size=j.get("chunk_size", 256),
+            vocab_size=j["vocab_size"],
+            rms_eps=j.get("layer_norm_epsilon", j.get("rms_norm_eps", 1e-5)),
+            time_step_min=j.get("time_step_min", 0.001),
+            time_step_max=j.get("time_step_max", 0.1),
+            tie_word_embeddings=int(j.get("tie_word_embeddings", True)),
+        )
 
-    _lib.sk_mamba2_step.argtypes = [ctypes.c_void_p]*6 + [ctypes.c_uint32]*3
-    _lib.sk_mamba2_step.restype = ctypes.c_int
 
-    _lib.sk_conv1d_silu.argtypes = [ctypes.c_void_p]*4 + [ctypes.c_uint32]*3
-    _lib.sk_conv1d_silu.restype = ctypes.c_int
+class _CConfig(ctypes.Structure):
+    _fields_ = [
+        ("batch",         ctypes.c_uint32),
+        ("seq_max",       ctypes.c_uint32),
+        ("n_layers",      ctypes.c_uint32),
+        ("d_model",       ctypes.c_uint32),
+        ("intermediate",  ctypes.c_uint32),
+        ("n_heads",       ctypes.c_uint32),
+        ("head_dim",      ctypes.c_uint32),
+        ("state_size",    ctypes.c_uint32),
+        ("n_groups",      ctypes.c_uint32),
+        ("conv_kernel",   ctypes.c_uint32),
+        ("chunk_size",    ctypes.c_uint32),
+        ("vocab_size",    ctypes.c_uint32),
+        ("rms_eps",       ctypes.c_float),
+        ("time_step_min", ctypes.c_float),
+        ("time_step_max", ctypes.c_float),
+        ("tie_word_embeddings", ctypes.c_uint32),
+    ]
 
-    _lib.sk_gate_norm.argtypes = [ctypes.c_void_p]*4 + [ctypes.c_uint32]*3 + [ctypes.c_float]
-    _lib.sk_gate_norm.restype = ctypes.c_int
-    return _lib
 
-def ssd(Q: np.ndarray, K: np.ndarray, V: np.ndarray, A_log: np.ndarray,
-        out: np.ndarray | None = None) -> np.ndarray:
-    """Mamba-2 selective scan. Q,K: (B*H, L, Ds). V: (B*H, L, Dv). A_log: (B*H, L)."""
-    assert Q.dtype == np.float16 and K.dtype == np.float16 and V.dtype == np.float16
-    if A_log.dtype != np.float16: A_log = A_log.astype(np.float16)
-    BH, L, Ds = Q.shape; Dv = V.shape[2]
-    if out is None: out = np.empty((BH, L, Dv), dtype=np.float16)
-    Q,K,V,A_log,out = map(np.ascontiguousarray, (Q,K,V,A_log,out))
-    lib = _load()
-    ret = lib.sk_mamba2_ssd(Q.ctypes.data, K.ctypes.data, V.ctypes.data,
-                            A_log.ctypes.data, out.ctypes.data, 1, L, Ds, Dv, BH)
-    if ret: raise RuntimeError(f"mamba2_ssd failed: {ret}")
-    return out
+class Mamba2Model:
+    """ctypes binding for libSuperKittens Mamba 2 C ABI."""
 
-def ssd_state(Q, K, V, A_log, h_state_in=None, h_state_out=None, out=None):
-    """Mamba-2 SSD with optional persistent SSM state (fp32, shape (BH, Ds, Dv))."""
-    BH, L, Ds = Q.shape; Dv = V.shape[2]
-    if A_log.dtype != np.float16: A_log = A_log.astype(np.float16)
-    if out is None: out = np.empty((BH, L, Dv), dtype=np.float16)
-    Q,K,V,A_log,out = map(np.ascontiguousarray, (Q,K,V,A_log,out))
-    si = h_state_in.ctypes.data if h_state_in is not None else 0
-    so = h_state_out.ctypes.data if h_state_out is not None else 0
-    if h_state_in is not None: assert h_state_in.dtype == np.float32
-    if h_state_out is not None: assert h_state_out.dtype == np.float32
-    lib = _load()
-    ret = lib.sk_mamba2_ssd_state(Q.ctypes.data, K.ctypes.data, V.ctypes.data,
-                                  A_log.ctypes.data, out.ctypes.data, si, so,
-                                  1, L, Ds, Dv, BH)
-    if ret: raise RuntimeError(f"mamba2_ssd_state failed: {ret}")
-    return out
+    def __init__(self, cfg: Mamba2Config, lib_path: str | None = None):
+        self.cfg = cfg
+        lib_path = lib_path or os.environ.get(
+            "SK_LIB", "build/libSuperKittens.dylib"
+        )
+        self._lib = ctypes.CDLL(lib_path)
 
-def step(x_t, B_t, C_t, A_log_t, h_state, out=None):
-    """Mamba-2 single-token step.  Shapes: x_t (BH,Dv), B_t/C_t (BH,Ds), A_log_t (BH,),
-    h_state (BH,Ds,Dv) fp32 (modified in place). Returns y_t (BH,Dv)."""
-    BH, Dv = x_t.shape; Ds = B_t.shape[1]
-    assert h_state.dtype == np.float32 and h_state.shape == (BH, Ds, Dv)
-    if A_log_t.dtype != np.float16: A_log_t = A_log_t.astype(np.float16)
-    if out is None: out = np.empty((BH, Dv), dtype=np.float16)
-    x_t,B_t,C_t,A_log_t,h_state,out = map(np.ascontiguousarray,
-                                          (x_t,B_t,C_t,A_log_t,h_state,out))
-    lib = _load()
-    ret = lib.sk_mamba2_step(x_t.ctypes.data, B_t.ctypes.data, C_t.ctypes.data,
-                             A_log_t.ctypes.data, h_state.ctypes.data, out.ctypes.data,
-                             BH, Ds, Dv)
-    if ret: raise RuntimeError(f"mamba2_step failed: {ret}")
-    return out
+        self._lib.sk_mamba2_create.argtypes = [ctypes.POINTER(_CConfig)]
+        self._lib.sk_mamba2_create.restype  = ctypes.c_void_p
+        self._lib.sk_mamba2_load_safetensors.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        self._lib.sk_mamba2_load_safetensors.restype  = ctypes.c_int
+        self._lib.sk_mamba2_forward.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_int), ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        self._lib.sk_mamba2_forward.restype = ctypes.c_int
+        self._lib.sk_mamba2_reset.argtypes = [ctypes.c_void_p]
+        self._lib.sk_mamba2_destroy.argtypes = [ctypes.c_void_p]
 
-def conv1d_silu(x: np.ndarray, weight: np.ndarray, bias: np.ndarray,
-                out: np.ndarray | None = None) -> np.ndarray:
-    """Depthwise causal Conv1D + SiLU. x: (B, L, C), weight: (C, 4), bias: (C,)."""
-    assert x.dtype == np.float16
-    B, L, C = x.shape
-    if out is None: out = np.empty_like(x)
-    x,w,b,out = map(np.ascontiguousarray, (x,weight,bias,out))
-    lib = _load()
-    ret = lib.sk_conv1d_silu(x.ctypes.data, w.ctypes.data, b.ctypes.data, out.ctypes.data, B, L, C)
-    if ret: raise RuntimeError(f"conv1d_silu failed: {ret}")
-    return out
+        c_cfg = _CConfig(
+            cfg.batch, cfg.seq_max, cfg.n_layers, cfg.d_model, cfg.intermediate,
+            cfg.n_heads, cfg.head_dim, cfg.state_size, cfg.n_groups, cfg.conv_kernel,
+            cfg.chunk_size, cfg.vocab_size, cfg.rms_eps,
+            cfg.time_step_min, cfg.time_step_max, cfg.tie_word_embeddings,
+        )
+        self._h = self._lib.sk_mamba2_create(ctypes.byref(c_cfg))
+        if not self._h:
+            raise RuntimeError("sk_mamba2_create returned NULL")
 
-def gate_norm(ssm_out: np.ndarray, z: np.ndarray, weight: np.ndarray,
-              out: np.ndarray | None = None, eps: float = 1e-5) -> np.ndarray:
-    """Gate (silu(z)*ssm_out) + RMSNorm. ssm_out,z: (B, L, E), weight: (E,)."""
-    assert ssm_out.dtype == np.float16
-    B, L, E = ssm_out.shape
-    if out is None: out = np.empty_like(ssm_out)
-    ssm_out,z,weight,out = map(np.ascontiguousarray, (ssm_out,z,weight,out))
-    lib = _load()
-    ret = lib.sk_gate_norm(ssm_out.ctypes.data, z.ctypes.data, weight.ctypes.data,
-                           out.ctypes.data, B, L, E, eps)
-    if ret: raise RuntimeError(f"gate_norm failed: {ret}")
-    return out
+    def load_safetensors(self, path: str | os.PathLike) -> None:
+        rc = self._lib.sk_mamba2_load_safetensors(self._h, str(path).encode())
+        if rc != 0:
+            raise RuntimeError(f"sk_mamba2_load_safetensors rc={rc}")
+
+    def forward(self, input_ids):
+        ids = (ctypes.c_int * len(input_ids))(*input_ids)
+        out = ctypes.c_int(0)
+        rc = self._lib.sk_mamba2_forward(self._h, ids, len(input_ids), ctypes.byref(out))
+        if rc != 0:
+            raise NotImplementedError(
+                f"sk_mamba2_forward rc={rc} (SSD kernel rewrite pending — see STATUS.md)"
+            )
+        return out.value
+
+    def reset(self) -> None:
+        self._lib.sk_mamba2_reset(self._h)
+
+    def __del__(self):
+        try:
+            if getattr(self, "_h", None):
+                self._lib.sk_mamba2_destroy(self._h)
+        except Exception:
+            pass
+
+
+# Registry entry — kept import-light.
+SPEC = {
+    "mamba2-130m": {
+        "hf_repo": "AntonV/mamba2-130m-hf",
+        "config_cls": Mamba2Config,
+        "model_cls": Mamba2Model,
+    },
+}
