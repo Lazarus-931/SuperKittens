@@ -308,13 +308,13 @@ extern "C" int sk_gemma4_load_from_store(sk_gemma4_handle* hp, sk::WeightStore* 
                 const size_t off = (size_t)L * ple_dim * dm * 2;
                 if (!copy_transpose_bf16(h->weights.w_per_layer_input_gate, off, store,
                                          layer_key(L, "per_layer_input_gate.weight"),
-                                         ple_dim, dm)) return -40;
+                                         dm, ple_dim)) return -40;
             }
             if (h->weights.w_per_layer_projection) {
                 const size_t off = (size_t)L * dm * ple_dim * 2;
                 if (!copy_transpose_bf16(h->weights.w_per_layer_projection, off, store,
                                          layer_key(L, "per_layer_projection.weight"),
-                                         dm, ple_dim)) return -41;
+                                         ple_dim, dm)) return -41;
             }
             if (h->weights.w_post_per_layer_input_norm) {
                 const size_t off = (size_t)L * dm * 2;
