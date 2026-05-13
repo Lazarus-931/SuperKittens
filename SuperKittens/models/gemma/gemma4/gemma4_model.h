@@ -57,12 +57,6 @@ struct LayerParams {
 struct LayerPSOs {
     MTL::ComputePipelineState* rmsnorm;
     MTL::ComputePipelineState* gemm;
-    // M=1 decode fast-paths (matvec). When non-null, encode_gemm() routes M==1
-    // dispatches through these instead of the 32-row-wide tile MMA. Mirrors
-    // the qwen3 M=1 win (commit b77880f). nullptr → fall back to tile GEMM.
-    MTL::ComputePipelineState* gemv_m1          = nullptr;  // bf16 → bf16
-    MTL::ComputePipelineState* gemv_t_m1        = nullptr;  // bf16 → bf16, W transposed
-    MTL::ComputePipelineState* gemv_m1_fp32_out = nullptr;  // bf16 → fp32 (PLE proj)
     MTL::ComputePipelineState* qkv_norm;
     MTL::ComputePipelineState* rope;            // standard (local)
     MTL::ComputePipelineState* prope;           // p-RoPE (global, legacy/unused for Gemma4 full-attn)
@@ -148,128 +142,6 @@ struct LayerBuffers {
     MTL::Buffer* ple_proj_back;      // (T, d_model)
 };
 
-// Encode a (transB=0) GEMM, routing M==1 through the gemv_m1 fast-path if the
-// caller supplied one. Layout matches gemma4_gemm_bf16: A(M,K) @ B(K,N) → C(M,N).
-inline void encode_gemm_bf16(
-    MTL::CommandBuffer* cmd, const LayerPSOs& P,
-    MTL::Buffer* A, size_t off_A,
-    MTL::Buffer* B, size_t off_B,
-    MTL::Buffer* C, size_t off_C,
-    uint32_t M, uint32_t N, uint32_t K)
-{
-    if (M == 1 && P.gemv_m1) {
-        auto* enc = cmd->computeCommandEncoder();
-        enc->setComputePipelineState(P.gemv_m1);
-        enc->setBuffer(A, off_A, 0);
-        enc->setBuffer(B, off_B, 1);
-        enc->setBuffer(C, off_C, 2);
-        enc->setBytes(&N, 4, 3);
-        enc->setBytes(&K, 4, 4);
-        const uint32_t BN = 128;
-        enc->dispatchThreadgroups(MTL::Size((N + BN - 1) / BN, 1, 1),
-                                  MTL::Size(BN, 1, 1));
-        enc->endEncoding();
-        return;
-    }
-    auto* enc = cmd->computeCommandEncoder();
-    enc->setComputePipelineState(P.gemm);
-    uint32_t ldA = K, ldB = N, ldC = N;
-    int transA = 0, transB = 0, has_bias = 0;
-    enc->setBuffer(A, off_A, 0);
-    enc->setBuffer(B, off_B, 1);
-    enc->setBuffer(C, off_C, 2);
-    enc->setBytes(&M, 4, 3); enc->setBytes(&N, 4, 4);
-    enc->setBytes(&K, 4, 5); enc->setBytes(&ldA, 4, 6);
-    enc->setBytes(&ldB, 4, 7); enc->setBytes(&ldC, 4, 8);
-    enc->setBytes(&transA, 4, 9); enc->setBytes(&transB, 4, 10);
-    enc->setBytes(&has_bias, 4, 11);
-    enc->setBuffer(C, off_C, 12);
-    enc->dispatchThreadgroups(MTL::Size((N + 63) / 64, (M + 63) / 64, 1),
-                              MTL::Size(64, 1, 1));
-    enc->endEncoding();
-}
-
-// transB=1 variant: A(M,K) @ B(N,K)^T → C(M,N). M==1 → gemv_t fast-path.
-inline void encode_gemm_bf16_transB(
-    MTL::CommandBuffer* cmd, const LayerPSOs& P,
-    MTL::Buffer* A, size_t off_A,
-    MTL::Buffer* B, size_t off_B,
-    MTL::Buffer* C, size_t off_C,
-    uint32_t M, uint32_t N, uint32_t K)
-{
-    if (M == 1 && P.gemv_t_m1) {
-        auto* enc = cmd->computeCommandEncoder();
-        enc->setComputePipelineState(P.gemv_t_m1);
-        enc->setBuffer(A, off_A, 0);
-        enc->setBuffer(B, off_B, 1);
-        enc->setBuffer(C, off_C, 2);
-        enc->setBytes(&N, 4, 3);
-        enc->setBytes(&K, 4, 4);
-        const uint32_t BN = 128;
-        enc->dispatchThreadgroups(MTL::Size((N + BN - 1) / BN, 1, 1),
-                                  MTL::Size(BN, 1, 1));
-        enc->endEncoding();
-        return;
-    }
-    auto* enc = cmd->computeCommandEncoder();
-    enc->setComputePipelineState(P.gemm);
-    uint32_t ldA = K, ldB = K, ldC = N;
-    int transA = 0, transB = 1, has_bias = 0;
-    enc->setBuffer(A, off_A, 0);
-    enc->setBuffer(B, off_B, 1);
-    enc->setBuffer(C, off_C, 2);
-    enc->setBytes(&M, 4, 3); enc->setBytes(&N, 4, 4);
-    enc->setBytes(&K, 4, 5); enc->setBytes(&ldA, 4, 6);
-    enc->setBytes(&ldB, 4, 7); enc->setBytes(&ldC, 4, 8);
-    enc->setBytes(&transA, 4, 9); enc->setBytes(&transB, 4, 10);
-    enc->setBytes(&has_bias, 4, 11);
-    enc->setBuffer(C, off_C, 12);
-    enc->dispatchThreadgroups(MTL::Size((N + 63) / 64, (M + 63) / 64, 1),
-                              MTL::Size(64, 1, 1));
-    enc->endEncoding();
-}
-
-// Same as encode_gemm_bf16 but PSO is gemm_fp32_out (writes fp32 C). Used for
-// the PLE proj precision-fix path; M==1 → gemv_m1_fp32_out.
-inline void encode_gemm_bf16_fp32_out(
-    MTL::CommandBuffer* cmd, const LayerPSOs& P,
-    MTL::Buffer* A, size_t off_A,
-    MTL::Buffer* B, size_t off_B,
-    MTL::Buffer* C, size_t off_C,
-    uint32_t M, uint32_t N, uint32_t K)
-{
-    if (M == 1 && P.gemv_m1_fp32_out) {
-        auto* enc = cmd->computeCommandEncoder();
-        enc->setComputePipelineState(P.gemv_m1_fp32_out);
-        enc->setBuffer(A, off_A, 0);
-        enc->setBuffer(B, off_B, 1);
-        enc->setBuffer(C, off_C, 2);
-        enc->setBytes(&N, 4, 3);
-        enc->setBytes(&K, 4, 4);
-        const uint32_t BN = 128;
-        enc->dispatchThreadgroups(MTL::Size((N + BN - 1) / BN, 1, 1),
-                                  MTL::Size(BN, 1, 1));
-        enc->endEncoding();
-        return;
-    }
-    auto* enc = cmd->computeCommandEncoder();
-    enc->setComputePipelineState(P.gemm_fp32_out);
-    uint32_t ldA = K, ldB = N, ldC = N;
-    int transA = 0, transB = 0, has_bias = 0;
-    enc->setBuffer(A, off_A, 0);
-    enc->setBuffer(B, off_B, 1);
-    enc->setBuffer(C, off_C, 2);
-    enc->setBytes(&M, 4, 3); enc->setBytes(&N, 4, 4);
-    enc->setBytes(&K, 4, 5); enc->setBytes(&ldA, 4, 6);
-    enc->setBytes(&ldB, 4, 7); enc->setBytes(&ldC, 4, 8);
-    enc->setBytes(&transA, 4, 9); enc->setBytes(&transB, 4, 10);
-    enc->setBytes(&has_bias, 4, 11);
-    enc->setBuffer(C, off_C, 12);
-    enc->dispatchThreadgroups(MTL::Size((N + 63) / 64, (M + 63) / 64, 1),
-                              MTL::Size(64, 1, 1));
-    enc->endEncoding();
-}
-
 inline void dispatch_layer(
     MTL::CommandBuffer*  cmd,
     const LayerPSOs&     P,
@@ -308,11 +180,29 @@ inline void dispatch_layer(
 
     // 2. QKV projection
     {
+        auto* enc = cmd->computeCommandEncoder();
+        enc->setComputePipelineState(P.gemm);
         const uint32_t M = p.batch * p.seq;
         const uint32_t K_v = p.d_model;
         const uint32_t N_v = (p.n_heads + 2 * p.n_kv_heads) * p.head_dim;
-        encode_gemm_bf16(cmd, P, B.x_norm, 0, B.w_qkv, off_qkv,
-                         B.qkv_packed, 0, M, N_v, K_v);
+        uint32_t ldA = K_v, ldB = N_v, ldC = N_v;
+        int transA = 0, transB = 0, has_bias = 0;
+        enc->setBuffer(B.x_norm,    0,       0);
+        enc->setBuffer(B.w_qkv,     off_qkv, 1);
+        enc->setBuffer(B.qkv_packed,0,       2);
+        enc->setBytes(&M,        4, 3);
+        enc->setBytes(&N_v,      4, 4);
+        enc->setBytes(&K_v,      4, 5);
+        enc->setBytes(&ldA,      4, 6);
+        enc->setBytes(&ldB,      4, 7);
+        enc->setBytes(&ldC,      4, 8);
+        enc->setBytes(&transA,   4, 9);
+        enc->setBytes(&transB,   4, 10);
+        enc->setBytes(&has_bias, 4, 11);
+        enc->setBuffer(B.qkv_packed, 0, 12);
+        enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M + 63) / 64, 1),
+                                  MTL::Size(64, 1, 1));
+        enc->endEncoding();
     }
 
     // DUMP (L1 only): qkv_packed last-token row (post-GEMM, pre-split).
@@ -522,11 +412,29 @@ inline void dispatch_layer(
 
     // 6. Output projection
     {
+        auto* enc = cmd->computeCommandEncoder();
+        enc->setComputePipelineState(P.gemm);
         const uint32_t M = p.batch * p.seq;
         const uint32_t K_v = p.n_heads * p.head_dim;
         const uint32_t N_v = p.d_model;
-        encode_gemm_bf16(cmd, P, B.attn_out, 0, B.w_out, off_w_out,
-                         B.o_proj, 0, M, N_v, K_v);
+        uint32_t ldA = K_v, ldB = N_v, ldC = N_v;
+        int transA = 0, transB = 0, has_bias = 0;
+        enc->setBuffer(B.attn_out, 0,         0);
+        enc->setBuffer(B.w_out,    off_w_out, 1);
+        enc->setBuffer(B.o_proj,   0,         2);
+        enc->setBytes(&M,        4, 3);
+        enc->setBytes(&N_v,      4, 4);
+        enc->setBytes(&K_v,      4, 5);
+        enc->setBytes(&ldA,      4, 6);
+        enc->setBytes(&ldB,      4, 7);
+        enc->setBytes(&ldC,      4, 8);
+        enc->setBytes(&transA,   4, 9);
+        enc->setBytes(&transB,   4, 10);
+        enc->setBytes(&has_bias, 4, 11);
+        enc->setBuffer(B.o_proj, 0, 12);
+        enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M + 63) / 64, 1),
+                                  MTL::Size(64, 1, 1));
+        enc->endEncoding();
     }
 
     // 7. Post-attn RMSNorm
@@ -651,12 +559,29 @@ inline void dispatch_ple_inject(
 
     // 1. per_layer_input_gate: (T, d_model) @ (d_model, PLE_dim) → (T, PLE_dim) bf16
     {
+        auto* enc = cmd->computeCommandEncoder();
+        enc->setComputePipelineState(P.gemm);
         const uint32_t M = T;
         const uint32_t K_v = p.d_model;
         const uint32_t N_v = p.ple_dim;
-        encode_gemm_bf16(cmd, P, B.residual, 0,
-                         B.w_per_layer_input_gate, off_gate,
-                         B.ple_gate_out, 0, M, N_v, K_v);
+        uint32_t ldA = K_v, ldB = N_v, ldC = N_v;
+        int transA = 0, transB = 0, has_bias = 0;
+        enc->setBuffer(B.residual,                0,        0);
+        enc->setBuffer(B.w_per_layer_input_gate,  off_gate, 1);
+        enc->setBuffer(B.ple_gate_out,            0,        2);
+        enc->setBytes(&M,        4, 3);
+        enc->setBytes(&N_v,      4, 4);
+        enc->setBytes(&K_v,      4, 5);
+        enc->setBytes(&ldA,      4, 6);
+        enc->setBytes(&ldB,      4, 7);
+        enc->setBytes(&ldC,      4, 8);
+        enc->setBytes(&transA,   4, 9);
+        enc->setBytes(&transB,   4, 10);
+        enc->setBytes(&has_bias, 4, 11);
+        enc->setBuffer(B.ple_gate_out, 0, 12);
+        enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M + 63) / 64, 1),
+                                  MTL::Size(64, 1, 1));
+        enc->endEncoding();
     }
 
     // 2. ple_gate_act (bf16 in/out — unchanged path).
@@ -681,12 +606,29 @@ inline void dispatch_ple_inject(
     //    by ple_inject_fp32 which applies RMSnorm * gamma; L1's input_layernorm
     //    gamma_max≈76 would otherwise amplify the bf16 quantization noise.
     {
+        auto* enc = cmd->computeCommandEncoder();
+        enc->setComputePipelineState(P.gemm_fp32_out);
         const uint32_t M = T;
         const uint32_t K_v = p.ple_dim;
         const uint32_t N_v = p.d_model;
-        encode_gemm_bf16_fp32_out(cmd, P, B.ple_gated, 0,
-                                  B.w_per_layer_projection, off_proj,
-                                  B.ple_proj_back, 0, M, N_v, K_v);
+        uint32_t ldA = K_v, ldB = N_v, ldC = N_v;
+        int transA = 0, transB = 0, has_bias = 0;
+        enc->setBuffer(B.ple_gated,                0,        0);
+        enc->setBuffer(B.w_per_layer_projection,   off_proj, 1);
+        enc->setBuffer(B.ple_proj_back,            0,        2);
+        enc->setBytes(&M,        4, 3);
+        enc->setBytes(&N_v,      4, 4);
+        enc->setBytes(&K_v,      4, 5);
+        enc->setBytes(&ldA,      4, 6);
+        enc->setBytes(&ldB,      4, 7);
+        enc->setBytes(&ldC,      4, 8);
+        enc->setBytes(&transA,   4, 9);
+        enc->setBytes(&transB,   4, 10);
+        enc->setBytes(&has_bias, 4, 11);
+        enc->setBuffer(B.ple_proj_back, 0, 12);
+        enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M + 63) / 64, 1),
+                                  MTL::Size(64, 1, 1));
+        enc->endEncoding();
     }
 
     // 4. fused rmsnorm + scaled add into residual (fp32 proj_back input).
@@ -897,14 +839,29 @@ inline void dispatch_model(
         // Then RMSnorm, combine with token-identity, scale by 1/sqrt(2).
         // HF modeling_gemma4.py:1779-1790 project_per_layer_inputs.
         {
+            auto* enc2 = cmd->computeCommandEncoder();
+            enc2->setComputePipelineState(P.layer.gemm);
             const uint32_t M_v = T;
             const uint32_t K_v = M.d_model;
             const uint32_t N_v = M.n_layers * M.ple_dim;   // 8960 for E2B
-            encode_gemm_bf16(cmd, P.layer,
-                             B.x_a, 0,
-                             W.w_per_layer_model_projection, 0,
-                             B.ple_ctx_proj, 0,
-                             M_v, N_v, K_v);
+            uint32_t ldA = K_v, ldB = N_v, ldC = N_v;
+            int transA = 0, transB = 0, has_bias = 0;
+            enc2->setBuffer(B.x_a,                          0, 0);
+            enc2->setBuffer(W.w_per_layer_model_projection, 0, 1);
+            enc2->setBuffer(B.ple_ctx_proj,                 0, 2);
+            enc2->setBytes(&M_v,     4, 3);
+            enc2->setBytes(&N_v,     4, 4);
+            enc2->setBytes(&K_v,     4, 5);
+            enc2->setBytes(&ldA,     4, 6);
+            enc2->setBytes(&ldB,     4, 7);
+            enc2->setBytes(&ldC,     4, 8);
+            enc2->setBytes(&transA,  4, 9);
+            enc2->setBytes(&transB,  4, 10);
+            enc2->setBytes(&has_bias,4, 11);
+            enc2->setBuffer(B.ple_ctx_proj, 0, 12);
+            enc2->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M_v + 63) / 64, 1),
+                                       MTL::Size(64, 1, 1));
+            enc2->endEncoding();
         }
         {
             auto* enc3 = cmd->computeCommandEncoder();
@@ -1193,19 +1150,31 @@ inline void dispatch_model(
         _dump_blit_row(cmd, nxt, B.dump_stash, T, M.d_model, base * M.d_model);
     }
 
-    // D. LM head GEMM (tied with input embedding). transB=1: y = x @ W_embed^T.
-    // At T==1 the 262144-row matvec is by far the most expensive single
-    // dispatch in decode (vocab is ~2× Qwen3); the gemv_t_m1 fast-path is
-    // critical here.
+    // D. LM head GEMM (tied with input embedding)
     {
+        auto* enc = cmd->computeCommandEncoder();
+        enc->setComputePipelineState(P.layer.gemm);
         const uint32_t M_v = T;
         const uint32_t K_v = M.d_model;
         const uint32_t N_v = M.vocab_size;
-        encode_gemm_bf16_transB(cmd, P.layer,
-                                nxt, 0,
-                                W.w_embed, 0,
-                                B.logits, 0,
-                                M_v, N_v, K_v);
+        uint32_t ldA = K_v, ldB = K_v, ldC = N_v;
+        int transA = 0, transB = 1, has_bias = 0;
+        enc->setBuffer(nxt,        0, 0);
+        enc->setBuffer(W.w_embed,  0, 1);
+        enc->setBuffer(B.logits,   0, 2);
+        enc->setBytes(&M_v,      4, 3);
+        enc->setBytes(&N_v,      4, 4);
+        enc->setBytes(&K_v,      4, 5);
+        enc->setBytes(&ldA,      4, 6);
+        enc->setBytes(&ldB,      4, 7);
+        enc->setBytes(&ldC,      4, 8);
+        enc->setBytes(&transA,   4, 9);
+        enc->setBytes(&transB,   4, 10);
+        enc->setBytes(&has_bias, 4, 11);
+        enc->setBuffer(B.logits, 0, 12);
+        enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M_v + 63) / 64, 1),
+                                  MTL::Size(64, 1, 1));
+        enc->endEncoding();
     }
 
     // D.4 Descale logits: SK pre-multiplied w_embed by sqrt(d_model) at load
