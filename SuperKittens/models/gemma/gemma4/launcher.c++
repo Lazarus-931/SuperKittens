@@ -53,8 +53,10 @@ static bool resolve_psos(ModelPSOs& P) {
     P.layer.ple_inject     = sk::bindings_pso("gemma4_ple_inject");
     P.embedding_lookup     = sk::bindings_pso("embedding_lookup");
     P.ple_lookup           = sk::bindings_pso("gemma4_ple_lookup");
+    P.ple_context_mix      = sk::bindings_pso("gemma4_ple_context_mix");
     P.argmax               = sk::bindings_pso("argmax");
     P.logit_softcap        = sk::bindings_pso("gemma4_logit_softcap");
+    P.logit_descale = sk::bindings_pso("gemma4_logit_descale");
 
     #define _CK(x) if (!(x)) return false;
     _CK(P.layer.rmsnorm);
@@ -73,8 +75,10 @@ static bool resolve_psos(ModelPSOs& P) {
     _CK(P.layer.ple_inject);
     _CK(P.embedding_lookup);
     _CK(P.ple_lookup);
+    _CK(P.ple_context_mix);
     _CK(P.argmax);
     _CK(P.logit_softcap);
+    _CK(P.logit_descale);
     #undef _CK
     return true;
 }
@@ -169,6 +173,15 @@ extern "C" sk_gemma4_handle* sk_gemma4_create(const sk_gemma4_config* cfg) {
     h->weights.w_post_per_layer_input_norm = cfg->has_ple
                                   ? alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * 2)
                                   : nullptr;
+    // per_layer_model_projection: (n_layers*ple_dim, d_model) — projects
+    // inputs_embeds to (n_layers, ple_dim) per token; combined with token-
+    // identity PLE per HF modeling_gemma4.py:1779-1790.
+    h->weights.w_per_layer_model_projection = cfg->has_ple
+                                  ? alloc_zero(dev, (size_t)cfg->n_layers * cfg->ple_dim * cfg->d_model * 2)
+                                  : nullptr;
+    h->weights.w_per_layer_projection_norm  = cfg->has_ple
+                                  ? alloc_zero(dev, (size_t)cfg->ple_dim * 2)
+                                  : nullptr;
     h->weights.w_pre_attn_norm = alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * 2);
     h->weights.w_post_attn_norm= alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * 2);
     h->weights.w_pre_feedforward_layernorm  = alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * 2);
@@ -229,20 +242,29 @@ extern "C" sk_gemma4_handle* sk_gemma4_create(const sk_gemma4_config* cfg) {
     h->bufs.m_out      = alloc_zero(dev, x_bytes);
     h->bufs.y_out      = alloc_zero(dev, x_bytes);
 
-    // Dump stash: (1 + 4*nL + 1) * d_model + vocab_size fp16 elements.
+    // Dump stash: (1 + 4*nL + 1) * d_model + vocab_size fp16 elements,
+    // plus L0-extra: 3*H*hd_max + 3*n_kv_max*hd_max for q/k pre+post RoPE and attn_pre.
     {
         const size_t per_dm = (size_t)(2 + 4 * cfg->n_layers) * cfg->d_model;
-        const size_t total_elems = per_dm + cfg->vocab_size;
+        const size_t hd_max_e = (cfg->head_dim_local > cfg->head_dim_global)
+                                ? cfg->head_dim_local : cfg->head_dim_global;
+        const size_t n_kv_max_e = (cfg->n_kv_heads_local > cfg->n_kv_heads_global)
+                                  ? cfg->n_kv_heads_local : cfg->n_kv_heads_global;
+        const size_t l0_extra = (size_t)3 * cfg->n_heads * hd_max_e
+                              + (size_t)3 * n_kv_max_e * hd_max_e;
+        const size_t total_elems = per_dm + cfg->vocab_size + l0_extra;
         h->bufs.dump_stash = alloc_zero(dev, total_elems * 2);
     }
 
     if (cfg->has_ple) {
         h->bufs.per_layer_inputs = alloc_zero(dev, (size_t)T_max * cfg->n_layers * cfg->ple_dim * 2);
+        h->bufs.ple_ctx_proj     = alloc_zero(dev, (size_t)T_max * cfg->n_layers * cfg->ple_dim * 2);
         h->bufs.ple_gate_out     = alloc_zero(dev, (size_t)T_max * cfg->ple_dim * 2);
         h->bufs.ple_gated        = alloc_zero(dev, (size_t)T_max * cfg->ple_dim * 2);
         h->bufs.ple_proj_back    = alloc_zero(dev, x_bytes);
     } else {
         h->bufs.per_layer_inputs = nullptr;
+        h->bufs.ple_ctx_proj     = nullptr;
         h->bufs.ple_gate_out     = nullptr;
         h->bufs.ple_gated        = nullptr;
         h->bufs.ple_proj_back    = nullptr;
@@ -266,6 +288,8 @@ extern "C" int sk_gemma4_load_weights(sk_gemma4_handle* hp, const sk_gemma4_weig
         cp(h->weights.w_per_layer_projection,      w->w_per_layer_projection);
         cp(h->weights.w_layer_scalar,              w->w_layer_scalar);
         cp(h->weights.w_post_per_layer_input_norm, w->w_post_per_layer_input_norm);
+        cp(h->weights.w_per_layer_model_projection, w->w_per_layer_model_projection);
+        cp(h->weights.w_per_layer_projection_norm,  w->w_per_layer_projection_norm);
     }
     cp(h->weights.w_pre_attn_norm, w->w_pre_attn_norm);
     cp(h->weights.w_post_attn_norm,w->w_post_attn_norm);
@@ -389,6 +413,29 @@ extern "C" int sk_gemma4_dump_layer(sk_gemma4_handle* hp, const char* name, void
         const size_t slot = (1 + 4 * nL + 1) * dm;
         copy_row(slot, V); return 0;
     }
+    // L0-extra slots (pre/post-RoPE q/k, attn-pre): laid out after logits.
+    {
+        const size_t base_extra = (1 + 4 * nL + 1) * dm + V;
+        const size_t hd_max_e   = (h->cfg.head_dim_local > h->cfg.head_dim_global)
+                                  ? h->cfg.head_dim_local : h->cfg.head_dim_global;
+        const size_t n_kv_max_e = (h->cfg.n_kv_heads_local > h->cfg.n_kv_heads_global)
+                                  ? h->cfg.n_kv_heads_local : h->cfg.n_kv_heads_global;
+        const size_t H_n  = h->cfg.n_heads;
+        const size_t off_qn = base_extra;
+        const size_t off_kn = off_qn + H_n * hd_max_e;
+        const size_t off_qr = off_kn + n_kv_max_e * hd_max_e;
+        const size_t off_kr = off_qr + H_n * hd_max_e;
+        const size_t off_ap = off_kr + n_kv_max_e * hd_max_e;
+        // For L0 we know layer-type is local → head_dim_local, n_kv_heads_local.
+        // (E2B/E4B have L0 sliding.) Return contiguous H*hd_local or n_kv*hd_local.
+        const size_t hd_l   = h->cfg.head_dim_local;
+        const size_t n_kv_l = h->cfg.n_kv_heads_local;
+        if (std::strcmp(name, "L0.q_normed") == 0) { copy_row(off_qn, H_n  * hd_l); return 0; }
+        if (std::strcmp(name, "L0.k_normed") == 0) { copy_row(off_kn, n_kv_l * hd_l); return 0; }
+        if (std::strcmp(name, "L0.q_rope")   == 0) { copy_row(off_qr, H_n  * hd_l); return 0; }
+        if (std::strcmp(name, "L0.k_rope")   == 0) { copy_row(off_kr, n_kv_l * hd_l); return 0; }
+        if (std::strcmp(name, "L0.attn_pre") == 0) { copy_row(off_ap, H_n  * hd_l); return 0; }
+    }
     // Parse "L{L}.<tag>"
     if (name[0] != 'L') return -3;
     const char* dot = std::strchr(name, '.');
@@ -418,6 +465,8 @@ extern "C" void sk_gemma4_destroy(sk_gemma4_handle* hp) {
     rel(h->weights.w_per_layer_projection);
     rel(h->weights.w_layer_scalar);
     rel(h->weights.w_post_per_layer_input_norm);
+    rel(h->weights.w_per_layer_model_projection);
+    rel(h->weights.w_per_layer_projection_norm);
     rel(h->weights.w_pre_attn_norm); rel(h->weights.w_post_attn_norm);
     rel(h->weights.w_pre_feedforward_layernorm);
     rel(h->weights.w_post_feedforward_layernorm);
@@ -440,7 +489,7 @@ extern "C" void sk_gemma4_destroy(sk_gemma4_handle* hp) {
     rel(h->bufs.q_norm); rel(h->bufs.k_tmp); rel(h->bufs.v_tmp);
     rel(h->bufs.attn_out); rel(h->bufs.o_proj); rel(h->bufs.y_attn);
     rel(h->bufs.m_in); rel(h->bufs.m_out); rel(h->bufs.y_out);
-    rel(h->bufs.per_layer_inputs); rel(h->bufs.ple_gate_out);
+    rel(h->bufs.per_layer_inputs); rel(h->bufs.ple_ctx_proj); rel(h->bufs.ple_gate_out);
     rel(h->bufs.ple_gated); rel(h->bufs.ple_proj_back);
     rel(h->bufs.dump_stash);
 

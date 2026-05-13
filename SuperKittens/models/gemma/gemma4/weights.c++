@@ -176,6 +176,23 @@ extern "C" int sk_gemma4_load_from_store(sk_gemma4_handle* hp, sk::WeightStore* 
         }
     }
 
+    // per_layer_model_projection: (n_layers*ple_dim, d_model) HF stores as (out, in).
+    // We need it as (d_model, n_layers*ple_dim) for GEMM. Transpose.
+    if (c.has_ple && h->weights.w_per_layer_model_projection) {
+        const size_t out_rows = (size_t)c.n_layers * c.ple_dim;  // 8960 for E2B
+        if (!copy_transpose_fp16(h->weights.w_per_layer_model_projection, 0, store,
+                                 "model.language_model.per_layer_model_projection.weight",
+                                 out_rows, c.d_model)) {
+            std::fprintf(stderr, "gemma4 weights: missing per_layer_model_projection\n");
+        }
+    }
+    if (c.has_ple && h->weights.w_per_layer_projection_norm) {
+        if (!copy_into(h->weights.w_per_layer_projection_norm, 0, store,
+                       "model.language_model.per_layer_projection_norm.weight", c.ple_dim)) {
+            std::fprintf(stderr, "gemma4 weights: missing per_layer_projection_norm\n");
+        }
+    }
+
     if (c.has_ple && h->weights.w_ple_table) {
         const char* nm = "model.language_model.embed_tokens_per_layer.weight";
         auto* v = store->get(nm);

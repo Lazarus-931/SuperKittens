@@ -244,6 +244,10 @@ class Gemma4:
         for the most recent forward(). Requires set_dump_enabled(True)."""
         if name == "logits":
             out = np.empty((self.cfg.vocab_size,), dtype=np.float16)
+        elif name in ("L0.q_normed", "L0.q_rope", "L0.attn_pre"):
+            out = np.empty((self.cfg.n_heads * self.cfg.head_dim_local,), dtype=np.float16)
+        elif name in ("L0.k_normed", "L0.k_rope"):
+            out = np.empty((self.cfg.n_kv_heads_local * self.cfg.head_dim_local,), dtype=np.float16)
         else:
             out = np.empty((self.cfg.d_model,), dtype=np.float16)
         rc = _load().sk_gemma4_dump_layer(self._h, name.encode(), out.ctypes.data)

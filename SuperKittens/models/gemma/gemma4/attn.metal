@@ -40,7 +40,9 @@ void gemma4_attn_local_d256(
     // Use split-Bc: each simdgroup processes Bc/4 = 4 rows of K per tile,
     // maintains its own online softmax, then merges across simdgroups at end.
     if (q_seq == 1) {
-        const float scale = 1.0f / sqrt(float(D));
+        // Gemma 4 uses scaling=1.0 (modeling_gemma4.py:1178). q_norm γ
+        // absorbs whatever scaling the model wants.
+        const float scale = 1.0f;
         const float4 q_lo = float4(reinterpret_cast<const device half4*>(Q + q_off)[lane])      * scale;
         const float4 q_hi = float4(reinterpret_cast<const device half4*>(Q + q_off)[lane + 32]) * scale;
 
@@ -175,20 +177,25 @@ void gemma4_attn_local_d256(
     }
 
     // ============================ ORIGINAL PATH ===============================
+    // NOTE: must not early-return before threadgroup_barriers below — would
+    // hang the barrier when q_row >= q_seq. Use `active` flag instead and
+    // guard only the final store.
     const uint q_row = gid.y * Br + simd;
-    if (q_row >= q_seq) return;
+    const bool active = (q_row < q_seq);
+    const uint q_row_clamped = active ? q_row : 0u;
 
-    const float scale = 1.0f / sqrt(float(D));
+    // Gemma 4 uses scaling=1.0 (modeling_gemma4.py:1178).
+    const float scale = 1.0f;
     const float4 q_lo = float4(
-        reinterpret_cast<const device half4*>(Q + q_off + (size_t)q_row * D)[lane])      * scale;
+        reinterpret_cast<const device half4*>(Q + q_off + (size_t)q_row_clamped * D)[lane])      * scale;
     const float4 q_hi = float4(
-        reinterpret_cast<const device half4*>(Q + q_off + (size_t)q_row * D)[lane + 32]) * scale;
+        reinterpret_cast<const device half4*>(Q + q_off + (size_t)q_row_clamped * D)[lane + 32]) * scale;
 
     float m = -INFINITY, s = 0.0f;
     float4 acc_lo = float4(0.0f), acc_hi = float4(0.0f);
 
     const uint causal_extra = kv_len - q_seq;
-    const uint upper        = q_row + 1u + causal_extra;
+    const uint upper        = q_row_clamped + 1u + causal_extra;
     const uint lower        = (upper > window) ? (upper - window) : 0u;
     const uint start_tile   = lower / Bc;
     const uint end_tile     = upper / Bc;
@@ -270,7 +277,7 @@ void gemma4_attn_local_d256(
     }
 
     const float inv_s = s > 0.0f ? 1.0f / s : 0.0f;
-    {
+    if (active) {
         const size_t o_w = o_base + (size_t)q_row * nheads * D;
         reinterpret_cast<device half4*>(O + o_w)[lane]      = half4(acc_lo * inv_s);
         reinterpret_cast<device half4*>(O + o_w)[lane + 32] = half4(acc_hi * inv_s);
@@ -311,7 +318,9 @@ void gemma4_attn_global_d512(
 
     // ============================ DECODE FAST PATH ============================
     if (q_seq == 1) {
-        const float scale = 1.0f / sqrt(float(D));
+        // Gemma 4 uses scaling=1.0 (modeling_gemma4.py:1178). q_norm γ
+        // absorbs whatever scaling the model wants.
+        const float scale = 1.0f;
         float4 q_chunk[4];
         for (uint c = 0; c < 4; ++c) {
             q_chunk[c] = float4(
@@ -440,22 +449,25 @@ void gemma4_attn_global_d512(
     }
 
     // ============================ ORIGINAL PATH ===============================
+    // NOTE: avoid early return (would hang barriers). Use active flag.
     const uint q_row = gid.y * Br + simd;
-    if (q_row >= q_seq) return;
+    const bool active = (q_row < q_seq);
+    const uint q_row_clamped = active ? q_row : 0u;
 
-    const float scale = 1.0f / sqrt(float(D));
+    // Gemma 4 uses scaling=1.0 (modeling_gemma4.py:1178).
+    const float scale = 1.0f;
     float4 q_chunk[4];
     [[clang::unroll]]
     for (uint c = 0; c < 4; ++c) {
         q_chunk[c] = float4(
-            reinterpret_cast<const device half4*>(Q + q_off + (size_t)q_row * D)[lane + c * 32]) * scale;
+            reinterpret_cast<const device half4*>(Q + q_off + (size_t)q_row_clamped * D)[lane + c * 32]) * scale;
     }
 
     float m = -INFINITY, s = 0.0f;
     float4 acc[4] = { float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f) };
 
     const uint causal_extra = kv_len - q_seq;
-    const uint upper        = q_row + 1u + causal_extra;
+    const uint upper        = q_row_clamped + 1u + causal_extra;
     const uint full_tiles   = upper / Bc;
     const uint partial_lim  = upper - full_tiles * Bc;
 
@@ -543,7 +555,7 @@ void gemma4_attn_global_d512(
     }
 
     const float inv_s = s > 0.0f ? 1.0f / s : 0.0f;
-    {
+    if (active) {
         const size_t o_w = o_base + (size_t)q_row * nheads * D;
         [[clang::unroll]]
         for (uint c = 0; c < 4; ++c) {

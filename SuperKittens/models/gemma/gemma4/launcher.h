@@ -48,6 +48,8 @@ typedef struct {
     const void* w_per_layer_projection;
     const void* w_layer_scalar;
     const void* w_post_per_layer_input_norm;
+    const void* w_per_layer_model_projection;     // (n_layers*ple_dim, d_model)
+    const void* w_per_layer_projection_norm;      // (ple_dim,)
     const void* w_pre_attn_norm;
     const void* w_post_attn_norm;
     const void* w_pre_feedforward_layernorm;
@@ -90,6 +92,9 @@ int sk_gemma4_get_last_logits(sk_gemma4_handle* h, void* out_fp16);
 //   "L{L}.mlp"    / "L{L}.out"           — per layer (size d_model)
 //   "final_norm"                         — (size d_model)
 //   "logits"                             — (size vocab_size, pre-softcap)
+//   "L0.q_normed" / "L0.k_normed"        — pre-RoPE per-head fp16 (n_heads*hd_local, n_kv*hd_local)
+//   "L0.q_rope"   / "L0.k_rope"          — post-RoPE
+//   "L0.attn_pre"                        — pre-o_proj attention output (n_heads*hd_local)
 // Returns 0 on success, <0 if name unknown or no stash populated.
 // Caller-allocated buffer must be large enough for the named slot.
 int sk_gemma4_dump_layer(sk_gemma4_handle* h, const char* name, void* out_fp16);
