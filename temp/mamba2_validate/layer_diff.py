@@ -53,11 +53,16 @@ def main():
         print(f"[!] {REF_NPZ} missing — run dump_hf_mamba2.py first", file=sys.stderr)
         return 1
     ref = np.load(REF_NPZ, allow_pickle=True)
-    print(f"[ref] keys: {len(ref.files)}  argmax={int(ref['_meta_argmax'])}")
-    ids = ref["_meta_input_ids"]
+    print(f"[ref] keys: {len(ref.files)}")
+    ids_key = "input_ids" if "input_ids" in ref.files else "_meta_input_ids"
+    ids = ref[ids_key]
     if ids.ndim == 2: ids = ids[0]
     ids = ids.astype(np.int32).tolist()
-    print(f"[ref] input_ids={ids}")
+    ref_logits = ref["logits"] if "logits" in ref.files else ref.get("logits_final")
+    ref_logits = np.asarray(ref_logits)
+    if ref_logits.ndim == 3: ref_logits = ref_logits[0]   # (T, V)
+    ref_argmax = int(ref_logits[-1].argmax())
+    print(f"[ref] input_ids={ids}  argmax={ref_argmax}")
 
     from SuperKittens.models.mamba2.mamba2 import Mamba2Config, Mamba2Model
     cfg_path = find_config()
@@ -78,14 +83,11 @@ def main():
     sk_argmax = m.forward(ids)
     t1 = time.time()
     print(f"[sk] forward({len(ids)} ids) → argmax={sk_argmax}  ({(t1-t0)*1000:.1f} ms)")
-    ref_argmax = int(ref["_meta_argmax"])
     print(f"[ref] argmax={ref_argmax}  match={sk_argmax == ref_argmax}")
 
     # ── Logits comparison ─────────────────────────────────────────────
-    if "logits_final" in ref.files:
-        ref_lg = ref["logits_final"].astype(np.float32)
-        if ref_lg.ndim == 3: ref_lg = ref_lg[0]   # (T, V)
-        ref_last = ref_lg[-1]
+    if True:
+        ref_last = ref_logits[-1].astype(np.float32)
         sk_last = m.get_last_logits().astype(np.float32)
         diff = sk_last - ref_last
         rel = np.linalg.norm(diff) / max(np.linalg.norm(ref_last), 1e-9)
