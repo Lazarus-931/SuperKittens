@@ -6,10 +6,10 @@ namespace meow::gemma4 {
 [[host_name("gemma4_attn_local_d256")]]
 [[kernel, max_total_threads_per_threadgroup(128)]]
 void gemma4_attn_local_d256(
-    device const half* Q          [[buffer(0)]],
-    device const half* K          [[buffer(1)]],
-    device const half* V          [[buffer(2)]],
-    device half*       O          [[buffer(3)]],
+    device const bfloat* Q          [[buffer(0)]],
+    device const bfloat* K          [[buffer(1)]],
+    device const bfloat* V          [[buffer(2)]],
+    device bfloat*       O          [[buffer(3)]],
     constant uint& q_seq          [[buffer(4)]],
     constant uint& kv_len         [[buffer(5)]],
     constant uint& nheads         [[buffer(6)]],
@@ -32,8 +32,8 @@ void gemma4_attn_local_d256(
     const size_t kv_off  = (size_t)(batch * n_kv_heads + kv_head) * cache_size * D;
     const size_t o_base  = (size_t)batch * q_seq * nheads * D + (size_t)head * D;
 
-    threadgroup half4 k_smem[Bc * D4];
-    threadgroup half4 v_smem[Bc * D4];
+    threadgroup bfloat4 k_smem[Bc * D4];
+    threadgroup bfloat4 v_smem[Bc * D4];
 
     // ============================ DECODE FAST PATH ============================
     // q_seq == 1: only one Q row, all 4 simdgroups would be wasted in baseline.
@@ -43,8 +43,8 @@ void gemma4_attn_local_d256(
         // Gemma 4 uses scaling=1.0 (modeling_gemma4.py:1178). q_norm γ
         // absorbs whatever scaling the model wants.
         const float scale = 1.0f;
-        const float4 q_lo = float4(reinterpret_cast<const device half4*>(Q + q_off)[lane])      * scale;
-        const float4 q_hi = float4(reinterpret_cast<const device half4*>(Q + q_off)[lane + 32]) * scale;
+        const float4 q_lo = float4(reinterpret_cast<const device bfloat4*>(Q + q_off)[lane])      * scale;
+        const float4 q_hi = float4(reinterpret_cast<const device bfloat4*>(Q + q_off)[lane + 32]) * scale;
 
         const uint causal_extra = kv_len - 1u;
         const uint upper        = 1u + causal_extra;
@@ -69,17 +69,17 @@ void gemma4_attn_local_d256(
                 const uint r = i / D4, d = i % D4;
                 const uint col_log = c0 + r;
                 const uint col_buf = (kv_buf_start + col_log) % cache_size;
-                k_smem[i] = reinterpret_cast<const device half4*>(K + kv_off + (size_t)col_buf * D)[d];
-                v_smem[i] = reinterpret_cast<const device half4*>(V + kv_off + (size_t)col_buf * D)[d];
+                k_smem[i] = reinterpret_cast<const device bfloat4*>(K + kv_off + (size_t)col_buf * D)[d];
+                v_smem[i] = reinterpret_cast<const device bfloat4*>(V + kv_off + (size_t)col_buf * D)[d];
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             for (uint j = j_lo; j < j_hi; j += 2) {
                 const uint o0 = j * D4, o1 = (j + 1) * D4;
-                half4 k0_lo = k_smem[o0 + kl_base];
-                half4 k0_hi = k_smem[o0 + kh_base];
-                half4 k1_lo = k_smem[o1 + kl_base];
-                half4 k1_hi = k_smem[o1 + kh_base];
+                bfloat4 k0_lo = k_smem[o0 + kl_base];
+                bfloat4 k0_hi = k_smem[o0 + kh_base];
+                bfloat4 k1_lo = k_smem[o1 + kl_base];
+                bfloat4 k1_hi = k_smem[o1 + kh_base];
 
                 float p0 = dot(q_lo, float4(k0_lo)) + dot(q_hi, float4(k0_hi));
                 float p1 = dot(q_lo, float4(k1_lo)) + dot(q_hi, float4(k1_hi));
@@ -107,11 +107,11 @@ void gemma4_attn_local_d256(
                 const uint col_log = c0 + r;
                 if (col_log < kv_len && col_log >= lower) {
                     const uint col_buf = (kv_buf_start + col_log) % cache_size;
-                    k_smem[i] = reinterpret_cast<const device half4*>(K + kv_off + (size_t)col_buf * D)[d];
-                    v_smem[i] = reinterpret_cast<const device half4*>(V + kv_off + (size_t)col_buf * D)[d];
+                    k_smem[i] = reinterpret_cast<const device bfloat4*>(K + kv_off + (size_t)col_buf * D)[d];
+                    v_smem[i] = reinterpret_cast<const device bfloat4*>(V + kv_off + (size_t)col_buf * D)[d];
                 } else {
-                    k_smem[i] = half4(0.0h);
-                    v_smem[i] = half4(0.0h);
+                    k_smem[i] = bfloat4((bfloat)0);
+                    v_smem[i] = bfloat4((bfloat)0);
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -119,7 +119,7 @@ void gemma4_attn_local_d256(
             if (simd == 0) {
                 for (uint j = 0; j < partial_lim; ++j) {
                     const uint o = j * D4;
-                    half4 kl = k_smem[o + kl_base], kh = k_smem[o + kh_base];
+                    bfloat4 kl = k_smem[o + kl_base], kh = k_smem[o + kh_base];
                     float score = simd_sum(dot(q_lo, float4(kl)) + dot(q_hi, float4(kh)));
                     float new_m = max(m, score);
                     float alpha = metal::fast::exp(m     - new_m);
@@ -139,7 +139,7 @@ void gemma4_attn_local_d256(
         // lane recompute the merged result. acc layout per lane is identical
         // across simdgroups (lane → dims [lane*4..+3] for lo / hi).
         threadgroup float tg_ms[4][2];
-        // Reuse k_smem (8 KB = 4096 half = 2048 float) for acc_lo (4 simd × 32
+        // Reuse k_smem (8 KB = 4096 bfloat = 2048 float) for acc_lo (4 simd × 32
         // lane × 4 floats = 512 floats), and v_smem for acc_hi.
         threadgroup float* tg_acc_lo = reinterpret_cast<threadgroup float*>(k_smem);
         threadgroup float* tg_acc_hi = reinterpret_cast<threadgroup float*>(v_smem);
@@ -170,8 +170,8 @@ void gemma4_attn_local_d256(
                 ah += w * ahi;
             }
             const float inv_s = sg > 0.0f ? 1.0f / sg : 0.0f;
-            reinterpret_cast<device half4*>(O + o_base)[lane]      = half4(al * inv_s);
-            reinterpret_cast<device half4*>(O + o_base)[lane + 32] = half4(ah * inv_s);
+            reinterpret_cast<device bfloat4*>(O + o_base)[lane]      = bfloat4(al * inv_s);
+            reinterpret_cast<device bfloat4*>(O + o_base)[lane + 32] = bfloat4(ah * inv_s);
         }
         return;
     }
@@ -187,9 +187,9 @@ void gemma4_attn_local_d256(
     // Gemma 4 uses scaling=1.0 (modeling_gemma4.py:1178).
     const float scale = 1.0f;
     const float4 q_lo = float4(
-        reinterpret_cast<const device half4*>(Q + q_off + (size_t)q_row_clamped * D)[lane])      * scale;
+        reinterpret_cast<const device bfloat4*>(Q + q_off + (size_t)q_row_clamped * D)[lane])      * scale;
     const float4 q_hi = float4(
-        reinterpret_cast<const device half4*>(Q + q_off + (size_t)q_row_clamped * D)[lane + 32]) * scale;
+        reinterpret_cast<const device bfloat4*>(Q + q_off + (size_t)q_row_clamped * D)[lane + 32]) * scale;
 
     float m = -INFINITY, s = 0.0f;
     float4 acc_lo = float4(0.0f), acc_hi = float4(0.0f);
@@ -212,18 +212,18 @@ void gemma4_attn_local_d256(
             const uint r = i / D4, d = i % D4;
             const uint col_log = c0 + r;
             const uint col_buf = (kv_buf_start + col_log) % cache_size;
-            k_smem[i] = reinterpret_cast<const device half4*>(K + kv_off + (size_t)col_buf * D)[d];
-            v_smem[i] = reinterpret_cast<const device half4*>(V + kv_off + (size_t)col_buf * D)[d];
+            k_smem[i] = reinterpret_cast<const device bfloat4*>(K + kv_off + (size_t)col_buf * D)[d];
+            v_smem[i] = reinterpret_cast<const device bfloat4*>(V + kv_off + (size_t)col_buf * D)[d];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         #pragma clang loop unroll(full)
         for (uint j = 0; j < Bc; j += 2) {
             const uint o0 = j * D4, o1 = (j + 1) * D4;
-            half4 k0_lo = k_smem[o0 + kl_base];
-            half4 k0_hi = k_smem[o0 + kh_base];
-            half4 k1_lo = k_smem[o1 + kl_base];
-            half4 k1_hi = k_smem[o1 + kh_base];
+            bfloat4 k0_lo = k_smem[o0 + kl_base];
+            bfloat4 k0_hi = k_smem[o0 + kh_base];
+            bfloat4 k1_lo = k_smem[o1 + kl_base];
+            bfloat4 k1_hi = k_smem[o1 + kh_base];
 
             float p0 = dot(q_lo, float4(k0_lo)) + dot(q_hi, float4(k0_hi));
             float p1 = dot(q_lo, float4(k1_lo)) + dot(q_hi, float4(k1_hi));
@@ -251,18 +251,18 @@ void gemma4_attn_local_d256(
             const uint col_log = c0 + r;
             if (col_log < kv_len && col_log >= lower) {
                 const uint col_buf = (kv_buf_start + col_log) % cache_size;
-                k_smem[i] = reinterpret_cast<const device half4*>(K + kv_off + (size_t)col_buf * D)[d];
-                v_smem[i] = reinterpret_cast<const device half4*>(V + kv_off + (size_t)col_buf * D)[d];
+                k_smem[i] = reinterpret_cast<const device bfloat4*>(K + kv_off + (size_t)col_buf * D)[d];
+                v_smem[i] = reinterpret_cast<const device bfloat4*>(V + kv_off + (size_t)col_buf * D)[d];
             } else {
-                k_smem[i] = half4(0.0h);
-                v_smem[i] = half4(0.0h);
+                k_smem[i] = bfloat4((bfloat)0);
+                v_smem[i] = bfloat4((bfloat)0);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (uint j = 0; j < partial_lim; ++j) {
             const uint o = j * D4;
-            half4 kl = k_smem[o + kl_base], kh = k_smem[o + kh_base];
+            bfloat4 kl = k_smem[o + kl_base], kh = k_smem[o + kh_base];
             float score = simd_sum(dot(q_lo, float4(kl)) + dot(q_hi, float4(kh)));
             float new_m = max(m, score);
             float alpha = metal::fast::exp(m     - new_m);
@@ -279,8 +279,8 @@ void gemma4_attn_local_d256(
     const float inv_s = s > 0.0f ? 1.0f / s : 0.0f;
     if (active) {
         const size_t o_w = o_base + (size_t)q_row * nheads * D;
-        reinterpret_cast<device half4*>(O + o_w)[lane]      = half4(acc_lo * inv_s);
-        reinterpret_cast<device half4*>(O + o_w)[lane + 32] = half4(acc_hi * inv_s);
+        reinterpret_cast<device bfloat4*>(O + o_w)[lane]      = bfloat4(acc_lo * inv_s);
+        reinterpret_cast<device bfloat4*>(O + o_w)[lane + 32] = bfloat4(acc_hi * inv_s);
     }
 }
 
@@ -288,10 +288,10 @@ void gemma4_attn_local_d256(
 [[host_name("gemma4_attn_global_d512")]]
 [[kernel, max_total_threads_per_threadgroup(128)]]
 void gemma4_attn_global_d512(
-    device const half* Q          [[buffer(0)]],
-    device const half* K          [[buffer(1)]],
-    device const half* V          [[buffer(2)]],
-    device half*       O          [[buffer(3)]],
+    device const bfloat* Q          [[buffer(0)]],
+    device const bfloat* K          [[buffer(1)]],
+    device const bfloat* V          [[buffer(2)]],
+    device bfloat*       O          [[buffer(3)]],
     constant uint& q_seq          [[buffer(4)]],
     constant uint& kv_len         [[buffer(5)]],
     constant uint& nheads         [[buffer(6)]],
@@ -313,8 +313,8 @@ void gemma4_attn_global_d512(
     const size_t kv_off  = (size_t)(batch * n_kv_heads + kv_head) * cache_size * D;
     const size_t o_base  = (size_t)batch * q_seq * nheads * D + (size_t)head * D;
 
-    threadgroup half4 k_smem[Bc * D4];   // 8 KB
-    threadgroup half4 v_smem[Bc * D4];   // 8 KB
+    threadgroup bfloat4 k_smem[Bc * D4];   // 8 KB
+    threadgroup bfloat4 v_smem[Bc * D4];   // 8 KB
 
     // ============================ DECODE FAST PATH ============================
     if (q_seq == 1) {
@@ -324,7 +324,7 @@ void gemma4_attn_global_d512(
         float4 q_chunk[4];
         for (uint c = 0; c < 4; ++c) {
             q_chunk[c] = float4(
-                reinterpret_cast<const device half4*>(Q + q_off)[lane + c * 32]) * scale;
+                reinterpret_cast<const device bfloat4*>(Q + q_off)[lane + c * 32]) * scale;
         }
 
         const uint causal_extra = kv_len - 1u;
@@ -344,8 +344,8 @@ void gemma4_attn_global_d512(
                 const uint r = i / D4, d = i % D4;
                 const uint col_log = c0 + r;
                 const uint col_buf = (kv_buf_start + col_log) % cache_size;
-                k_smem[i] = reinterpret_cast<const device half4*>(K + kv_off + (size_t)col_buf * D)[d];
-                v_smem[i] = reinterpret_cast<const device half4*>(V + kv_off + (size_t)col_buf * D)[d];
+                k_smem[i] = reinterpret_cast<const device bfloat4*>(K + kv_off + (size_t)col_buf * D)[d];
+                v_smem[i] = reinterpret_cast<const device bfloat4*>(V + kv_off + (size_t)col_buf * D)[d];
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -380,11 +380,11 @@ void gemma4_attn_global_d512(
                 const uint col_log = c0 + r;
                 if (col_log < kv_len) {
                     const uint col_buf = (kv_buf_start + col_log) % cache_size;
-                    k_smem[i] = reinterpret_cast<const device half4*>(K + kv_off + (size_t)col_buf * D)[d];
-                    v_smem[i] = reinterpret_cast<const device half4*>(V + kv_off + (size_t)col_buf * D)[d];
+                    k_smem[i] = reinterpret_cast<const device bfloat4*>(K + kv_off + (size_t)col_buf * D)[d];
+                    v_smem[i] = reinterpret_cast<const device bfloat4*>(V + kv_off + (size_t)col_buf * D)[d];
                 } else {
-                    k_smem[i] = half4(0.0h);
-                    v_smem[i] = half4(0.0h);
+                    k_smem[i] = bfloat4((bfloat)0);
+                    v_smem[i] = bfloat4((bfloat)0);
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -393,7 +393,7 @@ void gemma4_attn_global_d512(
                 for (uint j = 0; j < partial_lim; ++j) {
                     float p = 0.0f;
                     for (uint c = 0; c < 4; ++c) {
-                        half4 kc = k_smem[j * D4 + lane + c * 32];
+                        bfloat4 kc = k_smem[j * D4 + lane + c * 32];
                         p += dot(q_chunk[c], float4(kc));
                     }
                     float score = simd_sum(p);
@@ -442,7 +442,7 @@ void gemma4_attn_global_d512(
             }
             const float inv_s = sg > 0.0f ? 1.0f / sg : 0.0f;
             for (uint c = 0; c < 4; ++c) {
-                reinterpret_cast<device half4*>(O + o_base)[lane + c * 32] = half4(ao[c] * inv_s);
+                reinterpret_cast<device bfloat4*>(O + o_base)[lane + c * 32] = bfloat4(ao[c] * inv_s);
             }
         }
         return;
@@ -460,7 +460,7 @@ void gemma4_attn_global_d512(
     [[clang::unroll]]
     for (uint c = 0; c < 4; ++c) {
         q_chunk[c] = float4(
-            reinterpret_cast<const device half4*>(Q + q_off + (size_t)q_row_clamped * D)[lane + c * 32]) * scale;
+            reinterpret_cast<const device bfloat4*>(Q + q_off + (size_t)q_row_clamped * D)[lane + c * 32]) * scale;
     }
 
     float m = -INFINITY, s = 0.0f;
@@ -479,8 +479,8 @@ void gemma4_attn_global_d512(
             const uint r = i / D4, d = i % D4;
             const uint col_log = c0 + r;
             const uint col_buf = (kv_buf_start + col_log) % cache_size;
-            k_smem[i] = reinterpret_cast<const device half4*>(K + kv_off + (size_t)col_buf * D)[d];
-            v_smem[i] = reinterpret_cast<const device half4*>(V + kv_off + (size_t)col_buf * D)[d];
+            k_smem[i] = reinterpret_cast<const device bfloat4*>(K + kv_off + (size_t)col_buf * D)[d];
+            v_smem[i] = reinterpret_cast<const device bfloat4*>(V + kv_off + (size_t)col_buf * D)[d];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -523,11 +523,11 @@ void gemma4_attn_global_d512(
             const uint col_log = c0 + r;
             if (col_log < kv_len) {
                 const uint col_buf = (kv_buf_start + col_log) % cache_size;
-                k_smem[i] = reinterpret_cast<const device half4*>(K + kv_off + (size_t)col_buf * D)[d];
-                v_smem[i] = reinterpret_cast<const device half4*>(V + kv_off + (size_t)col_buf * D)[d];
+                k_smem[i] = reinterpret_cast<const device bfloat4*>(K + kv_off + (size_t)col_buf * D)[d];
+                v_smem[i] = reinterpret_cast<const device bfloat4*>(V + kv_off + (size_t)col_buf * D)[d];
             } else {
-                k_smem[i] = half4(0.0h);
-                v_smem[i] = half4(0.0h);
+                k_smem[i] = bfloat4((bfloat)0);
+                v_smem[i] = bfloat4((bfloat)0);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -536,7 +536,7 @@ void gemma4_attn_global_d512(
             float p = 0.0f;
             [[clang::unroll]]
             for (uint c = 0; c < 4; ++c) {
-                half4 kc = k_smem[j * D4 + lane + c * 32];
+                bfloat4 kc = k_smem[j * D4 + lane + c * 32];
                 p += dot(q_chunk[c], float4(kc));
             }
             float score = simd_sum(p);
@@ -559,7 +559,7 @@ void gemma4_attn_global_d512(
         const size_t o_w = o_base + (size_t)q_row * nheads * D;
         [[clang::unroll]]
         for (uint c = 0; c < 4; ++c) {
-            reinterpret_cast<device half4*>(O + o_w)[lane + c * 32] = half4(acc[c] * inv_s);
+            reinterpret_cast<device bfloat4*>(O + o_w)[lane + c * 32] = bfloat4(acc[c] * inv_s);
         }
     }
 }

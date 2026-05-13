@@ -15,9 +15,9 @@ namespace meow::gemma4::ple_inject {
 [[host_name("gemma4_ple_lookup")]]
 [[kernel]]
 void gemma4_ple_lookup(
-    device const half* ple_table       [[buffer(0)]],   // (V, n_layers, P)
+    device const bfloat* ple_table       [[buffer(0)]],   // (V, n_layers, P)
     device const int*  ids             [[buffer(1)]],   // (T,)
-    device       half* per_layer_inputs[[buffer(2)]],   // (T, n_layers, P)
+    device       bfloat* per_layer_inputs[[buffer(2)]],   // (T, n_layers, P)
     constant uint& T                   [[buffer(3)]],
     constant uint& n_layers            [[buffer(4)]],
     constant uint& P                   [[buffer(5)]],
@@ -32,30 +32,30 @@ void gemma4_ple_lookup(
 
     int  id  = ids[t];
     bool oob = (id < 0) || ((uint)id >= V);
-    half4 v = half4(0, 0, 0, 0);
+    bfloat4 v = bfloat4(0, 0, 0, 0);
     if (!oob) {
         const uint row_off = ((uint)id * n_layers + L) * P;
-        v = reinterpret_cast<const device half4*>(ple_table + row_off)[p4];
+        v = reinterpret_cast<const device bfloat4*>(ple_table + row_off)[p4];
     }
     const uint dst_off = (t * n_layers + L) * P;
-    reinterpret_cast<device half4*>(per_layer_inputs + dst_off)[p4] = v;
+    reinterpret_cast<device bfloat4*>(per_layer_inputs + dst_off)[p4] = v;
 }
 
-static inline half gelu_approx(half x) {
-    const half c0 = (half)0.7978845608028654h;     // sqrt(2/pi)
-    const half c1 = (half)0.044715h;
-    half x3 = x * x * x;
-    half u  = c0 * (x + c1 * x3);
-    half t  = tanh(u);
-    return (half)0.5h * x * ((half)1.0h + t);
+static inline float gelu_approx(float x) {
+    const float c0 = 0.7978845608028654f;     // sqrt(2/pi)
+    const float c1 = 0.044715f;
+    float x3 = x * x * x;
+    float u  = c0 * (x + c1 * x3);
+    float t  = metal::precise::tanh(u);
+    return 0.5f * x * (1.0f + t);
 }
 
 [[host_name("gemma4_ple_gate_act")]]
 [[kernel]]
 void gemma4_ple_gate_act(
-    device const half* gate            [[buffer(0)]],   // (T, P)
-    device const half* per_layer_inputs[[buffer(1)]],   // (T, n_layers, P)
-    device       half* out             [[buffer(2)]],   // (T, P)
+    device const bfloat* gate            [[buffer(0)]],   // (T, P)
+    device const bfloat* per_layer_inputs[[buffer(1)]],   // (T, n_layers, P)
+    device       bfloat* out             [[buffer(2)]],   // (T, P)
     constant uint& T                   [[buffer(3)]],
     constant uint& n_layers            [[buffer(4)]],
     constant uint& P                   [[buffer(5)]],
@@ -67,24 +67,24 @@ void gemma4_ple_gate_act(
     const uint P4 = P / 4u;
     if (t >= T || p4 >= P4) return;
 
-    half4 g  = reinterpret_cast<const device half4*>(gate + t * P)[p4];
+    bfloat4 g  = reinterpret_cast<const device bfloat4*>(gate + t * P)[p4];
     const uint ple_off = (t * n_layers + layer_idx) * P;
-    half4 ple= reinterpret_cast<const device half4*>(per_layer_inputs + ple_off)[p4];
+    bfloat4 ple= reinterpret_cast<const device bfloat4*>(per_layer_inputs + ple_off)[p4];
 
-    half4 a;
-    a.x = gelu_approx(g.x) * ple.x;
-    a.y = gelu_approx(g.y) * ple.y;
-    a.z = gelu_approx(g.z) * ple.z;
-    a.w = gelu_approx(g.w) * ple.w;
-    reinterpret_cast<device half4*>(out + t * P)[p4] = a;
+    bfloat4 a;
+    a.x = bfloat(gelu_approx(float(g.x)) * float(ple.x));
+    a.y = bfloat(gelu_approx(float(g.y)) * float(ple.y));
+    a.z = bfloat(gelu_approx(float(g.z)) * float(ple.z));
+    a.w = bfloat(gelu_approx(float(g.w)) * float(ple.w));
+    reinterpret_cast<device bfloat4*>(out + t * P)[p4] = a;
 }
 
 [[host_name("gemma4_ple_inject")]]
 [[kernel]]
 void gemma4_ple_inject(
-    device const half*  proj_back  [[buffer(0)]],   // (T, D)
-    device const half*  gamma      [[buffer(1)]],   // (D,) for this layer
-    device       half*  residual   [[buffer(2)]],   // (T, D) in-place
+    device const bfloat*  proj_back  [[buffer(0)]],   // (T, D)
+    device const bfloat*  gamma      [[buffer(1)]],   // (D,) for this layer
+    device       bfloat*  residual   [[buffer(2)]],   // (T, D) in-place
     constant uint&  T              [[buffer(3)]],
     constant uint&  D              [[buffer(4)]],
     constant float& eps            [[buffer(5)]],
@@ -95,8 +95,8 @@ void gemma4_ple_inject(
 {
     if (row >= T) return;
 
-    device const half* xrow = proj_back + (size_t)row * D;
-    device       half* rrow = residual  + (size_t)row * D;
+    device const bfloat* xrow = proj_back + (size_t)row * D;
+    device       bfloat* rrow = residual  + (size_t)row * D;
 
     threadgroup float tg_sum[32];
 
@@ -134,7 +134,7 @@ void gemma4_ple_inject(
     for (uint i = tid; i < D; i += tgs) {
         float n = (float)xrow[i] * invrms * (float)gamma[i];
         float r = ((float)rrow[i] + n) * scl;
-        rrow[i] = (half)r;
+        rrow[i] = (bfloat)r;
     }
 }
 

@@ -33,34 +33,46 @@ inline std::string layer_key(uint32_t L, const char* suffix) {
     return std::string(buf);
 }
 
-inline uint16_t fp32_bits_to_fp16(uint32_t f) {
-    uint32_t sign = (f >> 16) & 0x8000u;
-    uint32_t mant = f & 0x007fffffu;
-    int32_t  exp  = (int32_t)((f >> 23) & 0xffu) - 127 + 15;
-    if (((f >> 23) & 0xffu) == 0xffu) {
-        return (uint16_t)(sign | 0x7c00u | (mant ? 0x0200u : 0u));
+// fp32 -> bf16 (top half of word, round-to-nearest-even).
+inline uint16_t fp32_bits_to_bf16(uint32_t bits) {
+    if (((bits >> 23) & 0xff) == 0xff) {
+        // NaN/Inf: preserve top bits.
+        return (uint16_t)((bits >> 16) & 0xffffu) | (uint16_t)((bits & 0x7fffffu) ? 0x40 : 0);
     }
-    if (exp >= 31) {
-        return (uint16_t)(sign | 0x7c00u);
-    }
-    if (exp <= 0) {
-        if (exp < -10) return (uint16_t)sign;
-        mant = (mant | 0x00800000u) >> (uint32_t)(1 - exp);
-        if (mant & 0x00001000u) mant += 0x00002000u;
-        return (uint16_t)(sign | (mant >> 13));
-    }
-    if (mant & 0x00001000u) {
-        mant += 0x00002000u;
-        if (mant & 0x00800000u) { mant = 0; exp += 1; }
-        if (exp >= 31) return (uint16_t)(sign | 0x7c00u);
-    }
-    return (uint16_t)(sign | ((uint32_t)exp << 10) | (mant >> 13));
+    uint32_t rounding_bias = 0x00007fffu + ((bits >> 16) & 1u);
+    return (uint16_t)((bits + rounding_bias) >> 16);
 }
 
-inline void bf16_to_fp16(uint16_t* dst, const uint16_t* src, size_t n) {
-    for (size_t i = 0; i < n; ++i) {
-        uint32_t f = ((uint32_t)src[i]) << 16;
-        dst[i] = fp32_bits_to_fp16(f);
+// fp16 -> fp32 bits.
+inline uint32_t fp16_to_fp32_bits(uint16_t h16) {
+    uint32_t s = (uint32_t)(h16 >> 15) & 1u;
+    uint32_t e = (uint32_t)(h16 >> 10) & 0x1Fu;
+    uint32_t m = (uint32_t)h16 & 0x3FFu;
+    if (e == 0)       return (s << 31);
+    if (e == 31)      return (s << 31) | (0xFFu << 23) | (m << 13);
+    return (s << 31) | ((e + 112u) << 23) | (m << 13);
+}
+
+// bf16 (top half) -> fp32 bits.
+inline uint32_t bf16_to_fp32_bits(uint16_t b) {
+    return ((uint32_t)b) << 16;
+}
+
+// Copy 'expect_elems' bf16 elems. If source is bf16, memcpy. If source is fp16,
+// convert to bf16.
+inline void copy_bf16_from(uint16_t* dst, const void* src_v, sk::Dtype dt, size_t n) {
+    const uint16_t* src = (const uint16_t*)src_v;
+    if (dt == sk::Dtype::BF16) {
+        std::memcpy(dst, src, n * 2);
+    } else if (dt == sk::Dtype::F16) {
+        for (size_t i = 0; i < n; ++i) {
+            uint32_t f = fp16_to_fp32_bits(src[i]);
+            dst[i] = fp32_bits_to_bf16(f);
+        }
+    } else {
+        // assume fp32 -> bf16
+        const uint32_t* s32 = (const uint32_t*)src_v;
+        for (size_t i = 0; i < n; ++i) dst[i] = fp32_bits_to_bf16(s32[i]);
     }
 }
 
@@ -77,11 +89,7 @@ bool copy_into(MTL::Buffer* dst, size_t dst_off, sk::WeightStore* store,
         return false;
     }
     char* out = (char*)dst->contents() + dst_off;
-    if (v->dtype == sk::Dtype::BF16) {
-        bf16_to_fp16((uint16_t*)out, (const uint16_t*)v->data, expect_elems);
-    } else {
-        std::memcpy(out, v->data, expect_bytes);
-    }
+    copy_bf16_from((uint16_t*)out, v->data, v->dtype, expect_elems);
     return true;
 }
 
@@ -97,15 +105,11 @@ bool copy_partial(MTL::Buffer* dst, size_t dst_off, sk::WeightStore* store,
         return false;
     }
     char* out = (char*)dst->contents() + dst_off;
-    if (v->dtype == sk::Dtype::BF16) {
-        bf16_to_fp16((uint16_t*)out, (const uint16_t*)v->data, expect_elems);
-    } else {
-        std::memcpy(out, v->data, expect_bytes);
-    }
+    copy_bf16_from((uint16_t*)out, v->data, v->dtype, expect_elems);
     return true;
 }
 
-bool copy_transpose_fp16(MTL::Buffer* dst, size_t dst_off, sk::WeightStore* store,
+bool copy_transpose_bf16(MTL::Buffer* dst, size_t dst_off, sk::WeightStore* store,
                          const std::string& name, size_t out_rows, size_t out_cols)
 {
     auto* v = store->get(name);
@@ -122,14 +126,25 @@ bool copy_transpose_fp16(MTL::Buffer* dst, size_t dst_off, sk::WeightStore* stor
         for (size_t j = 0; j < out_cols; ++j) {
             uint16_t s = src[j * out_rows + i];
             if (is_bf16) {
-                uint32_t f = ((uint32_t)s) << 16;
-                d[i * out_cols + j] = fp32_bits_to_fp16(f);
-            } else {
                 d[i * out_cols + j] = s;
+            } else {
+                uint32_t f = fp16_to_fp32_bits(s);
+                d[i * out_cols + j] = fp32_bits_to_bf16(f);
             }
         }
     }
     return true;
+}
+
+// bf16 -> fp32, multiply, bf16
+inline void scale_bf16_inplace(uint16_t* p, size_t n, float scale) {
+    for (size_t i = 0; i < n; ++i) {
+        uint32_t bits = bf16_to_fp32_bits(p[i]);
+        float f; std::memcpy(&f, &bits, 4);
+        f *= scale;
+        uint32_t out; std::memcpy(&out, &f, 4);
+        p[i] = fp32_bits_to_bf16(out);
+    }
 }
 
 }
@@ -157,30 +172,18 @@ extern "C" int sk_gemma4_load_from_store(sk_gemma4_handle* hp, sk::WeightStore* 
     if (!copy_into(h->weights.w_final_norm, 0, store,
                    "model.language_model.norm.weight", dm)) return -11;
 
+    // Embed scale: multiply embed table by sqrt(d_model) — in bf16.
     {
         const float embed_scale = std::sqrt((float)dm);
         uint16_t* eb = (uint16_t*)h->weights.w_embed->contents();
         const size_t n = (size_t)c.vocab_size * dm;
-        for (size_t i = 0; i < n; ++i) {
-            uint16_t h16 = eb[i];
-            uint32_t s = (uint32_t)(h16 >> 15) & 1;
-            uint32_t e = (uint32_t)(h16 >> 10) & 0x1F;
-            uint32_t m = (uint32_t)h16 & 0x3FF;
-            uint32_t bits;
-            if (e == 0)       bits = (s << 31);
-            else if (e == 31) bits = (s << 31) | (0xFFu << 23) | (m << 13);
-            else              bits = (s << 31) | ((e + 112u) << 23) | (m << 13);
-            float f; std::memcpy(&f, &bits, 4);
-            f *= embed_scale;
-            eb[i] = fp32_bits_to_fp16(*(uint32_t*)&f);
-        }
+        scale_bf16_inplace(eb, n, embed_scale);
     }
 
-    // per_layer_model_projection: (n_layers*ple_dim, d_model) HF stores as (out, in).
-    // We need it as (d_model, n_layers*ple_dim) for GEMM. Transpose.
+    // per_layer_model_projection: HF (out, in) → (d_model, n_layers*ple_dim).
     if (c.has_ple && h->weights.w_per_layer_model_projection) {
-        const size_t out_rows = (size_t)c.n_layers * c.ple_dim;  // 8960 for E2B
-        if (!copy_transpose_fp16(h->weights.w_per_layer_model_projection, 0, store,
+        const size_t out_rows = (size_t)c.n_layers * c.ple_dim;
+        if (!copy_transpose_bf16(h->weights.w_per_layer_model_projection, 0, store,
                                  "model.language_model.per_layer_model_projection.weight",
                                  out_rows, c.d_model)) {
             std::fprintf(stderr, "gemma4 weights: missing per_layer_model_projection\n");
@@ -201,25 +204,9 @@ extern "C" int sk_gemma4_load_from_store(sk_gemma4_handle* hp, sk::WeightStore* 
         } else {
             const size_t ple_elems = v->nbytes / 2;
             uint16_t* dst = (uint16_t*)h->weights.w_ple_table->contents();
-            if (v->dtype == sk::Dtype::BF16) {
-                bf16_to_fp16(dst, (const uint16_t*)v->data, ple_elems);
-            } else {
-                std::memcpy(dst, v->data, v->nbytes);
-            }
+            copy_bf16_from(dst, v->data, v->dtype, ple_elems);
             const float ple_scale = std::sqrt((float)c.ple_dim);
-            for (size_t i = 0; i < ple_elems; ++i) {
-                uint16_t h16 = dst[i];
-                uint32_t s = (uint32_t)(h16 >> 15) & 1;
-                uint32_t e = (uint32_t)(h16 >> 10) & 0x1F;
-                uint32_t m = (uint32_t)h16 & 0x3FF;
-                uint32_t bits;
-                if (e == 0)       bits = (s << 31);
-                else if (e == 31) bits = (s << 31) | (0xFFu << 23) | (m << 13);
-                else              bits = (s << 31) | ((e + 112u) << 23) | (m << 13);
-                float f; std::memcpy(&f, &bits, 4);
-                f *= ple_scale;
-                dst[i] = fp32_bits_to_fp16(*(uint32_t*)&f);
-            }
+            scale_bf16_inplace(dst, ple_elems, ple_scale);
         }
     }
 
@@ -259,14 +246,14 @@ extern "C" int sk_gemma4_load_from_store(sk_gemma4_handle* hp, sk::WeightStore* 
                               layer_key(L, "self_attn.k_norm.weight"), hd)) return -25;
         }
 
-        if (!copy_transpose_fp16(h->weights.w_out, o_off, store,
+        if (!copy_transpose_bf16(h->weights.w_out, o_off, store,
                                  layer_key(L, "self_attn.o_proj.weight"), Nq, dm)) return -26;
 
-        if (!copy_transpose_fp16(h->weights.w_gate, gate_off, store,
+        if (!copy_transpose_bf16(h->weights.w_gate, gate_off, store,
                                  layer_key(L, "mlp.gate_proj.weight"), dm, ni)) return -27;
-        if (!copy_transpose_fp16(h->weights.w_up,   gate_off, store,
+        if (!copy_transpose_bf16(h->weights.w_up,   gate_off, store,
                                  layer_key(L, "mlp.up_proj.weight"),   dm, ni)) return -28;
-        if (!copy_transpose_fp16(h->weights.w_down, down_off, store,
+        if (!copy_transpose_bf16(h->weights.w_down, down_off, store,
                                  layer_key(L, "mlp.down_proj.weight"), ni, dm)) return -29;
 
         auto* q_v = store->get(layer_key(L, "self_attn.q_proj.weight"));
@@ -287,10 +274,10 @@ extern "C" int sk_gemma4_load_from_store(sk_gemma4_handle* hp, sk::WeightStore* 
                 for (size_t j = 0; j < out_cols; ++j) {
                     uint16_t x = s[j * out_rows + i];
                     if (is_bf16) {
-                        uint32_t f = ((uint32_t)x) << 16;
-                        layer[i * qkvN + col_off + j] = fp32_bits_to_fp16(f);
-                    } else {
                         layer[i * qkvN + col_off + j] = x;
+                    } else {
+                        uint32_t f = fp16_to_fp32_bits(x);
+                        layer[i * qkvN + col_off + j] = fp32_bits_to_bf16(f);
                     }
                 }
             }
@@ -319,13 +306,13 @@ extern "C" int sk_gemma4_load_from_store(sk_gemma4_handle* hp, sk::WeightStore* 
             const size_t ple_dim = (size_t)c.ple_dim;
             if (h->weights.w_per_layer_input_gate) {
                 const size_t off = (size_t)L * ple_dim * dm * 2;
-                if (!copy_transpose_fp16(h->weights.w_per_layer_input_gate, off, store,
+                if (!copy_transpose_bf16(h->weights.w_per_layer_input_gate, off, store,
                                          layer_key(L, "per_layer_input_gate.weight"),
                                          ple_dim, dm)) return -40;
             }
             if (h->weights.w_per_layer_projection) {
                 const size_t off = (size_t)L * dm * ple_dim * 2;
-                if (!copy_transpose_fp16(h->weights.w_per_layer_projection, off, store,
+                if (!copy_transpose_bf16(h->weights.w_per_layer_projection, off, store,
                                          layer_key(L, "per_layer_projection.weight"),
                                          dm, ple_dim)) return -41;
             }
@@ -335,31 +322,22 @@ extern "C" int sk_gemma4_load_from_store(sk_gemma4_handle* hp, sk::WeightStore* 
                                layer_key(L, "post_per_layer_input_norm.weight"), dm)) return -42;
             }
             if (h->weights.w_layer_scalar) {
-                const char* nm_full = layer_key(L, "layer_scalar").c_str();
                 auto key = layer_key(L, "layer_scalar");
                 auto* v = store->get(key);
                 if (v) {
                     float scalar_f = 0.f;
                     if (v->dtype == sk::Dtype::BF16) {
-                        uint32_t bits = ((uint32_t)((const uint16_t*)v->data)[0]) << 16;
+                        uint32_t bits = bf16_to_fp32_bits(((const uint16_t*)v->data)[0]);
                         std::memcpy(&scalar_f, &bits, 4);
                     } else if (v->dtype == sk::Dtype::F16) {
-                        uint16_t h16 = ((const uint16_t*)v->data)[0];
-                        uint32_t s = (uint32_t)(h16 >> 15) & 1;
-                        uint32_t e = (uint32_t)(h16 >> 10) & 0x1F;
-                        uint32_t m = (uint32_t)h16 & 0x3FF;
-                        uint32_t out;
-                        if (e == 0)       out = (s << 31);
-                        else if (e == 31) out = (s << 31) | (0xFFu << 23) | (m << 13);
-                        else              out = (s << 31) | ((e + 112u) << 23) | (m << 13);
-                        std::memcpy(&scalar_f, &out, 4);
+                        uint32_t bits = fp16_to_fp32_bits(((const uint16_t*)v->data)[0]);
+                        std::memcpy(&scalar_f, &bits, 4);
                     } else {
                         std::memcpy(&scalar_f, v->data, 4);
                     }
                     float* dst = (float*)h->weights.w_layer_scalar->contents();
                     dst[L] = scalar_f;
                 } else {
-                    (void)nm_full;
                     float* dst = (float*)h->weights.w_layer_scalar->contents();
                     dst[L] = 1.0f;
                 }

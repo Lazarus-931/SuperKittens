@@ -129,7 +129,16 @@ def _bake_rope(cache_max: int, head_dim: int, theta: float):
     inv_freq = 1.0 / (theta ** (np.arange(0, half, dtype=np.float64) / half))
     pos = np.arange(cache_max, dtype=np.float64)
     angles = np.outer(pos, inv_freq)
-    return np.cos(angles).astype(np.float16), np.sin(angles).astype(np.float16)
+    # Return bf16 (uint16 with top half of fp32 word).
+    def to_bf16(arr_f32):
+        u32 = arr_f32.astype(np.float32).view(np.uint32)
+        # Round-to-nearest-even: bias by 0x7fff + (LSB of result).
+        rb = 0x00007fff + ((u32 >> 16) & 1)
+        out = ((u32 + rb) >> 16).astype(np.uint16)
+        return out
+    c = to_bf16(np.cos(angles))
+    s = to_bf16(np.sin(angles))
+    return c, s
 
 
 def _preset(name: str) -> Gemma4Config:
@@ -243,24 +252,28 @@ class Gemma4:
         """Pull a per-layer/post-norm/logits activation from the SK dump stash
         for the most recent forward(). Requires set_dump_enabled(True)."""
         if name == "logits":
-            out = np.empty((self.cfg.vocab_size,), dtype=np.float16)
+            out = np.empty((self.cfg.vocab_size,), dtype=np.uint16)
         elif name in ("L0.q_normed", "L0.q_rope", "L0.attn_pre"):
-            out = np.empty((self.cfg.n_heads * self.cfg.head_dim_local,), dtype=np.float16)
+            out = np.empty((self.cfg.n_heads * self.cfg.head_dim_local,), dtype=np.uint16)
         elif name in ("L0.k_normed", "L0.k_rope"):
-            out = np.empty((self.cfg.n_kv_heads_local * self.cfg.head_dim_local,), dtype=np.float16)
+            out = np.empty((self.cfg.n_kv_heads_local * self.cfg.head_dim_local,), dtype=np.uint16)
         else:
-            out = np.empty((self.cfg.d_model,), dtype=np.float16)
+            out = np.empty((self.cfg.d_model,), dtype=np.uint16)
         rc = _load().sk_gemma4_dump_layer(self._h, name.encode(), out.ctypes.data)
         if rc:
             raise RuntimeError(f"sk_gemma4_dump_layer({name!r}) failed: {rc}")
-        return out
+        # Interpret as bf16 -> fp32 -> fp16 for downstream consumers.
+        u32 = out.astype(np.uint32) << 16
+        f32 = u32.view(np.float32)
+        return f32.astype(np.float16)
 
     def last_logits(self) -> np.ndarray:
-        out = np.empty((self.cfg.vocab_size,), dtype=np.float16)
+        out = np.empty((self.cfg.vocab_size,), dtype=np.uint16)
         rc = _load().sk_gemma4_get_last_logits(self._h, out.ctypes.data)
         if rc:
             raise RuntimeError(f"sk_gemma4_get_last_logits failed: {rc}")
-        return out
+        u32 = out.astype(np.uint32) << 16
+        return u32.view(np.float32).astype(np.float16)
 
     def _sample(self, logits: np.ndarray, temperature: float, top_p: float,
                 top_k: int | None, rng: np.random.Generator) -> int:
@@ -348,10 +361,11 @@ class Gemma4:
             raise RuntimeError(f"sk_gemma4_set_ple_input failed: {rc}")
 
     def set_rope_tables(self, cos_local, sin_local, cos_global, sin_global):
-        cl = np.ascontiguousarray(cos_local, dtype=np.float16)
-        sl = np.ascontiguousarray(sin_local, dtype=np.float16)
-        cg = np.ascontiguousarray(cos_global, dtype=np.float16)
-        sg = np.ascontiguousarray(sin_global, dtype=np.float16)
+        # Now uint16 bf16 bytes from _bake_rope.
+        cl = np.ascontiguousarray(cos_local, dtype=np.uint16)
+        sl = np.ascontiguousarray(sin_local, dtype=np.uint16)
+        cg = np.ascontiguousarray(cos_global, dtype=np.uint16)
+        sg = np.ascontiguousarray(sin_global, dtype=np.uint16)
         self._rope_keep = (cl, sl, cg, sg)
         rc = _load().sk_gemma4_set_rope_tables(
             self._h, cl.ctypes.data, sl.ctypes.data, cg.ctypes.data, sg.ctypes.data)

@@ -12,10 +12,10 @@ namespace meow::gemma4::prope {
 [[host_name("gemma4_prope_qk")]]
 [[kernel, max_total_threads_per_threadgroup(128)]]
 void gemma4_prope_qk(
-    device half* Q          [[buffer(0)]],
-    device half* K          [[buffer(1)]],
-    device const half* cos  [[buffer(2)]],
-    device const half* sin  [[buffer(3)]],
+    device bfloat* Q          [[buffer(0)]],
+    device bfloat* K          [[buffer(1)]],
+    device const bfloat* cos  [[buffer(2)]],
+    device const bfloat* sin  [[buffer(3)]],
     constant uint& seq      [[buffer(4)]],
     constant uint& head_dim [[buffer(5)]],
     constant uint& n_heads  [[buffer(6)]],
@@ -52,15 +52,15 @@ void gemma4_prope_qk(
         {
             float qlo = (float)Q[base + p];
             float qhi = (float)Q[base + p + hd_half];
-            Q[base + p]            = half(qlo * c - qhi * s);
-            Q[base + p + hd_half]  = half(qlo * s + qhi * c);
+            Q[base + p]            = bfloat(qlo * c - qhi * s);
+            Q[base + p + hd_half]  = bfloat(qlo * s + qhi * c);
         }
         // K
         {
             float klo = (float)K[base + p];
             float khi = (float)K[base + p + hd_half];
-            K[base + p]            = half(klo * c - khi * s);
-            K[base + p + hd_half]  = half(klo * s + khi * c);
+            K[base + p]            = bfloat(klo * c - khi * s);
+            K[base + p + hd_half]  = bfloat(klo * s + khi * c);
         }
     }
     // Pairs in [p_pairs, hd_half) are deliberately untouched.

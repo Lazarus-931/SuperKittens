@@ -30,12 +30,12 @@ inline float tg_sum_sq(threadgroup float* scratch, float x, uint tid, uint head_
 [[host_name("gemma4_qkv_norm")]]
 [[kernel]]
 void gemma4_qkv_norm(
-    device const half* qkv          [[buffer(0)]],
-    device const half* gamma_q      [[buffer(1)]],
-    device const half* gamma_k      [[buffer(2)]],
-    device       half* q_out        [[buffer(3)]],
-    device       half* k_out        [[buffer(4)]],
-    device       half* v_out        [[buffer(5)]],
+    device const bfloat* qkv          [[buffer(0)]],
+    device const bfloat* gamma_q      [[buffer(1)]],
+    device const bfloat* gamma_k      [[buffer(2)]],
+    device       bfloat* q_out        [[buffer(3)]],
+    device       bfloat* k_out        [[buffer(4)]],
+    device       bfloat* v_out        [[buffer(5)]],
     constant uint& T                [[buffer(6)]],
     constant uint& n_heads          [[buffer(7)]],
     constant uint& n_kv_heads       [[buffer(8)]],
@@ -86,15 +86,15 @@ void gemma4_qkv_norm(
     if (slot < q_end) {
         const uint head = slot;
         size_t out_off = ((size_t)head * T + t) * head_dim + tid;
-        q_out[out_off] = half(y);
+        q_out[out_off] = bfloat(y);
     } else if (slot < k_end) {
         const uint head = slot - q_end;
         size_t out_off = ((size_t)head * T + t) * head_dim + tid;
-        k_out[out_off] = half(y);
+        k_out[out_off] = bfloat(y);
     } else {
         const uint head = slot - k_end;
         size_t out_off = ((size_t)head * T + t) * head_dim + tid;
-        v_out[out_off] = half(y);
+        v_out[out_off] = bfloat(y);
     }
 }
 
