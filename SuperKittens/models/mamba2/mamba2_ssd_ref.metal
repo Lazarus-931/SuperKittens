@@ -92,7 +92,7 @@ void mamba2_ssd_ref(
             // softplus
             float dt;
             if (dtr > 20.0f) dt = dtr;
-            else dt = log1p(exp(dtr));
+            else dt = log(1.0f + exp(dtr));
             dt = clamp(dt, dt_min, dt_max);
             dt_t = dt;
             dA_t = exp(dt * A);

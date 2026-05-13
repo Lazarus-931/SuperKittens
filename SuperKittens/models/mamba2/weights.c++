@@ -130,11 +130,13 @@ bool copy_conv1d(MTL::Buffer* dst, size_t dst_off, sk::WeightStore* store,
     const uint16_t* src = (const uint16_t*)v->data;
     uint16_t* d = (uint16_t*)((char*)dst->contents() + dst_off);
     const bool is_bf16 = (v->dtype == sk::Dtype::BF16);
-    // src laid out as (C_in, K); want (K, C_in)
+    // src laid out as (C_in, K); kernel expects (C_in, K) too — pass through.
+    // (Earlier the code transposed to (K, C_in), but conv1d_silu reads
+    // weight[c*K + k] which is the (C_in, K) channel-major form.)
     for (size_t c = 0; c < C_in; ++c) {
         for (size_t k = 0; k < K; ++k) {
             uint16_t s = src[c * K + k];
-            d[k * C_in + c] = is_bf16 ? bf16_to_fp16(s) : s;
+            d[c * K + k] = is_bf16 ? bf16_to_fp16(s) : s;
         }
     }
     return true;

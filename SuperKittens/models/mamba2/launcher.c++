@@ -35,8 +35,11 @@ static bool resolve_psos(ModelPSOs& P) {
     P.layer.gemm         = sk::bindings_pso("gemm_fp16");
     P.layer.split_packed = sk::bindings_pso("split_packed");
     P.layer.conv1d_silu  = sk::bindings_pso("conv1d_silu");
-    P.layer.mamba2_ssd   = sk::bindings_pso("mamba2_ssd");
-    P.layer.mamba2_step  = sk::bindings_pso("mamba2_step");
+    // Prefer the reference (HF-signature-correct) kernels; fall back to legacy.
+    P.layer.mamba2_ssd   = sk::bindings_pso("mamba2_ssd_ref");
+    if (!P.layer.mamba2_ssd) P.layer.mamba2_ssd = sk::bindings_pso("mamba2_ssd");
+    P.layer.mamba2_step  = sk::bindings_pso("mamba2_step_ref");
+    if (!P.layer.mamba2_step) P.layer.mamba2_step = sk::bindings_pso("mamba2_step");
     P.layer.gate_norm    = sk::bindings_pso("gate_norm");
     P.layer.add          = sk::bindings_pso("add_f16");
     P.embedding_lookup   = sk::bindings_pso("embedding_lookup");
@@ -98,8 +101,9 @@ extern "C" sk_mamba2_handle* sk_mamba2_create(const sk_mamba2_config* cfg) {
     for (uint32_t L = 0; L < cfg->n_layers; ++L) {
         h->layer_states[L].conv_state = alloc_zero(dev,
             (size_t)cfg->batch * (K - 1) * C_in * fp16);
+        // SSM state is fp32 (kernel signature: device float*).
         h->layer_states[L].ssm_state = alloc_zero(dev,
-            (size_t)cfg->batch * H * P * N * fp16);
+            (size_t)cfg->batch * H * P * N * sizeof(float));
     }
     h->bufs.layer_states = h->layer_states.data();
 
@@ -134,18 +138,127 @@ extern "C" void sk_mamba2_reset(sk_mamba2_handle* hp) {
 extern "C" int sk_mamba2_forward(sk_mamba2_handle* hp,
                                  const int* input_ids, uint32_t seq, int* output_id) {
     if (!hp || !input_ids || !output_id || seq == 0) return -1;
-    // TODO: dispatch embed -> per-layer{pre_norm, in_proj, split, conv1d_silu,
-    //   ssd or step, gate_norm, out_proj, residual} -> final_norm -> argmax.
-    // Blocked on mamba2_ssd/mamba2_step kernel rewrite (HF signature) — see STATUS.md.
-    (void)input_ids; (void)seq; (void)output_id;
-    std::fprintf(stderr, "sk_mamba2_forward: not yet implemented (SSD kernel pending)\n");
-    return -38;  // ENOSYS-ish
+    auto* h = reinterpret_cast<meow::mamba2::Handle*>(hp);
+    if (seq > h->cfg.seq_max) return -2;
+
+    auto* q = sk::bindings_queue();
+    if (!q) return -3;
+
+    // Copy token ids into device buffer.
+    std::memcpy(h->bufs.tok_ids->contents(), input_ids,
+                (size_t)h->cfg.batch * seq * sizeof(int32_t));
+
+    meow::mamba2::ModelParams mp;
+    mp.batch        = h->cfg.batch;
+    mp.seq          = seq;
+    mp.n_layers     = h->cfg.n_layers;
+    mp.d_model      = h->cfg.d_model;
+    mp.intermediate = h->cfg.intermediate;
+    mp.n_heads      = h->cfg.n_heads;
+    mp.head_dim     = h->cfg.head_dim;
+    mp.state_size   = h->cfg.state_size;
+    mp.n_groups     = h->cfg.n_groups;
+    mp.conv_kernel  = h->cfg.conv_kernel;
+    mp.chunk_size   = h->cfg.chunk_size;
+    mp.vocab_size   = h->cfg.vocab_size;
+    mp.eps          = h->cfg.rms_eps;
+    mp.dt_min       = h->cfg.time_step_min;
+    mp.dt_max       = h->cfg.time_step_max;
+
+    // Use a single shared device buffer for output_id (1 int32).
+    static MTL::Buffer* s_out_id = nullptr;
+    if (!s_out_id) {
+        auto* dev = sk::bindings_device();
+        s_out_id = dev->newBuffer(sizeof(int32_t), MTL::ResourceStorageModeShared);
+    }
+    std::memset(s_out_id->contents(), 0, sizeof(int32_t));
+
+    auto* cmd = q->commandBuffer();
+    meow::mamba2::dispatch_model(cmd, h->psos, h->weights, h->bufs,
+                                 h->layer_states.data(), mp, s_out_id);
+    cmd->commit();
+    cmd->waitUntilCompleted();
+    cmd->release();
+
+    h->current_pos += seq;
+    int32_t v;
+    std::memcpy(&v, s_out_id->contents(), sizeof(int32_t));
+    *output_id = (int)v;
+    return 0;
 }
 
+extern "C" int sk_mamba2_get_last_logits(sk_mamba2_handle* hp, void* out_fp16) {
+    if (!hp || !out_fp16) return -1;
+    auto* h = reinterpret_cast<meow::mamba2::Handle*>(hp);
+    const size_t V = h->cfg.vocab_size;
+    // The last forward dispatched argmax on row (T-1). We need to know T.
+    // We don't track T across calls explicitly; in single-prompt usage T is
+    // the most recent seq. Conservatively the caller should know — they pass
+    // out_fp16 sized V*2 and we copy from offset (current_pos - 1) * V * 2.
+    if (h->current_pos == 0) return -2;
+    const size_t row = (size_t)(h->current_pos - 1);
+    const char* src = (const char*)h->bufs.logits->contents() + row * V * 2;
+    std::memcpy(out_fp16, src, V * 2);
+    return 0;
+}
+
+// Dump a named intermediate tensor for HF parity testing. Tags supported
+// (only the LAST forward()'s scratch buffers — for prefill of full prompt
+// this is what HF dumps with use_cache=False):
+//   "embed"          → (T, D) fp16  from B.x  (overwritten by layer 0)
+//   "x"              → (T, D) fp16  current residual
+//   "x_norm"         → (T, D) fp16  pre_norm of last layer, or final_norm
+//   "in_proj_out"    → (T, IN_OUT) fp16
+//   "z"              → (T, E) fp16
+//   "xBC"            → (T, C_in) fp16
+//   "dt_raw"         → (T, H) fp16
+//   "xBC_post"       → (T, C_in) fp16  (after conv1d+silu)
+//   "ssd_out"        → (T, E) fp16
+//   "gated"          → (T, E) fp16  (norm_gated)
+//   "out_proj_out"   → (T, D) fp16
+//   "logits"         → (T, V) fp16
+// State (cumulative, current values):
+//   "ssm_state.L{i}" → (B, H, P, N) fp32
+//   "conv_state.L{i}"→ (B, K-1, C_in) fp16
 extern "C" int sk_mamba2_dump_layer(sk_mamba2_handle* hp, const char* tag,
                                     void* out, size_t out_bytes) {
-    (void)hp; (void)tag; (void)out; (void)out_bytes;
-    return -38;
+    if (!hp || !tag || !out) return -1;
+    auto* h = reinterpret_cast<meow::mamba2::Handle*>(hp);
+    auto* b = &h->bufs;
+    auto cp = [&](MTL::Buffer* src) {
+        if (!src) return -10;
+        size_t n = std::min(out_bytes, (size_t)src->length());
+        std::memcpy(out, src->contents(), n);
+        return 0;
+    };
+    std::string t(tag);
+    if (t == "embed" || t == "x")        return cp(b->x);
+    if (t == "x_norm")                   return cp(b->x_norm);
+    if (t == "in_proj_out")              return cp(b->in_proj_out);
+    if (t == "z")                        return cp(b->z);
+    if (t == "xBC")                      return cp(b->xBC);
+    if (t == "dt_raw")                   return cp(b->dt_raw);
+    if (t == "xBC_post")                 return cp(b->xBC_post);
+    if (t == "ssd_out")                  return cp(b->ssd_out);
+    if (t == "gated")                    return cp(b->gated);
+    if (t == "out_proj_out")             return cp(b->out_proj_out);
+    if (t == "logits")                   return cp(b->logits);
+
+    auto parse_layer = [&](const char* prefix) -> int {
+        size_t plen = std::strlen(prefix);
+        if (t.size() <= plen) return -1;
+        if (std::strncmp(t.c_str(), prefix, plen) != 0) return -1;
+        return std::atoi(t.c_str() + plen);
+    };
+    int L = parse_layer("ssm_state.L");
+    if (L >= 0 && L < (int)h->layer_states.size())
+        return cp(h->layer_states[L].ssm_state);
+    L = parse_layer("conv_state.L");
+    if (L >= 0 && L < (int)h->layer_states.size())
+        return cp(h->layer_states[L].conv_state);
+
+    std::fprintf(stderr, "sk_mamba2_dump_layer: unknown tag '%s'\n", tag);
+    return -39;
 }
 
 extern "C" void sk_mamba2_destroy(sk_mamba2_handle* hp) {

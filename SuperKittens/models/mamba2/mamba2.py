@@ -97,6 +97,12 @@ class Mamba2Model:
         self._lib.sk_mamba2_forward.restype = ctypes.c_int
         self._lib.sk_mamba2_reset.argtypes = [ctypes.c_void_p]
         self._lib.sk_mamba2_destroy.argtypes = [ctypes.c_void_p]
+        self._lib.sk_mamba2_dump_layer.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t,
+        ]
+        self._lib.sk_mamba2_dump_layer.restype = ctypes.c_int
+        self._lib.sk_mamba2_get_last_logits.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        self._lib.sk_mamba2_get_last_logits.restype = ctypes.c_int
 
         c_cfg = _CConfig(
             cfg.batch, cfg.seq_max, cfg.n_layers, cfg.d_model, cfg.intermediate,
@@ -118,10 +124,50 @@ class Mamba2Model:
         out = ctypes.c_int(0)
         rc = self._lib.sk_mamba2_forward(self._h, ids, len(input_ids), ctypes.byref(out))
         if rc != 0:
-            raise NotImplementedError(
-                f"sk_mamba2_forward rc={rc} (SSD kernel rewrite pending — see STATUS.md)"
-            )
+            raise RuntimeError(f"sk_mamba2_forward rc={rc}")
         return out.value
+
+    def dump(self, tag: str):
+        """Return numpy fp16/fp32 array (best-effort sized to known buffer)."""
+        import numpy as np
+        # Size lookup table for known tags.
+        c = self.cfg
+        T = c.batch * c.seq_max
+        sizes = {
+            "embed":         (T * c.d_model, np.float16),
+            "x":             (T * c.d_model, np.float16),
+            "x_norm":        (T * c.d_model, np.float16),
+            "in_proj_out":   (T * (2 * c.intermediate + 2 * c.n_groups * c.state_size + c.n_heads), np.float16),
+            "z":             (T * c.intermediate, np.float16),
+            "xBC":           (T * (c.intermediate + 2 * c.n_groups * c.state_size), np.float16),
+            "dt_raw":        (T * c.n_heads, np.float16),
+            "xBC_post":      (T * (c.intermediate + 2 * c.n_groups * c.state_size), np.float16),
+            "ssd_out":       (T * c.intermediate, np.float16),
+            "gated":         (T * c.intermediate, np.float16),
+            "out_proj_out":  (T * c.d_model, np.float16),
+            "logits":        (T * c.vocab_size, np.float16),
+        }
+        if tag.startswith("ssm_state."):
+            n = c.batch * c.n_heads * c.head_dim * c.state_size
+            arr = np.zeros(n, dtype=np.float32)
+        elif tag.startswith("conv_state."):
+            n = c.batch * (c.conv_kernel - 1) * (c.intermediate + 2 * c.n_groups * c.state_size)
+            arr = np.zeros(n, dtype=np.float16)
+        else:
+            n, dt = sizes[tag]
+            arr = np.zeros(n, dtype=dt)
+        rc = self._lib.sk_mamba2_dump_layer(self._h, tag.encode(), arr.ctypes.data, arr.nbytes)
+        if rc != 0:
+            raise RuntimeError(f"sk_mamba2_dump_layer({tag!r}) rc={rc}")
+        return arr
+
+    def get_last_logits(self):
+        import numpy as np
+        v = np.zeros(self.cfg.vocab_size, dtype=np.float16)
+        rc = self._lib.sk_mamba2_get_last_logits(self._h, v.ctypes.data)
+        if rc != 0:
+            raise RuntimeError(f"sk_mamba2_get_last_logits rc={rc}")
+        return v
 
     def reset(self) -> None:
         self._lib.sk_mamba2_reset(self._h)

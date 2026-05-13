@@ -65,7 +65,7 @@ void mamba2_step_ref(
 
     if (n == 0) {
         float dtr = (float)dt_raw[(size_t)b * H + h] + (float)dt_bias[h];
-        float dt  = (dtr > 20.0f) ? dtr : log1p(exp(dtr));
+        float dt  = (dtr > 20.0f) ? dtr : log(1.0f + exp(dtr));
         dt   = clamp(dt, dt_min, dt_max);
         dt_t = dt;
         dA_t = exp(dt * (-exp((float)A_log[h])));

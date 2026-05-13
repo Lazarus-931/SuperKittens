@@ -74,6 +74,8 @@ int  sk_mamba2_forward(sk_mamba2_handle* h,
 // hf_ref.npz keys: "embed", "L{i}.{mixer_in,xBC_preconv,dt_pre,mixer_out,hidden}", "logits".
 int  sk_mamba2_dump_layer(sk_mamba2_handle* h, const char* tag,
                           void* out, size_t out_bytes);
+// Last-row logits (vocab_size fp16 elements) from the most recent forward().
+int  sk_mamba2_get_last_logits(sk_mamba2_handle* h, void* out_fp16);
 void sk_mamba2_reset(sk_mamba2_handle* h);
 void sk_mamba2_destroy(sk_mamba2_handle* h);
 
