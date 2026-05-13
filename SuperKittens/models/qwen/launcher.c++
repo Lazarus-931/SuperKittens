@@ -23,6 +23,7 @@ struct Handle {
 
     uint32_t layers_run     = 0;
     int32_t  capture_layer  = -1;
+    uint32_t last_seq       = 0;  // seq used at most recent forward (for get_capture sizing)
 };
 
 static MTL::Buffer* alloc_zero(MTL::Device* dev, size_t bytes) {
@@ -143,7 +144,10 @@ extern "C" int sk_qwen_set_capture_layer(sk_qwen_handle* hp, int32_t layer) {
 extern "C" int sk_qwen_get_capture(sk_qwen_handle* hp, void* out_fp16) {
     if (!hp || !out_fp16) return -1;
     auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
-    std::memcpy(out_fp16, h->bufs.capture->contents(), h->bufs.capture->length());
+    // Copy only the captured slice (last_seq * d_model fp16), not the whole T_max buffer.
+    const size_t bytes = (size_t)h->last_seq * h->cfg.d_model * 2;
+    if (bytes == 0) return -2;
+    std::memcpy(out_fp16, h->bufs.capture->contents(), bytes);
     return 0;
 }
 
@@ -212,6 +216,7 @@ extern "C" int sk_qwen_forward(sk_qwen_handle* hp,
     mp.rope_beta_slow  = h->cfg.rope_beta_slow;
     mp.layers_run      = h->layers_run;
     mp.capture_layer   = h->capture_layer;
+    h->last_seq        = seq;
 
     auto* cmd = q->commandBuffer();
     meow::qwen::dispatch_model(cmd, h->psos, h->weights, h->bufs, mp);
