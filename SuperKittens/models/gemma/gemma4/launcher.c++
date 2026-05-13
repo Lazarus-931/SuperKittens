@@ -39,6 +39,11 @@ static MTL::Buffer* alloc_zero(MTL::Device* dev, size_t bytes) {
 static bool resolve_psos(ModelPSOs& P) {
     P.layer.rmsnorm        = sk::bindings_pso("gemma4_rmsnorm_bf16");
     P.layer.gemm           = sk::bindings_pso("gemma4_gemm_bf16");
+    // M=1 decode fast-paths. nullptr-tolerant in encode_gemm_bf16(); if a
+    // kernel fails to compile we fall back to the tile GEMM. Logged below.
+    P.layer.gemv_m1          = sk::bindings_pso("gemma4_gemv_bf16_m1");
+    P.layer.gemv_t_m1        = sk::bindings_pso("gemma4_gemv_t_bf16_m1");
+    P.layer.gemv_m1_fp32_out = sk::bindings_pso("gemma4_gemv_bf16_fp32_m1");
     P.layer.qkv_norm       = sk::bindings_pso("gemma4_qkv_norm");
     P.layer.rope           = sk::bindings_pso("gemma4_rope_qk_bf16");
     P.layer.prope          = sk::bindings_pso("gemma4_prope_qk");
