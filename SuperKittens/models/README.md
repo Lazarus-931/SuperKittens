@@ -1,56 +1,33 @@
-# Model Support
+# Models
 
-X = inference script exists, runs end-to-end on SuperKittens.
-* = planned / in-progress.
+Per-family directories under `SuperKittens/models/<family>/`. Each family follows the same layout:
 
-Training column tracks whether backward pass + optimizer kernels are available.
+```
+<family>/
+  SPEC.md            # architecture + SK port notes (required)
+  <family>_model.h   # Metal-side dispatch orchestrator
+  launcher.{h,c++}   # C ABI: create / load / forward / destroy
+  weights.{h,c++}    # HF tensor-name → fused-buffer mapping
+  <family>.py        # ctypes wrapper, inherits inference.generation.Model
+  __init__.py        # calls SuperKittens.register(spec, Class)
+  *.metal            # family-specific kernels (shared kernels live in kernels/)
+```
 
-## Language Models
+See `dev_env.md` "Adding a new model" for the full template.
 
-| Model | Params | Attention | Norm | FFN Act | Inference | Training |
-|---|---|---|---|---|---|---|
-| LLaMA 3.2 1B | 1.2B | GQA d=64 (FA) | RMSNorm | SwiGLU | * | * |
-| LLaMA 3.2 3B | 3.2B | GQA d=128 (MHA) | RMSNorm | SwiGLU | * | * |
-| Qwen2.5 0.5B | 0.5B | GQA d=64 (FA) | RMSNorm | SwiGLU | * | * |
-| Qwen2.5 1.5B | 1.5B | GQA d=128 (MHA) | RMSNorm | SwiGLU | * | * |
-| Gemma 2B | 2.0B | MHA d=256 | RMSNorm | GeGLU | * | * |
-| SmolLM2 135M | 135M | MHA d=64 (FA) | RMSNorm | SwiGLU | * | * |
-| SmolLM2 360M | 360M | MHA d=64 (FA) | RMSNorm | SwiGLU | * | * |
-| SmolLM2 1.7B | 1.7B | GQA d=128 (MHA) | RMSNorm | SwiGLU | * | * |
-| TinyLlama 1.1B | 1.1B | MHA d=64 (FA) | RMSNorm | SwiGLU | * | * |
-| Phi-3 mini | 3.8B | MHA d=128 (MHA) | RMSNorm | SwiGLU | * | * |
+## Inference status
 
-## State Space Models
+| Family | Spec covered | Argmax vs HF | Decode tok/s | llama.cpp baseline |
+|---|---|---|---|---|
+| Qwen 3 | 0.6B, 1.7B, 8B, 32B | 0.6B: yes | 71.0 (lexie M4) | 118.8 Q8_0 |
+| Gemma 4 | E2B, E4B, 26B, 31B | E2B: yes | 0.10 (derek M4) | 54.9 |
+| Mamba 2 | 130m | yes | 90 (lexie M4) | 14.5 HF fp32 |
+| Mamba 3 | scaffold | — | — | — |
+| Mamba 1 | scaffold | — | — | — |
+| DeepSeek V3 | spec | — | — | — |
 
-| Model | Params | SSM | Norm | Conv | Inference | Training |
-|---|---|---|---|---|---|---|
-| Mamba-130M | 130M | mamba2_ssd | RMSNorm | Conv1d | * | * |
-| Mamba-370M | 370M | mamba2_ssd | RMSNorm | Conv1d | * | * |
-| Mamba-790M | 790M | mamba2_ssd | RMSNorm | Conv1d | * | * |
-| Mamba3-130M | 130M | mamba3_ssm | RMSNorm | Conv1d | * | * |
-| Mamba3-370M | 370M | mamba3_ssm | RMSNorm | Conv1d | * | * |
+Specs that exist but lack working end-to-end inference are marked `scaffold` / `spec`.
 
-## Kernel Coverage Required
+## Shared kernels
 
-| Kernel | Inference | Training | Status |
-|---|---|---|---|
-| GEMM fp16 | X | X | done |
-| FA d=64 | X | | done |
-| MHA d=128 | X | | done |
-| MHA d=256 (generic) | X | | fallback path works |
-| RoPE | X | X | done |
-| RMSNorm | X | X | done |
-| RMSNorm + residual | X | | done (fusion/) |
-| SiLU / SwiGLU gate | X | X | done |
-| GELU / GeGLU gate | X | X | done |
-| Causal Conv1d | X | | kernel exists, unverified |
-| mamba2_ssd | X | | done |
-| mamba3_ssm | X | | done |
-| mamba3_pre_ssm (norm+rotary) | X | | done |
-| mamba3_post_ssm (gate) | X | | done |
-| GEMM backward (dA/dB) | | X | not started |
-| Gradient reduction | | X | not started |
-| AdamW optimizer | | X | not started |
-| Cross-entropy loss | X | X | not started |
-| FP8 GEMM | X | X | M5 only, not started |
-| bfloat MMA | X | X | M2+, not started |
+Anything reusable across families lives in `SuperKittens/kernels/` (gemm, attention, rope, rmsnorm, fusion, ops, …). Per-family directories should only hold kernels that are family-specific (e.g. `gemma4_ple_inject.metal`, `mamba2_ssd.metal`).
