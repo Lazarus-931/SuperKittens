@@ -1,133 +1,116 @@
-# SuperKittens — dev environment
+# Contributing to SuperKittens
 
-Working notes for contributors / agents. Anything that's "how do I get the project running on a fresh Mac mini" lives here.
+SuperKittens is a Metal kernel library for transformer (and SSM) inference on Apple Silicon. This document covers how to bring up a dev environment, the repository layout, conventions, and how to contribute a new model or kernel.
 
-## Hardware in the tailnet (validation hosts)
+## Prerequisites
 
-| Host (tailnet) | IP | User | Chip | RAM | Owner | Notes |
-|---|---|---|---|---|---|---|
-| `dereks-mac-mini` | 100.64.169.42 | `derek` | Apple M4 | 16 GB | GrowlyX | Primary Gemma 4 validation host. SSH authorized. |
-| `amelias-mac-mini` | 100.102.119.75 | TBD | (verify) | (verify) | GrowlyX | Available for benchmarking. |
-| `github-lexies-mac-mini` | 100.77.36.51 | TBD | M4 (16 GB earlier session) | 16 GB | tagged-devices | Mamba 2 inference host. |
-| `alazars-macbook-air` | 100.84.102.71 | `alazarmanakelew` | (laptop) | (laptop) | — | Dev box. Source of all rsync. |
+- **Apple Silicon Mac** (M1/M2/M3/M4). x86 not supported.
+- **macOS 14+** with **full Xcode** installed (not just Command Line Tools — `metallib` ships only with the full app). Activate the toolchain:
+  ```bash
+  sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+  sudo xcodebuild -license accept
+  ```
+- **Homebrew** and **Python 3.12+** (Homebrew Python is fine; venv strongly recommended).
 
-SSH pattern: `ssh <user>@<ip>`. If user is unknown try `derek`, `lexie`, `amelia`, or fall back to `whoami` from the laptop login.
+If unsure, run `./setup.sh` — it verifies the toolchain, installs the Python deps in a venv, and builds the library.
 
-## Repo layout
-
-```
-SuperKittens/                       # repo root (this folder)
-├── build.sh                        # compile .metal → .metallib, .c++ → .dylib
-├── setup.sh                        # one-shot: chip detect, brew, venv, deps, build
-├── download.sh                     # unified model downloader (registry)
-├── dev_env.md                      # this file
-├── SuperKittens/                   # python package + C++ sources
-│   ├── __init__.py                 # exposes sk.load / sk.register / sk.Model
-│   ├── api.py                      # MODEL_REGISTRY + load()
-│   ├── inference/                  # WeightStore, generation loop
-│   ├── kernels/                    # shared Metal kernels (fp16 path; Qwen/DS reuse)
-│   ├── models/                     # per-family code
-│   │   ├── load/                   # gguf, safetensor, tokenizer
-│   │   ├── gemma/gemma4/           # Gemma 4 (bf16 native)
-│   │   ├── qwen/                   # Qwen3 (fp16)
-│   │   ├── deepseek/               # DeepSeek V3/V4 Flash (mixed precision)
-│   │   ├── mamba2/                 # Mamba 2 SSD
-│   │   └── mamba3/                 # Mamba 3
-│   ├── model_weights/              # downloaded weights (gitignored)
-│   └── temp/                       # agent scratch / experiments (gitignored)
-└── metal-cpp/                      # vendored Apple metal-cpp headers
-```
-
-## Local first-time setup (your laptop)
+## First-time setup
 
 ```bash
 git clone https://github.com/Lazarus-931/SuperKittens.git
 cd SuperKittens
 ./setup.sh
+source .venv/bin/activate
+./download.sh --list             # see supported models
+./download.sh gemma4-e2b          # pull weights into SuperKittens/model_weights/
 ```
 
-`setup.sh` will:
-1. Verify Apple Silicon
-2. Verify `xcrun metal` + `xcrun metallib` (needs full Xcode — Command Line Tools are NOT enough)
-3. Install Homebrew if missing
-4. Install `python@3.12` + `expat` (workaround for known brew pyexpat ABI mismatch)
-5. Create `.venv/` and install `huggingface_hub[cli] numpy sentencepiece tokenizers`
-6. Run `./build.sh` → produces `build/libsk.dylib`, `build/libsk.metallib`
-
-Common gotchas:
-- `xcrun metallib` not found → Xcode not installed (CLT alone insufficient). Install Xcode from App Store; `sudo xcode-select -s /Applications/Xcode.app/Contents/Developer`.
-- pip `pyexpat` ImportError → `export DYLD_LIBRARY_PATH=/opt/homebrew/opt/expat/lib` before pip.
-
-## Bringing up a remote mini (after first-time on laptop)
-
-```bash
-# 1. rsync the repo (exclude weights + build cache to not blow tailscale bandwidth)
-rsync -avz --delete \
-  --exclude='SuperKittens/model_weights/' \
-  --exclude='__pycache__/' \
-  --exclude='.git/' \
-  --exclude='.venv/' \
-  --exclude='*.xcuserstate' \
-  --exclude='temp/' \
-  ~/SuperKittens/ <user>@<ip>:~/SuperKittens/
-
-# 2. run setup on the mini (one-time)
-ssh <user>@<ip> 'cd ~/SuperKittens && ./setup.sh'
-
-# 3. download a model
-ssh <user>@<ip> 'cd ~/SuperKittens && ./download.sh gemma4-e2b'
-
-# 4. ship a fresh build from the laptop (skips remote toolchain)
-scp ~/SuperKittens/build/libsk.dylib ~/SuperKittens/build/libsk.metallib <user>@<ip>:~/SuperKittens/build/
+A successful setup produces `build/libsk.dylib` and `build/libsk.metallib`. Sanity check:
+```python
+import SuperKittens as sk
+import SuperKittens.models.gemma.gemma4    # auto-registers gemma4 specs
+m = sk.load("gemma4-e2b")
+print(m.chat("Hi", max_new_tokens=8))
 ```
 
-## Running anything on a remote mini
+## Repository layout
 
-Always prepend the env knobs:
-```bash
-ssh <user>@<ip> '
-  export DYLD_LIBRARY_PATH=/opt/homebrew/opt/expat/lib
-  export SK_METALLIB=/Users/<user>/SuperKittens/build/libsk.metallib
-  source ~/sk-venv/bin/activate
-  cd ~/SuperKittens
-  python3 -u <your-script>
-'
+```
+SuperKittens/
+├── build.sh                        # compile .metal → .metallib, .c++ → .dylib
+├── setup.sh                        # one-shot: toolchain check, deps, build
+├── download.sh                     # unified model downloader (registry)
+├── dev_env.md                      # this file
+├── SuperKittens/                   # python package + C++ sources
+│   ├── __init__.py                 # exposes sk.load / sk.register / sk.Model
+│   ├── api.py                      # MODEL_REGISTRY + load()
+│   ├── inference/                  # WeightStore, generation loop, Model base
+│   ├── kernels/                    # shared Metal kernels (gemm, attn, rope, norm, …)
+│   ├── models/                     # per-family code
+│   │   ├── load/                   # gguf, safetensor, tokenizer
+│   │   └── <family>/               # model-specific orchestrator + kernels
+│   ├── model_weights/              # downloaded weights (gitignored)
+│   └── temp/                       # scratch / experiments (gitignored)
+└── metal-cpp/                      # vendored Apple metal-cpp headers
 ```
 
-`SK_METALLIB` is needed because `bindings_init` reads `build/libsk.metallib` relative to CWD by default; explicitly setting the env var lets you run from any directory.
+## Build flow
 
-## Reference perf (M4 mini, 16 GB, derek)
+`./build.sh` does two things:
+1. Compiles every `.metal` under `SuperKittens/kernels/` and `SuperKittens/models/` to `.air` then links them into `build/libsk.metallib`.
+2. Compiles every `.c++` under those same trees plus `SuperKittens/inference/` into `build/libsk.dylib`, linked against `metal-cpp`.
 
-llama.cpp `llama-bench` on Gemma 4 E2B Q4_K_M:
-- prefill (pp64): **680 tok/s**
-- decode  (tg64): **54.9 tok/s**
-
-This is the bar SK should match (at equivalent quant) and beat (with bf16 native + fused decode).
-
-## Validation harness
-
-HF reference activations dump (per model):
-- `SuperKittens/temp/gemma4_validate/dump_hf_e2b.py` → produces `hf_ref.npz` (484 tensors for Gemma 4).
-- `SuperKittens/temp/gemma4_validate/layer_diff.py` → compares SK dumps against HF ref, reports first-divergent layer.
-
-SK-side dumps via `m.set_dump_enabled(True)` then `m.dump(name)` returning a numpy array. See `gemma4.py`.
+The build fails loud on any error — fix the first one before re-running. Python wrappers ctypes-load the dylib at runtime and look up kernel PSOs from the metallib (path read from `SK_METALLIB` env var, defaulting to `build/libsk.metallib` relative to cwd).
 
 ## Adding a new model
 
 1. Add an entry to `download.sh`'s `resolve()` case statement (one line: `spec → hf_repo  local_dir`).
 2. Create `SuperKittens/models/<family>/` with:
-   - `<family>_model.h` — dispatch orchestrator
-   - `launcher.{h,c++}` — C ABI
-   - `weights.{h,c++}` — HF/GGUF tensor-name → fused-buffer mapping
-   - `<family>.py` — Python wrapper class
-3. In `models/<family>/__init__.py`, register with `SuperKittens.register("<spec>", <Class>, variant="<v>")`.
-4. Document in this file under "validation hosts" or in the family folder if relevant.
+   - `<family>_model.h` — Metal-side dispatch orchestrator. Mirrors HF's `forward()` step order.
+   - `launcher.{h,c++}` — C ABI: `sk_<family>_create / load_safetensors / forward / dump_layer / destroy`.
+   - `weights.{h,c++}` — HF/GGUF tensor-name → fused-buffer mapping. Handles dtype casts.
+   - `<family>.py` — ctypes wrapper class. Inherits `SuperKittens.inference.generation.Model` for chat/generate.
+   - `<family>/__init__.py` — calls `SuperKittens.register("<spec>", <Class>)`.
+   - Any family-specific Metal kernels alongside the orchestrator.
+3. Write a validation harness under `SuperKittens/temp/<family>_validate/`:
+   - `dump_hf_<family>.py` — load HF reference via `transformers`, register forward hooks on every interesting module, save activations to `hf_ref.npz`.
+   - `layer_diff.py` — compare SK forward against HF reference layer by layer.
+4. Iterate until `argmax(SK_logits) == argmax(HF_logits)` and rel_err is in the bf16/fp16 noise floor.
 
 ## Conventions
 
 - **Default to no comments**: comments explain WHY only, not WHAT. Identifiers are self-explanatory.
-- **Build must stay clean**: `build.sh` exits non-zero on compile failure (no silent skip). Fix the first error before moving on.
-- **No worktree clutter**: agent worktrees under `.claude/worktrees/` are ephemeral. Use `git worktree remove -f -f` to clean.
-- **Throttle GPU benches**: ≤5 iters, ≥1 warmup, `time.sleep(0.3)` between iters, serialize. The validation Macs are shared.
-- **Real-checkpoint validation**: every model port must be checked against HF reference logits (rel_err < 0.1 + argmax match). Synthetic smoke tests are not sufficient.
-- **Default dtype per model**: Gemma 4 → bf16 native. Qwen 3 → fp16. DeepSeek V3 → bf16 with int2/int4 quant for routed experts.
+- **No emojis in code or files** unless explicitly requested.
+- **Build must stay clean**: `./build.sh` exits non-zero on compile failure. No silent skips.
+- **Validate against HF**: synthetic smoke tests are not sufficient. Every model port needs `rel_err < 0.1` + argmax match on a real prompt against the official `transformers` reference.
+- **Throttle GPU benches**: ≤5 iters, ≥1 warmup, `time.sleep(0.3)` between iters, serialize. Shared validation hardware is fragile.
+- **Default dtype per model**: match what the upstream releases ship in. Gemma 4 → bf16 native. Qwen 3 → fp16. DeepSeek V3 → bf16 with int2/int4 quant for routed experts.
+- **Fused kernels**: SK rewards fusion (fewer kernel dispatches, less bandwidth). If you can fuse `add + rmsnorm` or `gate + silu + up` into one kernel, do it — Apple's command-buffer encoding cost is real.
+- **Don't touch other models' code**: when porting a new family, treat existing model code (qwen, deepseek, gemma, mamba) as untouchable unless you're fixing a shared kernel that's verifiably backward-compatible.
+
+## Distributed development
+
+SuperKittens is designed so multiple contributors can work on different model families in parallel without stepping on each other. The structural rule: **per-family directories are isolated**; only `kernels/` is shared.
+
+For long-running validation against real models, run on whatever Apple Silicon hardware you have. The build output (`libsk.dylib`, `libsk.metallib`) is small enough (~1MB) to sync over the network; the heavy weights live locally.
+
+A typical workflow:
+1. Iterate locally on your laptop (M-series). Build with `./build.sh`.
+2. If the model is too big for your laptop, sync the repo + binaries to a beefier Mac (rsync; exclude `model_weights/`, `__pycache__/`, `.git/`, `.venv/`).
+3. Download weights on the validation host.
+4. Run forward / layer-diff there.
+5. Push fixes back via git. **GitHub (`main` branch) is the single source of truth.** Pull on your laptop, the validation host pulls in turn.
+
+## Quantization
+
+SK already has matvec kernels for Q2_K, Q4_K, IQ2_XXS (`SuperKittens/kernels/gemm/`). To consume a quantized GGUF, the loader path is `models/load/gguf/` → `WeightStore::add(name, ptr, nbytes, Dtype::Q4_K, shape, zero_copy=true)`. The orchestrator picks the appropriate matvec PSO based on the buffer's `Dtype`.
+
+## Reference perf
+
+`llama.cpp` is the de-facto Apple Silicon inference baseline. Install via `brew install llama.cpp`, then `llama-bench -m <path-to-gguf> -p 64 -n 64 -ngl 999` for prefill+decode numbers. SK's goal is to match (at equivalent quant) and beat (with native bf16 + fused decode paths).
+
+## Where to ask
+
+- **Code questions / new-model port**: open a GitHub issue with the model name + HF link.
+- **Kernel perf**: include the `llama-bench` baseline and your SK number on the same hardware.
+- **Bugs in a specific family's forward**: include the prompt, the rel_err per layer (via `layer_diff.py`), and the first divergent step.
