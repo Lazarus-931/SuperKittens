@@ -23,7 +23,9 @@ extern "C" {
 static inline sk_gemma4_config gemma4_e2b_config(void) {
     sk_gemma4_config c;
     c.batch              = 1;
-    c.seq_max            = 8192;      // largest one-shot input (memory-bounded; full 128K context emerges via decode)
+    c.seq_max            = 256;       // prefill cap: per-dispatch overhead scales with backing
+                                      // buffer size on Apple GPUs, so we size scratch for the
+                                      // common chat-prefill regime. Raise via override for long prompts.
     c.cache_max          = 8192;      // global KV cache cap (raise if more memory available)
     c.n_layers           = 35;
     c.local_period       = 6;         // 5 local : 1 global

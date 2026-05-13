@@ -17,6 +17,26 @@
 namespace meow {
 namespace gemma4 {
 
+// Lazy compute-encoder. Reuses a single MTL::ComputeCommandEncoder across
+// many dispatches (Fix 3 — merge per-dispatch encoders). Each .get() returns
+// the live encoder (opening one on first call); .flush() ends it so a blit
+// or other non-compute encoder can be issued. RAII closes on destruction.
+struct EncCtx {
+    MTL::CommandBuffer*           cmd;
+    MTL::ComputeCommandEncoder*   enc = nullptr;
+    explicit EncCtx(MTL::CommandBuffer* c) : cmd(c) {}
+    EncCtx(const EncCtx&) = delete;
+    EncCtx& operator=(const EncCtx&) = delete;
+    inline MTL::ComputeCommandEncoder* get() {
+        if (!enc) enc = cmd->computeCommandEncoder();
+        return enc;
+    }
+    inline void flush() {
+        if (enc) { enc->endEncoding(); enc = nullptr; }
+    }
+    ~EncCtx() { flush(); }
+};
+
 // ──────────────────────────────────────────────────────────────────────
 //  Layer-level
 // ──────────────────────────────────────────────────────────────────────
@@ -72,6 +92,7 @@ struct LayerPSOs {
     MTL::ComputePipelineState* gemm_fp32_out;     // bf16 A,B → fp32 C (for PLE inject precision)
     MTL::ComputePipelineState* ple_gate_act_fp32; // fp32 gate, bf16 ple → fp32 gated
     MTL::ComputePipelineState* ple_inject_fp32;   // fp32 proj_back → bf16 residual
+    MTL::ComputePipelineState* ple_inject_fused_t1; // single-dispatch PLE inject (T=1 decode fast path)
 };
 
 struct LayerBuffers {
@@ -150,6 +171,12 @@ inline void dispatch_layer(
 {
     using NS::UInteger;
 
+    // Fix 3: keep a single ComputeCommandEncoder alive across every compute
+    // step in this layer. Each encoder switch costs ~5 µs CPU; with ~12
+    // dispatches × 35 layers = 420 encoder-creates per forward, the saving
+    // compounds. Blits (dump path only) force a flush.
+    EncCtx E(cmd);
+
     const uint32_t L = p.layer_idx;
     const uint32_t qkv_out = (p.n_heads + 2u * p.n_kv_heads_max) * p.head_dim_max;
     const uint32_t qhd_max = p.n_heads * p.head_dim_max;
@@ -164,7 +191,7 @@ inline void dispatch_layer(
 
     // 1. Pre-attn RMSNorm
     {
-        auto* enc = cmd->computeCommandEncoder();
+        auto* enc = E.get();
         enc->setComputePipelineState(P.rmsnorm);
         enc->setBuffer(B.x,               0,        0);
         enc->setBuffer(B.w_pre_attn_norm, off_norm, 1);
@@ -175,12 +202,11 @@ inline void dispatch_layer(
         enc->setBytes(&p.eps,     4, 5);
         enc->dispatchThreadgroups(MTL::Size(1, (rows + 3) / 4, 1),
                                   MTL::Size(128, 1, 1));
-        enc->endEncoding();
     }
 
     // 2. QKV projection
     {
-        auto* enc = cmd->computeCommandEncoder();
+        auto* enc = E.get();
         enc->setComputePipelineState(P.gemm);
         const uint32_t M = p.batch * p.seq;
         const uint32_t K_v = p.d_model;
@@ -202,11 +228,11 @@ inline void dispatch_layer(
         enc->setBuffer(B.qkv_packed, 0, 12);
         enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M + 63) / 64, 1),
                                   MTL::Size(64, 1, 1));
-        enc->endEncoding();
     }
 
     // DUMP (L1 only): qkv_packed last-token row (post-GEMM, pre-split).
     if (B.dump_stash_extra && p.layer_idx == 1 && B.dump_extra_qkvN_pre1) {
+        E.flush();
         const uint32_t T_ = p.batch * p.seq;
         const size_t   qkvN_ = B.dump_extra_qkvN_pre1;
         const size_t   row_bytes = qkvN_ * 2;
@@ -219,7 +245,7 @@ inline void dispatch_layer(
 
     // 3. QKV split + per-head RMSNorm (V no γ)
     {
-        auto* enc = cmd->computeCommandEncoder();
+        auto* enc = E.get();
         enc->setComputePipelineState(P.qkv_norm);
         enc->setBuffer(B.qkv_packed, 0,         0);
         enc->setBuffer(B.gamma_q,    off_gamma, 1);
@@ -236,11 +262,11 @@ inline void dispatch_layer(
         const uint32_t slots = p.n_heads + 2u * p.n_kv_heads;
         enc->dispatchThreadgroups(MTL::Size(slots, T, 1),
                                   MTL::Size(p.head_dim, 1, 1));
-        enc->endEncoding();
     }
 
     // DUMP (L0 only): q_normed/k_normed pre-RoPE. q_norm/k_tmp layout (H,T,D).
     if (B.dump_stash_extra && p.layer_idx == 0) {
+        E.flush();
         const uint32_t T_ = p.batch * p.seq;
         const size_t   D_ = p.head_dim;
         const size_t   row_bytes = D_ * 2;
@@ -260,7 +286,7 @@ inline void dispatch_layer(
 
     // 4. RoPE / p-RoPE on Q and the in-flight K (k_tmp), in-place.
     {
-        auto* enc = cmd->computeCommandEncoder();
+        auto* enc = E.get();
         if (p.is_global) {
             // Gemma4 full_attention uses standard partial RoPE (HF
             // modeling_gemma4.py:1229,1245 with partial_rotary_factor=0.25),
@@ -278,11 +304,8 @@ inline void dispatch_layer(
             enc->setBytes(&p.n_heads,  4, 6);
             enc->setBytes(&rot_dims,   4, 7);
             enc->setBytes(&p.write_pos,4, 8);
-            // Grid: (n_heads, seq, 1). Each row gets its own threadgroup.
             enc->dispatchThreadgroups(MTL::Size(p.n_heads, p.seq, 1),
                                       MTL::Size(p.head_dim / 8, 1, 1));
-            enc->endEncoding();
-            enc = cmd->computeCommandEncoder();
             enc->setComputePipelineState(P.rope_partial);
             enc->setBuffer(B.k_tmp,  0, 0);
             enc->setBuffer(B.k_tmp,  0, 1);
@@ -307,8 +330,6 @@ inline void dispatch_layer(
             enc->setBytes(&p.write_pos,4, 7);
             enc->dispatchThreadgroups(MTL::Size(p.n_heads, p.seq, 1),
                                       MTL::Size(p.head_dim / 8, 1, 1));
-            enc->endEncoding();
-            enc = cmd->computeCommandEncoder();
             enc->setComputePipelineState(P.rope);
             enc->setBuffer(B.k_tmp,  0, 0);
             enc->setBuffer(B.k_tmp,  0, 1);
@@ -321,11 +342,11 @@ inline void dispatch_layer(
             enc->dispatchThreadgroups(MTL::Size(p.n_kv_heads, p.seq, 1),
                                       MTL::Size(p.head_dim / 8, 1, 1));
         }
-        enc->endEncoding();
     }
 
     // DUMP (L0 only): q_rope / k_rope (post-RoPE), same layout (H,T,D).
     if (B.dump_stash_extra && p.layer_idx == 0) {
+        E.flush();
         const uint32_t T_ = p.batch * p.seq;
         const size_t   D_ = p.head_dim;
         const size_t   row_bytes = D_ * 2;
@@ -344,9 +365,8 @@ inline void dispatch_layer(
     }
 
     // 4.5. KV cache write: stash rotated K and V into the layer's cache.
-    //      Skipped for kv-shared layers (they read from source layer's cache).
     if (!p.is_kv_shared) {
-        auto* enc = cmd->computeCommandEncoder();
+        auto* enc = E.get();
         enc->setComputePipelineState(P.kv_cache_write);
         enc->setBuffer(B.k_tmp,   0, 0);
         enc->setBuffer(B.v_tmp,   0, 1);
@@ -361,12 +381,11 @@ inline void dispatch_layer(
         const uint32_t D4 = p.head_dim / 4;
         enc->dispatchThreads(MTL::Size(D4, p.seq, p.batch * p.n_kv_heads),
                              MTL::Size(32, 4, 1));
-        enc->endEncoding();
     }
 
     // 5. Attention (cache-aware: reads from k_cache/v_cache).
     {
-        auto* enc = cmd->computeCommandEncoder();
+        auto* enc = E.get();
         if (p.is_global) {
             enc->setComputePipelineState(P.attn_global);
             enc->setBuffer(B.q_norm,   0, 0);
@@ -396,11 +415,11 @@ inline void dispatch_layer(
         enc->dispatchThreadgroups(
             MTL::Size(p.n_heads, (p.seq + 3) / 4, p.batch),
             MTL::Size(128, 1, 1));
-        enc->endEncoding();
     }
 
     // DUMP (L0 only): attn_pre (pre-o_proj). Layout (T,H,D), last token contiguous.
     if (B.dump_stash_extra && p.layer_idx == 0) {
+        E.flush();
         const uint32_t T_ = p.batch * p.seq;
         const size_t   tok_bytes = (size_t)p.n_heads * p.head_dim * 2;
         size_t src_off = (size_t)(T_ - 1) * tok_bytes;
@@ -412,7 +431,7 @@ inline void dispatch_layer(
 
     // 6. Output projection
     {
-        auto* enc = cmd->computeCommandEncoder();
+        auto* enc = E.get();
         enc->setComputePipelineState(P.gemm);
         const uint32_t M = p.batch * p.seq;
         const uint32_t K_v = p.n_heads * p.head_dim;
@@ -434,12 +453,11 @@ inline void dispatch_layer(
         enc->setBuffer(B.o_proj, 0, 12);
         enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M + 63) / 64, 1),
                                   MTL::Size(64, 1, 1));
-        enc->endEncoding();
     }
 
     // 7. Post-attn RMSNorm
     {
-        auto* enc = cmd->computeCommandEncoder();
+        auto* enc = E.get();
         enc->setComputePipelineState(P.rmsnorm);
         enc->setBuffer(B.o_proj,           0,        0);
         enc->setBuffer(B.w_post_attn_norm, off_norm, 1);
@@ -450,14 +468,11 @@ inline void dispatch_layer(
         enc->setBytes(&p.eps,     4, 5);
         enc->dispatchThreadgroups(MTL::Size(1, (rows + 3) / 4, 1),
                                   MTL::Size(128, 1, 1));
-        enc->endEncoding();
     }
 
     // 8+9. Fused residual + pre-MLP RMSNorm.
-    //     y_attn = y_attn + x;  m_in = RMSNorm(y_attn, w_pre_mlp_norm).
-    //     Replaces two kernels (add_f16 + rmsnorm) — 1.57–2.34× faster.
     {
-        auto* enc = cmd->computeCommandEncoder();
+        auto* enc = E.get();
         enc->setComputePipelineState(P.add_rmsnorm);
         enc->setBuffer(B.x,               0,        0);
         enc->setBuffer(B.y_attn,          0,        1);
@@ -469,16 +484,15 @@ inline void dispatch_layer(
         enc->setBytes(&p.d_model, 4, 6);
         enc->setBytes(&p.eps,     4, 7);
         enc->dispatchThreadgroups(MTL::Size(1, rows, 1), MTL::Size(128, 1, 1));
-        enc->endEncoding();
     }
 
-    // 10. Dense GeGLU MLP. (For 26B-A4B MoE: caller routes through moe_block.h instead.)
+    // 10. Dense GeGLU MLP.
     {
-        auto* enc = cmd->computeCommandEncoder();
+        auto* enc = E.get();
         enc->setComputePipelineState(P.gated_mlp_gelu);
         enc->setBuffer(B.m_in,   0,          0);
         enc->setBuffer(B.w_gate, off_w_gate, 1);
-        enc->setBuffer(B.w_up,   off_w_gate, 2);   // same per-layer slab size as w_gate
+        enc->setBuffer(B.w_up,   off_w_gate, 2);
         enc->setBuffer(B.w_down, off_w_down, 3);
         enc->setBuffer(B.m_out,  0,          4);
         uint32_t M = p.batch * p.seq;
@@ -490,12 +504,11 @@ inline void dispatch_layer(
         enc->setBytes(&p.n_int,  4, 8);
         enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M + 63) / 64, 1),
                                   MTL::Size(128, 1, 1));
-        enc->endEncoding();
     }
 
     // 11. Post-MLP RMSNorm
     {
-        auto* enc = cmd->computeCommandEncoder();
+        auto* enc = E.get();
         enc->setComputePipelineState(P.rmsnorm);
         enc->setBuffer(B.m_out,           0,        0);
         enc->setBuffer(B.w_post_feedforward_layernorm, off_norm, 1);
@@ -506,12 +519,11 @@ inline void dispatch_layer(
         enc->setBytes(&p.eps,     4, 5);
         enc->dispatchThreadgroups(MTL::Size(1, (rows + 3) / 4, 1),
                                   MTL::Size(128, 1, 1));
-        enc->endEncoding();
     }
 
     // 12. Residual: y_out += y_attn
     {
-        auto* enc = cmd->computeCommandEncoder();
+        auto* enc = E.get();
         enc->setComputePipelineState(P.add);
         enc->setBuffer(B.y_attn, 0, 0);
         enc->setBuffer(B.y_out,  0, 1);
@@ -521,8 +533,8 @@ inline void dispatch_layer(
         uint32_t total = (n / 4u) + (n & 3u);
         enc->dispatchThreadgroups(MTL::Size((total + 127) / 128, 1, 1),
                                   MTL::Size(128, 1, 1));
-        enc->endEncoding();
     }
+    // EncCtx destructor flushes.
 }
 
 // PLE inject: applied after the main residual stream update for each layer.
@@ -556,6 +568,29 @@ inline void dispatch_ple_inject(
     const size_t off_proj    = (size_t)L * p.d_model * p.ple_dim * 2;
     const size_t off_norm_pp = (size_t)L * p.d_model * 2;
     const size_t off_scalar  = (size_t)L * sizeof(float);
+
+    // Decode fast path: at T=1, run the entire 4-step PLE inject as a single
+    // threadgroup-resident dispatch. Removes 3 device-memory round trips and
+    // 3 encoder switches per layer (~140 dispatches per token across 35 layers).
+    if (T == 1 && P.ple_inject_fused_t1 != nullptr) {
+        auto* enc = cmd->computeCommandEncoder();
+        enc->setComputePipelineState(P.ple_inject_fused_t1);
+        enc->setBuffer(B.residual,                       0,           0);
+        enc->setBuffer(B.w_per_layer_input_gate,         off_gate,    1);
+        enc->setBuffer(B.w_per_layer_projection,         off_proj,    2);
+        enc->setBuffer(B.w_post_per_layer_input_norm,    off_norm_pp, 3);
+        enc->setBuffer(B.per_layer_inputs,               0,           4);
+        enc->setBuffer(B.w_layer_scalar,                 off_scalar,  5);
+        enc->setBytes(&p.d_model,  4, 6);
+        enc->setBytes(&p.ple_dim,  4, 7);
+        enc->setBytes(&n_layers,   4, 8);
+        enc->setBytes(&L,          4, 9);
+        enc->setBytes(&p.eps,      4, 10);
+        // 1 threadgroup per (token,layer); we're T=1 so just 1 TG total. 256 threads.
+        enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(256, 1, 1));
+        enc->endEncoding();
+        return;
+    }
 
     // 1. per_layer_input_gate: (T, d_model) @ (d_model, PLE_dim) → (T, PLE_dim) bf16
     {
@@ -881,6 +916,33 @@ inline void dispatch_model(
                                        MTL::Size(M.ple_dim, 1, 1));
             enc3->endEncoding();
         }
+
+        // DUMP L0.per_layer_inputs: post-context_mix bf16 slice for last token, L=0.
+        // Bug-hunting tap for the gate_act read: this is exactly what
+        // gemma4_ple_gate_act will fetch when launched with layer_idx=0 on token T-1.
+        if (M.dump_enabled && B.dump_stash) {
+            const size_t per_dm = (size_t)(2 + 4 * M.n_layers) * M.d_model;
+            const size_t hd_max = (M.head_dim_local > M.head_dim_global)
+                                  ? M.head_dim_local : M.head_dim_global;
+            const size_t n_kv_max = (M.n_kv_heads_local > M.n_kv_heads_global)
+                                    ? M.n_kv_heads_local : M.n_kv_heads_global;
+            const size_t base_extra   = per_dm + M.vocab_size;
+            const size_t l0_extra     = (size_t)3 * M.n_heads * hd_max
+                                      + (size_t)2 * n_kv_max * hd_max;
+            const size_t qkv_slots_max= M.n_heads + 2u * n_kv_max;
+            const size_t off_pre_ple  = base_extra + l0_extra + qkv_slots_max * hd_max;
+            const size_t off_ple_gate = off_pre_ple  + M.d_model;
+            const size_t off_ple_gated= off_ple_gate + M.ple_dim;
+            const size_t off_ple_proj = off_ple_gated+ M.ple_dim;
+            const size_t off_ple_pli  = off_ple_proj + (size_t)2 * M.d_model;
+            auto* blit = cmd->blitCommandEncoder();
+            const size_t rb = (size_t)M.ple_dim * 2;
+            // per_layer_inputs row stride = n_layers * ple_dim * 2 bytes; L=0 slice = first ple_dim.
+            const size_t src_off = (size_t)(T - 1) * M.n_layers * rb; // L=0 within row
+            blit->copyFromBuffer(B.per_layer_inputs, src_off,
+                                 B.dump_stash, off_ple_pli * 2, rb);
+            blit->endEncoding();
+        }
     }
 
     // B. Layer stack (ping-pong x_a ↔ x_b).
@@ -1053,6 +1115,44 @@ inline void dispatch_model(
             pb.ple_gated                  = B.ple_gated;
             pb.ple_proj_back              = B.ple_proj_back;
             dispatch_ple_inject(cmd, P.layer, pb, lp, M.n_layers);
+
+            // DUMP L0 PLE probes (ple_gate_out, ple_gated bf16; ple_proj_back fp32).
+            if (M.dump_enabled && B.dump_stash && L == 0) {
+                const size_t per_dm = (size_t)(2 + 4 * M.n_layers) * M.d_model;
+                const size_t hd_max = (M.head_dim_local > M.head_dim_global)
+                                      ? M.head_dim_local : M.head_dim_global;
+                const size_t n_kv_max = (M.n_kv_heads_local > M.n_kv_heads_global)
+                                        ? M.n_kv_heads_local : M.n_kv_heads_global;
+                const size_t base_extra   = per_dm + M.vocab_size;
+                const size_t l0_extra     = (size_t)3 * M.n_heads * hd_max
+                                          + (size_t)2 * n_kv_max * hd_max;
+                const size_t qkv_slots_max= M.n_heads + 2u * n_kv_max;
+                const size_t off_pre_ple  = base_extra + l0_extra + qkv_slots_max * hd_max;
+                const size_t off_ple_gate = off_pre_ple  + M.d_model;
+                const size_t off_ple_gated= off_ple_gate + M.ple_dim;
+                const size_t off_ple_proj = off_ple_gated+ M.ple_dim;
+                {
+                    auto* blit = cmd->blitCommandEncoder();
+                    const size_t rb = (size_t)M.ple_dim * 2;
+                    blit->copyFromBuffer(B.ple_gate_out, (size_t)(T - 1) * rb,
+                                         B.dump_stash,   off_ple_gate * 2, rb);
+                    blit->endEncoding();
+                }
+                {
+                    auto* blit = cmd->blitCommandEncoder();
+                    const size_t rb = (size_t)M.ple_dim * 2;
+                    blit->copyFromBuffer(B.ple_gated, (size_t)(T - 1) * rb,
+                                         B.dump_stash, off_ple_gated * 2, rb);
+                    blit->endEncoding();
+                }
+                {
+                    auto* blit = cmd->blitCommandEncoder();
+                    const size_t rb = (size_t)M.d_model * 4; // fp32
+                    blit->copyFromBuffer(B.ple_proj_back, (size_t)(T - 1) * rb,
+                                         B.dump_stash,    off_ple_proj * 2, rb);
+                    blit->endEncoding();
+                }
+            }
         }
 
         // DUMP L{L}.out: layer output residual stream (post-PLE if any).
