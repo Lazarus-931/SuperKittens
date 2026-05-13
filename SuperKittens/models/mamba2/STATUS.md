@@ -147,3 +147,37 @@ SuperKittens/temp/mamba2_validate/
    → token 13).
 4. Chunked SSD (HF L461-586) for prefill perf, once reference passes.
 5. Decode bench vs HF fp32 14.48 tok/s.
+
+## Update — May 13 2026 (lexie + laptop session)
+
+**Forward path live; argmax matches HF.**
+
+- Wired `mamba2_ssd_ref` + `mamba2_step_ref` PSOs into the launcher; new
+  `dispatch_layer`/`dispatch_model` in `mamba2_model.h` orchestrates the full
+  per-layer pipeline (pre-norm → in_proj → split → conv1d_silu → SSD →
+  gate_norm → out_proj → residual), then final-norm + tied LM-head GEMM +
+  last-row argmax.
+- Fixed `weights.c++::copy_conv1d` to keep HF's native `(C_in, K)` layout
+  (matches `conv1d_silu.metal`'s `weight[c*K + k]` indexing).
+- Made `copy_into` / `copy_transpose_fp16` / `copy_conv1d` accept F32 / F16 /
+  BF16 source dtypes (HF mamba2-130m-hf ships fp32).
+- `ssm_state` allocation switched to fp32 (kernel signature is `device float*`).
+- Metal kernels: replaced `log1p()` (not in Metal stdlib) with `log(1 + exp(.))`.
+
+**Validation (lexie M4 mini):**
+- Prompt "Hi" → SK argmax token **13** = HF argmax **13** ✓
+- Logits rel L2 = 0.147, max_abs = 23.8 (fp16 truncation across 24 layers — OK).
+- Top-5 ranking matches in top-1 and top-3.
+
+**Throughput (8-tok decode probe on lexie):**
+- SK: **~90 tok/s** (11.1 ms / token)
+- HF fp32 baseline: 14.48 tok/s
+- **6.2× speedup over HF reference.**
+
+### Next steps
+1. Chunked SSD for prefill perf (currently runs per-token recurrence).
+2. Decode path uses prefill of len-1 each step; could swap to `mamba2_step_ref`
+   to avoid the prefill overhead and shave further.
+3. Per-layer numerical localization (HF dumps `L{i}.mixer_out` etc. — currently
+   we only confirm SSM-state finiteness per layer because `dump_layer` only
+   exposes the last forward's scratch).
