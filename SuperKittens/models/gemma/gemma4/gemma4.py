@@ -87,6 +87,11 @@ def _load():
     _lib.sk_gemma4_set_rope_tables.restype         = ctypes.c_int
     _lib.sk_gemma4_get_last_logits.argtypes        = [ctypes.c_void_p, ctypes.c_void_p]
     _lib.sk_gemma4_get_last_logits.restype         = ctypes.c_int
+
+    _lib.sk_gemma4_set_dump_enabled.argtypes       = [ctypes.c_void_p, ctypes.c_int]
+    _lib.sk_gemma4_set_dump_enabled.restype        = None
+    _lib.sk_gemma4_dump_layer.argtypes             = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+    _lib.sk_gemma4_dump_layer.restype              = ctypes.c_int
     return _lib
 
 
@@ -229,6 +234,21 @@ class Gemma4:
             out.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)))
         if ret:
             raise RuntimeError(f"sk_gemma4_forward failed: {ret}")
+        return out
+
+    def set_dump_enabled(self, enabled: bool):
+        _load().sk_gemma4_set_dump_enabled(self._h, 1 if enabled else 0)
+
+    def dump(self, name: str) -> np.ndarray:
+        """Pull a per-layer/post-norm/logits activation from the SK dump stash
+        for the most recent forward(). Requires set_dump_enabled(True)."""
+        if name == "logits":
+            out = np.empty((self.cfg.vocab_size,), dtype=np.float16)
+        else:
+            out = np.empty((self.cfg.d_model,), dtype=np.float16)
+        rc = _load().sk_gemma4_dump_layer(self._h, name.encode(), out.ctypes.data)
+        if rc:
+            raise RuntimeError(f"sk_gemma4_dump_layer({name!r}) failed: {rc}")
         return out
 
     def last_logits(self) -> np.ndarray:

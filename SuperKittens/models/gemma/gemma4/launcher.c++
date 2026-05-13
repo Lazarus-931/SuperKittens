@@ -26,6 +26,8 @@ struct Handle {
     std::vector<size_t>   mlp_gate_off_e;
     std::vector<size_t>   mlp_down_off_e;
     std::vector<int32_t>  kv_source_layer;
+
+    bool dump_enabled = false;
 };
 
 static MTL::Buffer* alloc_zero(MTL::Device* dev, size_t bytes) {
@@ -227,6 +229,13 @@ extern "C" sk_gemma4_handle* sk_gemma4_create(const sk_gemma4_config* cfg) {
     h->bufs.m_out      = alloc_zero(dev, x_bytes);
     h->bufs.y_out      = alloc_zero(dev, x_bytes);
 
+    // Dump stash: (1 + 4*nL + 1) * d_model + vocab_size fp16 elements.
+    {
+        const size_t per_dm = (size_t)(2 + 4 * cfg->n_layers) * cfg->d_model;
+        const size_t total_elems = per_dm + cfg->vocab_size;
+        h->bufs.dump_stash = alloc_zero(dev, total_elems * 2);
+    }
+
     if (cfg->has_ple) {
         h->bufs.per_layer_inputs = alloc_zero(dev, (size_t)T_max * cfg->n_layers * cfg->ple_dim * 2);
         h->bufs.ple_gate_out     = alloc_zero(dev, (size_t)T_max * cfg->ple_dim * 2);
@@ -323,6 +332,7 @@ extern "C" int sk_gemma4_forward(sk_gemma4_handle* hp,
     mp.mlp_gate_off_e     = h->mlp_gate_off_e.data();
     mp.mlp_down_off_e     = h->mlp_down_off_e.data();
     mp.kv_source_layer    = h->kv_source_layer.data();
+    mp.dump_enabled       = h->dump_enabled;
 
     auto* cmd = q->commandBuffer();
     meow::gemma4::dispatch_model(cmd, h->psos, h->weights, h->bufs, mp);
@@ -347,6 +357,55 @@ extern "C" int sk_gemma4_get_last_logits(sk_gemma4_handle* hp, void* out_fp16) {
     const char* src = (const char*)h->bufs.logits->contents() + last_row * row_bytes;
     std::memcpy(out_fp16, src, row_bytes);
     return 0;
+}
+
+extern "C" void sk_gemma4_set_dump_enabled(sk_gemma4_handle* hp, int enabled) {
+    if (!hp) return;
+    auto* h = reinterpret_cast<meow::gemma4::Handle*>(hp);
+    h->dump_enabled = (enabled != 0);
+}
+
+extern "C" int sk_gemma4_dump_layer(sk_gemma4_handle* hp, const char* name, void* out_fp16) {
+    if (!hp || !name || !out_fp16) return -1;
+    auto* h = reinterpret_cast<meow::gemma4::Handle*>(hp);
+    if (!h->bufs.dump_stash) return -2;
+    const size_t dm  = h->cfg.d_model;
+    const size_t V   = h->cfg.vocab_size;
+    const size_t nL  = h->cfg.n_layers;
+    const char* base = (const char*)h->bufs.dump_stash->contents();
+
+    auto copy_row = [&](size_t slot_elems, size_t count_elems) {
+        std::memcpy(out_fp16, base + slot_elems * 2, count_elems * 2);
+    };
+
+    if (std::strcmp(name, "embed") == 0) {
+        copy_row(0, dm); return 0;
+    }
+    if (std::strcmp(name, "final_norm") == 0) {
+        const size_t slot = (1 + 4 * nL) * dm;
+        copy_row(slot, dm); return 0;
+    }
+    if (std::strcmp(name, "logits") == 0) {
+        const size_t slot = (1 + 4 * nL + 1) * dm;
+        copy_row(slot, V); return 0;
+    }
+    // Parse "L{L}.<tag>"
+    if (name[0] != 'L') return -3;
+    const char* dot = std::strchr(name, '.');
+    if (!dot) return -3;
+    char numbuf[16] = {0};
+    size_t numlen = (size_t)(dot - (name + 1));
+    if (numlen == 0 || numlen >= sizeof(numbuf)) return -3;
+    std::memcpy(numbuf, name + 1, numlen);
+    uint32_t L = (uint32_t)std::atoi(numbuf);
+    if (L >= nL) return -4;
+    const char* tag = dot + 1;
+    size_t off = 1 + 4 * (size_t)L;
+    if (std::strcmp(tag, "x_norm") == 0) { copy_row((off + 0) * dm, dm); return 0; }
+    if (std::strcmp(tag, "attn")   == 0) { copy_row((off + 1) * dm, dm); return 0; }
+    if (std::strcmp(tag, "mlp")    == 0) { copy_row((off + 2) * dm, dm); return 0; }
+    if (std::strcmp(tag, "out")    == 0) { copy_row((off + 3) * dm, dm); return 0; }
+    return -5;
 }
 
 extern "C" void sk_gemma4_destroy(sk_gemma4_handle* hp) {
@@ -383,6 +442,7 @@ extern "C" void sk_gemma4_destroy(sk_gemma4_handle* hp) {
     rel(h->bufs.m_in); rel(h->bufs.m_out); rel(h->bufs.y_out);
     rel(h->bufs.per_layer_inputs); rel(h->bufs.ple_gate_out);
     rel(h->bufs.ple_gated); rel(h->bufs.ple_proj_back);
+    rel(h->bufs.dump_stash);
 
     delete h;
 }

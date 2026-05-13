@@ -83,6 +83,22 @@ void sk_gemma4_reset(sk_gemma4_handle* h);
 
 int sk_gemma4_get_last_logits(sk_gemma4_handle* h, void* out_fp16);
 
+// Dump helpers: after a forward(), pull the named tensor's LAST-position
+// contents (fp16) from the internal stash. Names supported:
+//   "embed"                              — post-embedding (size d_model)
+//   "L{L}.x_norm" / "L{L}.attn"
+//   "L{L}.mlp"    / "L{L}.out"           — per layer (size d_model)
+//   "final_norm"                         — (size d_model)
+//   "logits"                             — (size vocab_size, pre-softcap)
+// Returns 0 on success, <0 if name unknown or no stash populated.
+// Caller-allocated buffer must be large enough for the named slot.
+int sk_gemma4_dump_layer(sk_gemma4_handle* h, const char* name, void* out_fp16);
+
+// Enable/disable per-layer dump stashing. Off by default. When on, each
+// forward() populates the internal stash. Adds latency proportional to
+// d_model*(4*n_layers + 2) + vocab_size copies.
+void sk_gemma4_set_dump_enabled(sk_gemma4_handle* h, int enabled);
+
 void sk_gemma4_destroy(sk_gemma4_handle* h);
 
 #ifdef __cplusplus

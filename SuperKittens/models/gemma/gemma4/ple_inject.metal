@@ -133,7 +133,7 @@ void gemma4_ple_inject(
 
     for (uint i = tid; i < D; i += tgs) {
         float n = (float)xrow[i] * invrms * (float)gamma[i];
-        float r = (float)rrow[i] + scl * n;
+        float r = ((float)rrow[i] + n) * scl;
         rrow[i] = (half)r;
     }
 }

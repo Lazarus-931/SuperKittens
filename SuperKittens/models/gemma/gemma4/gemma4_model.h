@@ -593,6 +593,18 @@ struct ModelParams {
     const size_t*   mlp_gate_off_e     = nullptr;  // cumulative dm*sum n_int_l (elements)
     const size_t*   mlp_down_off_e     = nullptr;  // cumulative sum n_int_l*dm  (elements)
     const int32_t*  kv_source_layer    = nullptr;  // -1 if not shared, else source idx
+
+    // Dump infra (per-layer activation stash). If enabled, dispatch_model
+    // appends blit copies of named buffers' last-position rows into
+    // bufs.dump_stash. Layout (fp16 elements):
+    //   [0]                       embed            (d_model)
+    //   [1 + 4L + 0]              L{L}.x_norm      (d_model)
+    //   [1 + 4L + 1]              L{L}.attn        (d_model)
+    //   [1 + 4L + 2]              L{L}.mlp         (d_model)
+    //   [1 + 4L + 3]              L{L}.out         (d_model)
+    //   [1 + 4*n_layers]          final_norm       (d_model)
+    //   [1 + 4*n_layers + 1]      logits           (vocab_size)
+    bool     dump_enabled       = false;
 };
 
 struct ModelPSOs {
@@ -664,7 +676,25 @@ struct ModelBuffers {
     MTL::Buffer* ple_gate_out;       // (T, PLE_dim)
     MTL::Buffer* ple_gated;          // (T, PLE_dim)
     MTL::Buffer* ple_proj_back;      // (T, d_model)
+
+    // Dump stash (optional). Big fp16 blob, see ModelParams.dump_enabled.
+    MTL::Buffer* dump_stash = nullptr;
 };
+
+// Helper: blit-copy the last position's d_model fp16 row from `src`
+// (shape (T, d_model)) into bufs.dump_stash at fp16-element offset `slot_elems`.
+inline void _dump_blit_row(MTL::CommandBuffer* cmd,
+                           MTL::Buffer* src, MTL::Buffer* stash,
+                           uint32_t T, uint32_t d_model, size_t slot_elems)
+{
+    if (!stash) return;
+    const size_t row_bytes = (size_t)d_model * 2;
+    const size_t src_off   = (size_t)(T - 1) * row_bytes;
+    const size_t dst_off   = slot_elems * 2;
+    auto* blit = cmd->blitCommandEncoder();
+    blit->copyFromBuffer(src, src_off, stash, dst_off, row_bytes);
+    blit->endEncoding();
+}
 
 inline void dispatch_model(
     MTL::CommandBuffer* cmd,
@@ -689,6 +719,11 @@ inline void dispatch_model(
         enc->dispatchThreadgroups(MTL::Size((D4 + 127) / 128, T, 1),
                                   MTL::Size(128, 1, 1));
         enc->endEncoding();
+    }
+
+    // DUMP: embed (slot 0)
+    if (M.dump_enabled) {
+        _dump_blit_row(cmd, B.x_a, B.dump_stash, T, M.d_model, 0);
     }
 
     // A.1 Per-Layer Embedding table lookup (one-time per forward).
@@ -797,6 +832,15 @@ inline void dispatch_model(
 
         dispatch_layer(cmd, P.layer, lb, lp);
 
+        // DUMP per-layer (before PLE inject so x_norm/attn/mlp are
+        // pristine; we re-dump "out" after PLE).
+        if (M.dump_enabled) {
+            const size_t base = 1 + (size_t)4 * L;
+            _dump_blit_row(cmd, B.x_norm, B.dump_stash, T, M.d_model, base * M.d_model);
+            _dump_blit_row(cmd, B.o_proj, B.dump_stash, T, M.d_model, (base + 1) * M.d_model);
+            _dump_blit_row(cmd, B.m_out , B.dump_stash, T, M.d_model, (base + 2) * M.d_model);
+        }
+
         if (M.has_ple) {
             PLELayerBuffers pb;
             pb.residual                   = nxt;
@@ -809,6 +853,12 @@ inline void dispatch_model(
             pb.ple_gated                  = B.ple_gated;
             pb.ple_proj_back              = B.ple_proj_back;
             dispatch_ple_inject(cmd, P.layer, pb, lp, M.n_layers);
+        }
+
+        // DUMP L{L}.out: layer output residual stream (post-PLE if any).
+        if (M.dump_enabled) {
+            const size_t base = 1 + (size_t)4 * L;
+            _dump_blit_row(cmd, nxt, B.dump_stash, T, M.d_model, (base + 3) * M.d_model);
         }
 
         MTL::Buffer* tmp = cur; cur = nxt; nxt = tmp;
@@ -827,6 +877,12 @@ inline void dispatch_model(
         enc->dispatchThreadgroups(MTL::Size(1, (T + 3) / 4, 1),
                                   MTL::Size(128, 1, 1));
         enc->endEncoding();
+    }
+
+    // DUMP final_norm
+    if (M.dump_enabled) {
+        const size_t base = 1 + (size_t)4 * M.n_layers;
+        _dump_blit_row(cmd, nxt, B.dump_stash, T, M.d_model, base * M.d_model);
     }
 
     // D. LM head GEMM (tied with input embedding)
@@ -854,6 +910,17 @@ inline void dispatch_model(
         enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M_v + 63) / 64, 1),
                                   MTL::Size(64, 1, 1));
         enc->endEncoding();
+    }
+
+    // DUMP logits (pre-softcap): copy last-row of B.logits, vocab_size fp16
+    if (M.dump_enabled) {
+        const size_t base = 1 + (size_t)4 * M.n_layers + 1;
+        const size_t row_bytes = (size_t)M.vocab_size * 2;
+        const size_t src_off   = (size_t)(T - 1) * row_bytes;
+        const size_t dst_off   = base * (size_t)M.d_model * 2;
+        auto* blit = cmd->blitCommandEncoder();
+        blit->copyFromBuffer(B.logits, src_off, B.dump_stash, dst_off, row_bytes);
+        blit->endEncoding();
     }
 
     // D.5 final logit softcap (Gemma4 specific, HF modeling_gemma4.py:1856-1859)
