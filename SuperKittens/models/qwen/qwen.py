@@ -106,6 +106,7 @@ class Config:
     batch: int = 1
     seq_max: int = 8192
     cache_max: int = 32768
+    tie_word_embeddings: int = 1  # Qwen3-0.6B and 32B share tied embeddings; set 0 for untied variants
 
     @classmethod
     def preset(cls, name: str) -> "Config":
