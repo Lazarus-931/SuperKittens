@@ -273,16 +273,23 @@ inline void dispatch_layer(
 
     // 5b. Transpose Q,K,V from (T,H,D) seq-major to (H,T,D) head-major
     //     (matches what kv_cache_write and mha_causal expect).
-    encode_transpose(cmd, P.t_seq_to_head, B.q,     B.q_th, p.seq, p.n_heads,    hd);
-    encode_transpose(cmd, P.t_seq_to_head, B.k_tmp, B.k_th, p.seq, p.n_kv_heads, hd);
-    encode_transpose(cmd, P.t_seq_to_head, B.v_tmp, B.v_th, p.seq, p.n_kv_heads, hd);
+    // At T==1 the two layouts coincide byte-for-byte → skip the copies.
+    MTL::Buffer* q_in = B.q;
+    MTL::Buffer* k_in = B.k_tmp;
+    MTL::Buffer* v_in = B.v_tmp;
+    if (p.seq > 1) {
+        encode_transpose(cmd, P.t_seq_to_head, B.q,     B.q_th, p.seq, p.n_heads,    hd);
+        encode_transpose(cmd, P.t_seq_to_head, B.k_tmp, B.k_th, p.seq, p.n_kv_heads, hd);
+        encode_transpose(cmd, P.t_seq_to_head, B.v_tmp, B.v_th, p.seq, p.n_kv_heads, hd);
+        q_in = B.q_th; k_in = B.k_th; v_in = B.v_th;
+    }
 
     // 6. KV cache write: k_th, v_th → k_cache, v_cache at write_pos.
     {
         auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(P.kv_cache_write);
-        enc->setBuffer(B.k_th,   0, 0);
-        enc->setBuffer(B.v_th,   0, 1);
+        enc->setBuffer(k_in,     0, 0);
+        enc->setBuffer(v_in,     0, 1);
         enc->setBuffer(B.k_cache, 0, 2);
         enc->setBuffer(B.v_cache, 0, 3);
         enc->setBytes(&p.batch,       4, 4);
@@ -302,7 +309,7 @@ inline void dispatch_layer(
     {
         auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(P.attn);
-        enc->setBuffer(B.q_th,     0, 0);
+        enc->setBuffer(q_in,       0, 0);
         enc->setBuffer(B.k_cache,  0, 1);
         enc->setBuffer(B.v_cache,  0, 2);
         enc->setBuffer(B.attn_out, 0, 3);
@@ -324,11 +331,16 @@ inline void dispatch_layer(
 
     // 7b. Transpose attn_out from (H, T, D) head-major back to (T, H, D)
     //     seq-major so o_proj GEMM reads contiguous rows of size n_heads*hd.
-    encode_transpose(cmd, P.t_head_to_seq, B.attn_out, B.attn_out_seq,
-                     p.seq, p.n_heads, hd);
+    // At T==1 layouts coincide → skip and feed attn_out directly.
+    MTL::Buffer* attn_o_in = B.attn_out;
+    if (p.seq > 1) {
+        encode_transpose(cmd, P.t_head_to_seq, B.attn_out, B.attn_out_seq,
+                         p.seq, p.n_heads, hd);
+        attn_o_in = B.attn_out_seq;
+    }
 
     // 8. O-projection GEMM: attn_out_seq → o_proj.
-    encode_gemm(cmd, P.gemm, B.attn_out_seq, 0, B.w_o, off_w_o, B.o_proj,
+    encode_gemm(cmd, P.gemm, attn_o_in, 0, B.w_o, off_w_o, B.o_proj,
                 T, p.d_model, p.n_heads * hd, P.gemv_m1);
 
     // 9. Fused residual + pre-MLP RMSNorm.
