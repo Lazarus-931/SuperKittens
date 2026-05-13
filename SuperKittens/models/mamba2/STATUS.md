@@ -103,3 +103,47 @@ SuperKittens/temp/mamba2_validate/
 ├── hf_bench.py            # ✓ working, 14.48 tok/s
 └── hf_ref.npz             # gitignored
 ```
+
+## Session 2026-05-13 progress
+
+- Synced `dev-mamba2` to origin/main (already up to date).
+- `llama.cpp` baseline: installed via `brew install llama.cpp` (9110). **No
+  Mamba 2 GGUF on HF Hub** (only Mamba 1 `dranger003/mamba-2.8b-hf-GGUF` and
+  `leliuga/mamba-2.8b-hf-GGUF` exist). Public llama.cpp Mamba 2 ecosystem for
+  small/130m model is absent; baseline skipped, HF fp32 14.48 tok/s remains
+  the sole reference.
+- Scaffolding written under `models/mamba2/`:
+    - `launcher.h` / `launcher.c++` — C ABI (`sk_mamba2_{create,forward,
+      reset,dump_layer,destroy}`), allocates fused weights + per-layer
+      `LayerState{conv_state, ssm_state}`. `forward()` is `ENOSYS` until SSD
+      lands end-to-end.
+    - `weights.h` / `weights.c++` — full HF name map for `mamba2-130m-hf`
+      (`backbone.embeddings.weight`, `backbone.norm_f.weight`,
+      `backbone.layers.{L}.{norm,mixer.{in_proj,conv1d,dt_bias,A_log,D,
+      norm,out_proj}}`), transpose for `in_proj`/`out_proj`, conv1d
+      `(C_in,1,K) -> (K, C_in)`. BF16→FP16 narrow.
+    - `mamba2_model.h` — `LayerParams`, `LayerPSOs`, `ModelWeights`,
+      `LayerState`, `ModelBuffers`. Pipeline doc comment matches HF
+      Mamba2Mixer order.
+    - `mamba2.py` — ctypes wrapper + `Mamba2Config.from_hf_json`.
+- SSD kernel rewrite (signature-correct reference, no chunking yet):
+    - `mamba2_ssd_ref.metal` — host name `mamba2_ssd_ref`. Inputs
+      `(x[B,L,H,P], dt_raw[B,L,H], A_log[H], B[B,L,G,N], C[B,L,G,N], D[H],
+      dt_bias[H])` → `y[B,L,H,P]`, `ssm_state[B,H,P,N]` fp32 in-out. Per-token
+      recurrence (HF `torch_forward` non-chunked path). Grid `(B*H, P, 1)`,
+      Nstate threads/tg.
+    - `mamba2_step_ref.metal` — single-token decode equivalent.
+
+## Remaining
+
+1. Add `mamba2_ssd_ref.metal` + `mamba2_step_ref.metal` to the Xcode build
+   (`SuperKittens.xcodeproj`) and register PSOs by name (`mamba2_ssd_ref` /
+   `mamba2_step_ref`) in `kernels/runtime_bindings`.
+2. Wire `sk_mamba2_forward` body: embed → per-layer{ pre_norm → in_proj →
+   split (z|xBC|dt_raw) → conv1d_silu → ssd_ref/step_ref → gate_norm →
+   out_proj → residual } → final_norm → tied lm_head argmax.
+3. `temp/mamba2_validate/layer_diff.py` — load SK forward intermediates,
+   compare to `hf_ref.npz` layer-by-layer (rel < 0.1 + argmax match for "Hi"
+   → token 13).
+4. Chunked SSD (HF L461-586) for prefill perf, once reference passes.
+5. Decode bench vs HF fp32 14.48 tok/s.
