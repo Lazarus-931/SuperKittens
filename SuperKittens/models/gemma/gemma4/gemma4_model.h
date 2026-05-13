@@ -72,6 +72,7 @@ struct LayerPSOs {
     MTL::ComputePipelineState* gemm_fp32_out;     // bf16 A,B → fp32 C (for PLE inject precision)
     MTL::ComputePipelineState* ple_gate_act_fp32; // fp32 gate, bf16 ple → fp32 gated
     MTL::ComputePipelineState* ple_inject_fp32;   // fp32 proj_back → bf16 residual
+    MTL::ComputePipelineState* ple_inject_fused_t1; // single-dispatch PLE inject (T=1 decode fast path)
 };
 
 struct LayerBuffers {
@@ -556,6 +557,29 @@ inline void dispatch_ple_inject(
     const size_t off_proj    = (size_t)L * p.d_model * p.ple_dim * 2;
     const size_t off_norm_pp = (size_t)L * p.d_model * 2;
     const size_t off_scalar  = (size_t)L * sizeof(float);
+
+    // Decode fast path: at T=1, run the entire 4-step PLE inject as a single
+    // threadgroup-resident dispatch. Removes 3 device-memory round trips and
+    // 3 encoder switches per layer (~140 dispatches per token across 35 layers).
+    if (T == 1 && P.ple_inject_fused_t1 != nullptr) {
+        auto* enc = cmd->computeCommandEncoder();
+        enc->setComputePipelineState(P.ple_inject_fused_t1);
+        enc->setBuffer(B.residual,                       0,           0);
+        enc->setBuffer(B.w_per_layer_input_gate,         off_gate,    1);
+        enc->setBuffer(B.w_per_layer_projection,         off_proj,    2);
+        enc->setBuffer(B.w_post_per_layer_input_norm,    off_norm_pp, 3);
+        enc->setBuffer(B.per_layer_inputs,               0,           4);
+        enc->setBuffer(B.w_layer_scalar,                 off_scalar,  5);
+        enc->setBytes(&p.d_model,  4, 6);
+        enc->setBytes(&p.ple_dim,  4, 7);
+        enc->setBytes(&n_layers,   4, 8);
+        enc->setBytes(&L,          4, 9);
+        enc->setBytes(&p.eps,      4, 10);
+        // 1 threadgroup per (token,layer); we're T=1 so just 1 TG total. 256 threads.
+        enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(256, 1, 1));
+        enc->endEncoding();
+        return;
+    }
 
     // 1. per_layer_input_gate: (T, d_model) @ (d_model, PLE_dim) → (T, PLE_dim) bf16
     {

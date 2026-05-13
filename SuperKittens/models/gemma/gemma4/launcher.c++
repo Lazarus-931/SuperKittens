@@ -54,6 +54,7 @@ static bool resolve_psos(ModelPSOs& P) {
     P.layer.gemm_fp32_out     = sk::bindings_pso("gemma4_gemm_bf16_fp32_out");
     P.layer.ple_gate_act_fp32 = sk::bindings_pso("gemma4_ple_gate_act_fp32");
     P.layer.ple_inject_fp32   = sk::bindings_pso("gemma4_ple_inject_fp32");
+    P.layer.ple_inject_fused_t1 = sk::bindings_pso("gemma4_ple_inject_fused_t1");
     P.embedding_lookup     = sk::bindings_pso("gemma4_embedding_lookup_bf16");
     P.ple_lookup           = sk::bindings_pso("gemma4_ple_lookup");
     P.ple_context_mix      = sk::bindings_pso("gemma4_ple_context_mix");
@@ -79,6 +80,7 @@ static bool resolve_psos(ModelPSOs& P) {
     _CK(P.layer.gemm_fp32_out);
     _CK(P.layer.ple_gate_act_fp32);
     _CK(P.layer.ple_inject_fp32);
+    _CK(P.layer.ple_inject_fused_t1);
     _CK(P.embedding_lookup);
     _CK(P.ple_lookup);
     _CK(P.ple_context_mix);
