@@ -38,6 +38,8 @@ struct LayerPSOs {
     MTL::ComputePipelineState* rmsnorm;
     MTL::ComputePipelineState* gemm;              // fp16 GEMM (M>1 path)
     MTL::ComputePipelineState* gemv_m1;           // fp16 GEMV M=1 fast-path (decode)
+    MTL::ComputePipelineState* gemv_swiglu_m1;    // fused gate+up+silu_mul GEMV (M=1)
+    MTL::ComputePipelineState* gemv_t_m1;         // M=1 matvec w/ transposed weight (LM-head)
     MTL::ComputePipelineState* split_packed;      // (T, A+B) → (T, A) + (T, B)
     MTL::ComputePipelineState* rope_qk;           // split-half RoPE on Q, K
     MTL::ComputePipelineState* attn;              // mha_causal (d=128, GQA)
@@ -365,11 +367,26 @@ inline void dispatch_layer(
     //   b) up_buf   = m_in @ w_up              (T, n_int)
     //   c) up_buf   = silu(gate_buf) * up_buf  (elementwise, in-place)
     //   d) mlp_out  = up_buf @ w_down          (T, d_model)
-    encode_gemm(cmd, P.gemm, B.m_in, 0, B.w_gate, off_w_gate,
-                B.gate_buf, T, p.n_int, p.d_model, P.gemv_m1);
-    encode_gemm(cmd, P.gemm, B.m_in, 0, B.w_up, off_w_gate,
-                B.up_buf, T, p.n_int, p.d_model, P.gemv_m1);
-    {
+    if (T == 1 && P.gemv_swiglu_m1 != nullptr) {
+        // Fused gate+up+silu_mul matvec (one dispatch, one m_in read).
+        auto* enc = cmd->computeCommandEncoder();
+        enc->setComputePipelineState(P.gemv_swiglu_m1);
+        enc->setBuffer(B.m_in,    0,          0);
+        enc->setBuffer(B.w_gate,  off_w_gate, 1);
+        enc->setBuffer(B.w_up,    off_w_gate, 2);
+        enc->setBuffer(B.up_buf,  0,          3);
+        uint32_t N_v = p.n_int, K_v = p.d_model;
+        enc->setBytes(&N_v, 4, 4);
+        enc->setBytes(&K_v, 4, 5);
+        const uint32_t BN = 128;
+        enc->dispatchThreadgroups(MTL::Size((N_v + BN - 1) / BN, 1, 1),
+                                  MTL::Size(BN, 1, 1));
+        enc->endEncoding();
+    } else {
+        encode_gemm(cmd, P.gemm, B.m_in, 0, B.w_gate, off_w_gate,
+                    B.gate_buf, T, p.n_int, p.d_model, P.gemv_m1);
+        encode_gemm(cmd, P.gemm, B.m_in, 0, B.w_up, off_w_gate,
+                    B.up_buf, T, p.n_int, p.d_model, P.gemv_m1);
         auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(P.silu_mul);
         enc->setBuffer(B.gate_buf, 0, 0);
@@ -605,24 +622,39 @@ inline void dispatch_model(
 
     // D. LM-head GEMM (tied → reuse embedding; untied → use w_lm_head). Both (V,D) row-major → transB=1.
     {
-        auto* enc = cmd->computeCommandEncoder();
-        enc->setComputePipelineState(P.layer.gemm);
         const uint32_t M_v = T, K_v = M.d_model, N_v = M.vocab_size;
-        uint32_t ldA = K_v, ldB = K_v, ldC = N_v;
-        int transA = 0, transB = 1, has_bias = 0;
         MTL::Buffer* w_head = W.w_lm_head ? W.w_lm_head : W.w_embed;
-        enc->setBuffer(nxt,        0, 0);
-        enc->setBuffer(w_head,     0, 1);
-        enc->setBuffer(B.logits,   0, 2);
-        enc->setBytes(&M_v,      4, 3); enc->setBytes(&N_v,      4, 4);
-        enc->setBytes(&K_v,      4, 5); enc->setBytes(&ldA,      4, 6);
-        enc->setBytes(&ldB,      4, 7); enc->setBytes(&ldC,      4, 8);
-        enc->setBytes(&transA,   4, 9); enc->setBytes(&transB,   4, 10);
-        enc->setBytes(&has_bias, 4, 11);
-        enc->setBuffer(B.logits, 0, 12);
-        enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M_v + 63) / 64, 1),
-                                  MTL::Size(64, 1, 1));
-        enc->endEncoding();
+        if (M_v == 1 && P.layer.gemv_t_m1 != nullptr) {
+            // Decode fast path: M=1 transposed-weight matvec.
+            auto* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(P.layer.gemv_t_m1);
+            enc->setBuffer(nxt,      0, 0);
+            enc->setBuffer(w_head,   0, 1);
+            enc->setBuffer(B.logits, 0, 2);
+            enc->setBytes(&N_v, 4, 3);
+            enc->setBytes(&K_v, 4, 4);
+            const uint32_t BN = 128;
+            enc->dispatchThreadgroups(MTL::Size((N_v + BN - 1) / BN, 1, 1),
+                                      MTL::Size(BN, 1, 1));
+            enc->endEncoding();
+        } else {
+            auto* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(P.layer.gemm);
+            uint32_t ldA = K_v, ldB = K_v, ldC = N_v;
+            int transA = 0, transB = 1, has_bias = 0;
+            enc->setBuffer(nxt,        0, 0);
+            enc->setBuffer(w_head,     0, 1);
+            enc->setBuffer(B.logits,   0, 2);
+            enc->setBytes(&M_v,      4, 3); enc->setBytes(&N_v,      4, 4);
+            enc->setBytes(&K_v,      4, 5); enc->setBytes(&ldA,      4, 6);
+            enc->setBytes(&ldB,      4, 7); enc->setBytes(&ldC,      4, 8);
+            enc->setBytes(&transA,   4, 9); enc->setBytes(&transB,   4, 10);
+            enc->setBytes(&has_bias, 4, 11);
+            enc->setBuffer(B.logits, 0, 12);
+            enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M_v + 63) / 64, 1),
+                                      MTL::Size(64, 1, 1));
+            enc->endEncoding();
+        }
     }
 
     // E. Argmax → output_id
