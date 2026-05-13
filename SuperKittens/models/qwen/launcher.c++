@@ -42,6 +42,9 @@ static bool resolve_psos(ModelPSOs& P) {
     P.layer.add            = sk::bindings_pso("add_f16");
     P.layer.add_rmsnorm    = sk::bindings_pso("add_rmsnorm");
     P.layer.gated_mlp      = sk::bindings_pso("gated_mlp");
+    P.layer.silu_mul       = sk::bindings_pso("silu_mul_f16");
+    P.layer.t_seq_to_head  = sk::bindings_pso("transpose_seq_to_head_f16");
+    P.layer.t_head_to_seq  = sk::bindings_pso("transpose_head_to_seq_f16");
     P.embedding_lookup     = sk::bindings_pso("embedding_lookup");
     P.argmax               = sk::bindings_pso("argmax");
 
@@ -55,6 +58,9 @@ static bool resolve_psos(ModelPSOs& P) {
     _CK("add_f16",          P.layer.add);
     _CK("add_rmsnorm",      P.layer.add_rmsnorm);
     _CK("gated_mlp",        P.layer.gated_mlp);
+    _CK("silu_mul_f16",     P.layer.silu_mul);
+    _CK("t_seq_to_head",    P.layer.t_seq_to_head);
+    _CK("t_head_to_seq",    P.layer.t_head_to_seq);
     _CK("embedding_lookup", P.embedding_lookup);
     _CK("argmax",           P.argmax);
     #undef _CK
@@ -127,6 +133,12 @@ extern "C" sk_qwen_handle* sk_qwen_create(const sk_qwen_config* cfg) {
     h->bufs.m_in       = alloc_zero(dev, (size_t)T_max * cfg->d_model * 2);
     h->bufs.mlp_out    = alloc_zero(dev, (size_t)T_max * cfg->d_model * 2);
     h->bufs.capture    = alloc_zero(dev, (size_t)T_max * cfg->d_model * 2);
+    h->bufs.gate_buf   = alloc_zero(dev, (size_t)T_max * cfg->n_int * 2);
+    h->bufs.up_buf     = alloc_zero(dev, (size_t)T_max * cfg->n_int * 2);
+    h->bufs.q_th       = alloc_zero(dev, (size_t)T_max * cfg->n_heads    * hd * 2);
+    h->bufs.k_th       = alloc_zero(dev, (size_t)T_max * cfg->n_kv_heads * hd * 2);
+    h->bufs.v_th       = alloc_zero(dev, (size_t)T_max * cfg->n_kv_heads * hd * 2);
+    h->bufs.attn_out_seq = alloc_zero(dev, (size_t)T_max * cfg->n_heads  * hd * 2);
 
     return reinterpret_cast<sk_qwen_handle*>(h);
 }
@@ -270,5 +282,7 @@ extern "C" void sk_qwen_destroy(sk_qwen_handle* hp) {
     rel(h->bufs.kv_pack); rel(h->bufs.k_tmp); rel(h->bufs.v_tmp);
     rel(h->bufs.attn_out); rel(h->bufs.o_proj); rel(h->bufs.y_attn);
     rel(h->bufs.m_in); rel(h->bufs.mlp_out); rel(h->bufs.capture);
+    rel(h->bufs.gate_buf); rel(h->bufs.up_buf);
+    rel(h->bufs.q_th); rel(h->bufs.k_th); rel(h->bufs.v_th); rel(h->bufs.attn_out_seq);
     delete h;
 }

@@ -44,6 +44,9 @@ struct LayerPSOs {
     MTL::ComputePipelineState* add;
     MTL::ComputePipelineState* add_rmsnorm;
     MTL::ComputePipelineState* gated_mlp;
+    MTL::ComputePipelineState* silu_mul;          // elementwise SiLU(gate)*up
+    MTL::ComputePipelineState* t_seq_to_head;     // (T,H,D) -> (H,T,D)
+    MTL::ComputePipelineState* t_head_to_seq;     // (H,T,D) -> (T,H,D)
 };
 
 struct LayerBuffers {
@@ -81,6 +84,16 @@ struct LayerBuffers {
     MTL::Buffer* m_in;
     MTL::Buffer* mlp_out;
     MTL::Buffer* y_out;
+
+    // MLP scratch: gate and up projections, each (T, n_int).
+    MTL::Buffer* gate_buf;
+    MTL::Buffer* up_buf;
+
+    // Head-major (H, T, D) scratch for Q, K, V and attn output.
+    MTL::Buffer* q_th;
+    MTL::Buffer* k_th;
+    MTL::Buffer* v_th;
+    MTL::Buffer* attn_out_seq;
 };
 
 
@@ -142,6 +155,22 @@ inline void encode_split(
     enc->setBytes(&A, 4, 4);
     enc->setBytes(&B, 4, 5);
     enc->dispatchThreads(MTL::Size(A + B, T, 1), MTL::Size(128, 1, 1));
+    enc->endEncoding();
+}
+
+inline void encode_transpose(
+    MTL::CommandBuffer* cmd, MTL::ComputePipelineState* pso,
+    MTL::Buffer* src, MTL::Buffer* dst,
+    uint32_t T, uint32_t H, uint32_t D)
+{
+    auto* enc = cmd->computeCommandEncoder();
+    enc->setComputePipelineState(pso);
+    enc->setBuffer(src, 0, 0);
+    enc->setBuffer(dst, 0, 1);
+    enc->setBytes(&T, 4, 2);
+    enc->setBytes(&H, 4, 3);
+    enc->setBytes(&D, 4, 4);
+    enc->dispatchThreads(MTL::Size(D, T, H), MTL::Size(32, 1, 1));
     enc->endEncoding();
 }
 
@@ -214,8 +243,7 @@ inline void dispatch_layer(
     encode_rmsnorm(cmd, P.rmsnorm, B.k_tmp, B.w_k_norm, off_w_k_norm,
                    B.k_tmp, T * p.n_kv_heads, hd, p.eps);
 
-    // 5. RoPE on Q and K (in-place). cos/sin tables are caller-baked with
-    //    Qwen's θ=1M and YaRN correction (no kernel change needed).
+    // 5. RoPE on Q and K (in-place, seq-major (T,H,D) layout).
     {
         const size_t cs_off = (size_t)p.write_pos * (hd / 2) * 2;
         encode_rope_qk_inplace(cmd, P.rope_qk, B.q,
@@ -226,12 +254,18 @@ inline void dispatch_layer(
                                p.seq, p.n_kv_heads, hd);
     }
 
-    // 6. KV cache write: k_tmp, v_tmp → k_cache, v_cache at write_pos.
+    // 5b. Transpose Q,K,V from (T,H,D) seq-major to (H,T,D) head-major
+    //     (matches what kv_cache_write and mha_causal expect).
+    encode_transpose(cmd, P.t_seq_to_head, B.q,     B.q_th, p.seq, p.n_heads,    hd);
+    encode_transpose(cmd, P.t_seq_to_head, B.k_tmp, B.k_th, p.seq, p.n_kv_heads, hd);
+    encode_transpose(cmd, P.t_seq_to_head, B.v_tmp, B.v_th, p.seq, p.n_kv_heads, hd);
+
+    // 6. KV cache write: k_th, v_th → k_cache, v_cache at write_pos.
     {
         auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(P.kv_cache_write);
-        enc->setBuffer(B.k_tmp,   0, 0);
-        enc->setBuffer(B.v_tmp,   0, 1);
+        enc->setBuffer(B.k_th,   0, 0);
+        enc->setBuffer(B.v_th,   0, 1);
         enc->setBuffer(B.k_cache, 0, 2);
         enc->setBuffer(B.v_cache, 0, 3);
         enc->setBytes(&p.batch,       4, 4);
@@ -247,11 +281,11 @@ inline void dispatch_layer(
     }
 
     // 7. Flash attention (mha_causal — GQA-aware, d=128).
-    //    Reads Q (post-RoPE) and the full K/V caches up to write_pos+seq.
+    //    Reads Q (post-RoPE, head-major) and the full K/V caches.
     {
         auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(P.attn);
-        enc->setBuffer(B.q,        0, 0);
+        enc->setBuffer(B.q_th,     0, 0);
         enc->setBuffer(B.k_cache,  0, 1);
         enc->setBuffer(B.v_cache,  0, 2);
         enc->setBuffer(B.attn_out, 0, 3);
@@ -271,8 +305,13 @@ inline void dispatch_layer(
         enc->endEncoding();
     }
 
-    // 8. O-projection GEMM: attn_out → o_proj.
-    encode_gemm(cmd, P.gemm, B.attn_out, 0, B.w_o, off_w_o, B.o_proj,
+    // 7b. Transpose attn_out from (H, T, D) head-major back to (T, H, D)
+    //     seq-major so o_proj GEMM reads contiguous rows of size n_heads*hd.
+    encode_transpose(cmd, P.t_head_to_seq, B.attn_out, B.attn_out_seq,
+                     p.seq, p.n_heads, hd);
+
+    // 8. O-projection GEMM: attn_out_seq → o_proj.
+    encode_gemm(cmd, P.gemm, B.attn_out_seq, 0, B.w_o, off_w_o, B.o_proj,
                 T, p.d_model, p.n_heads * hd);
 
     // 9. Fused residual + pre-MLP RMSNorm.
@@ -291,24 +330,30 @@ inline void dispatch_layer(
         enc->endEncoding();
     }
 
-    // 10. Dense SwiGLU MLP (fused gate + up + SiLU·mul + down).
+    // 10. Dense SwiGLU MLP: 3 separate GEMMs + silu_mul fusion (the
+    //     original `gated_mlp` kernel is structurally broken for N_int > BN).
+    //   a) gate_buf = m_in @ w_gate            (T, n_int)
+    //   b) up_buf   = m_in @ w_up              (T, n_int)
+    //   c) up_buf   = silu(gate_buf) * up_buf  (elementwise, in-place)
+    //   d) mlp_out  = up_buf @ w_down          (T, d_model)
+    encode_gemm(cmd, P.gemm, B.m_in, 0, B.w_gate, off_w_gate,
+                B.gate_buf, T, p.n_int, p.d_model);
+    encode_gemm(cmd, P.gemm, B.m_in, 0, B.w_up, off_w_gate,
+                B.up_buf, T, p.n_int, p.d_model);
     {
         auto* enc = cmd->computeCommandEncoder();
-        enc->setComputePipelineState(P.gated_mlp);
-        enc->setBuffer(B.m_in,    0,          0);
-        enc->setBuffer(B.w_gate,  off_w_gate, 1);
-        enc->setBuffer(B.w_up,    off_w_gate, 2);   // same per-layer slab size as w_gate
-        enc->setBuffer(B.w_down,  off_w_down, 3);
-        enc->setBuffer(B.mlp_out, 0,          4);
-        uint32_t M_v = T, N_v = p.d_model, K_v = p.d_model;
-        enc->setBytes(&M_v,     4, 5);
-        enc->setBytes(&N_v,     4, 6);
-        enc->setBytes(&K_v,     4, 7);
-        enc->setBytes(&p.n_int, 4, 8);
-        enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M_v + 63) / 64, 1),
-                                  MTL::Size(128, 1, 1));
+        enc->setComputePipelineState(P.silu_mul);
+        enc->setBuffer(B.gate_buf, 0, 0);
+        enc->setBuffer(B.up_buf,   0, 1);
+        enc->setBuffer(B.up_buf,   0, 2);
+        uint32_t N_total = T * p.n_int;
+        enc->setBytes(&N_total, 4, 3);
+        enc->dispatchThreadgroups(MTL::Size((N_total + 255) / 256, 1, 1),
+                                  MTL::Size(256, 1, 1));
         enc->endEncoding();
     }
+    encode_gemm(cmd, P.gemm, B.up_buf, 0, B.w_down, off_w_down,
+                B.mlp_out, T, p.d_model, p.n_int);
 
     // 11. Final residual: y_out = y_attn + mlp_out.
     {
@@ -405,6 +450,16 @@ struct ModelBuffers {
     MTL::Buffer* m_in;
     MTL::Buffer* mlp_out;
     MTL::Buffer* capture;  // optional snapshot buffer (T, d_model) fp16
+
+    // MLP scratch: gate and up projections, each (T, n_int).
+    MTL::Buffer* gate_buf;
+    MTL::Buffer* up_buf;
+
+    // Head-major (H, T, D) scratch for Q, K, V and a seq-major attn output.
+    MTL::Buffer* q_th;
+    MTL::Buffer* k_th;
+    MTL::Buffer* v_th;
+    MTL::Buffer* attn_out_seq;
 };
 
 inline void dispatch_model(
@@ -495,6 +550,12 @@ inline void dispatch_model(
         lb.m_in            = B.m_in;
         lb.mlp_out         = B.mlp_out;
         lb.y_out           = nxt;
+        lb.gate_buf        = B.gate_buf;
+        lb.up_buf          = B.up_buf;
+        lb.q_th            = B.q_th;
+        lb.k_th            = B.k_th;
+        lb.v_th            = B.v_th;
+        lb.attn_out_seq    = B.attn_out_seq;
 
         dispatch_layer(cmd, P.layer, lb, lp);
 
