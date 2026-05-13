@@ -20,6 +20,9 @@ struct Handle {
     std::vector<LayerCache> layer_caches;
     std::vector<MTL::Buffer*> k_caches;
     std::vector<MTL::Buffer*> v_caches;
+
+    uint32_t layers_run     = 0;
+    int32_t  capture_layer  = -1;
 };
 
 static MTL::Buffer* alloc_zero(MTL::Device* dev, size_t bytes) {
@@ -120,8 +123,26 @@ extern "C" sk_qwen_handle* sk_qwen_create(const sk_qwen_config* cfg) {
     h->bufs.y_attn     = alloc_zero(dev, (size_t)T_max * cfg->d_model * 2);
     h->bufs.m_in       = alloc_zero(dev, (size_t)T_max * cfg->d_model * 2);
     h->bufs.mlp_out    = alloc_zero(dev, (size_t)T_max * cfg->d_model * 2);
+    h->bufs.capture    = alloc_zero(dev, (size_t)T_max * cfg->d_model * 2);
 
     return reinterpret_cast<sk_qwen_handle*>(h);
+}
+
+extern "C" int sk_qwen_set_layers_run(sk_qwen_handle* hp, uint32_t n) {
+    if (!hp) return -1;
+    reinterpret_cast<meow::qwen::Handle*>(hp)->layers_run = n;
+    return 0;
+}
+extern "C" int sk_qwen_set_capture_layer(sk_qwen_handle* hp, int32_t layer) {
+    if (!hp) return -1;
+    reinterpret_cast<meow::qwen::Handle*>(hp)->capture_layer = layer;
+    return 0;
+}
+extern "C" int sk_qwen_get_capture(sk_qwen_handle* hp, void* out_fp16) {
+    if (!hp || !out_fp16) return -1;
+    auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
+    std::memcpy(out_fp16, h->bufs.capture->contents(), h->bufs.capture->length());
+    return 0;
 }
 
 extern "C" int sk_qwen_load_weights(sk_qwen_handle* hp, const sk_qwen_weights* w) {
@@ -186,6 +207,8 @@ extern "C" int sk_qwen_forward(sk_qwen_handle* hp,
     mp.rope_attn_factor = h->cfg.rope_attn_factor;
     mp.rope_beta_fast  = h->cfg.rope_beta_fast;
     mp.rope_beta_slow  = h->cfg.rope_beta_slow;
+    mp.layers_run      = h->layers_run;
+    mp.capture_layer   = h->capture_layer;
 
     auto* cmd = q->commandBuffer();
     meow::qwen::dispatch_model(cmd, h->psos, h->weights, h->bufs, mp);
@@ -237,6 +260,6 @@ extern "C" void sk_qwen_destroy(sk_qwen_handle* hp) {
     rel(h->bufs.x_norm); rel(h->bufs.qkv_packed); rel(h->bufs.q);
     rel(h->bufs.kv_pack); rel(h->bufs.k_tmp); rel(h->bufs.v_tmp);
     rel(h->bufs.attn_out); rel(h->bufs.o_proj); rel(h->bufs.y_attn);
-    rel(h->bufs.m_in); rel(h->bufs.mlp_out);
+    rel(h->bufs.m_in); rel(h->bufs.mlp_out); rel(h->bufs.capture);
     delete h;
 }

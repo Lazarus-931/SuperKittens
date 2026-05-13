@@ -17,6 +17,8 @@ struct Handle {
     std::vector<LayerCache> layer_caches;
     std::vector<MTL::Buffer*> k_caches;
     std::vector<MTL::Buffer*> v_caches;
+    uint32_t       layers_run;
+    int32_t        capture_layer;
 };
 }}
 

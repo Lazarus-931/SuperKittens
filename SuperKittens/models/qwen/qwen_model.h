@@ -350,6 +350,10 @@ struct ModelParams {
     float    rope_attn_factor = 1.f;
     float    rope_beta_fast   = 32.f;
     float    rope_beta_slow   = 1.f;
+
+    // Debug knobs (default = full model, no capture)
+    uint32_t layers_run     = 0;   // 0 → all n_layers; else only first N
+    int32_t  capture_layer  = -1;  // if >=0, copy post-layer residual to capture_buf
 };
 
 struct ModelPSOs {
@@ -399,6 +403,7 @@ struct ModelBuffers {
     MTL::Buffer* y_attn;
     MTL::Buffer* m_in;
     MTL::Buffer* mlp_out;
+    MTL::Buffer* capture;  // optional snapshot buffer (T, d_model) fp16
 };
 
 inline void dispatch_model(
@@ -430,7 +435,9 @@ inline void dispatch_model(
     MTL::Buffer* cur = B.x_a;
     MTL::Buffer* nxt = B.x_b;
 
-    for (uint32_t L = 0; L < M.n_layers; ++L) {
+    const uint32_t n_run = (M.layers_run > 0 && M.layers_run < M.n_layers)
+                           ? M.layers_run : M.n_layers;
+    for (uint32_t L = 0; L < n_run; ++L) {
         // KV-cache addressing
         const uint32_t total_after   = M.current_pos + M.seq;
         const uint32_t kv_len        = (total_after < M.cache_max) ? total_after : M.cache_max;
@@ -489,6 +496,14 @@ inline void dispatch_model(
         lb.y_out           = nxt;
 
         dispatch_layer(cmd, P.layer, lb, lp);
+
+        // Optional: snapshot this layer's residual output into capture buffer.
+        if (B.capture && M.capture_layer >= 0 && (int32_t)L == M.capture_layer) {
+            auto* benc = cmd->blitCommandEncoder();
+            benc->copyFromBuffer(nxt, 0, B.capture, 0,
+                                 (size_t)T * M.d_model * 2);
+            benc->endEncoding();
+        }
 
         MTL::Buffer* tmp = cur; cur = nxt; nxt = tmp;
     }
