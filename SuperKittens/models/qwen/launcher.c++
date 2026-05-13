@@ -32,7 +32,7 @@ static bool resolve_psos(ModelPSOs& P) {
     P.layer.rmsnorm        = sk::bindings_pso("rmsnorm");
     P.layer.gemm           = sk::bindings_pso("gemm_fp16");
     P.layer.split_packed   = sk::bindings_pso("split_packed");
-    P.layer.rope_qk        = sk::bindings_pso("rope_qk");
+    P.layer.rope_qk        = sk::bindings_pso("qwen_rope_qk");
     P.layer.attn           = sk::bindings_pso("mha_causal");
     P.layer.kv_cache_write = sk::bindings_pso("kv_cache_write");
     P.layer.add            = sk::bindings_pso("add_f16");
@@ -106,6 +106,8 @@ extern "C" sk_qwen_handle* sk_qwen_create(const sk_qwen_config* cfg) {
     h->bufs.x_b        = alloc_zero(dev, (size_t)T_max * cfg->d_model * 2);
     h->bufs.logits     = alloc_zero(dev, (size_t)T_max * cfg->vocab_size * 2);
     h->bufs.rope_pos   = alloc_zero(dev, (size_t)T_max * sizeof(int32_t));
+    h->bufs.cos_tbl    = alloc_zero(dev, (size_t)cfg->cache_max * (hd / 2) * 2);
+    h->bufs.sin_tbl    = alloc_zero(dev, (size_t)cfg->cache_max * (hd / 2) * 2);
 
     h->bufs.x_norm     = alloc_zero(dev, (size_t)T_max * cfg->d_model * 2);
     h->bufs.qkv_packed = alloc_zero(dev, (size_t)T_max * qkv_N * 2);
@@ -197,6 +199,15 @@ extern "C" int sk_qwen_forward(sk_qwen_handle* hp,
     return 0;
 }
 
+extern "C" int sk_qwen_set_rope_tables(sk_qwen_handle* hp, const void* cos, const void* sin) {
+    if (!hp || !cos || !sin) return -1;
+    auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
+    const size_t n = (size_t)h->cfg.cache_max * (h->cfg.head_dim / 2) * 2;
+    std::memcpy(h->bufs.cos_tbl->contents(), cos, n);
+    std::memcpy(h->bufs.sin_tbl->contents(), sin, n);
+    return 0;
+}
+
 extern "C" int sk_qwen_get_last_logits(sk_qwen_handle* hp, void* out_fp16) {
     if (!hp || !out_fp16) return -1;
     auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
@@ -222,6 +233,7 @@ extern "C" void sk_qwen_destroy(sk_qwen_handle* hp) {
     for (auto* b : h->v_caches) rel(b);
     rel(h->bufs.input_ids); rel(h->bufs.output_id);
     rel(h->bufs.x_a); rel(h->bufs.x_b); rel(h->bufs.logits); rel(h->bufs.rope_pos);
+    rel(h->bufs.cos_tbl); rel(h->bufs.sin_tbl);
     rel(h->bufs.x_norm); rel(h->bufs.qkv_packed); rel(h->bufs.q);
     rel(h->bufs.kv_pack); rel(h->bufs.k_tmp); rel(h->bufs.v_tmp);
     rel(h->bufs.attn_out); rel(h->bufs.o_proj); rel(h->bufs.y_attn);

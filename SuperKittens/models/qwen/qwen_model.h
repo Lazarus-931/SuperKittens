@@ -61,6 +61,8 @@ struct LayerBuffers {
     MTL::Buffer* w_down;              // (n_layers, n_int, d_model)
 
     MTL::Buffer* rope_pos;            // (seq,) int32 positions
+    MTL::Buffer* cos_tbl;             // (cache_size, head_dim/2) fp16
+    MTL::Buffer* sin_tbl;             // (cache_size, head_dim/2) fp16
 
     // Per-layer KV caches
     MTL::Buffer* k_cache;             // (cache_size, n_kv_heads, head_dim)
@@ -145,20 +147,26 @@ inline void encode_split(
 
 inline void encode_rope_qk_inplace(
     MTL::CommandBuffer* cmd, MTL::ComputePipelineState* pso,
-    MTL::Buffer* x, MTL::Buffer* pos,
-    MTL::Buffer* cos_tbl, MTL::Buffer* sin_tbl,
+    MTL::Buffer* x,
+    MTL::Buffer* cos_tbl, size_t cos_off,
+    MTL::Buffer* sin_tbl, size_t sin_off,
     uint32_t seq, uint32_t n_heads, uint32_t head_dim)
 {
     auto* enc = cmd->computeCommandEncoder();
     enc->setComputePipelineState(pso);
-    enc->setBuffer(x,       0, 0);
-    enc->setBuffer(x,       0, 1);
-    enc->setBuffer(cos_tbl, 0, 2);
-    enc->setBuffer(sin_tbl, 0, 3);
+    enc->setBuffer(x,       0,       0);
+    enc->setBuffer(x,       0,       1);
+    enc->setBuffer(cos_tbl, cos_off, 2);
+    enc->setBuffer(sin_tbl, sin_off, 3);
     enc->setBytes(&seq,      4, 4);
     enc->setBytes(&head_dim, 4, 5);
     enc->setBytes(&n_heads,  4, 6);
-    enc->dispatchThreadgroups(MTL::Size(n_heads, 1, 1), MTL::Size(1024, 1, 1));
+    const uint32_t hd4 = (head_dim / 2) / 4;
+    const uint32_t rows_per_tg = (hd4 > 0) ? (1024u / hd4) : 1u;
+    const uint32_t row_blocks = (seq + rows_per_tg - 1) / rows_per_tg;
+    enc->dispatchThreadgroups(
+        MTL::Size(n_heads, row_blocks, 1),
+        MTL::Size(hd4, rows_per_tg, 1));
     enc->endEncoding();
 }
 
@@ -208,11 +216,15 @@ inline void dispatch_layer(
 
     // 5. RoPE on Q and K (in-place). cos/sin tables are caller-baked with
     //    Qwen's θ=1M and YaRN correction (no kernel change needed).
-    // TODO: launcher needs to allocate + fill cos_tbl, sin_tbl buffers and
-    //       pass them through ModelBuffers. For now skip the encode — the
-    //       structural step is here.
-    // encode_rope_qk_inplace(cmd, P.rope_qk, B.q,     B.rope_pos, cos_tbl, sin_tbl, p.seq, p.n_heads,    hd);
-    // encode_rope_qk_inplace(cmd, P.rope_qk, B.k_tmp, B.rope_pos, cos_tbl, sin_tbl, p.seq, p.n_kv_heads, hd);
+    {
+        const size_t cs_off = (size_t)p.write_pos * (hd / 2) * 2;
+        encode_rope_qk_inplace(cmd, P.rope_qk, B.q,
+                               B.cos_tbl, cs_off, B.sin_tbl, cs_off,
+                               p.seq, p.n_heads, hd);
+        encode_rope_qk_inplace(cmd, P.rope_qk, B.k_tmp,
+                               B.cos_tbl, cs_off, B.sin_tbl, cs_off,
+                               p.seq, p.n_kv_heads, hd);
+    }
 
     // 6. KV cache write: k_tmp, v_tmp → k_cache, v_cache at write_pos.
     {
@@ -373,6 +385,8 @@ struct ModelBuffers {
     MTL::Buffer* x_b;
     MTL::Buffer* logits;
     MTL::Buffer* rope_pos;
+    MTL::Buffer* cos_tbl;
+    MTL::Buffer* sin_tbl;
 
     MTL::Buffer* x_norm;
     MTL::Buffer* qkv_packed;
@@ -457,6 +471,8 @@ inline void dispatch_model(
         lb.w_up            = W.w_up;
         lb.w_down          = W.w_down;
         lb.rope_pos        = B.rope_pos;
+        lb.cos_tbl         = B.cos_tbl;
+        lb.sin_tbl         = B.sin_tbl;
         lb.k_cache         = W.layer_caches[L].k;
         lb.v_cache         = W.layer_caches[L].v;
         lb.x_norm          = B.x_norm;
