@@ -35,6 +35,7 @@ static MTL::Buffer* alloc_zero(MTL::Device* dev, size_t bytes) {
 static bool resolve_psos(ModelPSOs& P) {
     P.layer.rmsnorm        = sk::bindings_pso("rmsnorm");
     P.layer.gemm           = sk::bindings_pso("gemm_fp16");
+    P.layer.gemv_m1        = sk::bindings_pso("gemv_fp16_m1");
     P.layer.split_packed   = sk::bindings_pso("split_packed");
     P.layer.rope_qk        = sk::bindings_pso("qwen_rope_qk");
     P.layer.attn           = sk::bindings_pso("mha_causal");
@@ -51,6 +52,7 @@ static bool resolve_psos(ModelPSOs& P) {
     #define _CK(name, val) if (!(val)) { std::fprintf(stderr, "qwen launcher: missing PSO " name "\n"); return false; }
     _CK("rmsnorm",          P.layer.rmsnorm);
     _CK("gemm_fp16",        P.layer.gemm);
+    _CK("gemv_fp16_m1",     P.layer.gemv_m1);
     _CK("split_packed",     P.layer.split_packed);
     _CK("rope_qk",          P.layer.rope_qk);
     _CK("mha_causal",       P.layer.attn);

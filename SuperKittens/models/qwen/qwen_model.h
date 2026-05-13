@@ -36,7 +36,8 @@ struct LayerParams {
 
 struct LayerPSOs {
     MTL::ComputePipelineState* rmsnorm;
-    MTL::ComputePipelineState* gemm;              // fp16 GEMM (M=1 → gemv fast-path)
+    MTL::ComputePipelineState* gemm;              // fp16 GEMM (M>1 path)
+    MTL::ComputePipelineState* gemv_m1;           // fp16 GEMV M=1 fast-path (decode)
     MTL::ComputePipelineState* split_packed;      // (T, A+B) → (T, A) + (T, B)
     MTL::ComputePipelineState* rope_qk;           // split-half RoPE on Q, K
     MTL::ComputePipelineState* attn;              // mha_causal (d=128, GQA)
@@ -102,8 +103,24 @@ inline void encode_gemm(
     MTL::Buffer* A, size_t off_A,
     MTL::Buffer* B, size_t off_B,
     MTL::Buffer* C,
-    uint32_t M, uint32_t N, uint32_t K)
+    uint32_t M, uint32_t N, uint32_t K,
+    MTL::ComputePipelineState* pso_gemv_m1 = nullptr)
 {
+    // Decode hot path: M==1 → specialized matvec (2–6× tile GEMM at typical decode shapes).
+    if (M == 1 && pso_gemv_m1 != nullptr) {
+        auto* enc = cmd->computeCommandEncoder();
+        enc->setComputePipelineState(pso_gemv_m1);
+        enc->setBuffer(A, off_A, 0);
+        enc->setBuffer(B, off_B, 1);
+        enc->setBuffer(C, 0,     2);
+        enc->setBytes(&N, 4, 3);
+        enc->setBytes(&K, 4, 4);
+        const uint32_t BN = 128;
+        enc->dispatchThreadgroups(MTL::Size((N + BN - 1) / BN, 1, 1),
+                                  MTL::Size(BN, 1, 1));
+        enc->endEncoding();
+        return;
+    }
     auto* enc = cmd->computeCommandEncoder();
     enc->setComputePipelineState(pso);
     uint32_t ldA = K, ldB = N, ldC = N;
@@ -227,7 +244,7 @@ inline void dispatch_layer(
 
     // 2. QKV-pack GEMM: x_norm → qkv_packed (T × (qN + 2*kvN)).
     encode_gemm(cmd, P.gemm, B.x_norm, 0, B.w_qkv, off_w_qkv,
-                B.qkv_packed, T, qkv_N, p.d_model);
+                B.qkv_packed, T, qkv_N, p.d_model, P.gemv_m1);
 
     // 3a. Split qkv_packed → q (T, qN) + kv_pack (T, 2*kvN).
     encode_split(cmd, P.split_packed, B.qkv_packed, B.q, B.kv_pack,
@@ -312,7 +329,7 @@ inline void dispatch_layer(
 
     // 8. O-projection GEMM: attn_out_seq → o_proj.
     encode_gemm(cmd, P.gemm, B.attn_out_seq, 0, B.w_o, off_w_o, B.o_proj,
-                T, p.d_model, p.n_heads * hd);
+                T, p.d_model, p.n_heads * hd, P.gemv_m1);
 
     // 9. Fused residual + pre-MLP RMSNorm.
     {
@@ -337,9 +354,9 @@ inline void dispatch_layer(
     //   c) up_buf   = silu(gate_buf) * up_buf  (elementwise, in-place)
     //   d) mlp_out  = up_buf @ w_down          (T, d_model)
     encode_gemm(cmd, P.gemm, B.m_in, 0, B.w_gate, off_w_gate,
-                B.gate_buf, T, p.n_int, p.d_model);
+                B.gate_buf, T, p.n_int, p.d_model, P.gemv_m1);
     encode_gemm(cmd, P.gemm, B.m_in, 0, B.w_up, off_w_gate,
-                B.up_buf, T, p.n_int, p.d_model);
+                B.up_buf, T, p.n_int, p.d_model, P.gemv_m1);
     {
         auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(P.silu_mul);
@@ -353,7 +370,7 @@ inline void dispatch_layer(
         enc->endEncoding();
     }
     encode_gemm(cmd, P.gemm, B.up_buf, 0, B.w_down, off_w_down,
-                B.mlp_out, T, p.d_model, p.n_int);
+                B.mlp_out, T, p.d_model, p.n_int, P.gemv_m1);
 
     // 11. Final residual: y_out = y_attn + mlp_out.
     {
