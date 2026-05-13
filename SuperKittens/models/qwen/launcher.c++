@@ -88,6 +88,8 @@ extern "C" sk_qwen_handle* sk_qwen_create(const sk_qwen_config* cfg) {
     h->weights.w_gate          = alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * cfg->n_int * 2);
     h->weights.w_up            = alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * cfg->n_int * 2);
     h->weights.w_down          = alloc_zero(dev, (size_t)cfg->n_layers * cfg->n_int * cfg->d_model * 2);
+    h->weights.w_lm_head       = cfg->tie_word_embeddings ? nullptr
+                                  : alloc_zero(dev, (size_t)cfg->vocab_size * cfg->d_model * 2);
 
     // Per-layer K, V caches (full cache; GQA → n_kv_heads not n_heads)
     h->layer_caches.resize(cfg->n_layers);
@@ -162,6 +164,7 @@ extern "C" int sk_qwen_load_weights(sk_qwen_handle* hp, const sk_qwen_weights* w
     cp(h->weights.w_gate,          w->w_gate);
     cp(h->weights.w_up,            w->w_up);
     cp(h->weights.w_down,          w->w_down);
+    if (h->weights.w_lm_head && w->w_lm_head) cp(h->weights.w_lm_head, w->w_lm_head);
     return 0;
 }
 
@@ -252,6 +255,7 @@ extern "C" void sk_qwen_destroy(sk_qwen_handle* hp) {
     rel(h->weights.w_qkv); rel(h->weights.w_q_norm); rel(h->weights.w_k_norm); rel(h->weights.w_o);
     rel(h->weights.w_pre_mlp_norm); rel(h->weights.w_final_norm);
     rel(h->weights.w_gate); rel(h->weights.w_up); rel(h->weights.w_down);
+    rel(h->weights.w_lm_head);
     for (auto* b : h->k_caches) rel(b);
     for (auto* b : h->v_caches) rel(b);
     rel(h->bufs.input_ids); rel(h->bufs.output_id);

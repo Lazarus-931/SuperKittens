@@ -379,6 +379,7 @@ struct ModelWeights {
     MTL::Buffer* w_gate;
     MTL::Buffer* w_up;
     MTL::Buffer* w_down;
+    MTL::Buffer* w_lm_head;  // null when tied
     const LayerCache* layer_caches;
 };
 
@@ -512,15 +513,16 @@ inline void dispatch_model(
     encode_rmsnorm(cmd, P.layer.rmsnorm, cur, W.w_final_norm, 0,
                    nxt, T, M.d_model, M.eps);
 
-    // D. LM-head GEMM (tied with embedding via transB=1)
+    // D. LM-head GEMM (tied → reuse embedding; untied → use w_lm_head). Both (V,D) row-major → transB=1.
     {
         auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(P.layer.gemm);
         const uint32_t M_v = T, K_v = M.d_model, N_v = M.vocab_size;
         uint32_t ldA = K_v, ldB = K_v, ldC = N_v;
         int transA = 0, transB = 1, has_bias = 0;
+        MTL::Buffer* w_head = W.w_lm_head ? W.w_lm_head : W.w_embed;
         enc->setBuffer(nxt,        0, 0);
-        enc->setBuffer(W.w_embed,  0, 1);
+        enc->setBuffer(w_head,     0, 1);
         enc->setBuffer(B.logits,   0, 2);
         enc->setBytes(&M_v,      4, 3); enc->setBytes(&N_v,      4, 4);
         enc->setBytes(&K_v,      4, 5); enc->setBytes(&ldA,      4, 6);

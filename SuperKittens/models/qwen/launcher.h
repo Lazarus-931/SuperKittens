@@ -33,6 +33,7 @@ typedef struct {
     float    rope_beta_slow;
 
     float    eps;
+    uint32_t tie_word_embeddings;  // 1 = tie LM head to embedding (Qwen3-0.6B), 0 = separate lm_head (Qwen3-8B)
 } sk_qwen_config;
 
 typedef struct {
@@ -47,6 +48,7 @@ typedef struct {
     const void* w_gate;
     const void* w_up;
     const void* w_down;
+    const void* w_lm_head;  // optional (untied); may be null when tie_word_embeddings=1
 } sk_qwen_weights;
 
 sk_qwen_handle* sk_qwen_create(const sk_qwen_config* cfg);

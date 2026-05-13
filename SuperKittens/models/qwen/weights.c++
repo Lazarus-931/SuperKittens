@@ -121,6 +121,10 @@ extern "C" int sk_qwen_load_from_store(sk_qwen_handle* hp, sk::WeightStore* stor
                    "model.embed_tokens.weight", (size_t)c.vocab_size * dm * fp16)) return -10;
     if (!copy_into(h->weights.w_final_norm, 0, store,
                    "model.norm.weight", dm * fp16)) return -11;
+    if (!c.tie_word_embeddings && h->weights.w_lm_head) {
+        if (!copy_into(h->weights.w_lm_head, 0, store,
+                       "lm_head.weight", (size_t)c.vocab_size * dm * fp16)) return -12;
+    }
 
     auto* qkv_base = (char*)h->weights.w_qkv->contents();
 
