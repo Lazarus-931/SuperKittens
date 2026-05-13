@@ -19,6 +19,10 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 REF_NPZ = ROOT / "temp/mamba2_validate/hf_ref.npz"
+if not REF_NPZ.exists():
+    alt = ROOT / "SuperKittens/temp/mamba2_validate/hf_ref.npz"
+    if alt.exists():
+        REF_NPZ = alt
 
 # Local model dir (downloaded snapshot) or HF id.
 HF_DIR = os.environ.get("MAMBA2_DIR",
