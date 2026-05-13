@@ -34,7 +34,6 @@ much faster kernels that are still performant.
 
 
 # Supported Chips
-April 2026:
 
 * We currently only support M1 and M2 and are in the process of adding support for M2+.
 
