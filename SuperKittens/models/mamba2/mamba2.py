@@ -81,9 +81,11 @@ class Mamba2Model:
 
     def __init__(self, cfg: Mamba2Config, lib_path: str | None = None):
         self.cfg = cfg
-        lib_path = lib_path or os.environ.get(
-            "SK_LIB", "build/libSuperKittens.dylib"
-        )
+        if lib_path is None:
+            lib_path = os.environ.get("SK_DYLIB") or os.environ.get("SK_LIB")
+        if lib_path is None:
+            here = Path(__file__).resolve()
+            lib_path = str(here.parents[3] / "build" / "libsk.dylib")
         self._lib = ctypes.CDLL(lib_path)
 
         self._lib.sk_mamba2_create.argtypes = [ctypes.POINTER(_CConfig)]
