@@ -180,12 +180,18 @@ extern "C" int sk_gemma4_load_from_store(sk_gemma4_handle* hp, sk::WeightStore* 
         scale_bf16_inplace(eb, n, embed_scale);
     }
 
-    // per_layer_model_projection: HF (out, in) → (d_model, n_layers*ple_dim).
+    // per_layer_model_projection: HF tensor shape (n_layers*ple_dim, d_model)
+    // (out_features=n_layers*ple_dim, in_features=d_model). SK GEMM
+    // computes `B.x_a @ W` with W laid out (d_model, n_layers*ple_dim), i.e.
+    // the transpose of HF. copy_transpose_bf16 treats src as
+    // (out_cols, out_rows) and writes dst as (out_rows, out_cols); so to
+    // transpose HF (8960, 1536) into SK (1536, 8960), we pass
+    // out_rows=d_model, out_cols=n_layers*ple_dim.
     if (c.has_ple && h->weights.w_per_layer_model_projection) {
-        const size_t out_rows = (size_t)c.n_layers * c.ple_dim;
+        const size_t out_cols = (size_t)c.n_layers * c.ple_dim;
         if (!copy_transpose_bf16(h->weights.w_per_layer_model_projection, 0, store,
                                  "model.language_model.per_layer_model_projection.weight",
-                                 out_rows, c.d_model)) {
+                                 c.d_model, out_cols)) {
             std::fprintf(stderr, "gemma4 weights: missing per_layer_model_projection\n");
         }
     }
