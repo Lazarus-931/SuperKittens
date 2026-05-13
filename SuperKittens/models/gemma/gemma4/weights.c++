@@ -3,6 +3,7 @@
 #include "../../../inference/weight_store.h"
 #include "../../load/safetensor/safetensor.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
@@ -156,6 +157,25 @@ extern "C" int sk_gemma4_load_from_store(sk_gemma4_handle* hp, sk::WeightStore* 
     if (!copy_into(h->weights.w_final_norm, 0, store,
                    "model.language_model.norm.weight", dm)) return -11;
 
+    {
+        const float embed_scale = std::sqrt((float)dm);
+        uint16_t* eb = (uint16_t*)h->weights.w_embed->contents();
+        const size_t n = (size_t)c.vocab_size * dm;
+        for (size_t i = 0; i < n; ++i) {
+            uint16_t h16 = eb[i];
+            uint32_t s = (uint32_t)(h16 >> 15) & 1;
+            uint32_t e = (uint32_t)(h16 >> 10) & 0x1F;
+            uint32_t m = (uint32_t)h16 & 0x3FF;
+            uint32_t bits;
+            if (e == 0)       bits = (s << 31);
+            else if (e == 31) bits = (s << 31) | (0xFFu << 23) | (m << 13);
+            else              bits = (s << 31) | ((e + 112u) << 23) | (m << 13);
+            float f; std::memcpy(&f, &bits, 4);
+            f *= embed_scale;
+            eb[i] = fp32_bits_to_fp16(*(uint32_t*)&f);
+        }
+    }
+
     if (c.has_ple && h->weights.w_ple_table) {
         const char* nm = "model.language_model.embed_tokens_per_layer.weight";
         auto* v = store->get(nm);
@@ -163,11 +183,25 @@ extern "C" int sk_gemma4_load_from_store(sk_gemma4_handle* hp, sk::WeightStore* 
             std::fprintf(stderr, "gemma4 weights: PLE tensor '%s' not found; leaving zero\n", nm);
         } else {
             const size_t ple_elems = v->nbytes / 2;
-            char* dst = (char*)h->weights.w_ple_table->contents();
+            uint16_t* dst = (uint16_t*)h->weights.w_ple_table->contents();
             if (v->dtype == sk::Dtype::BF16) {
-                bf16_to_fp16((uint16_t*)dst, (const uint16_t*)v->data, ple_elems);
+                bf16_to_fp16(dst, (const uint16_t*)v->data, ple_elems);
             } else {
                 std::memcpy(dst, v->data, v->nbytes);
+            }
+            const float ple_scale = std::sqrt((float)c.ple_dim);
+            for (size_t i = 0; i < ple_elems; ++i) {
+                uint16_t h16 = dst[i];
+                uint32_t s = (uint32_t)(h16 >> 15) & 1;
+                uint32_t e = (uint32_t)(h16 >> 10) & 0x1F;
+                uint32_t m = (uint32_t)h16 & 0x3FF;
+                uint32_t bits;
+                if (e == 0)       bits = (s << 31);
+                else if (e == 31) bits = (s << 31) | (0xFFu << 23) | (m << 13);
+                else              bits = (s << 31) | ((e + 112u) << 23) | (m << 13);
+                float f; std::memcpy(&f, &bits, 4);
+                f *= ple_scale;
+                dst[i] = fp32_bits_to_fp16(*(uint32_t*)&f);
             }
         }
     }
