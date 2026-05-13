@@ -1,4 +1,5 @@
 """gemma4.py — ctypes wrapper around the Gemma 4 launcher (libsk.dylib)."""
+from __future__ import annotations
 import ctypes, os, json, warnings
 import numpy as np
 from pathlib import Path
