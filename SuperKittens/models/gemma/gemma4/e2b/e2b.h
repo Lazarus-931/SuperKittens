@@ -29,9 +29,9 @@ static inline sk_gemma4_config gemma4_e2b_config(void) {
     c.local_period       = 6;         // 5 local : 1 global
     c.d_model            = 1536;
     c.n_int              = 6144;
-    c.n_heads            = 4;
-    c.n_kv_heads_local   = 4;         // local: GQA ratio 1
-    c.n_kv_heads_global  = 1;         // global: extreme GQA (4:1)
+    c.n_heads            = 8;         // E2B has 8 attention heads (HF config)
+    c.n_kv_heads_local   = 1;         // GQA ratio 8:1
+    c.n_kv_heads_global  = 1;
     c.head_dim_local     = 256;
     c.head_dim_global    = 512;
     c.window             = 4096;      // E-models: 4K SWA

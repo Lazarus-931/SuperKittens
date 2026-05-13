@@ -252,7 +252,9 @@ extern "C" sk_gemma4_handle* sk_gemma4_create(const sk_gemma4_config* cfg) {
                                   ? cfg->n_kv_heads_local : cfg->n_kv_heads_global;
         const size_t l0_extra = (size_t)3 * cfg->n_heads * hd_max_e
                               + (size_t)3 * n_kv_max_e * hd_max_e;
-        const size_t total_elems = per_dm + cfg->vocab_size + l0_extra;
+        const size_t qkv_slots_max_e = cfg->n_heads + 2u * n_kv_max_e;
+        const size_t l1_extra = (size_t)qkv_slots_max_e * hd_max_e;
+        const size_t total_elems = per_dm + cfg->vocab_size + l0_extra + l1_extra;
         h->bufs.dump_stash = alloc_zero(dev, total_elems * 2);
     }
 
@@ -435,6 +437,15 @@ extern "C" int sk_gemma4_dump_layer(sk_gemma4_handle* hp, const char* name, void
         if (std::strcmp(name, "L0.q_rope")   == 0) { copy_row(off_qr, H_n  * hd_l); return 0; }
         if (std::strcmp(name, "L0.k_rope")   == 0) { copy_row(off_kr, n_kv_l * hd_l); return 0; }
         if (std::strcmp(name, "L0.attn_pre") == 0) { copy_row(off_ap, H_n  * hd_l); return 0; }
+
+        // L1 qkv_pre_norm: comes immediately after the L0-extra block.
+        const size_t off_qkv_pre1 = off_ap + H_n * hd_max_e;
+        if (std::strcmp(name, "L1.qkv_pre_norm") == 0) {
+            // L1 is local layer-type (period=6, L=1 -> local). qkvN = (H+2*n_kv_l)*hd_l.
+            const size_t qkvN = (H_n + 2u * n_kv_l) * hd_l;
+            copy_row(off_qkv_pre1, qkvN);
+            return 0;
+        }
     }
     // Parse "L{L}.<tag>"
     if (name[0] != 'L') return -3;
@@ -453,6 +464,36 @@ extern "C" int sk_gemma4_dump_layer(sk_gemma4_handle* hp, const char* name, void
     if (std::strcmp(tag, "mlp")    == 0) { copy_row((off + 2) * dm, dm); return 0; }
     if (std::strcmp(tag, "out")    == 0) { copy_row((off + 3) * dm, dm); return 0; }
     return -5;
+}
+
+extern "C" int sk_gemma4_debug_weight(sk_gemma4_handle* hp, const char* name,
+                                      size_t byte_off, size_t nbytes, void* out)
+{
+    if (!hp || !name || !out) return -1;
+    auto* h = reinterpret_cast<meow::gemma4::Handle*>(hp);
+    MTL::Buffer* b = nullptr;
+    #define X(s, f) if (std::strcmp(name, s) == 0) b = h->weights.f
+    X("w_qkv", w_qkv);
+    X("w_out", w_out);
+    X("w_pre_attn_norm", w_pre_attn_norm);
+    X("w_post_attn_norm", w_post_attn_norm);
+    X("w_pre_feedforward_layernorm", w_pre_feedforward_layernorm);
+    X("w_post_feedforward_layernorm", w_post_feedforward_layernorm);
+    X("gamma_q", gamma_q);
+    X("gamma_k", gamma_k);
+    X("w_gate", w_gate);
+    X("w_up", w_up);
+    X("w_down", w_down);
+    X("w_per_layer_input_gate", w_per_layer_input_gate);
+    X("w_per_layer_projection", w_per_layer_projection);
+    X("w_post_per_layer_input_norm", w_post_per_layer_input_norm);
+    X("w_layer_scalar", w_layer_scalar);
+    X("w_final_norm", w_final_norm);
+    #undef X
+    if (!b) return -2;
+    if (byte_off + nbytes > b->length()) return -3;
+    std::memcpy(out, (const char*)b->contents() + byte_off, nbytes);
+    return 0;
 }
 
 extern "C" void sk_gemma4_destroy(sk_gemma4_handle* hp) {

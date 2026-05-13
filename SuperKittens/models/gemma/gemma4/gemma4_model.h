@@ -84,6 +84,11 @@ struct LayerBuffers {
     size_t       dump_extra_off_qr = 0;   // for q_rope
     size_t       dump_extra_off_kr = 0;   // for k_rope
     size_t       dump_extra_off_ap = 0;   // for attn_pre
+    // L1 qkv_pre_norm probe: dumps the last-token row of qkv_packed (post-GEMM,
+    // pre-qkv_norm-split). Used to verify whether the per-layer offsets into
+    // w_pre_attn_norm / w_qkv for L=1 are correct.
+    size_t       dump_extra_off_qkv_pre1 = 0; // 0 means disabled
+    uint32_t     dump_extra_qkvN_pre1    = 0; // (n_heads+2*n_kv)*head_dim for L1
 
     MTL::Buffer* x;                  // input
 
@@ -195,6 +200,18 @@ inline void dispatch_layer(
         enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M + 63) / 64, 1),
                                   MTL::Size(64, 1, 1));
         enc->endEncoding();
+    }
+
+    // DUMP (L1 only): qkv_packed last-token row (post-GEMM, pre-split).
+    if (B.dump_stash_extra && p.layer_idx == 1 && B.dump_extra_qkvN_pre1) {
+        const uint32_t T_ = p.batch * p.seq;
+        const size_t   qkvN_ = B.dump_extra_qkvN_pre1;
+        const size_t   row_bytes = qkvN_ * 2;
+        const size_t   src_off = (size_t)(T_ - 1) * row_bytes;
+        const size_t   dst_off = B.dump_extra_off_qkv_pre1 * 2;
+        auto* blit = cmd->blitCommandEncoder();
+        blit->copyFromBuffer(B.qkv_packed, src_off, B.dump_stash_extra, dst_off, row_bytes);
+        blit->endEncoding();
     }
 
     // 3. QKV split + per-head RMSNorm (V no γ)
@@ -930,6 +947,25 @@ inline void dispatch_model(
             lb.dump_extra_off_qr  = lb.dump_extra_off_kn + n_kv_max * hd_max;
             lb.dump_extra_off_kr  = lb.dump_extra_off_qr + (size_t)M.n_heads * hd_max;
             lb.dump_extra_off_ap  = lb.dump_extra_off_kr + n_kv_max * hd_max;
+        }
+        // L1 qkv_pre_norm probe wiring.
+        if (M.dump_enabled && B.dump_stash && L == 1) {
+            const size_t per_dm = (size_t)(2 + 4 * M.n_layers) * M.d_model;
+            const size_t hd_max = (M.head_dim_local > M.head_dim_global)
+                                  ? M.head_dim_local : M.head_dim_global;
+            const size_t n_kv_max = (M.n_kv_heads_local > M.n_kv_heads_global)
+                                    ? M.n_kv_heads_local : M.n_kv_heads_global;
+            const size_t base_extra = per_dm + M.vocab_size;
+            // L0-extra slot layout (matches sk_gemma4_dump_layer in launcher.c++):
+            // q_normed (H*hd_max), k_normed (n_kv_max*hd_max),
+            // q_rope   (H*hd_max), k_rope   (n_kv_max*hd_max),
+            // attn_pre (H*hd_max). Total: 3*H + 2*n_kv_max slots of hd_max.
+            const size_t l0_extra   = (size_t)3 * M.n_heads * hd_max
+                                    + (size_t)2 * n_kv_max * hd_max;
+            const uint32_t qkvN = (M.n_heads + 2u * n_kv) * hd;
+            lb.dump_stash_extra        = B.dump_stash;
+            lb.dump_extra_off_qkv_pre1 = base_extra + l0_extra;
+            lb.dump_extra_qkvN_pre1    = qkvN;
         }
         lb.x = cur;
         lb.w_pre_attn_norm  = W.w_pre_attn_norm;

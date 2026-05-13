@@ -257,6 +257,9 @@ class Gemma4:
             out = np.empty((self.cfg.n_heads * self.cfg.head_dim_local,), dtype=np.uint16)
         elif name in ("L0.k_normed", "L0.k_rope"):
             out = np.empty((self.cfg.n_kv_heads_local * self.cfg.head_dim_local,), dtype=np.uint16)
+        elif name == "L1.qkv_pre_norm":
+            qkvN = (self.cfg.n_heads + 2 * self.cfg.n_kv_heads_local) * self.cfg.head_dim_local
+            out = np.empty((qkvN,), dtype=np.uint16)
         else:
             out = np.empty((self.cfg.d_model,), dtype=np.uint16)
         rc = _load().sk_gemma4_dump_layer(self._h, name.encode(), out.ctypes.data)

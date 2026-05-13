@@ -104,6 +104,14 @@ int sk_gemma4_dump_layer(sk_gemma4_handle* h, const char* name, void* out_fp16);
 // d_model*(4*n_layers + 2) + vocab_size copies.
 void sk_gemma4_set_dump_enabled(sk_gemma4_handle* h, int enabled);
 
+// Debug: copy raw bytes from a named weight buffer (host-readable shared mem).
+// Names: "w_qkv","w_out","w_pre_attn_norm","w_post_attn_norm",
+//        "w_pre_feedforward_layernorm","w_post_feedforward_layernorm",
+//        "gamma_q","gamma_k","w_gate","w_up","w_down","w_per_layer_input_gate",
+//        "w_per_layer_projection","w_post_per_layer_input_norm","w_layer_scalar".
+int sk_gemma4_debug_weight(sk_gemma4_handle* h, const char* name,
+                           size_t byte_off, size_t nbytes, void* out);
+
 void sk_gemma4_destroy(sk_gemma4_handle* h);
 
 #ifdef __cplusplus
