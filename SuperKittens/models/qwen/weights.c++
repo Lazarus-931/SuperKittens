@@ -28,6 +28,33 @@ inline std::string layer_key(uint32_t L, const char* suffix) {
     return std::string(buf);
 }
 
+inline uint16_t fp32_bits_to_fp16(uint32_t f) {
+    uint32_t sign = (f >> 16) & 0x8000u;
+    uint32_t mant = f & 0x007fffffu;
+    int32_t  exp  = (int32_t)((f >> 23) & 0xffu) - 127 + 15;
+    if (((f >> 23) & 0xffu) == 0xffu) return (uint16_t)(sign | 0x7c00u | (mant ? 0x0200u : 0u));
+    if (exp >= 31) return (uint16_t)(sign | 0x7c00u);
+    if (exp <= 0) {
+        if (exp < -10) return (uint16_t)sign;
+        mant = (mant | 0x00800000u) >> (uint32_t)(1 - exp);
+        if (mant & 0x00001000u) mant += 0x00002000u;
+        return (uint16_t)(sign | (mant >> 13));
+    }
+    if (mant & 0x00001000u) {
+        mant += 0x00002000u;
+        if (mant & 0x00800000u) { mant = 0; exp += 1; }
+        if (exp >= 31) return (uint16_t)(sign | 0x7c00u);
+    }
+    return (uint16_t)(sign | ((uint32_t)exp << 10) | (mant >> 13));
+}
+
+inline void bf16_to_fp16(uint16_t* dst, const uint16_t* src, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        uint32_t f = ((uint32_t)src[i]) << 16;
+        dst[i] = fp32_bits_to_fp16(f);
+    }
+}
+
 bool copy_into(MTL::Buffer* dst, size_t dst_off, sk::WeightStore* store,
                const std::string& name, size_t expect_bytes)
 {
@@ -38,7 +65,12 @@ bool copy_into(MTL::Buffer* dst, size_t dst_off, sk::WeightStore* store,
                      name.c_str(), v->nbytes, expect_bytes);
         return false;
     }
-    std::memcpy((char*)dst->contents() + dst_off, v->data, expect_bytes);
+    char* out = (char*)dst->contents() + dst_off;
+    if (v->dtype == sk::Dtype::BF16) {
+        bf16_to_fp16((uint16_t*)out, (const uint16_t*)v->data, expect_bytes / 2);
+    } else {
+        std::memcpy(out, v->data, expect_bytes);
+    }
     return true;
 }
 
@@ -54,9 +86,18 @@ bool copy_transpose_fp16(MTL::Buffer* dst, size_t dst_off, sk::WeightStore* stor
     }
     const uint16_t* src = (const uint16_t*)v->data;
     uint16_t* d = (uint16_t*)((char*)dst->contents() + dst_off);
-    for (size_t i = 0; i < out_rows; ++i)
-        for (size_t j = 0; j < out_cols; ++j)
-            d[i * out_cols + j] = src[j * out_rows + i];
+    const bool is_bf16 = (v->dtype == sk::Dtype::BF16);
+    for (size_t i = 0; i < out_rows; ++i) {
+        for (size_t j = 0; j < out_cols; ++j) {
+            uint16_t s = src[j * out_rows + i];
+            if (is_bf16) {
+                uint32_t f = ((uint32_t)s) << 16;
+                d[i * out_cols + j] = fp32_bits_to_fp16(f);
+            } else {
+                d[i * out_cols + j] = s;
+            }
+        }
+    }
     return true;
 }
 
@@ -119,15 +160,24 @@ extern "C" int sk_qwen_load_from_store(sk_qwen_handle* hp, sk::WeightStore* stor
         const size_t vb = Nkv * dm * fp16;
         if (q_v->nbytes != qb || k_v->nbytes != kb || v_v->nbytes != vb) return -29;
         uint16_t* layer = (uint16_t*)(qkv_base + qkv_layer_off);
-        auto tx_into = [&](const void* src_v, size_t out_rows /*=dm*/, size_t out_cols, size_t col_off) {
+        auto tx_into = [&](const void* src_v, sk::Dtype dt, size_t out_rows, size_t out_cols, size_t col_off) {
             const uint16_t* s = (const uint16_t*)src_v;
-            for (size_t i = 0; i < out_rows; ++i)
-                for (size_t j = 0; j < out_cols; ++j)
-                    layer[i * qkvN + col_off + j] = s[j * out_rows + i];
+            const bool is_bf16 = (dt == sk::Dtype::BF16);
+            for (size_t i = 0; i < out_rows; ++i) {
+                for (size_t j = 0; j < out_cols; ++j) {
+                    uint16_t x = s[j * out_rows + i];
+                    if (is_bf16) {
+                        uint32_t f = ((uint32_t)x) << 16;
+                        layer[i * qkvN + col_off + j] = fp32_bits_to_fp16(f);
+                    } else {
+                        layer[i * qkvN + col_off + j] = x;
+                    }
+                }
+            }
         };
-        tx_into(q_v->data, dm, Nq,  0);
-        tx_into(k_v->data, dm, Nkv, Nq);
-        tx_into(v_v->data, dm, Nkv, Nq + Nkv);
+        tx_into(q_v->data, q_v->dtype, dm, Nq,  0);
+        tx_into(k_v->data, k_v->dtype, dm, Nkv, Nq);
+        tx_into(v_v->data, v_v->dtype, dm, Nkv, Nq + Nkv);
     }
 
     return 0;

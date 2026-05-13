@@ -197,6 +197,18 @@ extern "C" int sk_qwen_forward(sk_qwen_handle* hp,
     return 0;
 }
 
+extern "C" int sk_qwen_get_last_logits(sk_qwen_handle* hp, void* out_fp16) {
+    if (!hp || !out_fp16) return -1;
+    auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
+    const size_t V = h->cfg.vocab_size;
+    const size_t row_bytes = V * sizeof(uint16_t);
+    if (h->current_pos == 0) return -2;
+    const size_t last_row = (size_t)(h->current_pos - 1);
+    const char* src = (const char*)h->bufs.logits->contents() + last_row * row_bytes;
+    std::memcpy(out_fp16, src, row_bytes);
+    return 0;
+}
+
 extern "C" void sk_qwen_destroy(sk_qwen_handle* hp) {
     if (!hp) return;
     auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
