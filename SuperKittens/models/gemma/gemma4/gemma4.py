@@ -5,6 +5,8 @@ import numpy as np
 from pathlib import Path
 from dataclasses import dataclass
 
+from SuperKittens.inference.generation import Model
+
 
 _VARIANT_TO_DIR = {
     "e2b": "gemma-4-E2B-it",
@@ -193,7 +195,7 @@ def _to_cstruct(c: Gemma4Config) -> _Config:
     return cs
 
 
-class Gemma4:
+class Gemma4(Model):
     """Stateful Gemma 4 inference handle. Holds KV cache between forwards."""
 
     def __init__(self, variant_or_config):
@@ -207,6 +209,7 @@ class Gemma4:
         self._w_keep = None
         self._rope_keep = None
         self.tokenizer = None
+        self.vocab_size = cfg.vocab_size
 
     def load_weights(self, **arrays: np.ndarray):
         """Pass each weight as a contiguous fp16 numpy array, keyed by field name
@@ -245,6 +248,13 @@ class Gemma4:
         if ret:
             raise RuntimeError(f"sk_gemma4_forward failed: {ret}")
         return out
+
+    # Model base contract: int32 ids -> (batch,) int32 argmax, plus last_logits accessor.
+    def _forward(self, input_ids: np.ndarray) -> np.ndarray:
+        return self.forward(input_ids)
+
+    def _last_logits(self) -> np.ndarray:
+        return self.last_logits()
 
     def set_dump_enabled(self, enabled: bool):
         _load().sk_gemma4_set_dump_enabled(self._h, 1 if enabled else 0)
@@ -333,10 +343,36 @@ class Gemma4:
                 break
         return out
 
-    def chat(self, prompt: str, **gen_kwargs) -> str:
+    def chat(self, prompt, *, use_chat_template: bool = True, **gen_kwargs) -> str:
+        """End-to-end chat. `prompt` may be a str or list[{role,content}]."""
         if not getattr(self, "tokenizer", None):
-            raise RuntimeError("no tokenizer attached. use from_pretrained or set .tokenizer")
-        ids = self.tokenizer.encode(prompt)
+            raise RuntimeError("no tokenizer attached. use sk.load(...) or attach manually")
+        if isinstance(prompt, str):
+            messages = [{"role": "user", "content": prompt}]
+        else:
+            messages = list(prompt)
+
+        ids = None
+        if use_chat_template:
+            try:
+                if hasattr(self.tokenizer, "chat"):
+                    ids = self.tokenizer.chat(messages, add_generation_prompt=True, bos=True)
+            except Exception:
+                ids = None
+            if ids is None:
+                # Fallback: minimal in-repo gemma chat template.
+                role_map = {"user": "user", "assistant": "model",
+                            "model": "model", "system": "user"}
+                parts = []
+                for m in messages:
+                    role = role_map.get(m.get("role", "user").lower(), "user")
+                    parts.append(f"<start_of_turn>{role}\n{m.get('content','')}<end_of_turn>\n")
+                parts.append("<start_of_turn>model\n")
+                wrapped = "".join(parts)
+                ids = self.tokenizer.encode(wrapped, bos=True)
+        else:
+            ids = self.tokenizer.encode(messages[-1].get("content", ""), bos=True)
+
         eos = gen_kwargs.pop("eos_id", getattr(self.tokenizer, "eos_id", None))
         out_ids = self.generate(np.array(ids, dtype=np.int32), eos_id=eos, **gen_kwargs)
         return self.tokenizer.decode(out_ids)
