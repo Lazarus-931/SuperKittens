@@ -13,6 +13,7 @@ namespace sk {
 enum class Dtype : uint8_t {
     F32, F16, BF16,
     Q2_K, Q4_K, IQ2_XXS,
+    Q8_0,
 };
 
 struct TensorView {
