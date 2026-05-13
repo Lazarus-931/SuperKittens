@@ -66,3 +66,24 @@ logits = tanh(logits / cap) * cap     # cap = 30.0 for E2B/E4B
 3. V-norm + partial RoPE + softcap (kernel additions).
 4. PLE pipeline validation (already wired structurally).
 5. End-to-end logit comparison vs HF.
+
+## L0.out diagnostic note (2026-05-13, derek)
+
+Investigation status of the L0.out rel=0.020 residual divergence (validation against `hf_ref.npz` for prompt `[10979, 236888]`):
+
+### Cleanly verified
+- `W_per_layer_projection` is bit-exact vs HF safetensors after the loader transpose (`W_sk == W_hf.T`).
+- `W_per_layer_input_gate`, `W_post_per_layer_input_norm`, the PLE-table embed scale (sqrt(ple_dim)=16), and the `(proj + token_id) * 1/sqrt(2)` context-mix all match HF `modeling_gemma4.py:1754-1787`.
+- Gemma4RMSNorm in SK (`x * invrms * gamma`, *no* `1+w`) matches HF — Gemma4's RMSNorm differs from Gemma3/3n.
+- Decoder layer formula `out = layer_scalar * (residual + post_per_layer_input_norm(...))` matches HF `modeling_gemma4.py:1428-1437`.
+- End-to-end numpy reproduction with HF weights + SK's `pre_ple` reproduces `hf["L0.out"]` at max-abs=0.045.
+
+### Residual bug
+SK GPU output differs from the numpy reproduction by max-abs=0.46, concentrated on `post_per_layer_input_norm.weight == 5.4375` channels. Back-solving the kernel formula, SK's `ple_proj_back` differs from HF's `per_layer_projection` by ~4.8 on those channels — a structural miscompute somewhere in the PLE projection path (`gemma4_gemm_bf16_fp32_out` or its bf16 input from `gemma4_ple_gate_act`), not a precision/bf16 rounding issue.
+
+### Next probe
+- Add dump taps for `ple_gate_out` and `ple_proj_back` (only `pre_ple` is currently exposed).
+- Bisect by feeding SK's `ple_gate_out` into the numpy probe (`temp/gemma4_validate/probe8.py`) to isolate which of the two GEMMs is the offending kernel.
+- As a sanity check, swap `P.gemm_fp32_out` to `P.gemm` in `dispatch_ple_inject` step 3 to see if accuracy moves.
+
+Probes: `temp/gemma4_validate/probe{5..8}.py` on derek (gitignored).
