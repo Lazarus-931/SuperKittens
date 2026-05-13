@@ -40,7 +40,7 @@ SuperKittens/
 ├── build.sh                        # compile .metal → .metallib, .c++ → .dylib
 ├── setup.sh                        # one-shot: toolchain check, deps, build
 ├── download.sh                     # unified model downloader (registry)
-├── dev_env.md                      # this file
+├── CONTRIBUTION                    # this file
 ├── SuperKittens/                   # python package + C++ sources
 │   ├── __init__.py                 # exposes sk.load / sk.register / sk.Model
 │   ├── api.py                      # MODEL_REGISTRY + load()
