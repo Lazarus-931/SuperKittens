@@ -12,6 +12,8 @@ import numpy as np
 from pathlib import Path
 from dataclasses import dataclass, asdict
 
+from SuperKittens.inference.generation import Model
+
 
 class _Config(ctypes.Structure):
     _fields_ = [
@@ -82,6 +84,12 @@ def _load():
     if hasattr(_lib, "sk_qwen_load_gguf"):
         _lib.sk_qwen_load_gguf.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
         _lib.sk_qwen_load_gguf.restype  = ctypes.c_int
+    if hasattr(_lib, "sk_qwen_set_rope_tables"):
+        _lib.sk_qwen_set_rope_tables.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        _lib.sk_qwen_set_rope_tables.restype  = ctypes.c_int
+    if hasattr(_lib, "sk_qwen_get_last_logits"):
+        _lib.sk_qwen_get_last_logits.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        _lib.sk_qwen_get_last_logits.restype  = ctypes.c_int
     return _lib
 
 
@@ -129,8 +137,8 @@ class Config:
         return cs
 
 
-class Qwen:
-    """Stateful Qwen3-32B (dense) inference handle."""
+class Qwen(Model):
+    """Stateful Qwen3 (dense) inference handle."""
 
     def __init__(self, config: Config | str | None = None):
         if config is None: self.cfg = Config()
@@ -144,6 +152,9 @@ class Qwen:
         self._w_keep: list[np.ndarray] | None = None
         self._last_token: int | None = None
         self._tok = None
+        self._rope_keep = None
+        self.tokenizer = None
+        self.vocab_size = self.cfg.vocab_size
 
     @classmethod
     def test_config(cls) -> "Qwen":
@@ -219,6 +230,63 @@ class Qwen:
         self._last_token = int(out[0])
         return self._last_token
 
+    def _forward(self, input_ids: np.ndarray) -> np.ndarray:
+        """Model-base contract: take int32 ids, return (batch,) int32 argmax."""
+        ids = np.ascontiguousarray(np.asarray(input_ids, dtype=np.int32)).reshape(-1)
+        seq = ids.size // self.cfg.batch
+        out = np.empty((self.cfg.batch,), dtype=np.int32)
+        rc = _load().sk_qwen_forward(
+            self._h,
+            ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            seq,
+            out.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)))
+        if rc: raise RuntimeError(f"forward failed: {rc}")
+        self._last_token = int(out[0])
+        return out
+
+    def _last_logits(self) -> np.ndarray:
+        out = np.empty((self.cfg.vocab_size,), dtype=np.float16)
+        rc = _load().sk_qwen_get_last_logits(self._h, out.ctypes.data)
+        if rc: raise RuntimeError(f"sk_qwen_get_last_logits failed: {rc}")
+        return out
+
+    def set_rope_tables(self, cos: np.ndarray, sin: np.ndarray) -> None:
+        c = np.ascontiguousarray(cos, dtype=np.float16)
+        s = np.ascontiguousarray(sin, dtype=np.float16)
+        self._rope_keep = (c, s)
+        rc = _load().sk_qwen_set_rope_tables(self._h, c.ctypes.data, s.ctypes.data)
+        if rc: raise RuntimeError(f"sk_qwen_set_rope_tables failed: {rc}")
+
+    def bake_and_set_rope(self) -> None:
+        """Build RoPE cos/sin tables from cfg and upload to native handle."""
+        half = self.cfg.head_dim // 2
+        theta = self.cfg.rope_freq_base
+        inv_freq = 1.0 / (theta ** (np.arange(0, half, dtype=np.float64) / half))
+        pos = np.arange(self.cfg.cache_max, dtype=np.float64)
+        angles = np.outer(pos, inv_freq)
+        cos = np.cos(angles).astype(np.float16).copy()
+        sin = np.sin(angles).astype(np.float16).copy()
+        self.set_rope_tables(cos, sin)
+
+    def chat(self, prompt, *, use_chat_template: bool = True, **gen_kwargs) -> str:
+        """Run end-to-end chat. `prompt` may be str or list[{role,content}]."""
+        if self.tokenizer is None:
+            raise RuntimeError("no tokenizer attached. use sk.load(...) or attach manually")
+        if isinstance(prompt, str):
+            messages = [{"role": "user", "content": prompt}]
+        else:
+            messages = list(prompt)
+        if use_chat_template and hasattr(self.tokenizer, "chat"):
+            try:
+                ids = self.tokenizer.chat(messages, add_generation_prompt=True, bos=False)
+            except Exception:
+                ids = self.tokenizer.encode(messages[-1].get("content", ""))
+        else:
+            ids = self.tokenizer.encode(messages[-1].get("content", ""))
+        eos = gen_kwargs.pop("eos_id", getattr(self.tokenizer, "eos_id", None))
+        out_ids = self.generate(np.array(ids, dtype=np.int32), eos_id=eos, **gen_kwargs)
+        return self.tokenizer.decode(out_ids)
+
     def prefill(self, input_ids) -> int:
         self.reset()
         return self.forward(input_ids)
@@ -227,12 +295,6 @@ class Qwen:
         if self._last_token is None:
             raise RuntimeError("decode_step called before prefill/forward")
         return self.forward([self._last_token])
-
-    def generate(self, input_ids, max_new_tokens: int = 64) -> list[int]:
-        out: list[int] = [self.prefill(input_ids)]
-        for _ in range(max_new_tokens - 1):
-            out.append(self.decode_step())
-        return out
 
     def close(self) -> None:
         if self._h:
