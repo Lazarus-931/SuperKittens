@@ -881,6 +881,33 @@ inline void dispatch_model(
                                        MTL::Size(M.ple_dim, 1, 1));
             enc3->endEncoding();
         }
+
+        // DUMP L0.per_layer_inputs: post-context_mix bf16 slice for last token, L=0.
+        // Bug-hunting tap for the gate_act read: this is exactly what
+        // gemma4_ple_gate_act will fetch when launched with layer_idx=0 on token T-1.
+        if (M.dump_enabled && B.dump_stash) {
+            const size_t per_dm = (size_t)(2 + 4 * M.n_layers) * M.d_model;
+            const size_t hd_max = (M.head_dim_local > M.head_dim_global)
+                                  ? M.head_dim_local : M.head_dim_global;
+            const size_t n_kv_max = (M.n_kv_heads_local > M.n_kv_heads_global)
+                                    ? M.n_kv_heads_local : M.n_kv_heads_global;
+            const size_t base_extra   = per_dm + M.vocab_size;
+            const size_t l0_extra     = (size_t)3 * M.n_heads * hd_max
+                                      + (size_t)2 * n_kv_max * hd_max;
+            const size_t qkv_slots_max= M.n_heads + 2u * n_kv_max;
+            const size_t off_pre_ple  = base_extra + l0_extra + qkv_slots_max * hd_max;
+            const size_t off_ple_gate = off_pre_ple  + M.d_model;
+            const size_t off_ple_gated= off_ple_gate + M.ple_dim;
+            const size_t off_ple_proj = off_ple_gated+ M.ple_dim;
+            const size_t off_ple_pli  = off_ple_proj + (size_t)2 * M.d_model;
+            auto* blit = cmd->blitCommandEncoder();
+            const size_t rb = (size_t)M.ple_dim * 2;
+            // per_layer_inputs row stride = n_layers * ple_dim * 2 bytes; L=0 slice = first ple_dim.
+            const size_t src_off = (size_t)(T - 1) * M.n_layers * rb; // L=0 within row
+            blit->copyFromBuffer(B.per_layer_inputs, src_off,
+                                 B.dump_stash, off_ple_pli * 2, rb);
+            blit->endEncoding();
+        }
     }
 
     // B. Layer stack (ping-pong x_a ↔ x_b).

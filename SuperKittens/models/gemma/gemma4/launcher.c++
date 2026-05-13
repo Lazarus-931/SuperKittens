@@ -261,10 +261,11 @@ extern "C" sk_gemma4_handle* sk_gemma4_create(const sk_gemma4_config* cfg) {
         const size_t qkv_slots_max_e = cfg->n_heads + 2u * n_kv_max_e;
         const size_t l1_extra = (size_t)qkv_slots_max_e * hd_max_e;
         // +d_model     L0.pre_ple
-        // +ple_dim     L0.ple_gate_out  (bf16 step-1 output)
-        // +ple_dim     L0.ple_gated     (bf16 step-2 output)
-        // +2*d_model   L0.ple_proj_back (fp32 step-3 output; 2× bf16-sized slots)
-        const size_t ple_probe_elems = (size_t)2 * cfg->ple_dim + (size_t)2 * cfg->d_model;
+        // +ple_dim     L0.ple_gate_out      (bf16 step-1 output)
+        // +ple_dim     L0.ple_gated         (bf16 step-2 output)
+        // +2*d_model   L0.ple_proj_back     (fp32 step-3 output; 2× bf16-sized slots)
+        // +ple_dim     L0.per_layer_inputs  (bf16 L=0 slice post context_mix)
+        const size_t ple_probe_elems = (size_t)3 * cfg->ple_dim + (size_t)2 * cfg->d_model;
         const size_t total_elems = per_dm + cfg->vocab_size + l0_extra + l1_extra + cfg->d_model + ple_probe_elems;
         h->bufs.dump_stash = alloc_zero(dev, total_elems * 2);
     }
@@ -475,6 +476,8 @@ extern "C" int sk_gemma4_dump_layer(sk_gemma4_handle* hp, const char* name, void
             if (std::strcmp(name, "L0.ple_gate_out") == 0) { copy_row(off_ple_gate, h->cfg.ple_dim); return 0; }
             if (std::strcmp(name, "L0.ple_gated")    == 0) { copy_row(off_ple_gated, h->cfg.ple_dim); return 0; }
             if (std::strcmp(name, "L0.ple_proj_back")== 0) { copy_row(off_ple_proj, (size_t)2 * h->cfg.d_model); return 0; }
+            const size_t off_ple_pli     = off_ple_proj + (size_t)2 * h->cfg.d_model;
+            if (std::strcmp(name, "L0.per_layer_inputs") == 0) { copy_row(off_ple_pli, h->cfg.ple_dim); return 0; }
         }
     }
     // Parse "L{L}.<tag>"
