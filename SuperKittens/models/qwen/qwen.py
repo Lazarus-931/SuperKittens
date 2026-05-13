@@ -102,7 +102,6 @@ class Config:
     rope_beta_slow: float = 1.0
 
     eps: float = 1e-6
-    tie_word_embeddings: int = 1
     batch: int = 1
     seq_max: int = 8192
     cache_max: int = 32768
@@ -156,6 +155,10 @@ class Qwen:
         for name in _WEIGHT_FIELDS:
             a = weights.get(name)
             if a is None:
+                if name == "w_lm_head":
+                    # optional: only required when tie_word_embeddings == 0
+                    setattr(w, name, 0)
+                    continue
                 raise ValueError(f"missing weight: {name}. Required: {_WEIGHT_FIELDS}")
             a = np.ascontiguousarray(a, dtype=np.float16)
             keep.append(a)
