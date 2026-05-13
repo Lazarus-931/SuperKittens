@@ -33,6 +33,7 @@ class _Config(ctypes.Structure):
         ("rope_beta_fast",     ctypes.c_float),
         ("rope_beta_slow",     ctypes.c_float),
         ("eps",                ctypes.c_float),
+        ("tie_word_embeddings", ctypes.c_uint32),
     ]
 
 
@@ -48,6 +49,7 @@ _WEIGHT_FIELDS = (
     "w_gate",
     "w_up",
     "w_down",
+    "w_lm_head",
 )
 
 
@@ -100,6 +102,7 @@ class Config:
     rope_beta_slow: float = 1.0
 
     eps: float = 1e-6
+    tie_word_embeddings: int = 1
     batch: int = 1
     seq_max: int = 8192
     cache_max: int = 32768
