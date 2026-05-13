@@ -38,3 +38,5 @@ tmp/
 yarr/
 .pytest_cache/
 temp/
+__pycache__/
+*.pyc
