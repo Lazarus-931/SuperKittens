@@ -25,11 +25,13 @@ resolve() {
         qwen3-32b)          echo "Qwen/Qwen3-32B            Qwen3-32B" ;;
         deepseek-v3)        echo "deepseek-ai/DeepSeek-V3   DeepSeek-V3" ;;
         deepseek-v2-lite)   echo "deepseek-ai/DeepSeek-V2-Lite  DeepSeek-V2-Lite" ;;
+        mamba2-130m)        echo "AntonV/mamba2-130m-hf      mamba2-130m-hf" ;;
+        mamba2-2.7b)        echo "AntonV/mamba2-2.7b-hf      mamba2-2.7b-hf" ;;
         *)                  echo "" ;;
     esac
 }
 
-KNOWN="gemma4-e2b gemma4-e4b gemma4-26b gemma4-31b qwen3-0.6b qwen3-1.7b qwen3-8b qwen3-32b deepseek-v3 deepseek-v2-lite"
+KNOWN="gemma4-e2b gemma4-e4b gemma4-26b gemma4-31b qwen3-0.6b qwen3-1.7b qwen3-8b qwen3-32b deepseek-v3 deepseek-v2-lite mamba2-130m mamba2-2.7b"
 
 color() { printf "\033[1;36m%s\033[0m\n" "$*"; }
 warn()  { printf "\033[1;33m%s\033[0m\n" "$*"; }

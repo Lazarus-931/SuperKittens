@@ -69,6 +69,9 @@ struct LayerPSOs {
     MTL::ComputePipelineState* kv_cache_write;
     MTL::ComputePipelineState* ple_gate_act;
     MTL::ComputePipelineState* ple_inject;
+    MTL::ComputePipelineState* gemm_fp32_out;     // bf16 A,B → fp32 C (for PLE inject precision)
+    MTL::ComputePipelineState* ple_gate_act_fp32; // fp32 gate, bf16 ple → fp32 gated
+    MTL::ComputePipelineState* ple_inject_fp32;   // fp32 proj_back → bf16 residual
 };
 
 struct LayerBuffers {
@@ -554,7 +557,7 @@ inline void dispatch_ple_inject(
     const size_t off_norm_pp = (size_t)L * p.d_model * 2;
     const size_t off_scalar  = (size_t)L * sizeof(float);
 
-    // 1. per_layer_input_gate: (T, d_model) @ (d_model, PLE_dim) → (T, PLE_dim)
+    // 1. per_layer_input_gate: (T, d_model) @ (d_model, PLE_dim) → (T, PLE_dim) bf16
     {
         auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(P.gemm);
@@ -581,7 +584,7 @@ inline void dispatch_ple_inject(
         enc->endEncoding();
     }
 
-    // 2. ple_gate_act: gated = gelu_approx(gate_out) * ple_slice[L]
+    // 2. ple_gate_act (bf16 in/out — unchanged path).
     {
         auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(P.ple_gate_act);
@@ -597,10 +600,14 @@ inline void dispatch_ple_inject(
         enc->endEncoding();
     }
 
-    // 3. per_layer_projection: (T, PLE_dim) @ (PLE_dim, d_model) → (T, d_model)
+    // 3. per_layer_projection: (T, PLE_dim) bf16 @ (PLE_dim, d_model) bf16 → fp32 proj_back.
+    //    *** PRECISION FIX ***: fp32 destination preserves the GEMM accumulator
+    //    instead of bf16-truncating to 8 mantissa bits. ple_proj_back is consumed
+    //    by ple_inject_fp32 which applies RMSnorm * gamma; L1's input_layernorm
+    //    gamma_max≈76 would otherwise amplify the bf16 quantization noise.
     {
         auto* enc = cmd->computeCommandEncoder();
-        enc->setComputePipelineState(P.gemm);
+        enc->setComputePipelineState(P.gemm_fp32_out);
         const uint32_t M = T;
         const uint32_t K_v = p.ple_dim;
         const uint32_t N_v = p.d_model;
@@ -624,10 +631,10 @@ inline void dispatch_ple_inject(
         enc->endEncoding();
     }
 
-    // 4. fused rmsnorm + scaled add into residual
+    // 4. fused rmsnorm + scaled add into residual (fp32 proj_back input).
     {
         auto* enc = cmd->computeCommandEncoder();
-        enc->setComputePipelineState(P.ple_inject);
+        enc->setComputePipelineState(P.ple_inject_fp32);
         enc->setBuffer(B.ple_proj_back,                0,           0);
         enc->setBuffer(B.w_post_per_layer_input_norm,  off_norm_pp, 1);
         enc->setBuffer(B.residual,                     0,           2);
@@ -1015,6 +1022,23 @@ inline void dispatch_model(
             _dump_blit_row(cmd, B.x_norm, B.dump_stash, T, M.d_model, base * M.d_model);
             _dump_blit_row(cmd, B.o_proj, B.dump_stash, T, M.d_model, (base + 1) * M.d_model);
             _dump_blit_row(cmd, B.m_out , B.dump_stash, T, M.d_model, (base + 2) * M.d_model);
+        }
+
+        // DUMP L0.pre_ple: residual right before PLE inject (post step-12 residual,
+        // pre layer_scalar+PLE). Reuses L0-attn_pre extra slot — no, dedicated slot
+        // at the very END of the dump_stash (after L1.qkv_pre_norm).
+        if (M.dump_enabled && B.dump_stash && L == 0) {
+            const size_t per_dm = (size_t)(2 + 4 * M.n_layers) * M.d_model;
+            const size_t hd_max = (M.head_dim_local > M.head_dim_global)
+                                  ? M.head_dim_local : M.head_dim_global;
+            const size_t n_kv_max = (M.n_kv_heads_local > M.n_kv_heads_global)
+                                    ? M.n_kv_heads_local : M.n_kv_heads_global;
+            const size_t base_extra = per_dm + M.vocab_size;
+            const size_t l0_extra = (size_t)3 * M.n_heads * hd_max
+                                  + (size_t)2 * n_kv_max * hd_max;
+            const size_t qkv_slots_max = M.n_heads + 2u * n_kv_max;
+            const size_t off_pre_ple = base_extra + l0_extra + qkv_slots_max * hd_max;
+            _dump_blit_row(cmd, nxt, B.dump_stash, T, M.d_model, off_pre_ple);
         }
 
         if (M.has_ple) {

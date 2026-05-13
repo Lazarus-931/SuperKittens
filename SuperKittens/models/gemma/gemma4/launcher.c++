@@ -51,6 +51,9 @@ static bool resolve_psos(ModelPSOs& P) {
     P.layer.kv_cache_write = sk::bindings_pso("gemma4_kv_cache_write_bf16");
     P.layer.ple_gate_act   = sk::bindings_pso("gemma4_ple_gate_act");
     P.layer.ple_inject     = sk::bindings_pso("gemma4_ple_inject");
+    P.layer.gemm_fp32_out     = sk::bindings_pso("gemma4_gemm_bf16_fp32_out");
+    P.layer.ple_gate_act_fp32 = sk::bindings_pso("gemma4_ple_gate_act_fp32");
+    P.layer.ple_inject_fp32   = sk::bindings_pso("gemma4_ple_inject_fp32");
     P.embedding_lookup     = sk::bindings_pso("gemma4_embedding_lookup_bf16");
     P.ple_lookup           = sk::bindings_pso("gemma4_ple_lookup");
     P.ple_context_mix      = sk::bindings_pso("gemma4_ple_context_mix");
@@ -73,6 +76,9 @@ static bool resolve_psos(ModelPSOs& P) {
     _CK(P.layer.kv_cache_write);
     _CK(P.layer.ple_gate_act);
     _CK(P.layer.ple_inject);
+    _CK(P.layer.gemm_fp32_out);
+    _CK(P.layer.ple_gate_act_fp32);
+    _CK(P.layer.ple_inject_fp32);
     _CK(P.embedding_lookup);
     _CK(P.ple_lookup);
     _CK(P.ple_context_mix);
@@ -254,7 +260,8 @@ extern "C" sk_gemma4_handle* sk_gemma4_create(const sk_gemma4_config* cfg) {
                               + (size_t)3 * n_kv_max_e * hd_max_e;
         const size_t qkv_slots_max_e = cfg->n_heads + 2u * n_kv_max_e;
         const size_t l1_extra = (size_t)qkv_slots_max_e * hd_max_e;
-        const size_t total_elems = per_dm + cfg->vocab_size + l0_extra + l1_extra;
+        // +d_model for L0.pre_ple probe (last slot).
+        const size_t total_elems = per_dm + cfg->vocab_size + l0_extra + l1_extra + cfg->d_model;
         h->bufs.dump_stash = alloc_zero(dev, total_elems * 2);
     }
 
@@ -263,7 +270,8 @@ extern "C" sk_gemma4_handle* sk_gemma4_create(const sk_gemma4_config* cfg) {
         h->bufs.ple_ctx_proj     = alloc_zero(dev, (size_t)T_max * cfg->n_layers * cfg->ple_dim * 2);
         h->bufs.ple_gate_out     = alloc_zero(dev, (size_t)T_max * cfg->ple_dim * 2);
         h->bufs.ple_gated        = alloc_zero(dev, (size_t)T_max * cfg->ple_dim * 2);
-        h->bufs.ple_proj_back    = alloc_zero(dev, x_bytes);
+        // fp32 (4B/elem) — precision fix for PLE inject; amplified by L1 layernorm gamma.
+        h->bufs.ple_proj_back    = alloc_zero(dev, x_bytes * 2);
     } else {
         h->bufs.per_layer_inputs = nullptr;
         h->bufs.ple_ctx_proj     = nullptr;
@@ -440,6 +448,14 @@ extern "C" int sk_gemma4_dump_layer(sk_gemma4_handle* hp, const char* name, void
 
         // L1 qkv_pre_norm: comes immediately after the L0-extra block.
         const size_t off_qkv_pre1 = off_ap + H_n * hd_max_e;
+        // L0.pre_ple: residual right before PLE inject (post the step-12 residual add).
+        if (std::strcmp(name, "L0.pre_ple") == 0) {
+            const size_t qkv_slots_max_e = H_n + 2u * n_kv_max_e;
+            const size_t off_pre_ple = off_ap + H_n * hd_max_e   // skip attn_pre
+                                     + qkv_slots_max_e * hd_max_e; // skip L1.qkv_pre_norm
+            copy_row(off_pre_ple, h->cfg.d_model);
+            return 0;
+        }
         if (std::strcmp(name, "L1.qkv_pre_norm") == 0) {
             // L1 is local layer-type (period=6, L=1 -> local). qkvN = (H+2*n_kv_l)*hd_l.
             const size_t qkvN = (H_n + 2u * n_kv_l) * hd_l;
