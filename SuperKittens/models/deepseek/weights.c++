@@ -1,6 +1,7 @@
 #include "weights.h"
 #include "deepseek_model.h"
 #include "../../inference/weight_store.h"
+#include "../../inference/weight_utils.h"
 #include "../load/gguf/gguf.h"
 
 #include <cstdio>
@@ -29,42 +30,19 @@ inline std::string blk_key(uint32_t L, const char* suffix) {
     return std::string(buf);
 }
 
-bool copy_into(MTL::Buffer* dst, size_t dst_off, sk::WeightStore* store,
-               const std::string& name, size_t expect_bytes)
-{
-    auto* v = store->get(name);
-    if (!v) { std::fprintf(stderr, "ds4 weights: missing tensor '%s'\n", name.c_str()); return false; }
-    if (v->nbytes != expect_bytes) {
-        std::fprintf(stderr, "ds4 weights: size mismatch '%s' got %zu expect %zu\n",
-                     name.c_str(), v->nbytes, expect_bytes);
-        return false;
-    }
-    std::memcpy((char*)dst->contents() + dst_off, v->data, expect_bytes);
-    return true;
+inline bool copy_into(MTL::Buffer* dst, size_t dst_off, sk::WeightStore* store,
+                      const std::string& name, size_t expect_bytes) {
+    return sk::copy_into(dst, dst_off, store, name, expect_bytes, "ds4");
 }
 
-bool copy_raw(MTL::Buffer* dst, size_t dst_off, sk::WeightStore* store,
-              const std::string& name, size_t expect_bytes)
-{
-    return copy_into(dst, dst_off, store, name, expect_bytes);
+inline bool copy_raw(MTL::Buffer* dst, size_t dst_off, sk::WeightStore* store,
+                     const std::string& name, size_t expect_bytes) {
+    return sk::copy_into(dst, dst_off, store, name, expect_bytes, "ds4");
 }
 
-bool copy_transpose_fp16(MTL::Buffer* dst, size_t dst_off, sk::WeightStore* store,
-                         const std::string& name, size_t out_rows, size_t out_cols)
-{
-    auto* v = store->get(name);
-    if (!v) { std::fprintf(stderr, "ds4 weights: missing tensor '%s'\n", name.c_str()); return false; }
-    if (v->nbytes != out_rows * out_cols * 2) {
-        std::fprintf(stderr, "ds4 weights: tx size mismatch '%s' got %zu expect %zu\n",
-                     name.c_str(), v->nbytes, out_rows * out_cols * 2);
-        return false;
-    }
-    const uint16_t* src = (const uint16_t*)v->data;
-    uint16_t* d = (uint16_t*)((char*)dst->contents() + dst_off);
-    for (size_t i = 0; i < out_rows; ++i)
-        for (size_t j = 0; j < out_cols; ++j)
-            d[i * out_cols + j] = src[j * out_rows + i];
-    return true;
+inline bool copy_transpose_fp16(MTL::Buffer* dst, size_t dst_off, sk::WeightStore* store,
+                                const std::string& name, size_t out_rows, size_t out_cols) {
+    return sk::copy_transpose_fp16(dst, dst_off, store, name, out_rows, out_cols, "ds4");
 }
 
 bool is_block_quant(sk::Dtype t) {
