@@ -12,17 +12,16 @@ SuperKittens is a Metal kernel library for transformer (and SSM) inference on Ap
   ```
 - **Homebrew** and **Python 3.12+** (Homebrew Python is fine; venv strongly recommended).
 
-If unsure, run `./setup.sh` — it verifies the toolchain, installs the Python deps in a venv, and builds the library.
-
 ## First-time setup
 
 ```bash
 git clone https://github.com/Lazarus-931/SuperKittens.git
 cd SuperKittens
-./setup.sh
-source .venv/bin/activate
-./download.sh --list             # see supported models
-./download.sh gemma4-e2b          # pull weights into SuperKittens/model_weights/
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e '.[hf,tokenizer]'
+./build.sh
+# pull weights (any HF-hosted repo works; example):
+huggingface-cli download google/gemma-4-E2B-it --local-dir SuperKittens/model_weights/gemma-4-E2B-it
 ```
 
 A successful setup produces `build/libsk.dylib` and `build/libsk.metallib`. Sanity check:
@@ -38,8 +37,6 @@ print(m.chat("Hi", max_new_tokens=8))
 ```
 SuperKittens/
 ├── build.sh                        # compile .metal → .metallib, .c++ → .dylib
-├── setup.sh                        # one-shot: toolchain check, deps, build
-├── download.sh                     # unified model downloader (registry)
 ├── dev_env.md                      # this file
 ├── SuperKittens/                   # python package + C++ sources
 │   ├── __init__.py                 # exposes sk.load / sk.register / sk.Model
@@ -64,15 +61,14 @@ The build fails loud on any error — fix the first one before re-running. Pytho
 
 ## Adding a new model
 
-1. Add an entry to `download.sh`'s `resolve()` case statement (one line: `spec → hf_repo  local_dir`).
-2. Create `SuperKittens/models/<family>/` with:
+1. Create `SuperKittens/models/<family>/` with:
    - `<family>_model.h` — Metal-side dispatch orchestrator. Mirrors HF's `forward()` step order.
    - `launcher.{h,c++}` — C ABI: `sk_<family>_create / load_safetensors / forward / dump_layer / destroy`.
    - `weights.{h,c++}` — HF/GGUF tensor-name → fused-buffer mapping. Handles dtype casts.
    - `<family>.py` — ctypes wrapper class. Inherits `SuperKittens.inference.generation.Model` for chat/generate.
    - `<family>/__init__.py` — calls `SuperKittens.register("<spec>", <Class>)`.
    - Any family-specific Metal kernels alongside the orchestrator.
-3. Write a validation harness under `SuperKittens/temp/<family>_validate/`:
+2. Write a validation harness under `SuperKittens/temp/<family>_validate/`:
    - `dump_hf_<family>.py` — load HF reference via `transformers`, register forward hooks on every interesting module, save activations to `hf_ref.npz`.
    - `layer_diff.py` — compare SK forward against HF reference layer by layer.
 4. Iterate until `argmax(SK_logits) == argmax(HF_logits)` and rel_err is in the bf16/fp16 noise floor.

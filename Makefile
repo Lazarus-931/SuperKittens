@@ -1,7 +1,7 @@
 SHELL := /bin/bash
 PYTHON ?= python3
 
-.PHONY: help build clean install dev test bench list-models pr-list status
+.PHONY: help build clean install dev test bench pr-list status
 
 help:
 	@echo "SuperKittens dev targets:"
@@ -11,7 +11,6 @@ help:
 	@echo "  make dev           — install with [dev,hf,tokenizer] extras"
 	@echo "  make test          — run pytest (if any tests exist)"
 	@echo "  make bench SPEC=… GGUF=…  — SK vs llama.cpp side-by-side"
-	@echo "  make list-models   — show available model specs"
 	@echo "  make pr-list       — show open PRs"
 	@echo "  make status        — repo + branch summary"
 
@@ -33,9 +32,6 @@ test:
 bench:
 	@if [ -z "$(SPEC)" ] || [ -z "$(GGUF)" ]; then echo "usage: make bench SPEC=<spec> GGUF=<path>"; exit 1; fi
 	$(PYTHON) bench.py --spec $(SPEC) --gguf $(GGUF)
-
-list-models:
-	./download.sh --list
 
 pr-list:
 	gh pr list
