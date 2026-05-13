@@ -6,6 +6,8 @@
 #include <Metal/Metal.hpp>
 #include <cstdint>
 
+#include "../../inference/weight_store.h"
+
 namespace meow {
 namespace qwen {
 
@@ -40,6 +42,7 @@ struct LayerPSOs {
     MTL::ComputePipelineState* gemv_m1;           // fp16 GEMV M=1 fast-path (decode)
     MTL::ComputePipelineState* gemv_swiglu_m1;    // fused gate+up+silu_mul GEMV (M=1)
     MTL::ComputePipelineState* gemv_t_m1;         // M=1 matvec w/ transposed weight (LM-head)
+    MTL::ComputePipelineState* q8_0_matvec;       // M=1 matvec with Q8_0 weight (decode)
     MTL::ComputePipelineState* split_packed;      // (T, A+B) → (T, A) + (T, B)
     MTL::ComputePipelineState* rope_qk;           // split-half RoPE on Q, K
     MTL::ComputePipelineState* attn;              // mha_causal (d=128, GQA)
@@ -97,8 +100,51 @@ struct LayerBuffers {
     MTL::Buffer* k_th;
     MTL::Buffer* v_th;
     MTL::Buffer* attn_out_seq;
+
+    // Per-weight dtype (default FP16). Used by the M=1 fast-path to pick
+    // between gemv_fp16_m1 and q8_0_matvec.
+    sk::Dtype dt_qkv  = sk::Dtype::F16;
+    sk::Dtype dt_o    = sk::Dtype::F16;
+    sk::Dtype dt_gate = sk::Dtype::F16;
+    sk::Dtype dt_up   = sk::Dtype::F16;
+    sk::Dtype dt_down = sk::Dtype::F16;
 };
 
+// Encode a Q8_0 matvec: B (fp16 [K]) × A (q8_0 [N,K] row-major) → C (fp16 [N]).
+inline void encode_q8_0_matvec(
+    MTL::CommandBuffer* cmd, MTL::ComputePipelineState* pso,
+    MTL::Buffer* A, size_t off_A,
+    MTL::Buffer* B, size_t off_B,
+    MTL::Buffer* C,
+    uint32_t N, uint32_t K)
+{
+    auto* enc = cmd->computeCommandEncoder();
+    enc->setComputePipelineState(pso);
+    enc->setBuffer(B, off_B, 0);  // activation (fp16 [K])
+    enc->setBuffer(A, off_A, 1);  // q8_0 weight [N,K]
+    enc->setBuffer(C, 0,     2);
+    enc->setBytes(&K, 4, 3);
+    enc->setBytes(&N, 4, 4);
+    // Q8_NSG=4, Q8_NR0=2, 32 lanes per simdgroup → 128 threads/TG, 8 rows/TG.
+    const uint32_t rows_per_tg = 2;  // kernel writes NR0=2 rows per TG (all 4 SGs cooperate over K)
+    enc->dispatchThreadgroups(MTL::Size((N + rows_per_tg - 1) / rows_per_tg, 1, 1),
+                              MTL::Size(128, 1, 1));
+    enc->endEncoding();
+}
+
+
+// Q8_0-aware GEMM dispatch helper. If the weight is Q8_0 and M==1, route to
+// the Q8_0 matvec kernel (weight layout: row-major [N,K]). Otherwise fall back
+// to the regular fp16 GEMM/GEMV path.
+inline void encode_gemm_qaware(
+    MTL::CommandBuffer* cmd, MTL::ComputePipelineState* pso_gemm,
+    MTL::ComputePipelineState* pso_gemv_m1,
+    MTL::ComputePipelineState* pso_q8_0,
+    sk::Dtype                  dt_w,
+    MTL::Buffer* A, size_t off_A,            // activation (T,K) fp16
+    MTL::Buffer* W, size_t off_W,            // weight
+    MTL::Buffer* C,                          // output (T,N) fp16
+    uint32_t M, uint32_t N, uint32_t K);
 
 inline void encode_gemm(
     MTL::CommandBuffer* cmd, MTL::ComputePipelineState* pso,
@@ -139,6 +185,42 @@ inline void encode_gemm(
     enc->dispatchThreadgroups(MTL::Size((N + 63) / 64, (M + 63) / 64, 1),
                               MTL::Size(64, 1, 1));
     enc->endEncoding();
+}
+
+inline void encode_gemm_qaware(
+    MTL::CommandBuffer* cmd, MTL::ComputePipelineState* pso_gemm,
+    MTL::ComputePipelineState* pso_gemv_m1,
+    MTL::ComputePipelineState* pso_q8_0,
+    sk::Dtype                  dt_w,
+    MTL::Buffer* A, size_t off_A,
+    MTL::Buffer* W, size_t off_W,
+    MTL::Buffer* C,
+    uint32_t M, uint32_t N, uint32_t K)
+{
+    if (dt_w == sk::Dtype::Q8_0 && pso_q8_0 != nullptr) {
+        // Q8_0 weight: route via q8_0_matvec. For M>1 (prefill), iterate over
+        // rows of the activation/output (each row is a matvec). This is
+        // suboptimal but correct, and prefill of 2-token "Hi!" is fine.
+        for (uint32_t m = 0; m < M; ++m) {
+            const size_t off_A_row = off_A + (size_t)m * K * 2;        // fp16 activation row
+            // Output C is fp16 [M, N] row-major; row m starts at byte m*N*2.
+            // But our helper writes to C with no offset; emulate by adjusting
+            // the buffer offset for the output via setBuffer at index 2.
+            auto* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(pso_q8_0);
+            enc->setBuffer(W, off_W, 1);
+            enc->setBuffer(A, off_A_row, 0);
+            enc->setBuffer(C, (size_t)m * N * 2, 2);
+            enc->setBytes(&K, 4, 3);
+            enc->setBytes(&N, 4, 4);
+            const uint32_t rows_per_tg = 2;  // kernel writes NR0=2 rows per TG (all 4 SGs cooperate over K)
+            enc->dispatchThreadgroups(MTL::Size((N + rows_per_tg - 1) / rows_per_tg, 1, 1),
+                                      MTL::Size(128, 1, 1));
+            enc->endEncoding();
+        }
+        return;
+    }
+    encode_gemm(cmd, pso_gemm, A, off_A, W, off_W, C, M, N, K, pso_gemv_m1);
 }
 
 inline void encode_rmsnorm(
@@ -231,22 +313,25 @@ inline void dispatch_layer(
     const uint32_t kvN = p.n_kv_heads * hd;
     const uint32_t qkv_N = qN + 2 * kvN;
 
-    // Per-layer byte offsets.
+    // Per-layer byte offsets. fp16/bf16 = 2B/elem; Q8_0 = 34B per 32 elems.
+    auto wbytes = [](sk::Dtype d, size_t n) { return sk::dtype_bytes(d, n); };
     const size_t off_norm     = (size_t)L * p.d_model * 2;
-    const size_t off_w_qkv    = (size_t)L * p.d_model * qkv_N * 2;
+    const size_t off_w_qkv    = (size_t)L * wbytes(B.dt_qkv,  (size_t)p.d_model * qkv_N);
     const size_t off_w_q_norm = (size_t)L * hd * 2;
     const size_t off_w_k_norm = (size_t)L * hd * 2;
-    const size_t off_w_o      = (size_t)L * p.n_heads * hd * p.d_model * 2;
-    const size_t off_w_gate   = (size_t)L * p.d_model * p.n_int * 2;
-    const size_t off_w_down   = (size_t)L * p.n_int * p.d_model * 2;
+    const size_t off_w_o      = (size_t)L * wbytes(B.dt_o,    (size_t)p.n_heads * hd * p.d_model);
+    const size_t off_w_gate   = (size_t)L * wbytes(B.dt_gate, (size_t)p.d_model * p.n_int);
+    const size_t off_w_up     = (size_t)L * wbytes(B.dt_up,   (size_t)p.d_model * p.n_int);
+    const size_t off_w_down   = (size_t)L * wbytes(B.dt_down, (size_t)p.n_int * p.d_model);
 
     // 1. Pre-attn RMSNorm.
     encode_rmsnorm(cmd, P.rmsnorm, B.x, B.w_pre_attn_norm, off_norm,
                    B.x_norm, T, p.d_model, p.eps);
 
     // 2. QKV-pack GEMM: x_norm → qkv_packed (T × (qN + 2*kvN)).
-    encode_gemm(cmd, P.gemm, B.x_norm, 0, B.w_qkv, off_w_qkv,
-                B.qkv_packed, T, qkv_N, p.d_model, P.gemv_m1);
+    encode_gemm_qaware(cmd, P.gemm, P.gemv_m1, P.q8_0_matvec, B.dt_qkv,
+                       B.x_norm, 0, B.w_qkv, off_w_qkv,
+                       B.qkv_packed, T, qkv_N, p.d_model);
 
     // 3a. Split qkv_packed → q (T, qN) + kv_pack (T, 2*kvN).
     encode_split(cmd, P.split_packed, B.qkv_packed, B.q, B.kv_pack,
@@ -342,8 +427,9 @@ inline void dispatch_layer(
     }
 
     // 8. O-projection GEMM: attn_out_seq → o_proj.
-    encode_gemm(cmd, P.gemm, attn_o_in, 0, B.w_o, off_w_o, B.o_proj,
-                T, p.d_model, p.n_heads * hd, P.gemv_m1);
+    encode_gemm_qaware(cmd, P.gemm, P.gemv_m1, P.q8_0_matvec, B.dt_o,
+                       attn_o_in, 0, B.w_o, off_w_o, B.o_proj,
+                       T, p.d_model, p.n_heads * hd);
 
     // 9. Fused residual + pre-MLP RMSNorm.
     {
@@ -367,7 +453,8 @@ inline void dispatch_layer(
     //   b) up_buf   = m_in @ w_up              (T, n_int)
     //   c) up_buf   = silu(gate_buf) * up_buf  (elementwise, in-place)
     //   d) mlp_out  = up_buf @ w_down          (T, d_model)
-    if (T == 1 && P.gemv_swiglu_m1 != nullptr) {
+    const bool mlp_is_q8 = (B.dt_gate == sk::Dtype::Q8_0 || B.dt_up == sk::Dtype::Q8_0);
+    if (T == 1 && P.gemv_swiglu_m1 != nullptr && !mlp_is_q8) {
         // Fused gate+up+silu_mul matvec (one dispatch, one m_in read).
         auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(P.gemv_swiglu_m1);
@@ -383,10 +470,12 @@ inline void dispatch_layer(
                                   MTL::Size(BN, 1, 1));
         enc->endEncoding();
     } else {
-        encode_gemm(cmd, P.gemm, B.m_in, 0, B.w_gate, off_w_gate,
-                    B.gate_buf, T, p.n_int, p.d_model, P.gemv_m1);
-        encode_gemm(cmd, P.gemm, B.m_in, 0, B.w_up, off_w_gate,
-                    B.up_buf, T, p.n_int, p.d_model, P.gemv_m1);
+        encode_gemm_qaware(cmd, P.gemm, P.gemv_m1, P.q8_0_matvec, B.dt_gate,
+                           B.m_in, 0, B.w_gate, off_w_gate,
+                           B.gate_buf, T, p.n_int, p.d_model);
+        encode_gemm_qaware(cmd, P.gemm, P.gemv_m1, P.q8_0_matvec, B.dt_up,
+                           B.m_in, 0, B.w_up, off_w_up,
+                           B.up_buf, T, p.n_int, p.d_model);
         auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(P.silu_mul);
         enc->setBuffer(B.gate_buf, 0, 0);
@@ -398,8 +487,9 @@ inline void dispatch_layer(
                                   MTL::Size(256, 1, 1));
         enc->endEncoding();
     }
-    encode_gemm(cmd, P.gemm, B.up_buf, 0, B.w_down, off_w_down,
-                B.mlp_out, T, p.d_model, p.n_int, P.gemv_m1);
+    encode_gemm_qaware(cmd, P.gemm, P.gemv_m1, P.q8_0_matvec, B.dt_down,
+                       B.up_buf, 0, B.w_down, off_w_down,
+                       B.mlp_out, T, p.d_model, p.n_int);
 
     // 11. Final residual: y_out = y_attn + mlp_out.
     {
@@ -472,6 +562,14 @@ struct ModelWeights {
     MTL::Buffer* w_down;
     MTL::Buffer* w_lm_head;  // null when tied
     const LayerCache* layer_caches;
+
+    // Per-projection dtypes (default FP16). Set by loader when using Q8_0.
+    sk::Dtype dt_qkv     = sk::Dtype::F16;
+    sk::Dtype dt_o       = sk::Dtype::F16;
+    sk::Dtype dt_gate    = sk::Dtype::F16;
+    sk::Dtype dt_up      = sk::Dtype::F16;
+    sk::Dtype dt_down    = sk::Dtype::F16;
+    sk::Dtype dt_lm_head = sk::Dtype::F16;
 };
 
 struct ModelBuffers {
@@ -602,6 +700,11 @@ inline void dispatch_model(
         lb.k_th            = B.k_th;
         lb.v_th            = B.v_th;
         lb.attn_out_seq    = B.attn_out_seq;
+        lb.dt_qkv          = W.dt_qkv;
+        lb.dt_o            = W.dt_o;
+        lb.dt_gate         = W.dt_gate;
+        lb.dt_up           = W.dt_up;
+        lb.dt_down         = W.dt_down;
 
         dispatch_layer(cmd, P.layer, lb, lp);
 
@@ -624,6 +727,23 @@ inline void dispatch_model(
     {
         const uint32_t M_v = T, K_v = M.d_model, N_v = M.vocab_size;
         MTL::Buffer* w_head = W.w_lm_head ? W.w_lm_head : W.w_embed;
+        // Q8_0 LM head fast path: when caller provides a Q8_0-packed LM-head
+        // buffer in dt_lm_head, route to q8_0_matvec. For M>1 (prefill) we
+        // loop over rows since the kernel is a matvec.
+        if (W.dt_lm_head == sk::Dtype::Q8_0 && W.w_lm_head &&
+            P.layer.q8_0_matvec != nullptr) {
+            for (uint32_t m = 0; m < M_v; ++m) {
+                auto* enc = cmd->computeCommandEncoder();
+                enc->setComputePipelineState(P.layer.q8_0_matvec);
+                enc->setBuffer(nxt,           (size_t)m * K_v * 2, 0);
+                enc->setBuffer(W.w_lm_head,   0,                   1);
+                enc->setBuffer(B.logits,      (size_t)m * N_v * 2, 2);
+                enc->setBytes(&K_v, 4, 3);
+                enc->setBytes(&N_v, 4, 4);
+                enc->dispatchThreadgroups(MTL::Size((N_v + 1) / 2, 1, 1), MTL::Size(128, 1, 1));
+                enc->endEncoding();
+            }
+        } else
         if (M_v == 1 && P.layer.gemv_t_m1 != nullptr) {
             // Decode fast path: M=1 transposed-weight matvec.
             auto* enc = cmd->computeCommandEncoder();

@@ -11,8 +11,8 @@
 //
 // Dispatch (host): grid (N/NR0, 1, 1), threadgroup (NW * NSG, 1, 1).
 //   - NW  = 32 (simdgroup width)
-//   - NSG = 4  simdgroups per TG
-//   - NR0 = 2  output rows per simdgroup (so each TG produces NSG*NR0 = 8 rows)
+//   - NSG = 4  simdgroups per TG  (all SGs cooperate over the K dimension)
+//   - NR0 = 2  output rows per TG (TG writes 2 rows; NOT NSG*NR0=8)
 //
 // One thread reads NQ=8 activations and 8 quantized weights per inner step; the
 // simdgroup tiles over the K dimension by stepping NSG*NQ blocks at a time, then
@@ -32,7 +32,7 @@ using namespace metal;
 #define Q8_BLOCK 32
 #endif
 
-struct q8_block { half d; int8_t qs[Q8_BLOCK]; };
+struct __attribute__((packed)) q8_block { half d; int8_t qs[Q8_BLOCK]; };
 
 constant constexpr short Q8_NW  = 32;
 constant constexpr short Q8_NSG = 4;
@@ -95,12 +95,11 @@ kernel void q8_0_matvec(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (sgitg == 0 && tiisg < Q8_NSG) {
+    if (sgitg == 0) {
+        // All 32 lanes participate in simd_sum (only lanes 0..NSG-1 carry data).
         #pragma unroll
         for (short r = 0; r < Q8_NR0; ++r) {
-            // Lanes 0..NSG-1 each load one SG's partial.
-            float v = shmem[r * Q8_NSG + tiisg];
-            // Sum across these NSG lanes.
+            float v = (tiisg < Q8_NSG) ? shmem[r * Q8_NSG + tiisg] : 0.0f;
             v = simd_sum(v);
             if (tiisg == 0) {
                 const uint out_row = row0 + r;

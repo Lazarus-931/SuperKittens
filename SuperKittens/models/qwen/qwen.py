@@ -79,6 +79,9 @@ def _load():
     _lib.sk_qwen_destroy.restype        = None
     _lib.sk_qwen_load_safetensors.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
     _lib.sk_qwen_load_safetensors.restype  = ctypes.c_int
+    if hasattr(_lib, "sk_qwen_load_gguf"):
+        _lib.sk_qwen_load_gguf.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+        _lib.sk_qwen_load_gguf.restype  = ctypes.c_int
     return _lib
 
 
@@ -187,6 +190,17 @@ class Qwen:
             "w_up":            W(c.n_layers, c.d_model, c.n_int),
             "w_down":          W(c.n_layers, c.n_int, c.d_model),
         })
+
+    def load_gguf(self, path: str) -> None:
+        """Load Qwen3 weights from a GGUF file (e.g. q8_0). The file's projection
+        dtype (Q8_0 / F16) is auto-detected; the launcher reallocates the affected
+        weight buffers to the right size and routes M=1 GEMMs to q8_0_matvec."""
+        lib = _load()
+        if not hasattr(lib, "sk_qwen_load_gguf"):
+            raise RuntimeError("libsk.dylib has no sk_qwen_load_gguf symbol; rebuild dylib")
+        rc = lib.sk_qwen_load_gguf(self._h, str(path).encode())
+        if rc:
+            raise RuntimeError(f"sk_qwen_load_gguf failed: {rc}")
 
     def reset(self) -> None:
         _load().sk_qwen_reset(self._h)

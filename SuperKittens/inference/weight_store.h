@@ -16,6 +16,18 @@ enum class Dtype : uint8_t {
     Q8_0,
 };
 
+// Bytes required to hold `n_elems` elements of dtype `d`.
+// For Q8_0 caller must ensure n_elems % 32 == 0 (one block = 32 elems = 34 bytes).
+inline size_t dtype_bytes(Dtype d, size_t n_elems) {
+    switch (d) {
+        case Dtype::F32:  return n_elems * 4;
+        case Dtype::F16:  return n_elems * 2;
+        case Dtype::BF16: return n_elems * 2;
+        case Dtype::Q8_0: return (n_elems / 32) * 34;
+        default:          return n_elems * 2;  // best-effort fallback
+    }
+}
+
 struct TensorView {
     const void*          data;
     size_t               nbytes;
