@@ -262,9 +262,9 @@ class DeepSeek(Model):
         return _WEIGHT_FIELDS
 
     # ─── inference ───
-    def forward(self, input_ids) -> int:
-        """Forward pass over `seq` tokens; returns argmax token id."""
-        ids = np.asarray(input_ids, dtype=np.int32).reshape(-1)
+    def _forward(self, input_ids: np.ndarray) -> np.ndarray:
+        """Model-base contract: int32 ids in, (batch,) int32 argmax out."""
+        ids = np.ascontiguousarray(np.asarray(input_ids, dtype=np.int32)).reshape(-1)
         seq = ids.size // self.cfg.batch
         out = np.empty((self.cfg.batch,), dtype=np.int32)
         rc = _load().sk_deepseek_forward(
@@ -274,35 +274,11 @@ class DeepSeek(Model):
             out.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)))
         if rc: raise RuntimeError(f"forward failed: {rc}")
         self._last_token = int(out[0])
-        return self._last_token
-
-    def prefill(self, input_ids) -> int:
-        """Eats the prompt and returns the argmax of the last position."""
-        self.reset()
-        return self.forward(input_ids)
-
-    def decode_step(self) -> int:
-        """One decode step continuing from the last forward's argmax."""
-        if self._last_token is None:
-            raise RuntimeError("decode_step called before prefill/forward")
-        return self.forward([self._last_token])
-
-    def generate(self, input_ids, max_new_tokens: int = 64,
-                 *, stop_on_eos: bool = True) -> list[int]:
-        """Greedy decode: prefill, then loop. Stops at max_new_tokens or EOS
-        (when a tokenizer with an EOS id is attached and stop_on_eos=True).
-
-        Sampling is currently argmax only; temperature / top-p / top-k will
-        plug in here once the GPU sampler kernel is wired."""
-        out: list[int] = [self.prefill(input_ids)]
-        if stop_on_eos and self._tok and self._tok.is_eos(out[-1]):
-            return out
-        for _ in range(max_new_tokens - 1):
-            tok = self.decode_step()
-            out.append(tok)
-            if stop_on_eos and self._tok and self._tok.is_eos(tok):
-                break
         return out
+
+    def forward(self, input_ids) -> int:
+        """Backwards-compat wrapper returning the argmax token id."""
+        return int(self._forward(input_ids)[0])
 
     # ── tokenizer + chat API ─────────────────────────────────────────
     def attach_tokenizer(self, tokenizer) -> "DeepSeek":
@@ -330,7 +306,8 @@ class DeepSeek(Model):
             raise RuntimeError("attach_tokenizer() first")
         msgs = [{"role": "user", "content": text}] if isinstance(text, str) else text
         ids = self._tok.encode_chat(msgs)
-        out_ids = self.generate(ids, max_new_tokens=max_new_tokens)
+        out_ids = self.generate(ids, max_new_tokens=max_new_tokens,
+                                eos_id=getattr(self._tok, "eos_id", None))
         # Strip the prompt prefix; only return the newly generated portion.
         return self._tok.decode(out_ids[len(ids):] if len(out_ids) > len(ids) else out_ids)
 

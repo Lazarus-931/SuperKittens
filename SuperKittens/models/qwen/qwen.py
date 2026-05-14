@@ -275,12 +275,3 @@ class Qwen(Model):
         out_ids = self.generate(np.array(ids, dtype=np.int32), eos_id=eos, **gen_kwargs)
         return self.tokenizer.decode(out_ids)
 
-    def prefill(self, input_ids) -> int:
-        self.reset()
-        return self.forward(input_ids)
-
-    def decode_step(self) -> int:
-        if self._last_token is None:
-            raise RuntimeError("decode_step called before prefill/forward")
-        return self.forward([self._last_token])
-
