@@ -58,6 +58,7 @@ static bool resolve_psos(ModelPSOs& P) {
     // Optional T=1 decode fast-path PSOs (nullable; gated by null-check in dispatch_layer).
     P.layer.gemv_geglu_bf16_m1 = sk::bindings_pso("gemv_geglu_bf16_m1");
     P.layer.gemv_bf16_m1       = sk::bindings_pso("gemv_bf16_m1");
+    P.layer.qkv_norm_rope_partial_t1 = sk::bindings_pso("gemma4_qkv_norm_rope_partial_t1");
     P.embedding_lookup     = sk::bindings_pso("embedding_lookup_bf16");
     P.ple_lookup           = sk::bindings_pso("gemma4_ple_lookup");
     P.ple_context_mix      = sk::bindings_pso("gemma4_ple_context_mix");

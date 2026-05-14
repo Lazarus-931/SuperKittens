@@ -97,6 +97,7 @@ struct LayerPSOs {
     // T=1 decode fast paths (nullable; only used when seq==1).
     MTL::ComputePipelineState* gemv_geglu_bf16_m1 = nullptr; // fused gate+up+gelu+mul -> m_int
     MTL::ComputePipelineState* gemv_bf16_m1       = nullptr; // M=1 bf16 GEMV (down projection etc.)
+    MTL::ComputePipelineState* qkv_norm_rope_partial_t1 = nullptr; // fused qkv-split + per-head rmsnorm + partial RoPE (global layers)
 };
 
 struct LayerBuffers {
@@ -262,8 +263,43 @@ inline void dispatch_layer(
         blit->endEncoding();
     }
 
-    // 3. QKV split + per-head RMSNorm (V no γ)
-    {
+    // 3. QKV split + per-head RMSNorm (V no γ).
+    // T=1 decode fast path for global (partial-RoPE) layers: fuse split +
+    // per-head rmsnorm + partial RoPE for Q,K into a single dispatch. V is
+    // normed (no γ) and written straight to v_tmp by the same kernel.
+    // Skipped when dump_enabled (the dump blits between qkv_norm and rope
+    // require the un-rotated q/k_normed to still be in q_norm/k_tmp).
+    const bool use_qkv_fused =
+        (p.batch * p.seq == 1) &&
+        p.is_global &&
+        (P.qkv_norm_rope_partial_t1 != nullptr) &&
+        (B.dump_stash_extra == nullptr || p.layer_idx != 0);
+
+    if (use_qkv_fused) {
+        auto* enc = E.get();
+        enc->setComputePipelineState(P.qkv_norm_rope_partial_t1);
+        uint32_t rot_dims = p.rot_dims
+                            ? p.rot_dims
+                            : (uint32_t)(p.head_dim * 0.25f);
+        enc->setBuffer(B.qkv_packed, 0,         0);
+        enc->setBuffer(B.gamma_q,    off_gamma, 1);
+        enc->setBuffer(B.gamma_k,    off_gamma, 2);
+        enc->setBuffer(B.cos,        0,         3);
+        enc->setBuffer(B.sin,        0,         4);
+        enc->setBuffer(B.q_norm,     0,         5);
+        enc->setBuffer(B.k_tmp,      0,         6);
+        enc->setBuffer(B.v_tmp,      0,         7);
+        enc->setBytes(&p.n_heads,    4, 8);
+        enc->setBytes(&p.n_kv_heads, 4, 9);
+        enc->setBytes(&p.head_dim,   4, 10);
+        enc->setBytes(&rot_dims,     4, 11);
+        enc->setBytes(&p.write_pos,  4, 12);
+        enc->setBytes(&p.eps,        4, 13);
+        const uint32_t slots = p.n_heads + 2u * p.n_kv_heads;
+        enc->dispatchThreadgroups(MTL::Size(slots, 1, 1),
+                                  MTL::Size(p.head_dim, 1, 1));
+        // Fall through past the legacy qkv_norm + rope blocks below.
+    } else {
         auto* enc = E.get();
         enc->setComputePipelineState(P.qkv_norm);
         enc->setBuffer(B.qkv_packed, 0,         0);
@@ -304,7 +340,9 @@ inline void dispatch_layer(
     }
 
     // 4. RoPE / p-RoPE on Q and the in-flight K (k_tmp), in-place.
-    {
+    // Skipped when the fused qkv_norm+rope kernel above already produced the
+    // rotated Q,K (T=1 global decode path).
+    if (!use_qkv_fused) {
         auto* enc = E.get();
         if (p.is_global) {
             // Gemma4 full_attention uses standard partial RoPE (HF
