@@ -93,6 +93,10 @@ struct LayerPSOs {
     MTL::ComputePipelineState* ple_gate_act_fp32; // fp32 gate, bf16 ple → fp32 gated
     MTL::ComputePipelineState* ple_inject_fp32;   // fp32 proj_back → bf16 residual
     MTL::ComputePipelineState* ple_inject_fused_t1; // single-dispatch PLE inject (T=1 decode fast path)
+
+    // T=1 decode fast paths (nullable; only used when seq==1).
+    MTL::ComputePipelineState* gemv_geglu_bf16_m1 = nullptr; // fused gate+up+gelu+mul -> m_int
+    MTL::ComputePipelineState* gemv_bf16_m1       = nullptr; // M=1 bf16 GEMV (down projection etc.)
 };
 
 struct LayerBuffers {
@@ -156,6 +160,7 @@ struct LayerBuffers {
     MTL::Buffer* m_in;
     MTL::Buffer* m_out;
     MTL::Buffer* y_out;
+    MTL::Buffer* m_int_scratch = nullptr; // (T, N_int) bf16 — used by gemv_geglu_bf16_m1 fast path
 
     // PLE scratch
     MTL::Buffer* ple_gate_out;       // (T, PLE_dim)
@@ -487,23 +492,68 @@ inline void dispatch_layer(
     }
 
     // 10. Dense GeGLU MLP.
+    // T=1 decode fast path: replace the monolithic tile-MMA GEMM-3 fusion with
+    //   gemv_geglu_bf16_m1(W_gate, W_up, x_norm) -> m_int_scratch
+    //   gemv_bf16_m1     (W_down, m_int_scratch) -> m_out
+    // The lab measured ~36x speedup at M=1 (E2B decode, Apple M4). The original
+    // gemma4_gated_mlp_bf16 stays as the prefill (T>1) path.
     {
-        auto* enc = E.get();
-        enc->setComputePipelineState(P.gated_mlp_gelu);
-        enc->setBuffer(B.m_in,   0,          0);
-        enc->setBuffer(B.w_gate, off_w_gate, 1);
-        enc->setBuffer(B.w_up,   off_w_gate, 2);
-        enc->setBuffer(B.w_down, off_w_down, 3);
-        enc->setBuffer(B.m_out,  0,          4);
-        uint32_t M = p.batch * p.seq;
-        uint32_t N_v = p.d_model;
-        uint32_t K_v = p.d_model;
-        enc->setBytes(&M,        4, 5);
-        enc->setBytes(&N_v,      4, 6);
-        enc->setBytes(&K_v,      4, 7);
-        enc->setBytes(&p.n_int,  4, 8);
-        enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M + 63) / 64, 1),
-                                  MTL::Size(128, 1, 1));
+        const uint32_t T_mlp = p.batch * p.seq;
+        const bool use_fast =
+            (T_mlp == 1) &&
+            (P.gemv_geglu_bf16_m1 != nullptr) &&
+            (P.gemv_bf16_m1       != nullptr) &&
+            (B.m_int_scratch      != nullptr);
+
+        if (use_fast) {
+            // 10a: fused gate+up+gelu+mul -> m_int_scratch (1, n_int).
+            {
+                auto* enc = E.get();
+                enc->setComputePipelineState(P.gemv_geglu_bf16_m1);
+                enc->setBuffer(B.m_in,          0,          0);
+                enc->setBuffer(B.w_gate,        off_w_gate, 1);
+                enc->setBuffer(B.w_up,          off_w_gate, 2);
+                enc->setBuffer(B.m_int_scratch, 0,          3);
+                uint32_t N_int_v = p.n_int;
+                uint32_t K_v     = p.d_model;
+                enc->setBytes(&N_int_v, 4, 4);
+                enc->setBytes(&K_v,     4, 5);
+                enc->dispatchThreadgroups(MTL::Size((N_int_v + 7) / 8, 1, 1),
+                                          MTL::Size(256, 1, 1));
+            }
+            // 10b: down projection m_out = m_int_scratch @ W_down.
+            // W_down is (N_int, d_model) row-major; for gemv_bf16_m1 treat K=N_int, N=d_model.
+            {
+                auto* enc = E.get();
+                enc->setComputePipelineState(P.gemv_bf16_m1);
+                enc->setBuffer(B.m_int_scratch, 0,          0);
+                enc->setBuffer(B.w_down,        off_w_down, 1);
+                enc->setBuffer(B.m_out,         0,          2);
+                uint32_t N_v = p.d_model;
+                uint32_t K_v = p.n_int;
+                enc->setBytes(&N_v, 4, 3);
+                enc->setBytes(&K_v, 4, 4);
+                enc->dispatchThreadgroups(MTL::Size((N_v + 127) / 128, 1, 1),
+                                          MTL::Size(128, 1, 1));
+            }
+        } else {
+            auto* enc = E.get();
+            enc->setComputePipelineState(P.gated_mlp_gelu);
+            enc->setBuffer(B.m_in,   0,          0);
+            enc->setBuffer(B.w_gate, off_w_gate, 1);
+            enc->setBuffer(B.w_up,   off_w_gate, 2);
+            enc->setBuffer(B.w_down, off_w_down, 3);
+            enc->setBuffer(B.m_out,  0,          4);
+            uint32_t M = p.batch * p.seq;
+            uint32_t N_v = p.d_model;
+            uint32_t K_v = p.d_model;
+            enc->setBytes(&M,        4, 5);
+            enc->setBytes(&N_v,      4, 6);
+            enc->setBytes(&K_v,      4, 7);
+            enc->setBytes(&p.n_int,  4, 8);
+            enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M + 63) / 64, 1),
+                                      MTL::Size(128, 1, 1));
+        }
     }
 
     // 11. Post-MLP RMSNorm
@@ -797,6 +847,7 @@ struct ModelBuffers {
     MTL::Buffer* m_in;
     MTL::Buffer* m_out;
     MTL::Buffer* y_out;
+    MTL::Buffer* m_int_scratch = nullptr; // (T, max_N_int) bf16 — gemv_geglu_bf16_m1 T=1 fast path
 
     // PLE scratch
     MTL::Buffer* per_layer_inputs;   // (T, n_layers, PLE_dim)
@@ -1073,6 +1124,7 @@ inline void dispatch_model(
         lb.y_attn     = B.y_attn;
         lb.m_in       = B.m_in;
         lb.m_out      = B.m_out;
+        lb.m_int_scratch = B.m_int_scratch;
         lb.y_out      = nxt;
 
         dispatch_layer(cmd, P.layer, lb, lp);
