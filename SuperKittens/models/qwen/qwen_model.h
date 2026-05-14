@@ -38,6 +38,11 @@ struct LayerParams {
 
 struct LayerPSOs {
     MTL::ComputePipelineState* rmsnorm;
+    // Optional single-row fast path (T=1 decode). 256 threads/8 SGs on one
+    // row's reduction; same buffer ABI as `rmsnorm`. When non-null AND the
+    // rmsnorm has rows==1, dispatch_layer uses this instead. Bit-exact at
+    // d divisible by 4. nullptr → fall back to `rmsnorm`.
+    MTL::ComputePipelineState* rmsnorm_t1 = nullptr;
     MTL::ComputePipelineState* gemm;              // fp16 GEMM (M>1 path)
     MTL::ComputePipelineState* gemv_m1;           // fp16 GEMV M=1 fast-path (decode)
     MTL::ComputePipelineState* gemv_swiglu_m1;    // fused gate+up+silu_mul GEMV (M=1)
@@ -231,18 +236,29 @@ inline void encode_gemm_qaware(
 inline void encode_rmsnorm(
     MTL::CommandBuffer* cmd, MTL::ComputePipelineState* pso,
     MTL::Buffer* x, MTL::Buffer* gamma, size_t off_gamma,
-    MTL::Buffer* out, uint32_t rows, uint32_t n, float eps)
+    MTL::Buffer* out, uint32_t rows, uint32_t n, float eps,
+    MTL::ComputePipelineState* pso_t1 = nullptr)
 {
+    // Single-row fast path: 256 threads collaborating on one row's reduction.
+    // Bit-exact vs the default 128-thread kernel at d divisible by 4. Only
+    // engaged when rows==1 — the only case where the default kernel leaves
+    // 3/4 of its threadgroup idle.
+    const bool use_t1 = (pso_t1 != nullptr) && (rows == 1u);
     auto* enc = cmd->computeCommandEncoder();
-    enc->setComputePipelineState(pso);
+    enc->setComputePipelineState(use_t1 ? pso_t1 : pso);
     enc->setBuffer(x,     0,         0);
     enc->setBuffer(gamma, off_gamma, 1);
     enc->setBuffer(out,   0,         2);
     enc->setBytes(&rows, 4, 3);
     enc->setBytes(&n,    4, 4);
     enc->setBytes(&eps,  4, 5);
-    enc->dispatchThreadgroups(MTL::Size(1, (rows + 3) / 4, 1),
-                              MTL::Size(128, 1, 1));
+    if (use_t1) {
+        enc->dispatchThreadgroups(MTL::Size(1, rows, 1),
+                                  MTL::Size(256, 1, 1));
+    } else {
+        enc->dispatchThreadgroups(MTL::Size(1, (rows + 3) / 4, 1),
+                                  MTL::Size(128, 1, 1));
+    }
     enc->endEncoding();
 }
 
@@ -334,7 +350,7 @@ inline void dispatch_layer(
 
     // 1. Pre-attn RMSNorm.
     encode_rmsnorm(cmd, P.rmsnorm, B.x, B.w_pre_attn_norm, off_norm,
-                   B.x_norm, T, p.d_model, p.eps);
+                   B.x_norm, T, p.d_model, p.eps, P.rmsnorm_t1);
 
     // 2. QKV-pack GEMM: x_norm → qkv_packed (T × (qN + 2*kvN)).
     encode_gemm_qaware(cmd, P.gemm, P.gemv_m1, P.q8_0_matvec, B.dt_qkv,
@@ -755,7 +771,7 @@ inline void dispatch_model(
 
     // C. Final RMSNorm
     encode_rmsnorm(cmd, P.layer.rmsnorm, cur, W.w_final_norm, 0,
-                   nxt, T, M.d_model, M.eps);
+                   nxt, T, M.d_model, M.eps, P.layer.rmsnorm_t1);
 
     // D. LM-head GEMM (tied → reuse embedding; untied → use w_lm_head). Both (V,D) row-major → transB=1.
     {

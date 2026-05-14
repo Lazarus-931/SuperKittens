@@ -45,6 +45,8 @@ static MTL::Buffer* alloc_zero(MTL::Device* dev, size_t bytes) {
 
 static bool resolve_psos(ModelPSOs& P) {
     P.layer.rmsnorm        = sk::bindings_pso("rmsnorm");
+    // Optional T=1 fast path (nullable). 256-thread single-row variant.
+    P.layer.rmsnorm_t1     = sk::bindings_pso("rmsnorm_t1");
     P.layer.gemm           = sk::bindings_pso("gemm_fp16");
     P.layer.gemv_m1        = sk::bindings_pso("gemv_fp16_m1");
     P.layer.gemv_swiglu_m1 = sk::bindings_pso("gemv_swiglu_fp16_m1");
