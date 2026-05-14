@@ -33,7 +33,32 @@ class ModelSpec:
     dims: dict[str, Any] = field(default_factory=dict)  # hardcoded fallback dims
 
 
-SPECS: dict[str, ModelSpec] = {}
+SPECS: dict[str, ModelSpec] = {
+    "qwen3-0.6b": ModelSpec(
+        family="qwen3",
+        adapter="SuperKittens.models.qwen.qwen:Qwen",
+        hf_repo="Qwen/Qwen3-0.6B",
+        weight_dir="Qwen3-0.6B",
+        gguf_name="Qwen3-0.6B-Q8_0.gguf",
+        default_quant="q8_0",
+        tokenizer_family="qwen3",
+        dims=dict(n_layers=28, d_model=1024, n_heads=16, n_kv_heads=8,
+                  head_dim=128, n_int=3072, vocab_size=151936,
+                  eps=1e-6, rope_freq_base=1_000_000.0, tie_word_embeddings=1),
+    ),
+    "qwen3-8b": ModelSpec(
+        family="qwen3",
+        adapter="SuperKittens.models.qwen.qwen:Qwen",
+        hf_repo="Qwen/Qwen3-8B",
+        weight_dir="Qwen3-8B-GGUF",
+        gguf_name="Qwen3-8B-Q8_0.gguf",
+        default_quant="q8_0",
+        tokenizer_family="qwen3",
+        dims=dict(n_layers=36, d_model=4096, n_heads=32, n_kv_heads=8,
+                  head_dim=128, n_int=12288, vocab_size=151936,
+                  eps=1e-6, rope_freq_base=1_000_000.0, tie_word_embeddings=0),
+    ),
+}
 
 
 def get_spec(name: str) -> ModelSpec:

@@ -256,6 +256,93 @@ class Qwen(Model):
         sin = np.sin(angles).astype(np.float16).copy()
         self.set_rope_tables(cos, sin)
 
+    @classmethod
+    def from_spec(cls, spec, **overrides) -> "Qwen":
+        """Build a Qwen3 model from a central-registry ModelSpec.
+
+        Reads ``config.json`` from ``spec.weight_dir`` (falling back to
+        ``spec.dims`` if absent), constructs a :class:`Config`, loads the
+        canonical artifact (GGUF if ``spec.gguf_name`` is set; otherwise
+        safetensors), bakes RoPE tables, and attaches the tokenizer.
+        """
+        import json
+        sk_root = Path(__file__).resolve().parents[3]
+        snap = Path(overrides.pop("snapshot", None)
+                    or (sk_root / "SuperKittens" / "model_weights" / spec.weight_dir))
+
+        # Build Config: prefer on-disk config.json, fall back to spec.dims.
+        d = dict(spec.dims)
+        cfg_json = snap / "config.json"
+        if cfg_json.exists():
+            j = json.loads(cfg_json.read_text())
+            d.update(
+                n_layers   = j.get("num_hidden_layers", d.get("n_layers")),
+                d_model    = j.get("hidden_size",     d.get("d_model")),
+                n_heads    = j.get("num_attention_heads", d.get("n_heads")),
+                n_kv_heads = j.get("num_key_value_heads", d.get("n_kv_heads")),
+                head_dim   = j.get("head_dim", d.get("head_dim",
+                              (j.get("hidden_size", 0) // max(j.get("num_attention_heads", 1), 1)))),
+                n_int      = j.get("intermediate_size", d.get("n_int")),
+                vocab_size = j.get("vocab_size",   d.get("vocab_size")),
+                eps        = j.get("rms_norm_eps", d.get("eps", 1e-6)),
+                rope_freq_base = j.get("rope_theta", d.get("rope_freq_base", 1_000_000.0)),
+                tie_word_embeddings = int(j.get("tie_word_embeddings", d.get("tie_word_embeddings", 1))),
+            )
+        # seq_max / cache_max have sensible Config defaults; allow overrides.
+        for k in ("seq_max", "cache_max"):
+            if k in overrides:
+                d[k] = overrides.pop(k)
+        # Filter d to Config fields only.
+        from dataclasses import fields
+        allowed = {f.name for f in fields(Config)}
+        cfg = Config(**{k: v for k, v in d.items() if k in allowed and v is not None})
+        for k, v in overrides.items():
+            if hasattr(cfg, k):
+                setattr(cfg, k, v)
+
+        m = cls(cfg)
+
+        # Load weights: GGUF if spec says so, else safetensors (index or single).
+        gguf_path = None
+        if spec.gguf_name:
+            gguf_path = snap / spec.gguf_name
+            # Also accept the gguf living one level up alongside snapshot dirs.
+            if not gguf_path.exists():
+                alt = sk_root / "SuperKittens" / "model_weights" / spec.gguf_name
+                if alt.exists():
+                    gguf_path = alt
+        if gguf_path and gguf_path.exists():
+            m.load_gguf(str(gguf_path))
+        else:
+            if not snap.exists():
+                raise FileNotFoundError(f"snapshot dir not found: {snap}")
+            idx = snap / "model.safetensors.index.json"
+            single = snap / "model.safetensors"
+            target = idx if idx.exists() else single
+            if not target.exists():
+                raise FileNotFoundError(f"no safetensors in {snap}")
+            rc = _load().sk_qwen_load_safetensors(m._h, str(target).encode())
+            if rc:
+                raise RuntimeError(f"sk_qwen_load_safetensors failed: {rc}")
+
+        m.bake_and_set_rope()
+
+        # Tokenizer.
+        if spec.tokenizer_family:
+            try:
+                from SuperKittens.models.load.tokenizer import Tokenizer
+                json_path = snap / "tokenizer.json"
+                sp_path   = snap / "tokenizer.model"
+                if json_path.exists():
+                    m.tokenizer = Tokenizer.from_hf_json(str(json_path), family=spec.tokenizer_family)
+                elif sp_path.exists():
+                    m.tokenizer = Tokenizer.from_sentencepiece(str(sp_path), family=spec.tokenizer_family)
+                else:
+                    print(f"[qwen] no tokenizer.json or tokenizer.model in {snap}")
+            except Exception as e:
+                print(f"[qwen] tokenizer attach failed: {e}")
+        return m
+
     def chat(self, prompt, *, use_chat_template: bool = True, **gen_kwargs) -> str:
         """Run end-to-end chat. `prompt` may be str or list[{role,content}]."""
         if self.tokenizer is None:
