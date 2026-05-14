@@ -19,7 +19,7 @@ inline float _gelu_tanh(float x) {
     const float K0 = 0.7978845608028654f;  // sqrt(2/pi)
     const float K1 = 0.044715f;
     float u = K0 * (x + K1 * x * x * x);
-    float t = tanh(u);
+    float t = precise::tanh(u);
     return 0.5f * x * (1.0f + t);
 }
 
