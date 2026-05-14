@@ -99,6 +99,7 @@ struct LayerPSOs {
     MTL::ComputePipelineState* gemv_geglu_bf16_m1 = nullptr; // fused gate+up+gelu+mul -> m_int
     MTL::ComputePipelineState* gemv_bf16_m1       = nullptr; // M=1 bf16 GEMV (down projection etc.)
     MTL::ComputePipelineState* qkv_norm_rope_partial_t1 = nullptr; // fused qkv-split + per-head rmsnorm + partial RoPE (global layers)
+    MTL::ComputePipelineState* q8_0_matvec_bf16   = nullptr; // M=1 Q8_0 × bf16 matvec → bf16 (LM head fast path)
 };
 
 struct LayerBuffers {
@@ -883,6 +884,10 @@ struct LayerCache {
 
 struct ModelWeights {
     MTL::Buffer* w_embed;
+    // Optional Q8_0-packed LM head (gemma4 ties lm_head = embed_tokens).
+    // When non-null, dispatch_model routes the final GEMM through
+    // q8_0_matvec_bf16 (decode-only, T=1). nullptr → bf16 fallback.
+    MTL::Buffer* w_lm_head_q8 = nullptr;
     MTL::Buffer* w_ple_table;                 // (vocab, n_layers, PLE_dim), null if !has_ple
     MTL::Buffer* w_per_layer_input_gate;      // (n_layers, PLE_dim, d_model)
     MTL::Buffer* w_per_layer_projection;      // (n_layers, d_model, PLE_dim)
@@ -1321,8 +1326,33 @@ inline void dispatch_model(
         _dump_blit_row(cmd, nxt, B.dump_stash, T, M.d_model, base * M.d_model);
     }
 
-    // D. LM head GEMM (tied with input embedding)
-    {
+    // D. LM head GEMM (tied with input embedding).
+    //
+    // Q8_0 fast path (decode, T=1): when w_lm_head_q8 is populated and the
+    // q8_0_matvec_bf16 PSO is available, route through the Q8_0 matvec for a
+    // ~3.8x speedup vs the bf16 tile-MMA at decode shapes. Falls back to the
+    // bf16 GEMM for prefill (T>1) and when the Q8_0 buffer is absent.
+    const bool use_q8_lm_head =
+        (T == 1) && (W.w_lm_head_q8 != nullptr) && (P.layer.q8_0_matvec_bf16 != nullptr);
+
+    if (use_q8_lm_head) {
+        auto* enc = cmd->computeCommandEncoder();
+        enc->setComputePipelineState(P.layer.q8_0_matvec_bf16);
+        uint32_t K_v = M.d_model;
+        uint32_t N_v = M.vocab_size;
+        enc->setBuffer(nxt,             0, 0);
+        enc->setBuffer(W.w_lm_head_q8,  0, 1);
+        enc->setBuffer(B.logits,        0, 2);
+        enc->setBytes(&K_v, 4, 3);
+        enc->setBytes(&N_v, 4, 4);
+        // NR0 = 2 rows per threadgroup; NSG = 4 simdgroups (NW=32 each) per TG.
+        const uint32_t NR0 = 2;
+        const uint32_t NSG = 4;
+        const uint32_t NW  = 32;
+        enc->dispatchThreadgroups(MTL::Size((N_v + NR0 - 1) / NR0, 1, 1),
+                                  MTL::Size(NW * NSG, 1, 1));
+        enc->endEncoding();
+    } else {
         auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(P.layer.gemm);
         const uint32_t M_v = T;

@@ -1,6 +1,7 @@
 #include "weights.h"
 #include "gemma4_model.h"
 #include "../../../inference/weight_store.h"
+#include "../../../inference/quantize.h"
 #include "../../load/safetensor/safetensor.h"
 
 #include <cmath>
@@ -178,6 +179,18 @@ extern "C" int sk_gemma4_load_from_store(sk_gemma4_handle* hp, sk::WeightStore* 
         uint16_t* eb = (uint16_t*)h->weights.w_embed->contents();
         const size_t n = (size_t)c.vocab_size * dm;
         scale_bf16_inplace(eb, n, embed_scale);
+    }
+
+    // Q8_0 LM-head packing: gemma4 ties lm_head = embed_tokens, so when the
+    // launcher allocated a Q8_0 LM-head buffer we quantize the already-scaled
+    // bf16 embed table into it. dispatch_model then routes the decode-time
+    // (T=1) lm_head matvec through q8_0_matvec_bf16. Logit descale stays the
+    // same (still divides by sqrt(d_model)).
+    if (h->weights.w_lm_head_q8) {
+        const uint16_t* src = (const uint16_t*)h->weights.w_embed->contents();
+        uint8_t* dst        = (uint8_t*)h->weights.w_lm_head_q8->contents();
+        const size_t n_elems = (size_t)c.vocab_size * dm;
+        sk::quantize_q8_0_bf16(src, n_elems, dst);
     }
 
     // per_layer_model_projection: HF tensor shape (n_layers*ple_dim, d_model)

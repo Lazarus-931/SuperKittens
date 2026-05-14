@@ -59,6 +59,7 @@ static bool resolve_psos(ModelPSOs& P) {
     P.layer.gemv_geglu_bf16_m1 = sk::bindings_pso("gemv_geglu_bf16_m1");
     P.layer.gemv_bf16_m1       = sk::bindings_pso("gemv_bf16_m1");
     P.layer.qkv_norm_rope_partial_t1 = sk::bindings_pso("gemma4_qkv_norm_rope_partial_t1");
+    P.layer.q8_0_matvec_bf16   = sk::bindings_pso("q8_0_matvec_bf16");
     P.embedding_lookup     = sk::bindings_pso("embedding_lookup_bf16");
     P.ple_lookup           = sk::bindings_pso("gemma4_ple_lookup");
     P.ple_context_mix      = sk::bindings_pso("gemma4_ple_context_mix");
@@ -170,6 +171,22 @@ extern "C" sk_gemma4_handle* sk_gemma4_create(const sk_gemma4_config* cfg) {
     // Weight buffers — sized for the slab layout dispatch_layer expects
     // (uniform per-layer stride using head_dim_max / n_kv_max).
     h->weights.w_embed         = alloc_zero(dev, (size_t)cfg->vocab_size * cfg->d_model * 2);
+    // Optional Q8_0 LM-head buffer. Enabled by default; disable with
+    // SK_GEMMA4_LMHEAD_Q8=0 to keep the bf16 fallback (and skip the ~400 MB
+    // alloc for E2B). Populated by weights.c++ when the bf16 lm_head is
+    // available (tied with embed_tokens for gemma4).
+    {
+        const char* env = std::getenv("SK_GEMMA4_LMHEAD_Q8");
+        const bool want_q8 = !env || (env[0] != '0');
+        if (want_q8 && (cfg->d_model % 32 == 0) && h->psos.layer.q8_0_matvec_bf16) {
+            const size_t n_elems  = (size_t)cfg->vocab_size * cfg->d_model;
+            const size_t n_blocks = n_elems / 32;
+            const size_t q8_bytes = n_blocks * 34;
+            h->weights.w_lm_head_q8 = alloc_zero(dev, q8_bytes);
+        } else {
+            h->weights.w_lm_head_q8 = nullptr;
+        }
+    }
     h->weights.w_ple_table     = cfg->has_ple
                                   ? alloc_zero(dev, (size_t)cfg->vocab_size * cfg->n_layers * cfg->ple_dim * 2)
                                   : nullptr;
@@ -548,7 +565,7 @@ extern "C" void sk_gemma4_destroy(sk_gemma4_handle* hp) {
     auto* h = reinterpret_cast<meow::gemma4::Handle*>(hp);
 
     auto rel = [](MTL::Buffer* b) { if (b) b->release(); };
-    rel(h->weights.w_embed); rel(h->weights.w_ple_table);
+    rel(h->weights.w_embed); rel(h->weights.w_lm_head_q8); rel(h->weights.w_ple_table);
     rel(h->weights.w_per_layer_input_gate);
     rel(h->weights.w_per_layer_projection);
     rel(h->weights.w_layer_scalar);
