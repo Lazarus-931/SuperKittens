@@ -9,14 +9,6 @@ from SuperKittens.inference.c_binder import bind, optional, CtypesConfig
 from SuperKittens.inference.generation import Model
 
 
-_VARIANT_TO_DIR = {
-    "e2b": "gemma-4-E2B-it",
-    "e4b": "gemma-4-E4B-it",
-    "26b": "gemma-4-26B-it",
-    "31b": "gemma-4-31B-it",
-}
-
-
 class _Config(ctypes.Structure):
     _fields_ = [
         ("batch",              ctypes.c_uint32),
@@ -364,18 +356,6 @@ class Gemma4(Model):
                           config_path=spec.config_path,
                           tokenizer_family=spec.tokenizer_family,
                           **overrides)
-
-    @classmethod
-    def from_pretrained(cls, variant: str = "e2b", name: str | None = None, **cfg_overrides):
-        if name is None:
-            name = variant
-        if name in _VARIANT_TO_DIR:
-            dir_name = _VARIANT_TO_DIR[name]
-            variant = name
-        else:
-            dir_name = name
-            variant = next((v for v, d in _VARIANT_TO_DIR.items() if d == name), "e4b")
-        return cls._build(variant, dir_name, **cfg_overrides)
 
     @classmethod
     def _build(cls, variant: str, dir_name: str, *,

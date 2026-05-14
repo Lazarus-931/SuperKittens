@@ -98,6 +98,18 @@ SPECS: dict[str, ModelSpec] = {
                   chunk_size=256, vocab_size=50288, rms_eps=1e-5,
                   tie_word_embeddings=1),
     ),
+    # DeepSeek inference isn't wired end-to-end yet (no Python adapter exposing
+    # from_spec; ctypes launcher exists but no working factory). Once the
+    # adapter lands, uncomment and point .adapter at it.
+    #
+    # "deepseek-v2-lite": ModelSpec(
+    #     family="deepseek",
+    #     adapter="SuperKittens.models.deepseek.deepseek:DeepSeek",
+    #     hf_repo="deepseek-ai/DeepSeek-V2-Lite",
+    #     weight_dir="DeepSeek-V2-Lite",
+    #     tokenizer_family="deepseek",
+    #     dims=dict(...),
+    # ),
     "qwen3-8b": ModelSpec(
         family="qwen3",
         adapter="SuperKittens.models.qwen.qwen:Qwen",
