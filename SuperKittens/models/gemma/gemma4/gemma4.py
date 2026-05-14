@@ -5,6 +5,8 @@ import numpy as np
 from pathlib import Path
 from dataclasses import dataclass
 
+from SuperKittens.inference.c_binder import bind, optional
+
 
 _VARIANT_TO_DIR = {
     "e2b": "gemma-4-E2B-it",
@@ -51,48 +53,28 @@ class _Weights(ctypes.Structure):
     )]
 
 
+GEMMA4_ABI = {
+    "create":                 ([ctypes.POINTER(_Config)], ctypes.c_void_p),
+    "load_weights":           ([ctypes.c_void_p, ctypes.POINTER(_Weights)], ctypes.c_int),
+    "forward":                ([ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
+                                ctypes.c_uint32, ctypes.POINTER(ctypes.c_int32)], ctypes.c_int),
+    "reset":                  ([ctypes.c_void_p], None),
+    "destroy":                ([ctypes.c_void_p], None),
+    "load_safetensors":       ([ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int),
+    "load_safetensors_index": ([ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int),
+    "set_rope_tables":        ([ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                                ctypes.c_void_p, ctypes.c_void_p], ctypes.c_int),
+    "get_last_logits":        ([ctypes.c_void_p, ctypes.c_void_p], ctypes.c_int),
+    "set_dump_enabled":       ([ctypes.c_void_p, ctypes.c_int], None),
+    "dump_layer":             ([ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p], ctypes.c_int),
+}
+
+
 _lib = None
 def _load():
     global _lib
-    if _lib is not None:
-        return _lib
-    dylib = os.environ.get(
-        "SK_DYLIB",
-        str(Path(__file__).resolve().parents[4] / "build" / "libsk.dylib"))
-    _lib = ctypes.CDLL(dylib)
-
-    _lib.sk_gemma4_create.argtypes = [ctypes.POINTER(_Config)]
-    _lib.sk_gemma4_create.restype  = ctypes.c_void_p
-
-    _lib.sk_gemma4_load_weights.argtypes = [ctypes.c_void_p, ctypes.POINTER(_Weights)]
-    _lib.sk_gemma4_load_weights.restype  = ctypes.c_int
-
-    _lib.sk_gemma4_forward.argtypes = [
-        ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
-        ctypes.c_uint32, ctypes.POINTER(ctypes.c_int32)]
-    _lib.sk_gemma4_forward.restype = ctypes.c_int
-
-    _lib.sk_gemma4_reset.argtypes  = [ctypes.c_void_p]
-    _lib.sk_gemma4_reset.restype   = None
-
-    _lib.sk_gemma4_destroy.argtypes = [ctypes.c_void_p]
-    _lib.sk_gemma4_destroy.restype  = None
-
-    _lib.sk_gemma4_load_safetensors.argtypes       = [ctypes.c_void_p, ctypes.c_char_p]
-    _lib.sk_gemma4_load_safetensors.restype        = ctypes.c_int
-    _lib.sk_gemma4_load_safetensors_index.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-    _lib.sk_gemma4_load_safetensors_index.restype  = ctypes.c_int
-    _lib.sk_gemma4_set_rope_tables.argtypes        = [ctypes.c_void_p,
-                                                      ctypes.c_void_p, ctypes.c_void_p,
-                                                      ctypes.c_void_p, ctypes.c_void_p]
-    _lib.sk_gemma4_set_rope_tables.restype         = ctypes.c_int
-    _lib.sk_gemma4_get_last_logits.argtypes        = [ctypes.c_void_p, ctypes.c_void_p]
-    _lib.sk_gemma4_get_last_logits.restype         = ctypes.c_int
-
-    _lib.sk_gemma4_set_dump_enabled.argtypes       = [ctypes.c_void_p, ctypes.c_int]
-    _lib.sk_gemma4_set_dump_enabled.restype        = None
-    _lib.sk_gemma4_dump_layer.argtypes             = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
-    _lib.sk_gemma4_dump_layer.restype              = ctypes.c_int
+    if _lib is None:
+        _lib = bind("gemma4", GEMMA4_ABI)
     return _lib
 
 

@@ -28,6 +28,8 @@ import numpy as np
 from pathlib import Path
 from dataclasses import dataclass, asdict
 
+from SuperKittens.inference.c_binder import bind
+
 
 # ─── C ABI ──────────────────────────────────────────────────────────────────
 
@@ -88,26 +90,21 @@ class _Weights(ctypes.Structure):
     _fields_ = [(n, ctypes.c_void_p) for n in _WEIGHT_FIELDS]
 
 
+DEEPSEEK_ABI = {
+    "create":       ([ctypes.POINTER(_Config)], ctypes.c_void_p),
+    "load_weights": ([ctypes.c_void_p, ctypes.POINTER(_Weights)], ctypes.c_int),
+    "forward":      ([ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
+                      ctypes.c_uint32, ctypes.POINTER(ctypes.c_int32)], ctypes.c_int),
+    "reset":        ([ctypes.c_void_p], None),
+    "destroy":      ([ctypes.c_void_p], None),
+}
+
+
 _lib = None
 def _load():
     global _lib
-    if _lib is not None: return _lib
-    dylib = os.environ.get("SK_DYLIB",
-                           str(Path(__file__).resolve().parents[3] / "build" / "libsk.dylib"))
-    _lib = ctypes.CDLL(dylib)
-    _lib.sk_deepseek_create.argtypes        = [ctypes.POINTER(_Config)]
-    _lib.sk_deepseek_create.restype         = ctypes.c_void_p
-    _lib.sk_deepseek_load_weights.argtypes  = [ctypes.c_void_p, ctypes.POINTER(_Weights)]
-    _lib.sk_deepseek_load_weights.restype   = ctypes.c_int
-    _lib.sk_deepseek_forward.argtypes       = [ctypes.c_void_p,
-                                               ctypes.POINTER(ctypes.c_int32),
-                                               ctypes.c_uint32,
-                                               ctypes.POINTER(ctypes.c_int32)]
-    _lib.sk_deepseek_forward.restype        = ctypes.c_int
-    _lib.sk_deepseek_reset.argtypes         = [ctypes.c_void_p]
-    _lib.sk_deepseek_reset.restype          = None
-    _lib.sk_deepseek_destroy.argtypes       = [ctypes.c_void_p]
-    _lib.sk_deepseek_destroy.restype        = None
+    if _lib is None:
+        _lib = bind("deepseek", DEEPSEEK_ABI)
     return _lib
 
 
