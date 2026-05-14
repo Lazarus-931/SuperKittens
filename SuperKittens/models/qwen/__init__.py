@@ -55,7 +55,6 @@ def _from_pretrained(variant: str = "qwen3-0.6b", quant: str | None = None,
             raise FileNotFoundError(f"gguf file not found: {gpath}")
         m.load_gguf(str(gpath))
     else:
-        # fp16 safetensors path
         from .qwen import _load
         idx_path = snap / "model.safetensors.index.json"
         single = snap / "model.safetensors"
@@ -66,10 +65,8 @@ def _from_pretrained(variant: str = "qwen3-0.6b", quant: str | None = None,
         if rc:
             raise RuntimeError(f"sk_qwen_load_safetensors failed: {rc}")
 
-    # RoPE tables
     m.bake_and_set_rope()
 
-    # Tokenizer
     try:
         from SuperKittens.models.load.tokenizer import Tokenizer
         json_path = snap / "tokenizer.json"
