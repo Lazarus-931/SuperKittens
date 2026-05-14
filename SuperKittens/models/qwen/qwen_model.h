@@ -561,6 +561,7 @@ struct ModelWeights {
     MTL::Buffer* w_up;
     MTL::Buffer* w_down;
     MTL::Buffer* w_lm_head;  // null when tied
+    size_t       off_w_lm_head = 0;  // byte offset into w_lm_head (for mmap-backed weights)
     const LayerCache* layer_caches;
 
     // Per-projection dtypes (default FP16). Set by loader when using Q8_0.
@@ -735,9 +736,9 @@ inline void dispatch_model(
             for (uint32_t m = 0; m < M_v; ++m) {
                 auto* enc = cmd->computeCommandEncoder();
                 enc->setComputePipelineState(P.layer.q8_0_matvec);
-                enc->setBuffer(nxt,           (size_t)m * K_v * 2, 0);
-                enc->setBuffer(W.w_lm_head,   0,                   1);
-                enc->setBuffer(B.logits,      (size_t)m * N_v * 2, 2);
+                enc->setBuffer(nxt,           (size_t)m * K_v * 2,  0);
+                enc->setBuffer(W.w_lm_head,   W.off_w_lm_head,      1);
+                enc->setBuffer(B.logits,      (size_t)m * N_v * 2,  2);
                 enc->setBytes(&K_v, 4, 3);
                 enc->setBytes(&N_v, 4, 4);
                 enc->dispatchThreadgroups(MTL::Size((N_v + 1) / 2, 1, 1), MTL::Size(128, 1, 1));
@@ -746,11 +747,12 @@ inline void dispatch_model(
         } else
         if (M_v == 1 && P.layer.gemv_t_m1 != nullptr) {
             // Decode fast path: M=1 transposed-weight matvec.
+            const size_t off_head = (w_head == W.w_lm_head) ? W.off_w_lm_head : 0;
             auto* enc = cmd->computeCommandEncoder();
             enc->setComputePipelineState(P.layer.gemv_t_m1);
-            enc->setBuffer(nxt,      0, 0);
-            enc->setBuffer(w_head,   0, 1);
-            enc->setBuffer(B.logits, 0, 2);
+            enc->setBuffer(nxt,      0,        0);
+            enc->setBuffer(w_head,   off_head, 1);
+            enc->setBuffer(B.logits, 0,        2);
             enc->setBytes(&N_v, 4, 3);
             enc->setBytes(&K_v, 4, 4);
             const uint32_t BN = 128;
@@ -758,13 +760,14 @@ inline void dispatch_model(
                                       MTL::Size(BN, 1, 1));
             enc->endEncoding();
         } else {
+            const size_t off_head = (w_head == W.w_lm_head) ? W.off_w_lm_head : 0;
             auto* enc = cmd->computeCommandEncoder();
             enc->setComputePipelineState(P.layer.gemm);
             uint32_t ldA = K_v, ldB = K_v, ldC = N_v;
             int transA = 0, transB = 1, has_bias = 0;
-            enc->setBuffer(nxt,        0, 0);
-            enc->setBuffer(w_head,     0, 1);
-            enc->setBuffer(B.logits,   0, 2);
+            enc->setBuffer(nxt,        0,        0);
+            enc->setBuffer(w_head,     off_head, 1);
+            enc->setBuffer(B.logits,   0,        2);
             enc->setBytes(&M_v,      4, 3); enc->setBytes(&N_v,      4, 4);
             enc->setBytes(&K_v,      4, 5); enc->setBytes(&ldA,      4, 6);
             enc->setBytes(&ldB,      4, 7); enc->setBytes(&ldC,      4, 8);

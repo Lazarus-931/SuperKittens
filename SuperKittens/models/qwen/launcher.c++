@@ -3,6 +3,7 @@
 #include "launcher.h"
 #include "qwen_model.h"
 #include "../../kernels/runtime_bindings.h"
+#include "../../inference/silicon/mmap_buffer.h"
 
 #include <cstring>
 #include <cstdlib>
@@ -24,6 +25,11 @@ struct Handle {
     uint32_t layers_run     = 0;
     int32_t  capture_layer  = -1;
     uint32_t last_seq       = 0;  // seq used at most recent forward (for get_capture sizing)
+
+    // Zero-copy mmap of the GGUF file, when used (otherwise nullptr).
+    // Owns the MTL::Buffer that w_lm_head (and future mmap-backed weights)
+    // alias into via per-weight byte offsets.
+    sk::silicon::MmapBuffer* gguf_mmap = nullptr;
 };
 
 static MTL::Buffer* alloc_zero(MTL::Device* dev, size_t bytes) {
@@ -277,7 +283,13 @@ extern "C" void sk_qwen_destroy(sk_qwen_handle* hp) {
     rel(h->weights.w_qkv); rel(h->weights.w_q_norm); rel(h->weights.w_k_norm); rel(h->weights.w_o);
     rel(h->weights.w_pre_mlp_norm); rel(h->weights.w_final_norm);
     rel(h->weights.w_gate); rel(h->weights.w_up); rel(h->weights.w_down);
-    rel(h->weights.w_lm_head);
+    // w_lm_head may be a borrowed pointer into h->gguf_mmap when zero-copy is
+    // active. Only release when it is NOT the mmap-owned buffer.
+    if (h->weights.w_lm_head &&
+        (!h->gguf_mmap || h->weights.w_lm_head != h->gguf_mmap->buffer())) {
+        h->weights.w_lm_head->release();
+    }
+    if (h->gguf_mmap) { delete h->gguf_mmap; h->gguf_mmap = nullptr; }
     for (auto* b : h->k_caches) rel(b);
     for (auto* b : h->v_caches) rel(b);
     rel(h->bufs.input_ids); rel(h->bufs.output_id);
