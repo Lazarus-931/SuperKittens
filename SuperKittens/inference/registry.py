@@ -86,6 +86,18 @@ SPECS: dict[str, ModelSpec] = {
         config_path="text_config",
         dims=dict(variant="31b"),
     ),
+    "mamba2-130m": ModelSpec(
+        family="mamba2",
+        adapter="SuperKittens.models.mamba2.mamba2:Mamba2Model",
+        hf_repo="AntonV/mamba2-130m-hf",
+        weight_dir="mamba2-130m-hf",
+        default_quant=None,
+        tokenizer_family=None,  # pre-instruct: no chat template, no specials needed
+        dims=dict(n_layers=24, d_model=768, intermediate=1536, n_heads=24,
+                  head_dim=64, state_size=128, n_groups=1, conv_kernel=4,
+                  chunk_size=256, vocab_size=50288, rms_eps=1e-5,
+                  tie_word_embeddings=1),
+    ),
     "qwen3-8b": ModelSpec(
         family="qwen3",
         adapter="SuperKittens.models.qwen.qwen:Qwen",

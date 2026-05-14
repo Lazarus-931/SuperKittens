@@ -163,6 +163,57 @@ class Mamba2Model(Model):
     def reset(self) -> None:
         self._lib.sk_mamba2_reset(self._h)
 
+    @classmethod
+    def from_spec(cls, spec, **overrides) -> "Mamba2Model":
+        """Build a Mamba2 model from a central-registry ModelSpec.
+
+        Mamba2 has no RoPE (it's a state-space model). The pre-instruct
+        130m checkpoint also has no chat template, so tokenizer attach is
+        best-effort and gated on ``spec.tokenizer_family``.
+        """
+        sk_root = Path(__file__).resolve().parents[3]
+        snap = Path(overrides.pop("snapshot", None)
+                    or (sk_root / "SuperKittens" / "model_weights" / spec.weight_dir))
+        cfg_json = snap / "config.json"
+        if cfg_json.exists():
+            cfg = Mamba2Config.from_hf_json(cfg_json)
+        else:
+            # Fall back to spec.dims (filtered to Mamba2Config fields).
+            from dataclasses import fields
+            allowed = {f.name for f in fields(Mamba2Config)}
+            cfg = Mamba2Config(**{k: v for k, v in spec.dims.items() if k in allowed})
+        for k, v in overrides.items():
+            if hasattr(cfg, k):
+                setattr(cfg, k, v)
+
+        m = cls(cfg)
+
+        # Weights: prefer index, then single safetensors, then directory itself.
+        idx = snap / "model.safetensors.index.json"
+        single = snap / "model.safetensors"
+        if single.exists():
+            m.load_safetensors(single)
+        elif idx.exists():
+            m.load_safetensors(idx)
+        elif snap.exists():
+            m.load_safetensors(snap)
+        else:
+            raise FileNotFoundError(f"snapshot dir not found: {snap}")
+
+        m.tokenizer = None
+        if spec.tokenizer_family:
+            try:
+                from SuperKittens.models.load.tokenizer import Tokenizer
+                json_path = snap / "tokenizer.json"
+                sp_path = snap / "tokenizer.model"
+                if json_path.exists():
+                    m.tokenizer = Tokenizer.from_hf_json(str(json_path), family=spec.tokenizer_family)
+                elif sp_path.exists():
+                    m.tokenizer = Tokenizer.from_sentencepiece(str(sp_path), family=spec.tokenizer_family)
+            except Exception as e:
+                print(f"[mamba2] tokenizer attach failed: {e}")
+        return m
+
 
 # Registry entry — kept import-light.
 SPEC = {
