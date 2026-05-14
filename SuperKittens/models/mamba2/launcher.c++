@@ -44,6 +44,8 @@ static bool resolve_psos(ModelPSOs& P) {
     P.layer.add          = sk::bindings_pso("add_f16");
     P.embedding_lookup   = sk::bindings_pso("embedding_lookup");
     P.argmax             = sk::bindings_pso("argmax");
+    P.argmax_partial     = sk::bindings_pso("argmax_partial");
+    P.argmax_reduce      = sk::bindings_pso("argmax_reduce");
 
     #define _CK(name, val) if (!(val)) { std::fprintf(stderr, "mamba2 launcher: missing PSO %s\n", name); return false; }
     _CK("rmsnorm",          P.layer.rmsnorm);
@@ -120,6 +122,14 @@ extern "C" sk_mamba2_handle* sk_mamba2_create(const sk_mamba2_config* cfg) {
     h->bufs.gated         = alloc_zero(dev, T_max * E * fp16);
     h->bufs.out_proj_out  = alloc_zero(dev, T_max * D * fp16);
     h->bufs.logits        = alloc_zero(dev, (size_t)cfg->vocab_size * fp16);
+
+    // 2-pass argmax scratch.
+    {
+        constexpr uint32_t ELTS_PER_TG = 16384u;
+        const uint32_t n_blocks = (cfg->vocab_size + ELTS_PER_TG - 1u) / ELTS_PER_TG;
+        h->bufs.argmax_val_buf = alloc_zero(dev, (size_t)n_blocks * sizeof(float));
+        h->bufs.argmax_idx_buf = alloc_zero(dev, (size_t)n_blocks * sizeof(int32_t));
+    }
 
     h->current_pos = 0;
     return reinterpret_cast<sk_mamba2_handle*>(h);
@@ -281,5 +291,6 @@ extern "C" void sk_mamba2_destroy(sk_mamba2_handle* hp) {
     rel(h->bufs.in_proj_out); rel(h->bufs.z); rel(h->bufs.xBC);
     rel(h->bufs.dt_raw); rel(h->bufs.xBC_post); rel(h->bufs.ssd_out);
     rel(h->bufs.gated); rel(h->bufs.out_proj_out); rel(h->bufs.logits);
+    rel(h->bufs.argmax_val_buf); rel(h->bufs.argmax_idx_buf);
     delete h;
 }

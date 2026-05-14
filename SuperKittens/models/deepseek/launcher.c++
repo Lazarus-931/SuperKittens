@@ -94,6 +94,8 @@ static bool resolve_psos(ModelPSOs& P, uint32_t dk, uint32_t dv) {
 
     P.embedding_lookup = sk::bindings_pso("embedding_lookup");
     P.argmax           = sk::bindings_pso("argmax");
+    P.argmax_partial   = sk::bindings_pso("argmax_partial");
+    P.argmax_reduce    = sk::bindings_pso("argmax_reduce");
 
     #define _CK(name, val) if (!(val)) { std::fprintf(stderr, "ds4 launcher: missing PSO " name "\n"); return false; }
     _CK("rmsnorm",        P.layer.rmsnorm);
@@ -229,6 +231,14 @@ extern "C" sk_deepseek_handle* sk_deepseek_create(const sk_deepseek_config* cfg)
     h->bufs.moe_top_idx   = alloc_zero(dev, (size_t)T_max * cfg->top_k * sizeof(int32_t));
     h->bufs.moe_top_score = alloc_zero(dev, (size_t)T_max * cfg->top_k * 2);
     h->bufs.moe_hidden    = alloc_zero(dev, (size_t)T_max * cfg->top_k * cfg->n_int * 2);
+
+    // 2-pass argmax scratch.
+    {
+        constexpr uint32_t ELTS_PER_TG = 16384u;
+        const uint32_t n_blocks = (cfg->vocab_size + ELTS_PER_TG - 1u) / ELTS_PER_TG;
+        h->bufs.argmax_val_buf = alloc_zero(dev, (size_t)n_blocks * sizeof(float));
+        h->bufs.argmax_idx_buf = alloc_zero(dev, (size_t)n_blocks * sizeof(int32_t));
+    }
 
     // c_kv / k_pe scratch live in the same memory budget as q_packed / etc.
     // We allocate fresh:
@@ -382,6 +392,7 @@ extern "C" void sk_deepseek_destroy(sk_deepseek_handle* hp) {
     rel(h->bufs.attn_out); rel(h->bufs.o_proj); rel(h->bufs.y_attn);
     rel(h->bufs.m_in); rel(h->bufs.shared_mid); rel(h->bufs.shared_out);
     rel(h->bufs.moe_top_idx); rel(h->bufs.moe_top_score); rel(h->bufs.moe_hidden);
+    rel(h->bufs.argmax_val_buf); rel(h->bufs.argmax_idx_buf);
 
     delete h;
 }

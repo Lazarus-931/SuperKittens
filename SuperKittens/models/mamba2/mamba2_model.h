@@ -64,6 +64,9 @@ struct ModelPSOs {
     LayerPSOs layer;
     MTL::ComputePipelineState* embedding_lookup;
     MTL::ComputePipelineState* argmax;
+    // Optional 2-pass fp16 argmax PSOs (≈1.8× at V=50288).
+    MTL::ComputePipelineState* argmax_partial = nullptr;
+    MTL::ComputePipelineState* argmax_reduce  = nullptr;
 };
 
 struct ModelWeights {
@@ -102,6 +105,10 @@ struct ModelBuffers {
     MTL::Buffer* out_proj_out;   // (T, D)
     MTL::Buffer* logits;         // (V,)
     LayerState* layer_states;    // [n_layers]
+
+    // 2-pass argmax scratch (ceil(vocab_size/16384) partials each).
+    MTL::Buffer* argmax_val_buf = nullptr;
+    MTL::Buffer* argmax_idx_buf = nullptr;
 };
 
 // ── Encode helpers ──────────────────────────────────────────────────
@@ -460,14 +467,43 @@ inline void dispatch_model(
 
     // E. Argmax over LAST token row only
     {
-        auto* enc = cmd->computeCommandEncoder();
-        enc->setComputePipelineState(P.argmax);
         const size_t last_off = (size_t)(T - 1) * M.vocab_size * 2;
-        enc->setBuffer(B.logits,  last_off, 0);
-        enc->setBuffer(output_id, 0,        1);
-        enc->setBytes(&M.vocab_size, 4, 2);
-        enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(1024, 1, 1));
-        enc->endEncoding();
+        const bool can_2pass = P.argmax_partial && P.argmax_reduce
+                            && B.argmax_val_buf && B.argmax_idx_buf;
+        if (can_2pass) {
+            constexpr uint32_t ELTS_PER_TG = 16384u;
+            const uint32_t n_blocks = (M.vocab_size + ELTS_PER_TG - 1u) / ELTS_PER_TG;
+            {
+                auto* enc = cmd->computeCommandEncoder();
+                enc->setComputePipelineState(P.argmax_partial);
+                enc->setBuffer(B.logits,         last_off, 0);
+                enc->setBuffer(B.argmax_val_buf, 0,        1);
+                enc->setBuffer(B.argmax_idx_buf, 0,        2);
+                enc->setBytes(&M.vocab_size,     4, 3);
+                enc->dispatchThreadgroups(MTL::Size(n_blocks, 1, 1),
+                                          MTL::Size(1024, 1, 1));
+                enc->endEncoding();
+            }
+            {
+                auto* enc = cmd->computeCommandEncoder();
+                enc->setComputePipelineState(P.argmax_reduce);
+                enc->setBuffer(B.argmax_val_buf, 0, 0);
+                enc->setBuffer(B.argmax_idx_buf, 0, 1);
+                enc->setBuffer(output_id,        0, 2);
+                enc->setBytes(&n_blocks,         4, 3);
+                enc->dispatchThreadgroups(MTL::Size(1, 1, 1),
+                                          MTL::Size(1024, 1, 1));
+                enc->endEncoding();
+            }
+        } else {
+            auto* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(P.argmax);
+            enc->setBuffer(B.logits,  last_off, 0);
+            enc->setBuffer(output_id, 0,        1);
+            enc->setBytes(&M.vocab_size, 4, 2);
+            enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(1024, 1, 1));
+            enc->endEncoding();
+        }
     }
 }
 

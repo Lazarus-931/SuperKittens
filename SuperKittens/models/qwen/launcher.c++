@@ -62,6 +62,9 @@ static bool resolve_psos(ModelPSOs& P) {
     P.layer.t_head_to_seq  = sk::bindings_pso("transpose_head_to_seq_f16");
     P.embedding_lookup     = sk::bindings_pso("embedding_lookup");
     P.argmax               = sk::bindings_pso("argmax");
+    // Optional 2-pass argmax (nullable; T==1 fast path).
+    P.argmax_partial       = sk::bindings_pso("argmax_partial");
+    P.argmax_reduce        = sk::bindings_pso("argmax_reduce");
 
     #define _CK(name, val) if (!(val)) { std::fprintf(stderr, "qwen launcher: missing PSO " name "\n"); return false; }
     _CK("rmsnorm",          P.layer.rmsnorm);
@@ -175,6 +178,14 @@ extern "C" sk_qwen_handle* sk_qwen_create(const sk_qwen_config* cfg) {
     h->bufs.k_th       = alloc_zero(dev, (size_t)T_max * cfg->n_kv_heads * hd * 2);
     h->bufs.v_th       = alloc_zero(dev, (size_t)T_max * cfg->n_kv_heads * hd * 2);
     h->bufs.attn_out_seq = alloc_zero(dev, (size_t)T_max * cfg->n_heads  * hd * 2);
+
+    // 2-pass argmax scratch (one entry per 16384-elt tile of vocab_size).
+    {
+        constexpr uint32_t ELTS_PER_TG = 16384u;
+        const uint32_t n_blocks = (cfg->vocab_size + ELTS_PER_TG - 1u) / ELTS_PER_TG;
+        h->bufs.argmax_val_buf = alloc_zero(dev, (size_t)n_blocks * sizeof(float));
+        h->bufs.argmax_idx_buf = alloc_zero(dev, (size_t)n_blocks * sizeof(int32_t));
+    }
 
     return reinterpret_cast<sk_qwen_handle*>(h);
 }
@@ -358,5 +369,6 @@ extern "C" void sk_qwen_destroy(sk_qwen_handle* hp) {
     rel(h->bufs.m_in); rel(h->bufs.mlp_out); rel(h->bufs.capture);
     rel(h->bufs.gate_buf); rel(h->bufs.up_buf);
     rel(h->bufs.q_th); rel(h->bufs.k_th); rel(h->bufs.v_th); rel(h->bufs.attn_out_seq);
+    rel(h->bufs.argmax_val_buf); rel(h->bufs.argmax_idx_buf);
     delete h;
 }
