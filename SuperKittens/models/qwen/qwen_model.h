@@ -60,14 +60,19 @@ struct LayerBuffers {
 
     // Per-layer concatenated weights (offsets via layer_idx)
     MTL::Buffer* w_pre_attn_norm;     // (n_layers, d_model)
-    MTL::Buffer* w_qkv;               // (n_layers, d_model, (n_heads + 2*n_kv_heads)*head_dim)
+    MTL::Buffer* w_qkv;               // this layer's QKV slab
+    size_t       w_qkv_inner_off = 0; // byte offset within w_qkv to the start of layer data
     MTL::Buffer* w_q_norm;            // (n_layers, head_dim) — per-head Q-norm γ
     MTL::Buffer* w_k_norm;            // (n_layers, head_dim) — per-head K-norm γ
-    MTL::Buffer* w_o;                 // (n_layers, n_heads*head_dim, d_model)
+    MTL::Buffer* w_o;                 // this layer's O slab
+    size_t       w_o_inner_off   = 0;
     MTL::Buffer* w_pre_mlp_norm;      // (n_layers, d_model)
-    MTL::Buffer* w_gate;              // (n_layers, d_model, n_int)
-    MTL::Buffer* w_up;                // (n_layers, d_model, n_int)
-    MTL::Buffer* w_down;              // (n_layers, n_int, d_model)
+    MTL::Buffer* w_gate;              // this layer's gate slab
+    size_t       w_gate_inner_off = 0;
+    MTL::Buffer* w_up;                // this layer's up slab
+    size_t       w_up_inner_off   = 0;
+    MTL::Buffer* w_down;              // this layer's down slab
+    size_t       w_down_inner_off = 0;
 
     MTL::Buffer* rope_pos;            // (seq,) int32 positions
     MTL::Buffer* cos_tbl;             // (cache_size, head_dim/2) fp16
@@ -314,15 +319,18 @@ inline void dispatch_layer(
     const uint32_t qkv_N = qN + 2 * kvN;
 
     // Per-layer byte offsets. fp16/bf16 = 2B/elem; Q8_0 = 34B per 32 elems.
-    auto wbytes = [](sk::Dtype d, size_t n) { return sk::dtype_bytes(d, n); };
+    // Norms are still single-buffer-per-weight (layer-strided). Bulk Q8_0
+    // weights (qkv/o/gate/up/down) are passed in already pointing at this
+    // layer's slab, with an inner offset accounting for page-alignment of the
+    // mmap range (zero for the legacy memcpy path).
     const size_t off_norm     = (size_t)L * p.d_model * 2;
-    const size_t off_w_qkv    = (size_t)L * wbytes(B.dt_qkv,  (size_t)p.d_model * qkv_N);
+    const size_t off_w_qkv    = B.w_qkv_inner_off;
     const size_t off_w_q_norm = (size_t)L * hd * 2;
     const size_t off_w_k_norm = (size_t)L * hd * 2;
-    const size_t off_w_o      = (size_t)L * wbytes(B.dt_o,    (size_t)p.n_heads * hd * p.d_model);
-    const size_t off_w_gate   = (size_t)L * wbytes(B.dt_gate, (size_t)p.d_model * p.n_int);
-    const size_t off_w_up     = (size_t)L * wbytes(B.dt_up,   (size_t)p.d_model * p.n_int);
-    const size_t off_w_down   = (size_t)L * wbytes(B.dt_down, (size_t)p.n_int * p.d_model);
+    const size_t off_w_o      = B.w_o_inner_off;
+    const size_t off_w_gate   = B.w_gate_inner_off;
+    const size_t off_w_up     = B.w_up_inner_off;
+    const size_t off_w_down   = B.w_down_inner_off;
 
     // 1. Pre-attn RMSNorm.
     encode_rmsnorm(cmd, P.rmsnorm, B.x, B.w_pre_attn_norm, off_norm,
@@ -460,7 +468,7 @@ inline void dispatch_layer(
         enc->setComputePipelineState(P.gemv_swiglu_m1);
         enc->setBuffer(B.m_in,    0,          0);
         enc->setBuffer(B.w_gate,  off_w_gate, 1);
-        enc->setBuffer(B.w_up,    off_w_gate, 2);
+        enc->setBuffer(B.w_up,    off_w_up,   2);
         enc->setBuffer(B.up_buf,  0,          3);
         uint32_t N_v = p.n_int, K_v = p.d_model;
         enc->setBytes(&N_v, 4, 4);
@@ -551,16 +559,27 @@ struct LayerCache {
 struct ModelWeights {
     MTL::Buffer* w_embed;
     MTL::Buffer* w_pre_attn_norm;
-    MTL::Buffer* w_qkv;
+    // Bulk Q8_0 weights: one MTL::Buffer per layer, each backed by either a
+    // dedicated mmap range of the GGUF file (zero-copy) or by a legacy memcpy
+    // buffer. The inner offset accounts for page alignment of mmap ranges
+    // (the requested file offset may not be page-aligned, so the buffer
+    // actually starts a few KB before the layer data).
+    std::vector<MTL::Buffer*> w_qkv;        // size n_layers
+    std::vector<size_t>       w_qkv_off;    // size n_layers
     MTL::Buffer* w_q_norm;        // (n_layers, head_dim)
     MTL::Buffer* w_k_norm;        // (n_layers, head_dim)
-    MTL::Buffer* w_o;
+    std::vector<MTL::Buffer*> w_o;
+    std::vector<size_t>       w_o_off;
     MTL::Buffer* w_pre_mlp_norm;
     MTL::Buffer* w_final_norm;
-    MTL::Buffer* w_gate;
-    MTL::Buffer* w_up;
-    MTL::Buffer* w_down;
+    std::vector<MTL::Buffer*> w_gate;
+    std::vector<size_t>       w_gate_off;
+    std::vector<MTL::Buffer*> w_up;
+    std::vector<size_t>       w_up_off;
+    std::vector<MTL::Buffer*> w_down;
+    std::vector<size_t>       w_down_off;
     MTL::Buffer* w_lm_head;  // null when tied
+    size_t       off_w_lm_head = 0;  // byte offset into w_lm_head (for mmap-backed weights)
     const LayerCache* layer_caches;
 
     // Per-projection dtypes (default FP16). Set by loader when using Q8_0.
@@ -669,14 +688,19 @@ inline void dispatch_model(
         LayerBuffers lb{};
         lb.x = cur;
         lb.w_pre_attn_norm = W.w_pre_attn_norm;
-        lb.w_qkv           = W.w_qkv;
-        lb.w_q_norm        = W.w_q_norm;
-        lb.w_k_norm        = W.w_k_norm;
-        lb.w_o             = W.w_o;
-        lb.w_pre_mlp_norm  = W.w_pre_mlp_norm;
-        lb.w_gate          = W.w_gate;
-        lb.w_up            = W.w_up;
-        lb.w_down          = W.w_down;
+        lb.w_qkv             = W.w_qkv[L];
+        lb.w_qkv_inner_off   = W.w_qkv_off[L];
+        lb.w_q_norm          = W.w_q_norm;
+        lb.w_k_norm          = W.w_k_norm;
+        lb.w_o               = W.w_o[L];
+        lb.w_o_inner_off     = W.w_o_off[L];
+        lb.w_pre_mlp_norm    = W.w_pre_mlp_norm;
+        lb.w_gate            = W.w_gate[L];
+        lb.w_gate_inner_off  = W.w_gate_off[L];
+        lb.w_up              = W.w_up[L];
+        lb.w_up_inner_off    = W.w_up_off[L];
+        lb.w_down            = W.w_down[L];
+        lb.w_down_inner_off  = W.w_down_off[L];
         lb.rope_pos        = B.rope_pos;
         lb.cos_tbl         = B.cos_tbl;
         lb.sin_tbl         = B.sin_tbl;
@@ -735,9 +759,9 @@ inline void dispatch_model(
             for (uint32_t m = 0; m < M_v; ++m) {
                 auto* enc = cmd->computeCommandEncoder();
                 enc->setComputePipelineState(P.layer.q8_0_matvec);
-                enc->setBuffer(nxt,           (size_t)m * K_v * 2, 0);
-                enc->setBuffer(W.w_lm_head,   0,                   1);
-                enc->setBuffer(B.logits,      (size_t)m * N_v * 2, 2);
+                enc->setBuffer(nxt,           (size_t)m * K_v * 2,  0);
+                enc->setBuffer(W.w_lm_head,   W.off_w_lm_head,      1);
+                enc->setBuffer(B.logits,      (size_t)m * N_v * 2,  2);
                 enc->setBytes(&K_v, 4, 3);
                 enc->setBytes(&N_v, 4, 4);
                 enc->dispatchThreadgroups(MTL::Size((N_v + 1) / 2, 1, 1), MTL::Size(128, 1, 1));
@@ -746,11 +770,12 @@ inline void dispatch_model(
         } else
         if (M_v == 1 && P.layer.gemv_t_m1 != nullptr) {
             // Decode fast path: M=1 transposed-weight matvec.
+            const size_t off_head = (w_head == W.w_lm_head) ? W.off_w_lm_head : 0;
             auto* enc = cmd->computeCommandEncoder();
             enc->setComputePipelineState(P.layer.gemv_t_m1);
-            enc->setBuffer(nxt,      0, 0);
-            enc->setBuffer(w_head,   0, 1);
-            enc->setBuffer(B.logits, 0, 2);
+            enc->setBuffer(nxt,      0,        0);
+            enc->setBuffer(w_head,   off_head, 1);
+            enc->setBuffer(B.logits, 0,        2);
             enc->setBytes(&N_v, 4, 3);
             enc->setBytes(&K_v, 4, 4);
             const uint32_t BN = 128;
@@ -758,13 +783,14 @@ inline void dispatch_model(
                                       MTL::Size(BN, 1, 1));
             enc->endEncoding();
         } else {
+            const size_t off_head = (w_head == W.w_lm_head) ? W.off_w_lm_head : 0;
             auto* enc = cmd->computeCommandEncoder();
             enc->setComputePipelineState(P.layer.gemm);
             uint32_t ldA = K_v, ldB = K_v, ldC = N_v;
             int transA = 0, transB = 1, has_bias = 0;
-            enc->setBuffer(nxt,        0, 0);
-            enc->setBuffer(w_head,     0, 1);
-            enc->setBuffer(B.logits,   0, 2);
+            enc->setBuffer(nxt,        0,        0);
+            enc->setBuffer(w_head,     off_head, 1);
+            enc->setBuffer(B.logits,   0,        2);
             enc->setBytes(&M_v,      4, 3); enc->setBytes(&N_v,      4, 4);
             enc->setBytes(&K_v,      4, 5); enc->setBytes(&ldA,      4, 6);
             enc->setBytes(&ldB,      4, 7); enc->setBytes(&ldC,      4, 8);

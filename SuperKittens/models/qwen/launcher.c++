@@ -3,6 +3,7 @@
 #include "launcher.h"
 #include "qwen_model.h"
 #include "../../kernels/runtime_bindings.h"
+#include "../../inference/silicon/mmap_buffer.h"
 
 #include <cstring>
 #include <cstdlib>
@@ -24,6 +25,16 @@ struct Handle {
     uint32_t layers_run     = 0;
     int32_t  capture_layer  = -1;
     uint32_t last_seq       = 0;  // seq used at most recent forward (for get_capture sizing)
+
+    // Zero-copy mmap of the GGUF file, when used (otherwise nullptr).
+    // Owns the MTL::Buffer that w_lm_head (and future mmap-backed weights)
+    // alias into via per-weight byte offsets.
+    sk::silicon::MmapBuffer* gguf_mmap = nullptr;
+
+    // Per-layer zero-copy mmap ranges for bulk Q8_0 weights (qkv/o/gate/up/down).
+    // Each layer's slab is a separate file-range mmap; this vector owns the
+    // MmapBuffer objects so they can be destroyed alongside the handle.
+    std::vector<sk::silicon::MmapBuffer*> tensor_mmaps;
 };
 
 static MTL::Buffer* alloc_zero(MTL::Device* dev, size_t bytes) {
@@ -91,15 +102,35 @@ extern "C" sk_qwen_handle* sk_qwen_create(const sk_qwen_config* cfg) {
     // Weights
     h->weights.w_embed         = alloc_zero(dev, (size_t)cfg->vocab_size * cfg->d_model * 2);
     h->weights.w_pre_attn_norm = alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * 2);
-    h->weights.w_qkv           = alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * qkv_N * 2);
     h->weights.w_q_norm        = alloc_zero(dev, (size_t)cfg->n_layers * hd * 2);
     h->weights.w_k_norm        = alloc_zero(dev, (size_t)cfg->n_layers * hd * 2);
-    h->weights.w_o             = alloc_zero(dev, (size_t)cfg->n_layers * cfg->n_heads * hd * cfg->d_model * 2);
     h->weights.w_pre_mlp_norm  = alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * 2);
     h->weights.w_final_norm    = alloc_zero(dev, (size_t)cfg->d_model * 2);
-    h->weights.w_gate          = alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * cfg->n_int * 2);
-    h->weights.w_up            = alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * cfg->n_int * 2);
-    h->weights.w_down          = alloc_zero(dev, (size_t)cfg->n_layers * cfg->n_int * cfg->d_model * 2);
+
+    // Bulk Q8_0 weights: by default we allocate one big shared buffer per type
+    // (matching the legacy single-buffer + strided-offset layout) so that
+    // sk_qwen_load_weights() and sk_qwen_load_from_store() can keep their
+    // existing one-memcpy-per-tensor logic. sk_qwen_load_gguf() replaces this
+    // with per-layer mmap ranges. The per-layer vectors fan out to the SAME
+    // shared buffer with strided offsets in this default path.
+    auto fan_out = [&](size_t per_layer_bytes,
+                       std::vector<MTL::Buffer*>& vbuf,
+                       std::vector<size_t>& voff) {
+        auto* big = alloc_zero(dev, (size_t)cfg->n_layers * per_layer_bytes);
+        vbuf.assign(cfg->n_layers, big);
+        voff.resize(cfg->n_layers);
+        for (uint32_t L = 0; L < cfg->n_layers; ++L) voff[L] = (size_t)L * per_layer_bytes;
+    };
+    fan_out((size_t)cfg->d_model * qkv_N * 2,
+            h->weights.w_qkv, h->weights.w_qkv_off);
+    fan_out((size_t)cfg->n_heads * hd * cfg->d_model * 2,
+            h->weights.w_o, h->weights.w_o_off);
+    fan_out((size_t)cfg->d_model * cfg->n_int * 2,
+            h->weights.w_gate, h->weights.w_gate_off);
+    fan_out((size_t)cfg->d_model * cfg->n_int * 2,
+            h->weights.w_up, h->weights.w_up_off);
+    fan_out((size_t)cfg->n_int * cfg->d_model * 2,
+            h->weights.w_down, h->weights.w_down_off);
     h->weights.w_lm_head       = cfg->tie_word_embeddings ? nullptr
                                   : alloc_zero(dev, (size_t)cfg->vocab_size * cfg->d_model * 2);
 
@@ -174,17 +205,19 @@ extern "C" int sk_qwen_load_weights(sk_qwen_handle* hp, const sk_qwen_weights* w
     auto cp = [](MTL::Buffer* dst, const void* src) {
         if (dst && src) std::memcpy(dst->contents(), src, dst->length());
     };
+    // Per-weight fan-out vectors share a single underlying buffer in the
+    // non-GGUF loader path, so copying into [0] populates all layers.
     cp(h->weights.w_embed,         w->w_embed);
     cp(h->weights.w_pre_attn_norm, w->w_pre_attn_norm);
-    cp(h->weights.w_qkv,           w->w_qkv);
+    cp(h->weights.w_qkv[0],        w->w_qkv);
     cp(h->weights.w_q_norm,        w->w_q_norm);
     cp(h->weights.w_k_norm,        w->w_k_norm);
-    cp(h->weights.w_o,             w->w_o);
+    cp(h->weights.w_o[0],          w->w_o);
     cp(h->weights.w_pre_mlp_norm,  w->w_pre_mlp_norm);
     cp(h->weights.w_final_norm,    w->w_final_norm);
-    cp(h->weights.w_gate,          w->w_gate);
-    cp(h->weights.w_up,            w->w_up);
-    cp(h->weights.w_down,          w->w_down);
+    cp(h->weights.w_gate[0],       w->w_gate);
+    cp(h->weights.w_up[0],         w->w_up);
+    cp(h->weights.w_down[0],       w->w_down);
     if (h->weights.w_lm_head && w->w_lm_head) cp(h->weights.w_lm_head, w->w_lm_head);
     return 0;
 }
@@ -274,10 +307,46 @@ extern "C" void sk_qwen_destroy(sk_qwen_handle* hp) {
     auto rel = [](MTL::Buffer* b) { if (b) b->release(); };
 
     rel(h->weights.w_embed); rel(h->weights.w_pre_attn_norm);
-    rel(h->weights.w_qkv); rel(h->weights.w_q_norm); rel(h->weights.w_k_norm); rel(h->weights.w_o);
+    rel(h->weights.w_q_norm); rel(h->weights.w_k_norm);
     rel(h->weights.w_pre_mlp_norm); rel(h->weights.w_final_norm);
-    rel(h->weights.w_gate); rel(h->weights.w_up); rel(h->weights.w_down);
-    rel(h->weights.w_lm_head);
+    // Bulk Q8_0 vectors may contain duplicates (default fan-out path: all
+    // entries point at the same big buffer) or unique entries (GGUF mmap
+    // path: each entry is its own MmapBuffer-owned MTL::Buffer; those are
+    // released via h->tensor_mmaps cleanup, NOT here). Walk each vector and
+    // release each *unique* MTL::Buffer at most once, skipping any pointer
+    // that an MmapBuffer owns.
+    {
+        std::vector<MTL::Buffer*> mmap_owned;
+        mmap_owned.reserve(h->tensor_mmaps.size());
+        for (auto* mb : h->tensor_mmaps) if (mb) mmap_owned.push_back(mb->buffer());
+        auto is_mmap = [&](MTL::Buffer* b) {
+            for (auto* o : mmap_owned) if (o == b) return true;
+            return false;
+        };
+        auto release_vec_unique = [&](const std::vector<MTL::Buffer*>& v) {
+            std::vector<MTL::Buffer*> seen;
+            for (auto* b : v) {
+                if (!b || is_mmap(b)) continue;
+                bool dup = false;
+                for (auto* s : seen) if (s == b) { dup = true; break; }
+                if (!dup) { seen.push_back(b); b->release(); }
+            }
+        };
+        release_vec_unique(h->weights.w_qkv);
+        release_vec_unique(h->weights.w_o);
+        release_vec_unique(h->weights.w_gate);
+        release_vec_unique(h->weights.w_up);
+        release_vec_unique(h->weights.w_down);
+    }
+    for (auto* mb : h->tensor_mmaps) delete mb;
+    h->tensor_mmaps.clear();
+    // w_lm_head may be a borrowed pointer into h->gguf_mmap when zero-copy is
+    // active. Only release when it is NOT the mmap-owned buffer.
+    if (h->weights.w_lm_head &&
+        (!h->gguf_mmap || h->weights.w_lm_head != h->gguf_mmap->buffer())) {
+        h->weights.w_lm_head->release();
+    }
+    if (h->gguf_mmap) { delete h->gguf_mmap; h->gguf_mmap = nullptr; }
     for (auto* b : h->k_caches) rel(b);
     for (auto* b : h->v_caches) rel(b);
     rel(h->bufs.input_ids); rel(h->bufs.output_id);
