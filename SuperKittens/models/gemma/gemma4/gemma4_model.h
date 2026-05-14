@@ -1386,13 +1386,19 @@ inline void dispatch_model(
     }
 
     // E. argmax → output_id
+    //
+    // Only the LAST token's argmax matters for decode; output_id is sized
+    // batch*sizeof(int32_t) (one slot), so dispatching T threadgroups would
+    // OOB-write past the buffer for T>1. Offset the logits view by (T-1) rows
+    // and run a single threadgroup so out[0] = argmax(logits[last_row, :]).
     {
         auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(P.argmax);
-        enc->setBuffer(B.logits,   0, 0);
-        enc->setBuffer(B.output_id,0, 1);
+        const size_t last_row_off = (size_t)(T - 1u) * (size_t)M.vocab_size * sizeof(uint16_t);
+        enc->setBuffer(B.logits,    last_row_off, 0);
+        enc->setBuffer(B.output_id, 0,            1);
         enc->setBytes(&M.vocab_size, 4, 2);
-        enc->dispatchThreadgroups(MTL::Size(T, 1, 1), MTL::Size(1024, 1, 1));
+        enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(1024, 1, 1));
         enc->endEncoding();
     }
 }
