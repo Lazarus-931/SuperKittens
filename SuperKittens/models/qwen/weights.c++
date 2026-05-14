@@ -352,20 +352,10 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
         return rc;
     }
 
-    // Zero-copy mmap of the GGUF file. We hand its bytes directly to Metal
-    // (via newBufferWithBytesNoCopy) and alias each mmap-backed weight as
-    // (gguf_mmap->buffer(), byte_offset_into_file). This eliminates the
-    // per-tensor memcpy for large Q8_0 weights — the largest single tensor
-    // (the LM head) is several hundred MB on 8B-class models.
-    if (!h->gguf_mmap) {
-        h->gguf_mmap = sk::silicon::MmapBuffer::from_file(dev, path);
-        if (!h->gguf_mmap) {
-            std::fprintf(stderr, "sk_qwen_load_gguf: MmapBuffer::from_file failed for '%s'\n", path);
-            return -3;
-        }
-    }
-    const uint8_t* mmap_base = (const uint8_t*)h->gguf_mmap->data();
-    const size_t   mmap_size = h->gguf_mmap->size();
+    // We use per-tensor range mmaps below (sk::silicon::MmapBuffer::from_file_range)
+    // for the bulk Q8_0 weights, so that the resident set is just those bytes
+    // rather than the full multi-GB GGUF. The handle holds a single owning
+    // pointer for now (lm_head only); follow-up commits will track a vector.
 
     const size_t dm   = c.d_model;
     const size_t hd   = c.head_dim;
@@ -401,30 +391,35 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
                 return -15;
             }
             // Zero-copy: alias the LM-head tensor in the mmap'd GGUF directly
-            // as the Metal buffer for w_lm_head, with a byte offset into the
-            // file. Saves the ~600 MB memcpy on Qwen3-8B Q8_0.
+            // as the Metal buffer for w_lm_head. Saves the ~600 MB memcpy on
+            // Qwen3-8B Q8_0. We use a per-tensor range mmap rather than a
+            // whole-file mmap: on memory-constrained systems (16 GB lexie),
+            // page-faulting an 8 GB+ region through MTL's resource registry
+            // can trigger jetsam SIGKILL during load.
             //
-            // We can't pointer-subtract v->data because gmodel and our
-            // MmapBuffer are two independent mmaps of the same file. Use
-            // the absolute byte offset GGUF records instead.
+            // Use the absolute byte offset GGUF records on disk — we can't
+            // pointer-subtract v->data because WeightStore mmaps the file
+            // independently of MmapBuffer.
             size_t tensor_off = (size_t)-1;
             for (const auto& ti : gmodel.tensors) {
                 if (ti.name == tname) { tensor_off = (size_t)ti.abs_offset; break; }
             }
-            if (tensor_off == (size_t)-1 ||
-                tensor_off > mmap_size || bytes > mmap_size - tensor_off) {
-                std::fprintf(stderr, "gguf: %s tensor offset out of mmap (off=%zu bytes=%zu mmap=%zu)\n",
-                             tname, tensor_off, bytes, mmap_size);
+            if (tensor_off == (size_t)-1) {
+                std::fprintf(stderr, "gguf: %s tensor missing from gmodel\n", tname);
                 return -17;
             }
-            // setBuffer:offset alignment is 4B on Apple Silicon (M1+) for
-            // compute. Q8_0 block size is 34B → tensor_off is at least 4-aligned
-            // by GGUF's 32-byte tensor alignment. Verify defensively.
             // SK_NO_MMAP_LMHEAD=1 forces the legacy memcpy path for A/B testing.
             const bool disable_mmap = std::getenv("SK_NO_MMAP_LMHEAD") != nullptr;
-            if (disable_mmap || tensor_off % 4 != 0) {
-                std::fprintf(stderr, "gguf: %s offset %zu not 4B-aligned — falling back to memcpy\n",
-                             tname, tensor_off);
+            sk::silicon::MmapBuffer* lmh_map = nullptr;
+            size_t inner_off = 0;
+            if (!disable_mmap) {
+                lmh_map = sk::silicon::MmapBuffer::from_file_range(
+                    dev, path, tensor_off, bytes, &inner_off);
+            }
+            if (!lmh_map) {
+                if (!disable_mmap) {
+                    std::fprintf(stderr, "gguf: %s mmap range failed; falling back to memcpy\n", tname);
+                }
                 if (h->weights.w_lm_head) h->weights.w_lm_head->release();
                 h->weights.w_lm_head = dev->newBuffer(bytes, MTL::ResourceStorageModeShared);
                 if (!h->weights.w_lm_head) return -16;
@@ -432,11 +427,10 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
                 h->weights.off_w_lm_head = 0;
             } else {
                 if (h->weights.w_lm_head) h->weights.w_lm_head->release();
-                // Retain the mmap-backed buffer (it's owned by gguf_mmap; the
-                // weights struct holds a borrowed pointer). We don't retain()
-                // because gguf_mmap outlives the weights (both freed in destroy).
-                h->weights.w_lm_head     = h->gguf_mmap->buffer();
-                h->weights.off_w_lm_head = tensor_off;
+                if (h->gguf_mmap) { delete h->gguf_mmap; }
+                h->gguf_mmap             = lmh_map;
+                h->weights.w_lm_head     = lmh_map->buffer();
+                h->weights.off_w_lm_head = inner_off;
             }
             h->weights.dt_lm_head = sk::Dtype::Q8_0;
         } else if (!c.tie_word_embeddings && h->weights.w_lm_head) {

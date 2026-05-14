@@ -23,6 +23,16 @@ public:
     // Returns nullptr on failure (file missing, mmap fails, MTL alloc fails).
     static MmapBuffer* from_file(MTL::Device* dev, const std::string& path);
 
+    // mmap only [file_offset, file_offset + length) of `path` (rounded out to
+    // page boundaries). The resulting `data()` points at the page-aligned
+    // base; the byte offset of the requested region within `data()` is
+    // returned via `out_inner_off` (call setBuffer:offset:inner_off+sub).
+    // Intended for the GGUF case where we only need a single tensor's bytes
+    // mapped, not the whole multi-GB file.
+    static MmapBuffer* from_file_range(MTL::Device* dev, const std::string& path,
+                                       std::size_t file_offset, std::size_t length,
+                                       std::size_t* out_inner_off);
+
     ~MmapBuffer();
 
     MTL::Buffer* buffer() const { return buf_; }    // borrowed; lifetime tied to *this
