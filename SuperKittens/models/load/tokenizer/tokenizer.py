@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, List, Optional, Sequence
+from typing import Any, Callable, ClassVar, List, Optional, Sequence
 
 from .chat_templates import CHAT_TEMPLATES, gemma_template, qwen_template, deepseek_template
 
@@ -26,6 +26,21 @@ class Tokenizer:
     _special_ids: set = field(default_factory=set, repr=False)
     _gguf_vocab: Optional[List[str]] = field(default=None, repr=False)
     _gguf_lookup: Optional[dict] = field(default=None, repr=False)
+
+    # Per-family special-token names. First hit in each ordered list wins.
+    # Adding a new model family means one row here — no heuristic edits elsewhere.
+    _FAMILY_SPECIALS: ClassVar[dict] = {
+        "qwen3":   {"bos": ("<|im_start|>",),            "eos": ("<|im_end|>", "<|endoftext|>"), "pad": ("<|endoftext|>", "<pad>")},
+        "gemma4":  {"bos": ("<bos>",),                   "eos": ("<end_of_turn>", "<eos>"),       "pad": ("<pad>",)},
+        "gemma":   {"bos": ("<bos>",),                   "eos": ("<end_of_turn>", "<eos>"),       "pad": ("<pad>",)},
+        "llama":   {"bos": ("<s>", "<|begin_of_text|>"), "eos": ("</s>", "<|end_of_text|>", "<|eot_id|>"), "pad": ("<pad>",)},
+        "mistral": {"bos": ("<s>",),                     "eos": ("</s>",),                        "pad": ("<pad>",)},
+    }
+    _DEFAULT_SPECIALS: ClassVar[dict] = {
+        "bos": ("<|im_start|>", "<bos>", "<s>", "<|startoftext|>"),
+        "eos": ("<|im_end|>", "<end_of_turn>", "</s>", "<eos>", "<|endoftext|>"),
+        "pad": ("<pad>", "<|pad|>", "<|endoftext|>"),
+    }
 
     # ---- constructors ----
 
@@ -64,18 +79,16 @@ class Tokenizer:
 
         bos_id = eos_id = pad_id = unk_id = None
         specials = set()
-        eos_candidates = ("<|im_end|>", "<end_of_turn>", "<eos>", "<|endoftext|>")
-        bos_candidates = ("<|im_start|>", "<start_of_turn>", "<bos>", "<|startoftext|>", "<s>")
-        pad_candidates = ("<pad>", "<|pad|>", "<|endoftext|>")
-        for name in eos_candidates:
+        family_map = cls._FAMILY_SPECIALS.get(family, cls._DEFAULT_SPECIALS)
+        for name in family_map["eos"]:
             tid = hf.token_to_id(name)
             if tid is not None:
                 eos_id = tid; specials.add(tid); break
-        for name in bos_candidates:
+        for name in family_map["bos"]:
             tid = hf.token_to_id(name)
             if tid is not None:
                 bos_id = tid; specials.add(tid); break
-        for name in pad_candidates:
+        for name in family_map["pad"]:
             tid = hf.token_to_id(name)
             if tid is not None:
                 pad_id = tid; break
