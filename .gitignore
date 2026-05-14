@@ -28,6 +28,7 @@ xcuserdata/
 *.metallib
 *.air
 *.dia
+tools/quantize-to-gguf
 
 # GPU traces
 tmp/

@@ -1,11 +1,12 @@
 SHELL := /bin/bash
 PYTHON ?= python3
 
-.PHONY: help build clean install dev test bench list-models pr-list status
+.PHONY: help build clean install dev test bench list-models pr-list status tools/quantize-to-gguf
 
 help:
 	@echo "SuperKittens dev targets:"
 	@echo "  make build         — compile metallib + dylib"
+	@echo "  make tools/quantize-to-gguf  — build the C safetensors→GGUF Q8_0 quantizer"
 	@echo "  make clean         — wipe build/"
 	@echo "  make install       — pip install -e . into current venv"
 	@echo "  make dev           — install with [dev,hf,tokenizer] extras"
@@ -39,6 +40,11 @@ list-models:
 
 pr-list:
 	gh pr list
+
+tools/quantize-to-gguf:
+	@mkdir -p tools
+	clang -O3 -ffast-math -framework Accelerate -pthread \
+	      -o tools/quantize-to-gguf SuperKittens/tools/quantization/quantize-to-gguf.c
 
 status:
 	@echo "branch: $$(git branch --show-current)"
