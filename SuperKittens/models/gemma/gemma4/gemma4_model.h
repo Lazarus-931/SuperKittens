@@ -77,6 +77,7 @@ struct LayerParams {
 
 struct LayerPSOs {
     MTL::ComputePipelineState* rmsnorm;
+    MTL::ComputePipelineState* rmsnorm_t1 = nullptr;  // optional T=1 fast path (rmsnorm_bf16_t1)
     MTL::ComputePipelineState* gemm;
     MTL::ComputePipelineState* qkv_norm;
     MTL::ComputePipelineState* rope;            // standard (local)
@@ -200,16 +201,22 @@ inline void dispatch_layer(
     // 1. Pre-attn RMSNorm
     {
         auto* enc = E.get();
-        enc->setComputePipelineState(P.rmsnorm);
+        uint32_t rows = p.batch * p.seq;
+        const bool use_t1 = (P.rmsnorm_t1 != nullptr) && (rows == 1u);
+        enc->setComputePipelineState(use_t1 ? P.rmsnorm_t1 : P.rmsnorm);
         enc->setBuffer(B.x,               0,        0);
         enc->setBuffer(B.w_pre_attn_norm, off_norm, 1);
         enc->setBuffer(B.x_norm,          0,        2);
-        uint32_t rows = p.batch * p.seq;
         enc->setBytes(&rows,      4, 3);
         enc->setBytes(&p.d_model, 4, 4);
         enc->setBytes(&p.eps,     4, 5);
-        enc->dispatchThreadgroups(MTL::Size(1, (rows + 3) / 4, 1),
-                                  MTL::Size(128, 1, 1));
+        if (use_t1) {
+            enc->dispatchThreadgroups(MTL::Size(1, rows, 1),
+                                      MTL::Size(256, 1, 1));
+        } else {
+            enc->dispatchThreadgroups(MTL::Size(1, (rows + 3) / 4, 1),
+                                      MTL::Size(128, 1, 1));
+        }
     }
 
     // 2. QKV projection
@@ -533,16 +540,22 @@ inline void dispatch_layer(
     // 7. Post-attn RMSNorm
     {
         auto* enc = E.get();
-        enc->setComputePipelineState(P.rmsnorm);
+        uint32_t rows = p.batch * p.seq;
+        const bool use_t1 = (P.rmsnorm_t1 != nullptr) && (rows == 1u);
+        enc->setComputePipelineState(use_t1 ? P.rmsnorm_t1 : P.rmsnorm);
         enc->setBuffer(B.o_proj,           0,        0);
         enc->setBuffer(B.w_post_attn_norm, off_norm, 1);
         enc->setBuffer(B.y_attn,           0,        2);
-        uint32_t rows = p.batch * p.seq;
         enc->setBytes(&rows,      4, 3);
         enc->setBytes(&p.d_model, 4, 4);
         enc->setBytes(&p.eps,     4, 5);
-        enc->dispatchThreadgroups(MTL::Size(1, (rows + 3) / 4, 1),
-                                  MTL::Size(128, 1, 1));
+        if (use_t1) {
+            enc->dispatchThreadgroups(MTL::Size(1, rows, 1),
+                                      MTL::Size(256, 1, 1));
+        } else {
+            enc->dispatchThreadgroups(MTL::Size(1, (rows + 3) / 4, 1),
+                                      MTL::Size(128, 1, 1));
+        }
     }
 
     // 8+9. Fused residual + pre-MLP RMSNorm.
@@ -631,16 +644,22 @@ inline void dispatch_layer(
     // 11. Post-MLP RMSNorm
     {
         auto* enc = E.get();
-        enc->setComputePipelineState(P.rmsnorm);
+        uint32_t rows = p.batch * p.seq;
+        const bool use_t1 = (P.rmsnorm_t1 != nullptr) && (rows == 1u);
+        enc->setComputePipelineState(use_t1 ? P.rmsnorm_t1 : P.rmsnorm);
         enc->setBuffer(B.m_out,           0,        0);
         enc->setBuffer(B.w_post_feedforward_layernorm, off_norm, 1);
         enc->setBuffer(B.y_out,           0,        2);
-        uint32_t rows = p.batch * p.seq;
         enc->setBytes(&rows,      4, 3);
         enc->setBytes(&p.d_model, 4, 4);
         enc->setBytes(&p.eps,     4, 5);
-        enc->dispatchThreadgroups(MTL::Size(1, (rows + 3) / 4, 1),
-                                  MTL::Size(128, 1, 1));
+        if (use_t1) {
+            enc->dispatchThreadgroups(MTL::Size(1, rows, 1),
+                                      MTL::Size(256, 1, 1));
+        } else {
+            enc->dispatchThreadgroups(MTL::Size(1, (rows + 3) / 4, 1),
+                                      MTL::Size(128, 1, 1));
+        }
     }
 
     // 12. Residual: y_out += y_attn
@@ -1316,15 +1335,21 @@ inline void dispatch_model(
     // C. Final RMSNorm
     {
         auto* enc = cmd->computeCommandEncoder();
-        enc->setComputePipelineState(P.layer.rmsnorm);
+        const bool use_t1 = (P.layer.rmsnorm_t1 != nullptr) && (T == 1u);
+        enc->setComputePipelineState(use_t1 ? P.layer.rmsnorm_t1 : P.layer.rmsnorm);
         enc->setBuffer(cur,            0, 0);
         enc->setBuffer(W.w_final_norm, 0, 1);
         enc->setBuffer(nxt,            0, 2);
         enc->setBytes(&T,         4, 3);
         enc->setBytes(&M.d_model, 4, 4);
         enc->setBytes(&M.eps,     4, 5);
-        enc->dispatchThreadgroups(MTL::Size(1, (T + 3) / 4, 1),
-                                  MTL::Size(128, 1, 1));
+        if (use_t1) {
+            enc->dispatchThreadgroups(MTL::Size(1, T, 1),
+                                      MTL::Size(256, 1, 1));
+        } else {
+            enc->dispatchThreadgroups(MTL::Size(1, (T + 3) / 4, 1),
+                                      MTL::Size(128, 1, 1));
+        }
         enc->endEncoding();
     }
 

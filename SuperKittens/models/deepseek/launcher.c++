@@ -69,6 +69,7 @@ static MTL::ComputePipelineState* resolve_fa_vec_pso(MTL::Library* lib,
 
 static bool resolve_psos(ModelPSOs& P, uint32_t dk, uint32_t dv) {
     P.layer.rmsnorm        = sk::bindings_pso("rmsnorm");
+    P.layer.rmsnorm_t1     = sk::bindings_pso("rmsnorm_t1");  // optional T=1 fast path
     P.layer.gemm           = sk::bindings_pso("gemm_fp16");
     P.layer.rope_tail      = sk::bindings_pso("kernel_dsv4_rope_tail_f32");
     P.layer.rope_interleave = sk::bindings_pso("rope_interleave_f32");

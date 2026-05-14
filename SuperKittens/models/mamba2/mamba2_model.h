@@ -51,6 +51,7 @@ struct LayerParams {
 
 struct LayerPSOs {
     MTL::ComputePipelineState* rmsnorm;
+    MTL::ComputePipelineState* rmsnorm_t1 = nullptr;  // optional T=1 fast path
     MTL::ComputePipelineState* gemm;          // gemm_fp16 (M=1 fast-path for decode)
     MTL::ComputePipelineState* split_packed;
     MTL::ComputePipelineState* conv1d_silu;
@@ -141,18 +142,25 @@ inline void encode_gemm_mb(
 inline void encode_rmsnorm_mb(
     MTL::CommandBuffer* cmd, MTL::ComputePipelineState* pso,
     MTL::Buffer* x, MTL::Buffer* gamma, size_t off_gamma,
-    MTL::Buffer* out, uint32_t rows, uint32_t n, float eps)
+    MTL::Buffer* out, uint32_t rows, uint32_t n, float eps,
+    MTL::ComputePipelineState* pso_t1 = nullptr)
 {
+    const bool use_t1 = (pso_t1 != nullptr) && (rows == 1u);
     auto* enc = cmd->computeCommandEncoder();
-    enc->setComputePipelineState(pso);
+    enc->setComputePipelineState(use_t1 ? pso_t1 : pso);
     enc->setBuffer(x,     0,         0);
     enc->setBuffer(gamma, off_gamma, 1);
     enc->setBuffer(out,   0,         2);
     enc->setBytes(&rows, 4, 3);
     enc->setBytes(&n,    4, 4);
     enc->setBytes(&eps,  4, 5);
-    enc->dispatchThreadgroups(MTL::Size(1, (rows + 3) / 4, 1),
-                              MTL::Size(128, 1, 1));
+    if (use_t1) {
+        enc->dispatchThreadgroups(MTL::Size(1, rows, 1),
+                                  MTL::Size(256, 1, 1));
+    } else {
+        enc->dispatchThreadgroups(MTL::Size(1, (rows + 3) / 4, 1),
+                                  MTL::Size(128, 1, 1));
+    }
     enc->endEncoding();
 }
 
@@ -287,7 +295,7 @@ inline void dispatch_layer(
 
     // 1. pre-norm
     encode_rmsnorm_mb(cmd, P.rmsnorm, b.x_in, b.w_pre_norm, off_pre,
-                      b.x_norm, T, D, p.eps);
+                      b.x_norm, T, D, p.eps, P.rmsnorm_t1);
 
     // 2. in_proj GEMM: (T,D) x (D,IN_OUT) -> (T,IN_OUT)
     encode_gemm_mb(cmd, P.gemm, b.x_norm, 0, b.w_in_proj, off_in,
@@ -442,7 +450,7 @@ inline void dispatch_model(
 
     // C. Final RMSNorm  B.x -> B.x_norm
     encode_rmsnorm_mb(cmd, P.layer.rmsnorm, B.x, W.w_final_norm, 0,
-                      B.x_norm, T, M.d_model, M.eps);
+                      B.x_norm, T, M.d_model, M.eps, P.layer.rmsnorm_t1);
 
     // D. LM head (tied): (T,D) x (V,D)^T → (T,V) logits
     {

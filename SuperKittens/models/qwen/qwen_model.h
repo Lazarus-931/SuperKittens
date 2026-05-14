@@ -38,6 +38,8 @@ struct LayerParams {
 
 struct LayerPSOs {
     MTL::ComputePipelineState* rmsnorm;
+
+    MTL::ComputePipelineState* rmsnorm_t1 = nullptr;
     MTL::ComputePipelineState* gemm;              // fp16 GEMM (M>1 path)
     MTL::ComputePipelineState* gemv_m1;           // fp16 GEMV M=1 fast-path (decode)
     MTL::ComputePipelineState* gemv_swiglu_m1;    // fused gate+up+silu_mul GEMV (M=1)
@@ -138,9 +140,6 @@ inline void encode_q8_0_matvec(
 }
 
 
-// Q8_0-aware GEMM dispatch helper. If the weight is Q8_0 and M==1, route to
-// the Q8_0 matvec kernel (weight layout: row-major [N,K]). Otherwise fall back
-// to the regular fp16 GEMM/GEMV path.
 inline void encode_gemm_qaware(
     MTL::CommandBuffer* cmd, MTL::ComputePipelineState* pso_gemm,
     MTL::ComputePipelineState* pso_gemv_m1,
@@ -203,14 +202,10 @@ inline void encode_gemm_qaware(
     uint32_t M, uint32_t N, uint32_t K)
 {
     if (dt_w == sk::Dtype::Q8_0 && pso_q8_0 != nullptr) {
-        // Q8_0 weight: route via q8_0_matvec. For M>1 (prefill), iterate over
-        // rows of the activation/output (each row is a matvec). This is
-        // suboptimal but correct, and prefill of 2-token "Hi!" is fine.
+
         for (uint32_t m = 0; m < M; ++m) {
             const size_t off_A_row = off_A + (size_t)m * K * 2;        // fp16 activation row
-            // Output C is fp16 [M, N] row-major; row m starts at byte m*N*2.
-            // But our helper writes to C with no offset; emulate by adjusting
-            // the buffer offset for the output via setBuffer at index 2.
+
             auto* enc = cmd->computeCommandEncoder();
             enc->setComputePipelineState(pso_q8_0);
             enc->setBuffer(W, off_W, 1);
@@ -231,18 +226,26 @@ inline void encode_gemm_qaware(
 inline void encode_rmsnorm(
     MTL::CommandBuffer* cmd, MTL::ComputePipelineState* pso,
     MTL::Buffer* x, MTL::Buffer* gamma, size_t off_gamma,
-    MTL::Buffer* out, uint32_t rows, uint32_t n, float eps)
+    MTL::Buffer* out, uint32_t rows, uint32_t n, float eps,
+    MTL::ComputePipelineState* pso_t1 = nullptr)
 {
+
+    const bool use_t1 = (pso_t1 != nullptr) && (rows == 1u);
     auto* enc = cmd->computeCommandEncoder();
-    enc->setComputePipelineState(pso);
+    enc->setComputePipelineState(use_t1 ? pso_t1 : pso);
     enc->setBuffer(x,     0,         0);
     enc->setBuffer(gamma, off_gamma, 1);
     enc->setBuffer(out,   0,         2);
     enc->setBytes(&rows, 4, 3);
     enc->setBytes(&n,    4, 4);
     enc->setBytes(&eps,  4, 5);
-    enc->dispatchThreadgroups(MTL::Size(1, (rows + 3) / 4, 1),
-                              MTL::Size(128, 1, 1));
+    if (use_t1) {
+        enc->dispatchThreadgroups(MTL::Size(1, rows, 1),
+                                  MTL::Size(256, 1, 1));
+    } else {
+        enc->dispatchThreadgroups(MTL::Size(1, (rows + 3) / 4, 1),
+                                  MTL::Size(128, 1, 1));
+    }
     enc->endEncoding();
 }
 
@@ -318,11 +321,7 @@ inline void dispatch_layer(
     const uint32_t kvN = p.n_kv_heads * hd;
     const uint32_t qkv_N = qN + 2 * kvN;
 
-    // Per-layer byte offsets. fp16/bf16 = 2B/elem; Q8_0 = 34B per 32 elems.
-    // Norms are still single-buffer-per-weight (layer-strided). Bulk Q8_0
-    // weights (qkv/o/gate/up/down) are passed in already pointing at this
-    // layer's slab, with an inner offset accounting for page-alignment of the
-    // mmap range (zero for the legacy memcpy path).
+
     const size_t off_norm     = (size_t)L * p.d_model * 2;
     const size_t off_w_qkv    = B.w_qkv_inner_off;
     const size_t off_w_q_norm = (size_t)L * hd * 2;
@@ -334,7 +333,7 @@ inline void dispatch_layer(
 
     // 1. Pre-attn RMSNorm.
     encode_rmsnorm(cmd, P.rmsnorm, B.x, B.w_pre_attn_norm, off_norm,
-                   B.x_norm, T, p.d_model, p.eps);
+                   B.x_norm, T, p.d_model, p.eps, P.rmsnorm_t1);
 
     // 2. QKV-pack GEMM: x_norm → qkv_packed (T × (qN + 2*kvN)).
     encode_gemm_qaware(cmd, P.gemm, P.gemv_m1, P.q8_0_matvec, B.dt_qkv,
@@ -366,9 +365,7 @@ inline void dispatch_layer(
                                p.seq, p.n_kv_heads, hd);
     }
 
-    // 5b. Transpose Q,K,V from (T,H,D) seq-major to (H,T,D) head-major
-    //     (matches what kv_cache_write and mha_causal expect).
-    // At T==1 the two layouts coincide byte-for-byte → skip the copies.
+
     MTL::Buffer* q_in = B.q;
     MTL::Buffer* k_in = B.k_tmp;
     MTL::Buffer* v_in = B.v_tmp;
@@ -399,7 +396,6 @@ inline void dispatch_layer(
         enc->endEncoding();
     }
 
-    // 7. Flash attention (mha_causal — GQA-aware, d=128).
     //    Reads Q (post-RoPE, head-major) and the full K/V caches.
     {
         auto* enc = cmd->computeCommandEncoder();
@@ -424,8 +420,7 @@ inline void dispatch_layer(
         enc->endEncoding();
     }
 
-    // 7b. Transpose attn_out from (H, T, D) head-major back to (T, H, D)
-    //     seq-major so o_proj GEMM reads contiguous rows of size n_heads*hd.
+
     // At T==1 layouts coincide → skip and feed attn_out directly.
     MTL::Buffer* attn_o_in = B.attn_out;
     if (p.seq > 1) {
@@ -455,12 +450,6 @@ inline void dispatch_layer(
         enc->endEncoding();
     }
 
-    // 10. Dense SwiGLU MLP: 3 separate GEMMs + silu_mul fusion (the
-    //     original `gated_mlp` kernel is structurally broken for N_int > BN).
-    //   a) gate_buf = m_in @ w_gate            (T, n_int)
-    //   b) up_buf   = m_in @ w_up              (T, n_int)
-    //   c) up_buf   = silu(gate_buf) * up_buf  (elementwise, in-place)
-    //   d) mlp_out  = up_buf @ w_down          (T, d_model)
     const bool mlp_is_q8 = (B.dt_gate == sk::Dtype::Q8_0 || B.dt_up == sk::Dtype::Q8_0);
     if (T == 1 && P.gemv_swiglu_m1 != nullptr && !mlp_is_q8) {
         // Fused gate+up+silu_mul matvec (one dispatch, one m_in read).
@@ -564,11 +553,6 @@ struct LayerCache {
 struct ModelWeights {
     MTL::Buffer* w_embed;
     MTL::Buffer* w_pre_attn_norm;
-    // Bulk Q8_0 weights: one MTL::Buffer per layer, each backed by either a
-    // dedicated mmap range of the GGUF file (zero-copy) or by a legacy memcpy
-    // buffer. The inner offset accounts for page alignment of mmap ranges
-    // (the requested file offset may not be page-aligned, so the buffer
-    // actually starts a few KB before the layer data).
     std::vector<MTL::Buffer*> w_qkv;        // size n_layers
     std::vector<size_t>       w_qkv_off;    // size n_layers
     MTL::Buffer* w_q_norm;        // (n_layers, head_dim)
@@ -755,15 +739,13 @@ inline void dispatch_model(
 
     // C. Final RMSNorm
     encode_rmsnorm(cmd, P.layer.rmsnorm, cur, W.w_final_norm, 0,
-                   nxt, T, M.d_model, M.eps);
+                   nxt, T, M.d_model, M.eps, P.layer.rmsnorm_t1);
 
     // D. LM-head GEMM (tied → reuse embedding; untied → use w_lm_head). Both (V,D) row-major → transB=1.
     {
         const uint32_t M_v = T, K_v = M.d_model, N_v = M.vocab_size;
         MTL::Buffer* w_head = W.w_lm_head ? W.w_lm_head : W.w_embed;
-        // Q8_0 LM head fast path: when caller provides a Q8_0-packed LM-head
-        // buffer in dt_lm_head, route to q8_0_matvec. For M>1 (prefill) we
-        // loop over rows since the kernel is a matvec.
+
         if (W.dt_lm_head == sk::Dtype::Q8_0 && W.w_lm_head &&
             P.layer.q8_0_matvec != nullptr) {
             for (uint32_t m = 0; m < M_v; ++m) {
