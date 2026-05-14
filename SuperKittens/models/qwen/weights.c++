@@ -25,6 +25,7 @@ struct Handle {
     int32_t        capture_layer;
     uint32_t       last_seq;
     sk::silicon::MmapBuffer* gguf_mmap;
+    std::vector<sk::silicon::MmapBuffer*> tensor_mmaps;
 };
 }}
 
@@ -132,7 +133,9 @@ extern "C" int sk_qwen_load_from_store(sk_qwen_handle* hp, sk::WeightStore* stor
                        "lm_head.weight", (size_t)c.vocab_size * dm * fp16)) return -12;
     }
 
-    auto* qkv_base = (char*)h->weights.w_qkv->contents();
+    // In the safetensors path all per-layer vector entries share one big
+    // MTL::Buffer with strided offsets — walk it via the [0] entry.
+    auto* qkv_base = (char*)h->weights.w_qkv[0]->contents();
 
     for (uint32_t L = 0; L < c.n_layers; ++L) {
         const size_t pre_off = (size_t)L * dm * fp16;
@@ -151,13 +154,13 @@ extern "C" int sk_qwen_load_from_store(sk_qwen_handle* hp, sk::WeightStore* stor
                        layer_key(L, "self_attn.q_norm.weight"), hd * fp16)) return -22;
         if (!copy_into(h->weights.w_k_norm, qnorm_off, store,
                        layer_key(L, "self_attn.k_norm.weight"), hd * fp16)) return -23;
-        if (!copy_transpose_fp16(h->weights.w_o, o_off, store,
+        if (!copy_transpose_fp16(h->weights.w_o[0], o_off, store,
                        layer_key(L, "self_attn.o_proj.weight"), Nq, dm)) return -24;
-        if (!copy_transpose_fp16(h->weights.w_gate, gate_off, store,
+        if (!copy_transpose_fp16(h->weights.w_gate[0], gate_off, store,
                        layer_key(L, "mlp.gate_proj.weight"), dm, ni)) return -25;
-        if (!copy_transpose_fp16(h->weights.w_up, gate_off, store,
+        if (!copy_transpose_fp16(h->weights.w_up[0], gate_off, store,
                        layer_key(L, "mlp.up_proj.weight"), dm, ni)) return -26;
-        if (!copy_transpose_fp16(h->weights.w_down, down_off, store,
+        if (!copy_transpose_fp16(h->weights.w_down[0], down_off, store,
                        layer_key(L, "mlp.down_proj.weight"), ni, dm)) return -27;
 
         auto* q_v = store->get(layer_key(L, "self_attn.q_proj.weight"));
@@ -353,9 +356,11 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
     }
 
     // We use per-tensor range mmaps below (sk::silicon::MmapBuffer::from_file_range)
-    // for the bulk Q8_0 weights, so that the resident set is just those bytes
-    // rather than the full multi-GB GGUF. The handle holds a single owning
-    // pointer for now (lm_head only); follow-up commits will track a vector.
+    // for the bulk Q8_0 weights (lm_head + per-layer qkv/o/gate/up/down), so
+    // that the resident set is just those bytes rather than the full multi-GB
+    // GGUF. The handle stores all owning MmapBuffer pointers in
+    // h->tensor_mmaps (plus h->gguf_mmap for the historical lm_head slot);
+    // sk_qwen_destroy releases them en masse.
 
     const size_t dm   = c.d_model;
     const size_t hd   = c.head_dim;
@@ -439,14 +444,6 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
         }
     }
 
-    // Helper: reallocate a buffer to nbytes (releases the old buffer first).
-    auto realloc_buf = [&](MTL::Buffer*& b, size_t nbytes) -> bool {
-        if (b) b->release();
-        b = dev->newBuffer(nbytes, MTL::ResourceStorageModeShared);
-        if (b) std::memset(b->contents(), 0, nbytes);
-        return b != nullptr;
-    };
-
     // ── Inspect dtype of layer-0 projections to decide allocation sizes. ──
     auto* v0_q = store.get("blk.0.attn_q.weight");
     if (!v0_q) { std::fprintf(stderr, "gguf: missing blk.0.attn_q.weight\n"); return -20; }
@@ -461,11 +458,30 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
     const size_t ffn_layer_bytes  = sk::dtype_bytes(dt_proj, dm * ni);
     const size_t down_layer_bytes = sk::dtype_bytes(dt_proj, ni * dm);
 
-    if (!realloc_buf(h->weights.w_qkv,  c.n_layers * qkv_layer_bytes))  return -30;
-    if (!realloc_buf(h->weights.w_o,    c.n_layers * o_layer_bytes))    return -31;
-    if (!realloc_buf(h->weights.w_gate, c.n_layers * ffn_layer_bytes))  return -32;
-    if (!realloc_buf(h->weights.w_up,   c.n_layers * ffn_layer_bytes))  return -33;
-    if (!realloc_buf(h->weights.w_down, c.n_layers * down_layer_bytes)) return -34;
+    // Release the default fan-out buffers allocated in sk_qwen_create — we
+    // are about to replace every per-layer entry with its own (mmap-backed
+    // or memcpy-backed) MTL::Buffer. Each default-path vector currently
+    // holds n_layers copies of the same pointer; dedupe before release.
+    auto release_default_fanout = [](std::vector<MTL::Buffer*>& v) {
+        if (v.empty()) return;
+        MTL::Buffer* shared = v[0];
+        bool all_same = true;
+        for (auto* b : v) if (b != shared) { all_same = false; break; }
+        if (all_same && shared) shared->release();
+        else for (auto* b : v) if (b) b->release();
+        v.clear();
+    };
+    release_default_fanout(h->weights.w_qkv);   h->weights.w_qkv_off.clear();
+    release_default_fanout(h->weights.w_o);     h->weights.w_o_off.clear();
+    release_default_fanout(h->weights.w_gate);  h->weights.w_gate_off.clear();
+    release_default_fanout(h->weights.w_up);    h->weights.w_up_off.clear();
+    release_default_fanout(h->weights.w_down);  h->weights.w_down_off.clear();
+
+    h->weights.w_qkv .resize(c.n_layers, nullptr); h->weights.w_qkv_off .resize(c.n_layers, 0);
+    h->weights.w_o   .resize(c.n_layers, nullptr); h->weights.w_o_off   .resize(c.n_layers, 0);
+    h->weights.w_gate.resize(c.n_layers, nullptr); h->weights.w_gate_off.resize(c.n_layers, 0);
+    h->weights.w_up  .resize(c.n_layers, nullptr); h->weights.w_up_off  .resize(c.n_layers, 0);
+    h->weights.w_down.resize(c.n_layers, nullptr); h->weights.w_down_off.resize(c.n_layers, 0);
 
     h->weights.dt_qkv  = dt_proj;
     h->weights.dt_o    = dt_proj;
@@ -473,20 +489,113 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
     h->weights.dt_up   = dt_proj;
     h->weights.dt_down = dt_proj;
 
-    auto copy_layer_proj = [&](MTL::Buffer* dst, size_t dst_off, const char* gname,
-                               size_t expect_bytes) -> bool {
-        auto* v = store.get(gname);
-        if (!v) { std::fprintf(stderr, "gguf: missing %s\n", gname); return false; }
+    // Look up a tensor's absolute byte offset in the GGUF file.
+    auto find_abs_off = [&](const char* name, uint64_t* out_off, uint64_t* out_nbytes) -> bool {
+        for (const auto& ti : gmodel.tensors) {
+            if (ti.name == name) {
+                if (out_off)    *out_off    = ti.abs_offset;
+                if (out_nbytes) *out_nbytes = ti.nbytes;
+                return true;
+            }
+        }
+        return false;
+    };
+
+    const bool disable_mmap = std::getenv("SK_NO_MMAP_WEIGHTS") != nullptr;
+
+    // Try to mmap a single-GGUF-tensor span into a per-layer MTL::Buffer.
+    // Falls back to a fresh MTL::Buffer + memcpy on failure or when disabled.
+    auto load_single_tensor = [&](const char* name, size_t expect_bytes,
+                                  MTL::Buffer** out_buf, size_t* out_off) -> bool {
+        auto* v = store.get(name);
+        if (!v) { std::fprintf(stderr, "gguf: missing %s\n", name); return false; }
         if (v->dtype != dt_proj) {
-            std::fprintf(stderr, "gguf: dtype mismatch %s (got %d)\n", gname, (int)v->dtype);
+            std::fprintf(stderr, "gguf: dtype mismatch %s (got %d)\n", name, (int)v->dtype);
             return false;
         }
         if (v->nbytes != expect_bytes) {
             std::fprintf(stderr, "gguf: size mismatch %s got %zu want %zu\n",
-                         gname, v->nbytes, expect_bytes);
+                         name, v->nbytes, expect_bytes);
             return false;
         }
-        std::memcpy((char*)dst->contents() + dst_off, v->data, expect_bytes);
+        uint64_t abs_off = 0, nb = 0;
+        if (!find_abs_off(name, &abs_off, &nb)) {
+            std::fprintf(stderr, "gguf: %s not in gmodel.tensors\n", name);
+            return false;
+        }
+        if (!disable_mmap) {
+            size_t inner = 0;
+            auto* mb = sk::silicon::MmapBuffer::from_file_range(
+                dev, path, (size_t)abs_off, (size_t)nb, &inner);
+            if (mb) {
+                h->tensor_mmaps.push_back(mb);
+                *out_buf = mb->buffer();
+                *out_off = inner;
+                return true;
+            }
+            std::fprintf(stderr, "gguf: %s mmap failed; falling back to memcpy\n", name);
+        }
+        // Memcpy fallback (or SK_NO_MMAP_WEIGHTS=1).
+        auto* b = dev->newBuffer(expect_bytes, MTL::ResourceStorageModeShared);
+        if (!b) return false;
+        std::memcpy(b->contents(), v->data, expect_bytes);
+        *out_buf = b;
+        *out_off = 0;
+        return true;
+    };
+
+    // For QKV we want a single per-layer Buffer holding [Q | K | V] row-concat
+    // (the dispatch reads the slab as one [Nq+Nkv+Nkv, dm] Q8_0 matrix). GGUF
+    // stores Q, K, V as 3 separate tensors. If they happen to be adjacent in
+    // file with no padding between them, we can mmap one combined range.
+    // Otherwise fall back to memcpy-pack into a fresh MTL::Buffer.
+    auto load_qkv_layer = [&](uint32_t L) -> bool {
+        char qn[128], kn[128], vn[128];
+        std::snprintf(qn, sizeof(qn), "blk.%u.attn_q.weight", L);
+        std::snprintf(kn, sizeof(kn), "blk.%u.attn_k.weight", L);
+        std::snprintf(vn, sizeof(vn), "blk.%u.attn_v.weight", L);
+        const size_t qb = sk::dtype_bytes(dt_proj, Nq  * dm);
+        const size_t kb = sk::dtype_bytes(dt_proj, Nkv * dm);
+        const size_t vb = sk::dtype_bytes(dt_proj, Nkv * dm);
+        const size_t total = qb + kb + vb;
+
+        auto* qv = store.get(qn); auto* kv = store.get(kn); auto* vv = store.get(vn);
+        if (!qv || !kv || !vv) { std::fprintf(stderr, "gguf: qkv miss L=%u\n", L); return false; }
+        if (qv->nbytes != qb || kv->nbytes != kb || vv->nbytes != vb ||
+            qv->dtype != dt_proj || kv->dtype != dt_proj || vv->dtype != dt_proj) {
+            std::fprintf(stderr, "gguf: qkv shape/dtype mismatch L=%u\n", L);
+            return false;
+        }
+
+        uint64_t qoff = 0, koff = 0, voff_ = 0, qn_ = 0, kn_ = 0, vn_ = 0;
+        bool have_offs =
+            find_abs_off(qn, &qoff, &qn_) &&
+            find_abs_off(kn, &koff, &kn_) &&
+            find_abs_off(vn, &voff_, &vn_);
+
+        if (!disable_mmap && have_offs &&
+            koff == qoff + qn_ && voff_ == koff + kn_) {
+            // Q, K, V are file-adjacent → mmap one combined range.
+            size_t inner = 0;
+            auto* mb = sk::silicon::MmapBuffer::from_file_range(
+                dev, path, (size_t)qoff, total, &inner);
+            if (mb) {
+                h->tensor_mmaps.push_back(mb);
+                h->weights.w_qkv[L]     = mb->buffer();
+                h->weights.w_qkv_off[L] = inner;
+                return true;
+            }
+            std::fprintf(stderr, "gguf: qkv L=%u mmap failed; falling back to memcpy\n", L);
+        }
+        // Memcpy fallback: pack Q|K|V into a fresh Buffer.
+        auto* b = dev->newBuffer(total, MTL::ResourceStorageModeShared);
+        if (!b) return false;
+        char* dst = (char*)b->contents();
+        std::memcpy(dst,           qv->data, qb);
+        std::memcpy(dst + qb,      kv->data, kb);
+        std::memcpy(dst + qb + kb, vv->data, vb);
+        h->weights.w_qkv[L]     = b;
+        h->weights.w_qkv_off[L] = 0;
         return true;
     };
 
@@ -494,10 +603,6 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
     for (uint32_t L = 0; L < c.n_layers; ++L) {
         const size_t pre_off   = (size_t)L * dm * 2;
         const size_t qnorm_off = (size_t)L * hd * 2;
-        const size_t qkv_off   = (size_t)L * qkv_layer_bytes;
-        const size_t o_off_b   = (size_t)L * o_layer_bytes;
-        const size_t ffn_off   = (size_t)L * ffn_layer_bytes;
-        const size_t down_off  = (size_t)L * down_layer_bytes;
 
         std::snprintf(nbuf, sizeof(nbuf), "blk.%u.attn_norm.weight", L);
         if (!read_to_fp16((uint16_t*)((char*)h->weights.w_pre_attn_norm->contents() + pre_off),
@@ -512,27 +617,20 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
         if (!read_to_fp16((uint16_t*)((char*)h->weights.w_k_norm->contents() + qnorm_off),
                           store.get(nbuf), hd)) return -43;
 
-        // QKV concat: rows are [Q (Nq), K (Nkv), V (Nkv)] with K columns = dm.
-        // GGUF stores each separately row-major (N, K). We memcpy them sequentially.
-        const size_t qb_bytes  = sk::dtype_bytes(dt_proj, Nq  * dm);
-        const size_t kb_bytes  = sk::dtype_bytes(dt_proj, Nkv * dm);
-        const size_t vb_bytes  = sk::dtype_bytes(dt_proj, Nkv * dm);
-        std::snprintf(nbuf, sizeof(nbuf), "blk.%u.attn_q.weight", L);
-        if (!copy_layer_proj(h->weights.w_qkv, qkv_off,             nbuf, qb_bytes)) return -50;
-        std::snprintf(nbuf, sizeof(nbuf), "blk.%u.attn_k.weight", L);
-        if (!copy_layer_proj(h->weights.w_qkv, qkv_off + qb_bytes,  nbuf, kb_bytes)) return -51;
-        std::snprintf(nbuf, sizeof(nbuf), "blk.%u.attn_v.weight", L);
-        if (!copy_layer_proj(h->weights.w_qkv, qkv_off + qb_bytes + kb_bytes,
-                             nbuf, vb_bytes)) return -52;
+        if (!load_qkv_layer(L)) return -50;
 
         std::snprintf(nbuf, sizeof(nbuf), "blk.%u.attn_output.weight", L);
-        if (!copy_layer_proj(h->weights.w_o,    o_off_b,  nbuf, o_layer_bytes))    return -53;
+        if (!load_single_tensor(nbuf, o_layer_bytes,
+                                &h->weights.w_o[L], &h->weights.w_o_off[L])) return -53;
         std::snprintf(nbuf, sizeof(nbuf), "blk.%u.ffn_gate.weight", L);
-        if (!copy_layer_proj(h->weights.w_gate, ffn_off,  nbuf, ffn_layer_bytes))  return -54;
+        if (!load_single_tensor(nbuf, ffn_layer_bytes,
+                                &h->weights.w_gate[L], &h->weights.w_gate_off[L])) return -54;
         std::snprintf(nbuf, sizeof(nbuf), "blk.%u.ffn_up.weight", L);
-        if (!copy_layer_proj(h->weights.w_up,   ffn_off,  nbuf, ffn_layer_bytes))  return -55;
+        if (!load_single_tensor(nbuf, ffn_layer_bytes,
+                                &h->weights.w_up[L], &h->weights.w_up_off[L])) return -55;
         std::snprintf(nbuf, sizeof(nbuf), "blk.%u.ffn_down.weight", L);
-        if (!copy_layer_proj(h->weights.w_down, down_off, nbuf, down_layer_bytes)) return -56;
+        if (!load_single_tensor(nbuf, down_layer_bytes,
+                                &h->weights.w_down[L], &h->weights.w_down_off[L])) return -56;
     }
 
     return 0;
