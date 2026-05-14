@@ -29,9 +29,11 @@ def _build_cfg_from_snapshot(snap: Path, **overrides) -> Config:
 
 _VARIANT_TO_DIR = {
     "qwen3-0.6b": "Qwen3-0.6B",
+    "qwen3-8b":   "Qwen3-8B",
 }
 _VARIANT_TO_GGUF = {
     "qwen3-0.6b": "Qwen3-0.6B-Q8_0.gguf",
+    "qwen3-8b":   "Qwen3-8B-Q8_0.gguf",
 }
 
 
@@ -39,7 +41,7 @@ def _from_pretrained(variant: str = "qwen3-0.6b", quant: str | None = None,
                      snapshot: str | None = None, gguf_path: str | None = None,
                      **cfg_overrides) -> Qwen:
     spec = variant
-    dir_name = _VARIANT_TO_DIR.get(spec.lower(), "Qwen3-0.6B")
+    dir_name = _VARIANT_TO_DIR.get(spec.lower(), spec)
     sk_root = Path(__file__).resolve().parents[3]
     snap = Path(snapshot) if snapshot else (sk_root / "SuperKittens" / "model_weights" / dir_name)
     if not snap.exists():
@@ -59,12 +61,19 @@ def _from_pretrained(variant: str = "qwen3-0.6b", quant: str | None = None,
         from .qwen import _load
         idx_path = snap / "model.safetensors.index.json"
         single = snap / "model.safetensors"
-        target = idx_path if idx_path.exists() else single
-        if not target.exists():
+        lib = _load()
+        if idx_path.exists():
+            if not hasattr(lib, "sk_qwen_load_safetensors_index"):
+                raise RuntimeError("libsk.dylib has no sk_qwen_load_safetensors_index symbol; rebuild dylib")
+            rc = lib.sk_qwen_load_safetensors_index(m._h, str(idx_path).encode())
+            if rc:
+                raise RuntimeError(f"sk_qwen_load_safetensors_index failed: {rc}")
+        elif single.exists():
+            rc = lib.sk_qwen_load_safetensors(m._h, str(single).encode())
+            if rc:
+                raise RuntimeError(f"sk_qwen_load_safetensors failed: {rc}")
+        else:
             raise FileNotFoundError(f"no safetensors in {snap}")
-        rc = _load().sk_qwen_load_safetensors(m._h, str(target).encode())
-        if rc:
-            raise RuntimeError(f"sk_qwen_load_safetensors failed: {rc}")
 
     # RoPE tables
     m.bake_and_set_rope()
@@ -94,7 +103,7 @@ class _QwenFactory:
 
 
 from SuperKittens.api import register
-for _spec in ("qwen3-0.6b",):
+for _spec in ("qwen3-0.6b", "qwen3-8b"):
     try:
         register(_spec, _QwenFactory, variant=_spec)
     except ValueError:
