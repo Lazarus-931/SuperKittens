@@ -14,9 +14,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from SuperKittens.inference.c_binder import bind, CtypesConfig
+from SuperKittens.inference.generation import Model
+
 
 @dataclass
-class Mamba2Config:
+class Mamba2Config(CtypesConfig):
     batch: int = 1
     seq_max: int = 2048
     n_layers: int = 24
@@ -76,42 +79,28 @@ class _CConfig(ctypes.Structure):
     ]
 
 
-class Mamba2Model:
+class Mamba2Model(Model):
     """ctypes binding for libSuperKittens Mamba 2 C ABI."""
+
+    _ABI = {
+        "create":           ([ctypes.POINTER(_CConfig)], ctypes.c_void_p),
+        "load_safetensors": ([ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int),
+        "forward":          ([ctypes.c_void_p, ctypes.POINTER(ctypes.c_int),
+                              ctypes.c_uint32, ctypes.POINTER(ctypes.c_int)], ctypes.c_int),
+        "reset":            ([ctypes.c_void_p], None),
+        "destroy":          ([ctypes.c_void_p], None),
+        "dump_layer":       ([ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t], ctypes.c_int),
+        "get_last_logits":  ([ctypes.c_void_p, ctypes.c_void_p], ctypes.c_int),
+    }
 
     def __init__(self, cfg: Mamba2Config, lib_path: str | None = None):
         self.cfg = cfg
-        if lib_path is None:
-            lib_path = os.environ.get("SK_DYLIB") or os.environ.get("SK_LIB")
-        if lib_path is None:
-            here = Path(__file__).resolve()
-            lib_path = str(here.parents[3] / "build" / "libsk.dylib")
-        self._lib = ctypes.CDLL(lib_path)
+        if lib_path is not None:
+            os.environ.setdefault("SK_DYLIB", lib_path)
+        self._lib = bind("mamba2", self._ABI)
+        self._destroy_fn = self._lib.sk_mamba2_destroy
 
-        self._lib.sk_mamba2_create.argtypes = [ctypes.POINTER(_CConfig)]
-        self._lib.sk_mamba2_create.restype  = ctypes.c_void_p
-        self._lib.sk_mamba2_load_safetensors.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-        self._lib.sk_mamba2_load_safetensors.restype  = ctypes.c_int
-        self._lib.sk_mamba2_forward.argtypes = [
-            ctypes.c_void_p, ctypes.POINTER(ctypes.c_int), ctypes.c_uint32,
-            ctypes.POINTER(ctypes.c_int),
-        ]
-        self._lib.sk_mamba2_forward.restype = ctypes.c_int
-        self._lib.sk_mamba2_reset.argtypes = [ctypes.c_void_p]
-        self._lib.sk_mamba2_destroy.argtypes = [ctypes.c_void_p]
-        self._lib.sk_mamba2_dump_layer.argtypes = [
-            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t,
-        ]
-        self._lib.sk_mamba2_dump_layer.restype = ctypes.c_int
-        self._lib.sk_mamba2_get_last_logits.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-        self._lib.sk_mamba2_get_last_logits.restype = ctypes.c_int
-
-        c_cfg = _CConfig(
-            cfg.batch, cfg.seq_max, cfg.n_layers, cfg.d_model, cfg.intermediate,
-            cfg.n_heads, cfg.head_dim, cfg.state_size, cfg.n_groups, cfg.conv_kernel,
-            cfg.chunk_size, cfg.vocab_size, cfg.rms_eps,
-            cfg.time_step_min, cfg.time_step_max, cfg.tie_word_embeddings,
-        )
+        c_cfg = cfg.to_c(_CConfig)
         self._h = self._lib.sk_mamba2_create(ctypes.byref(c_cfg))
         if not self._h:
             raise RuntimeError("sk_mamba2_create returned NULL")
@@ -173,13 +162,6 @@ class Mamba2Model:
 
     def reset(self) -> None:
         self._lib.sk_mamba2_reset(self._h)
-
-    def __del__(self):
-        try:
-            if getattr(self, "_h", None):
-                self._lib.sk_mamba2_destroy(self._h)
-        except Exception:
-            pass
 
 
 # Registry entry — kept import-light.

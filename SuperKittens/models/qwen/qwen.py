@@ -10,9 +10,10 @@ from __future__ import annotations
 import ctypes, os
 import numpy as np
 from pathlib import Path
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 
 from SuperKittens.inference.generation import Model
+from SuperKittens.inference.c_binder import bind, optional, CtypesConfig
 
 
 class _Config(ctypes.Structure):
@@ -59,42 +60,30 @@ class _Weights(ctypes.Structure):
     _fields_ = [(n, ctypes.c_void_p) for n in _WEIGHT_FIELDS]
 
 
+QWEN_ABI = {
+    "create":           ([ctypes.POINTER(_Config)], ctypes.c_void_p),
+    "load_weights":     ([ctypes.c_void_p, ctypes.POINTER(_Weights)], ctypes.c_int),
+    "forward":          ([ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
+                          ctypes.c_uint32, ctypes.POINTER(ctypes.c_int32)], ctypes.c_int),
+    "reset":            ([ctypes.c_void_p], None),
+    "destroy":          ([ctypes.c_void_p], None),
+    "load_safetensors": ([ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int),
+    "load_gguf":        optional([ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int),
+    "set_rope_tables":  optional([ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p], ctypes.c_int),
+    "get_last_logits":  optional([ctypes.c_void_p, ctypes.c_void_p], ctypes.c_int),
+}
+
+
 _lib = None
 def _load():
     global _lib
-    if _lib is not None: return _lib
-    dylib = os.environ.get("SK_DYLIB",
-                           str(Path(__file__).resolve().parents[3] / "build" / "libsk.dylib"))
-    _lib = ctypes.CDLL(dylib)
-    _lib.sk_qwen_create.argtypes        = [ctypes.POINTER(_Config)]
-    _lib.sk_qwen_create.restype         = ctypes.c_void_p
-    _lib.sk_qwen_load_weights.argtypes  = [ctypes.c_void_p, ctypes.POINTER(_Weights)]
-    _lib.sk_qwen_load_weights.restype   = ctypes.c_int
-    _lib.sk_qwen_forward.argtypes       = [ctypes.c_void_p,
-                                           ctypes.POINTER(ctypes.c_int32),
-                                           ctypes.c_uint32,
-                                           ctypes.POINTER(ctypes.c_int32)]
-    _lib.sk_qwen_forward.restype        = ctypes.c_int
-    _lib.sk_qwen_reset.argtypes         = [ctypes.c_void_p]
-    _lib.sk_qwen_reset.restype          = None
-    _lib.sk_qwen_destroy.argtypes       = [ctypes.c_void_p]
-    _lib.sk_qwen_destroy.restype        = None
-    _lib.sk_qwen_load_safetensors.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-    _lib.sk_qwen_load_safetensors.restype  = ctypes.c_int
-    if hasattr(_lib, "sk_qwen_load_gguf"):
-        _lib.sk_qwen_load_gguf.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-        _lib.sk_qwen_load_gguf.restype  = ctypes.c_int
-    if hasattr(_lib, "sk_qwen_set_rope_tables"):
-        _lib.sk_qwen_set_rope_tables.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
-        _lib.sk_qwen_set_rope_tables.restype  = ctypes.c_int
-    if hasattr(_lib, "sk_qwen_get_last_logits"):
-        _lib.sk_qwen_get_last_logits.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-        _lib.sk_qwen_get_last_logits.restype  = ctypes.c_int
+    if _lib is None:
+        _lib = bind("qwen", QWEN_ABI)
     return _lib
 
 
 @dataclass
-class Config:
+class Config(CtypesConfig):
     # Qwen3-32B dense defaults (per HF config.json).
     n_layers: int       = 64
     d_model: int        = 5120
@@ -131,21 +120,20 @@ class Config:
                        rope_freq_base=1_000_000.0, rope_n_ctx_orig=64)
         raise ValueError(f"unknown Qwen preset: {name!r}")
 
-    def _to_c(self) -> _Config:
-        cs = _Config()
-        for k, v in asdict(self).items(): setattr(cs, k, v)
-        return cs
-
 
 class Qwen(Model):
     """Stateful Qwen3 (dense) inference handle."""
+
+    _repr_fields = (("L", "n_layers"), ("D", "d_model"), ("H", "n_heads"),
+                    ("hd", "head_dim"), ("n_int", "n_int"))
 
     def __init__(self, config: Config | str | None = None):
         if config is None: self.cfg = Config()
         elif isinstance(config, str): self.cfg = Config.preset(config)
         else: self.cfg = config
         lib = _load()
-        self._cstruct = self.cfg._to_c()
+        self._destroy_fn = lib.sk_qwen_destroy
+        self._cstruct = self.cfg.to_c(_Config)
         self._h = lib.sk_qwen_create(ctypes.byref(self._cstruct))
         if not self._h:
             raise RuntimeError("sk_qwen_create failed (missing PSO or wrong dims)")
@@ -287,28 +275,3 @@ class Qwen(Model):
         out_ids = self.generate(np.array(ids, dtype=np.int32), eos_id=eos, **gen_kwargs)
         return self.tokenizer.decode(out_ids)
 
-    def prefill(self, input_ids) -> int:
-        self.reset()
-        return self.forward(input_ids)
-
-    def decode_step(self) -> int:
-        if self._last_token is None:
-            raise RuntimeError("decode_step called before prefill/forward")
-        return self.forward([self._last_token])
-
-    def close(self) -> None:
-        if self._h:
-            _load().sk_qwen_destroy(self._h)
-            self._h = None
-            self._w_keep = None
-
-    def __enter__(self): return self
-    def __exit__(self, *_): self.close()
-    def __del__(self):
-        try: self.close()
-        except Exception: pass
-
-    def __repr__(self) -> str:
-        c = self.cfg
-        return (f"Qwen(L={c.n_layers}, D={c.d_model}, H={c.n_heads}/"
-                f"{c.n_kv_heads}KV, hd={c.head_dim}, n_int={c.n_int})")

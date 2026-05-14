@@ -26,7 +26,10 @@ from __future__ import annotations
 import ctypes, os
 import numpy as np
 from pathlib import Path
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
+
+from SuperKittens.inference.c_binder import bind, CtypesConfig
+from SuperKittens.inference.generation import Model
 
 
 # ─── C ABI ──────────────────────────────────────────────────────────────────
@@ -88,33 +91,28 @@ class _Weights(ctypes.Structure):
     _fields_ = [(n, ctypes.c_void_p) for n in _WEIGHT_FIELDS]
 
 
+DEEPSEEK_ABI = {
+    "create":       ([ctypes.POINTER(_Config)], ctypes.c_void_p),
+    "load_weights": ([ctypes.c_void_p, ctypes.POINTER(_Weights)], ctypes.c_int),
+    "forward":      ([ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
+                      ctypes.c_uint32, ctypes.POINTER(ctypes.c_int32)], ctypes.c_int),
+    "reset":        ([ctypes.c_void_p], None),
+    "destroy":      ([ctypes.c_void_p], None),
+}
+
+
 _lib = None
 def _load():
     global _lib
-    if _lib is not None: return _lib
-    dylib = os.environ.get("SK_DYLIB",
-                           str(Path(__file__).resolve().parents[3] / "build" / "libsk.dylib"))
-    _lib = ctypes.CDLL(dylib)
-    _lib.sk_deepseek_create.argtypes        = [ctypes.POINTER(_Config)]
-    _lib.sk_deepseek_create.restype         = ctypes.c_void_p
-    _lib.sk_deepseek_load_weights.argtypes  = [ctypes.c_void_p, ctypes.POINTER(_Weights)]
-    _lib.sk_deepseek_load_weights.restype   = ctypes.c_int
-    _lib.sk_deepseek_forward.argtypes       = [ctypes.c_void_p,
-                                               ctypes.POINTER(ctypes.c_int32),
-                                               ctypes.c_uint32,
-                                               ctypes.POINTER(ctypes.c_int32)]
-    _lib.sk_deepseek_forward.restype        = ctypes.c_int
-    _lib.sk_deepseek_reset.argtypes         = [ctypes.c_void_p]
-    _lib.sk_deepseek_reset.restype          = None
-    _lib.sk_deepseek_destroy.argtypes       = [ctypes.c_void_p]
-    _lib.sk_deepseek_destroy.restype        = None
+    if _lib is None:
+        _lib = bind("deepseek", DEEPSEEK_ABI)
     return _lib
 
 
 # ─── Config ─────────────────────────────────────────────────────────────────
 
 @dataclass
-class Config:
+class Config(CtypesConfig):
     """Model dimensions. Use `Config.preset(name)` for known variants."""
     n_layers: int       = 60
     d_model: int        = 7168
@@ -171,19 +169,17 @@ class Config:
                        vocab_size=1024, seq_max=16, cache_max=64)
         raise ValueError(f"unknown DeepSeek preset: {name!r}")
 
-    def _to_c(self) -> _Config:
-        cs = _Config()
-        for k, v in asdict(self).items(): setattr(cs, k, v)
-        return cs
-
     @property
     def dk(self) -> int: return self.qk_nope_dim + self.qk_rope_dim
 
 
 # ─── Main handle ────────────────────────────────────────────────────────────
 
-class DeepSeek:
+class DeepSeek(Model):
     """Stateful DeepSeek V4 Flash inference handle."""
+
+    _repr_fields = (("L", "n_layers"), ("D", "d_model"), ("H", "n_heads"),
+                    ("E", "n_expert"), ("top_k", "top_k"))
 
     def __init__(self, config: Config | str | None = None):
         if config is None:
@@ -193,7 +189,8 @@ class DeepSeek:
         else:
             self.cfg = config
         lib = _load()
-        self._cstruct = self.cfg._to_c()
+        self._destroy_fn = lib.sk_deepseek_destroy
+        self._cstruct = self.cfg.to_c(_Config)
         self._h = lib.sk_deepseek_create(ctypes.byref(self._cstruct))
         if not self._h:
             raise RuntimeError("sk_deepseek_create failed (likely missing PSO or "
@@ -265,9 +262,9 @@ class DeepSeek:
         return _WEIGHT_FIELDS
 
     # ─── inference ───
-    def forward(self, input_ids) -> int:
-        """Forward pass over `seq` tokens; returns argmax token id."""
-        ids = np.asarray(input_ids, dtype=np.int32).reshape(-1)
+    def _forward(self, input_ids: np.ndarray) -> np.ndarray:
+        """Model-base contract: int32 ids in, (batch,) int32 argmax out."""
+        ids = np.ascontiguousarray(np.asarray(input_ids, dtype=np.int32)).reshape(-1)
         seq = ids.size // self.cfg.batch
         out = np.empty((self.cfg.batch,), dtype=np.int32)
         rc = _load().sk_deepseek_forward(
@@ -277,35 +274,11 @@ class DeepSeek:
             out.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)))
         if rc: raise RuntimeError(f"forward failed: {rc}")
         self._last_token = int(out[0])
-        return self._last_token
-
-    def prefill(self, input_ids) -> int:
-        """Eats the prompt and returns the argmax of the last position."""
-        self.reset()
-        return self.forward(input_ids)
-
-    def decode_step(self) -> int:
-        """One decode step continuing from the last forward's argmax."""
-        if self._last_token is None:
-            raise RuntimeError("decode_step called before prefill/forward")
-        return self.forward([self._last_token])
-
-    def generate(self, input_ids, max_new_tokens: int = 64,
-                 *, stop_on_eos: bool = True) -> list[int]:
-        """Greedy decode: prefill, then loop. Stops at max_new_tokens or EOS
-        (when a tokenizer with an EOS id is attached and stop_on_eos=True).
-
-        Sampling is currently argmax only; temperature / top-p / top-k will
-        plug in here once the GPU sampler kernel is wired."""
-        out: list[int] = [self.prefill(input_ids)]
-        if stop_on_eos and self._tok and self._tok.is_eos(out[-1]):
-            return out
-        for _ in range(max_new_tokens - 1):
-            tok = self.decode_step()
-            out.append(tok)
-            if stop_on_eos and self._tok and self._tok.is_eos(tok):
-                break
         return out
+
+    def forward(self, input_ids) -> int:
+        """Backwards-compat wrapper returning the argmax token id."""
+        return int(self._forward(input_ids)[0])
 
     # ── tokenizer + chat API ─────────────────────────────────────────
     def attach_tokenizer(self, tokenizer) -> "DeepSeek":
@@ -333,24 +306,8 @@ class DeepSeek:
             raise RuntimeError("attach_tokenizer() first")
         msgs = [{"role": "user", "content": text}] if isinstance(text, str) else text
         ids = self._tok.encode_chat(msgs)
-        out_ids = self.generate(ids, max_new_tokens=max_new_tokens)
+        out_ids = self.generate(ids, max_new_tokens=max_new_tokens,
+                                eos_id=getattr(self._tok, "eos_id", None))
         # Strip the prompt prefix; only return the newly generated portion.
         return self._tok.decode(out_ids[len(ids):] if len(out_ids) > len(ids) else out_ids)
 
-    # ─── lifecycle ───
-    def close(self) -> None:
-        if self._h:
-            _load().sk_deepseek_destroy(self._h)
-            self._h = None
-            self._w_keep = None
-
-    def __enter__(self): return self
-    def __exit__(self, *_): self.close()
-    def __del__(self):
-        try: self.close()
-        except Exception: pass
-
-    def __repr__(self) -> str:
-        c = self.cfg
-        return (f"DeepSeek(L={c.n_layers}, D={c.d_model}, H={c.n_heads}, "
-                f"dk={c.dk}, dv={c.v_head_dim}, E={c.n_expert}, top_k={c.top_k})")

@@ -5,6 +5,9 @@ import numpy as np
 from pathlib import Path
 from dataclasses import dataclass
 
+from SuperKittens.inference.c_binder import bind, optional, CtypesConfig
+from SuperKittens.inference.generation import Model
+
 
 _VARIANT_TO_DIR = {
     "e2b": "gemma-4-E2B-it",
@@ -51,53 +54,33 @@ class _Weights(ctypes.Structure):
     )]
 
 
+GEMMA4_ABI = {
+    "create":                 ([ctypes.POINTER(_Config)], ctypes.c_void_p),
+    "load_weights":           ([ctypes.c_void_p, ctypes.POINTER(_Weights)], ctypes.c_int),
+    "forward":                ([ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
+                                ctypes.c_uint32, ctypes.POINTER(ctypes.c_int32)], ctypes.c_int),
+    "reset":                  ([ctypes.c_void_p], None),
+    "destroy":                ([ctypes.c_void_p], None),
+    "load_safetensors":       ([ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int),
+    "load_safetensors_index": ([ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int),
+    "set_rope_tables":        ([ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                                ctypes.c_void_p, ctypes.c_void_p], ctypes.c_int),
+    "get_last_logits":        ([ctypes.c_void_p, ctypes.c_void_p], ctypes.c_int),
+    "set_dump_enabled":       ([ctypes.c_void_p, ctypes.c_int], None),
+    "dump_layer":             ([ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p], ctypes.c_int),
+}
+
+
 _lib = None
 def _load():
     global _lib
-    if _lib is not None:
-        return _lib
-    dylib = os.environ.get(
-        "SK_DYLIB",
-        str(Path(__file__).resolve().parents[4] / "build" / "libsk.dylib"))
-    _lib = ctypes.CDLL(dylib)
-
-    _lib.sk_gemma4_create.argtypes = [ctypes.POINTER(_Config)]
-    _lib.sk_gemma4_create.restype  = ctypes.c_void_p
-
-    _lib.sk_gemma4_load_weights.argtypes = [ctypes.c_void_p, ctypes.POINTER(_Weights)]
-    _lib.sk_gemma4_load_weights.restype  = ctypes.c_int
-
-    _lib.sk_gemma4_forward.argtypes = [
-        ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
-        ctypes.c_uint32, ctypes.POINTER(ctypes.c_int32)]
-    _lib.sk_gemma4_forward.restype = ctypes.c_int
-
-    _lib.sk_gemma4_reset.argtypes  = [ctypes.c_void_p]
-    _lib.sk_gemma4_reset.restype   = None
-
-    _lib.sk_gemma4_destroy.argtypes = [ctypes.c_void_p]
-    _lib.sk_gemma4_destroy.restype  = None
-
-    _lib.sk_gemma4_load_safetensors.argtypes       = [ctypes.c_void_p, ctypes.c_char_p]
-    _lib.sk_gemma4_load_safetensors.restype        = ctypes.c_int
-    _lib.sk_gemma4_load_safetensors_index.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-    _lib.sk_gemma4_load_safetensors_index.restype  = ctypes.c_int
-    _lib.sk_gemma4_set_rope_tables.argtypes        = [ctypes.c_void_p,
-                                                      ctypes.c_void_p, ctypes.c_void_p,
-                                                      ctypes.c_void_p, ctypes.c_void_p]
-    _lib.sk_gemma4_set_rope_tables.restype         = ctypes.c_int
-    _lib.sk_gemma4_get_last_logits.argtypes        = [ctypes.c_void_p, ctypes.c_void_p]
-    _lib.sk_gemma4_get_last_logits.restype         = ctypes.c_int
-
-    _lib.sk_gemma4_set_dump_enabled.argtypes       = [ctypes.c_void_p, ctypes.c_int]
-    _lib.sk_gemma4_set_dump_enabled.restype        = None
-    _lib.sk_gemma4_dump_layer.argtypes             = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
-    _lib.sk_gemma4_dump_layer.restype              = ctypes.c_int
+    if _lib is None:
+        _lib = bind("gemma4", GEMMA4_ABI)
     return _lib
 
 
 @dataclass
-class Gemma4Config:
+class Gemma4Config(CtypesConfig):
     n_layers: int
     local_period: int
     d_model: int
@@ -168,39 +151,21 @@ def _preset(name: str) -> Gemma4Config:
 
 
 def _to_cstruct(c: Gemma4Config) -> _Config:
-    cs = _Config()
-    cs.batch              = c.batch
-    cs.seq_max            = c.seq_max
-    cs.cache_max          = c.cache_max
-    cs.n_layers           = c.n_layers
-    cs.local_period       = c.local_period
-    cs.d_model            = c.d_model
-    cs.n_int              = c.n_int
-    cs.n_heads            = c.n_heads
-    cs.n_kv_heads_local   = c.n_kv_heads_local
-    cs.n_kv_heads_global  = c.n_kv_heads_global
-    cs.head_dim_local     = c.head_dim_local
-    cs.head_dim_global    = c.head_dim_global
-    cs.window             = c.window
-    cs.prope_p_pairs      = c.prope_p_pairs
-    cs.vocab_size         = c.vocab_size
-    cs.ple_dim            = c.ple_dim
-    cs.has_ple            = 1 if c.has_ple else 0
-    cs.eps                = c.eps
-    cs.final_logit_softcap = float(c.final_logit_softcap)
-    cs.use_double_wide_mlp  = 1 if c.use_double_wide_mlp else 0
-    cs.num_kv_shared_layers = int(c.num_kv_shared_layers)
-    return cs
+    return c.to_c(_Config)
 
 
-class Gemma4:
+class Gemma4(Model):
     """Stateful Gemma 4 inference handle. Holds KV cache between forwards."""
+
+    _repr_fields = (("L", "n_layers"), ("D", "d_model"), ("H", "n_heads"),
+                    ("n_int", "n_int"))
 
     def __init__(self, variant_or_config):
         cfg = _preset(variant_or_config) if isinstance(variant_or_config, str) else variant_or_config
         self.cfg = cfg
         self._cstruct = _to_cstruct(cfg)
         lib = _load()
+        self._destroy_fn = lib.sk_gemma4_destroy
         self._h = lib.sk_gemma4_create(ctypes.byref(self._cstruct))
         if not self._h:
             raise RuntimeError("sk_gemma4_create failed")
@@ -475,12 +440,3 @@ class Gemma4:
                 print(f"[gemma4] hf-json attach failed: {e}")
         return m
 
-    def close(self):
-        if self._h:
-            _load().sk_gemma4_destroy(self._h)
-            self._h = None
-            self._w_keep = None
-
-    def __del__(self):
-        try: self.close()
-        except Exception: pass
