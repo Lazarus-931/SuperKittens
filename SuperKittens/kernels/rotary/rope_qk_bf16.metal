@@ -11,9 +11,9 @@ using namespace metal;
 
 namespace meow::gemma4::rope_bf16 {
 
-[[host_name("gemma4_rope_qk_bf16")]]
+[[host_name("rope_qk_bf16")]]
 [[kernel, max_total_threads_per_threadgroup(512)]]
-void gemma4_rope_qk_bf16(
+void rope_qk_bf16(
     device bfloat* Q          [[buffer(0)]],
     device bfloat* K          [[buffer(1)]],
     device const bfloat* cos  [[buffer(2)]],

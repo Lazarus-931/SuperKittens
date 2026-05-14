@@ -10,9 +10,9 @@ using namespace metal;
 
 namespace meow::gemma4::kv_cache_bf16 {
 
-[[host_name("gemma4_kv_cache_write_bf16")]]
+[[host_name("kv_cache_write_bf16")]]
 [[kernel]]
-void gemma4_kv_cache_write_bf16(
+void kv_cache_write_bf16(
     device const bfloat* new_k       [[buffer(0)]],   // (B, H_kv, seq_in, D)
     device const bfloat* new_v       [[buffer(1)]],
     device       bfloat* k_cache     [[buffer(2)]],   // (B, H_kv, cache_size, D)

@@ -5,9 +5,9 @@ using namespace metal;
 
 enum : uint { THREADS = 128, SIMDS = 4 };
 
-[[host_name("gemma4_add_rmsnorm_bf16")]]
+[[host_name("add_rmsnorm_bf16")]]
 [[kernel, max_total_threads_per_threadgroup(THREADS)]]
-void gemma4_add_rmsnorm_bf16(
+void add_rmsnorm_bf16(
     device const bfloat* x      [[buffer(0)]],
     device const bfloat* delta  [[buffer(1)]],
     device const bfloat* gamma  [[buffer(2)]],
