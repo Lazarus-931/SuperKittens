@@ -348,6 +348,24 @@ class Gemma4(Model):
             raise RuntimeError(f"sk_gemma4_set_rope_tables failed: {rc}")
 
     @classmethod
+    def from_spec(cls, spec, **overrides) -> "Gemma4":
+        """Build a Gemma 4 model from a central-registry ModelSpec."""
+        # Derive variant for _preset (e.g. "gemma4-e2b" -> "e2b"); falls back to
+        # spec.dims if no preset key matches.
+        variant = spec.dims.get("variant") if spec.dims else None
+        if variant is None:
+            # spec name is e.g. "gemma4-e2b"; pull suffix.
+            for v in ("e2b", "e4b", "26b", "31b"):
+                if v in spec.weight_dir.lower() or v in spec.adapter.lower() + spec.hf_repo.lower():
+                    variant = v
+                    break
+            variant = variant or "e2b"
+        return cls._build(variant, spec.weight_dir,
+                          config_path=spec.config_path,
+                          tokenizer_family=spec.tokenizer_family,
+                          **overrides)
+
+    @classmethod
     def from_pretrained(cls, variant: str = "e2b", name: str | None = None, **cfg_overrides):
         if name is None:
             name = variant
@@ -357,7 +375,13 @@ class Gemma4(Model):
         else:
             dir_name = name
             variant = next((v for v, d in _VARIANT_TO_DIR.items() if d == name), "e4b")
+        return cls._build(variant, dir_name, **cfg_overrides)
 
+    @classmethod
+    def _build(cls, variant: str, dir_name: str, *,
+               config_path: str | None = "text_config",
+               tokenizer_family: str | None = "gemma",
+               **cfg_overrides):
         root = Path(__file__).resolve().parents[4] / "SuperKittens" / "model_weights" / dir_name
         if not root.exists():
             raise FileNotFoundError(
@@ -367,7 +391,8 @@ class Gemma4(Model):
         if not cfg_path.exists():
             raise FileNotFoundError(f"missing {cfg_path}")
         hf = json.loads(cfg_path.read_text())
-        text_cfg = hf.get("text_config", {}) if isinstance(hf.get("text_config"), dict) else {}
+        sub_key = config_path if config_path else "text_config"
+        text_cfg = hf.get(sub_key, {}) if isinstance(hf.get(sub_key), dict) else {}
         def _get(key, default):
             if key in text_cfg: return text_cfg[key]
             if key in hf: return hf[key]
@@ -421,6 +446,8 @@ class Gemma4(Model):
         m.set_rope_tables(cos_l, sin_l, cos_g, sin_g)
 
         m.tokenizer = None
+        if not tokenizer_family:
+            return m
         try:
             from SuperKittens.models.load.tokenizer import Tokenizer
         except Exception as e:
@@ -430,12 +457,12 @@ class Gemma4(Model):
         json_path = root / "tokenizer.json"
         if sp_path.exists():
             try:
-                m.tokenizer = Tokenizer.from_sentencepiece(str(sp_path))
+                m.tokenizer = Tokenizer.from_sentencepiece(str(sp_path), family=tokenizer_family)
             except Exception as e:
                 print(f"[gemma4] sentencepiece attach failed: {e}")
         if m.tokenizer is None and json_path.exists():
             try:
-                m.tokenizer = Tokenizer.from_hf_json(str(json_path), family="gemma")
+                m.tokenizer = Tokenizer.from_hf_json(str(json_path), family=tokenizer_family)
             except Exception as e:
                 print(f"[gemma4] hf-json attach failed: {e}")
         return m
