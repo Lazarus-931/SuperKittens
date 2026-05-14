@@ -1,0 +1,47 @@
+// MmapBuffer: zero-copy view of a file as an MTL::Buffer.
+//
+// On Apple Silicon the GPU and CPU share physical memory; an mmap'd region can
+// be handed to `MTL::Device::newBufferWithBytesNoCopy(...)` so the GPU reads
+// pages directly without any host-side memcpy. The intended use is GGUF weights
+// — the file's bytes ARE the GPU's input bytes (Q8_0 blocks, fp16, etc.).
+//
+// Lifetime: the MmapBuffer owns the mmap and the MTL::Buffer; destruction
+// releases the buffer (which triggers our deallocator → munmap + close).
+#ifndef SK_INFERENCE_SILICON_MMAP_BUFFER_H
+#define SK_INFERENCE_SILICON_MMAP_BUFFER_H
+
+#include "Metal/Metal.hpp"
+
+#include <cstddef>
+#include <string>
+
+namespace sk { namespace silicon {
+
+class MmapBuffer {
+public:
+    // mmap `path` read-only and wrap it as a shared-storage MTL::Buffer.
+    // Returns nullptr on failure (file missing, mmap fails, MTL alloc fails).
+    static MmapBuffer* from_file(MTL::Device* dev, const std::string& path);
+
+    ~MmapBuffer();
+
+    MTL::Buffer* buffer() const { return buf_; }    // borrowed; lifetime tied to *this
+    const void*  data()   const { return base_; }
+    std::size_t  size()   const { return size_; }
+
+    MmapBuffer(const MmapBuffer&) = delete;
+    MmapBuffer& operator=(const MmapBuffer&) = delete;
+
+private:
+    MmapBuffer(MTL::Buffer* buf, void* base, std::size_t size, int fd)
+        : buf_(buf), base_(base), size_(size), fd_(fd) {}
+
+    MTL::Buffer* buf_;
+    void*        base_;
+    std::size_t  size_;
+    int          fd_;
+};
+
+}}  // namespace sk::silicon
+
+#endif  // SK_INFERENCE_SILICON_MMAP_BUFFER_H
