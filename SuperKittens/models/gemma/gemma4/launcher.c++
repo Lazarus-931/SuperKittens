@@ -37,28 +37,28 @@ static MTL::Buffer* alloc_zero(MTL::Device* dev, size_t bytes) {
 }
 
 static bool resolve_psos(ModelPSOs& P) {
-    P.layer.rmsnorm        = sk::bindings_pso("gemma4_rmsnorm_bf16");
-    P.layer.gemm           = sk::bindings_pso("gemma4_gemm_bf16");
+    P.layer.rmsnorm        = sk::bindings_pso("rmsnorm_bf16");
+    P.layer.gemm           = sk::bindings_pso("gemm_bf16");
     P.layer.qkv_norm       = sk::bindings_pso("gemma4_qkv_norm");
-    P.layer.rope           = sk::bindings_pso("gemma4_rope_qk_bf16");
+    P.layer.rope           = sk::bindings_pso("rope_qk_bf16");
     P.layer.prope          = sk::bindings_pso("gemma4_prope_qk");
     P.layer.rope_partial   = sk::bindings_pso("gemma4_rope_qk_partial");
     P.layer.attn_local     = sk::bindings_pso("gemma4_attn_local_d256");
     P.layer.attn_global    = sk::bindings_pso("gemma4_attn_global_d512");
-    P.layer.gated_mlp_gelu = sk::bindings_pso("gemma4_gated_mlp_bf16");
+    P.layer.gated_mlp_gelu = sk::bindings_pso("gated_mlp_bf16");
     P.layer.add            = sk::bindings_pso("add_bf16");
-    P.layer.add_rmsnorm    = sk::bindings_pso("gemma4_add_rmsnorm_bf16");
-    P.layer.kv_cache_write = sk::bindings_pso("gemma4_kv_cache_write_bf16");
+    P.layer.add_rmsnorm    = sk::bindings_pso("add_rmsnorm_bf16");
+    P.layer.kv_cache_write = sk::bindings_pso("kv_cache_write_bf16");
     P.layer.ple_gate_act   = sk::bindings_pso("gemma4_ple_gate_act");
     P.layer.ple_inject     = sk::bindings_pso("gemma4_ple_inject");
     P.layer.gemm_fp32_out     = sk::bindings_pso("gemma4_gemm_bf16_fp32_out");
     P.layer.ple_gate_act_fp32 = sk::bindings_pso("gemma4_ple_gate_act_fp32");
     P.layer.ple_inject_fp32   = sk::bindings_pso("gemma4_ple_inject_fp32");
     P.layer.ple_inject_fused_t1 = sk::bindings_pso("gemma4_ple_inject_fused_t1");
-    P.embedding_lookup     = sk::bindings_pso("gemma4_embedding_lookup_bf16");
+    P.embedding_lookup     = sk::bindings_pso("embedding_lookup_bf16");
     P.ple_lookup           = sk::bindings_pso("gemma4_ple_lookup");
     P.ple_context_mix      = sk::bindings_pso("gemma4_ple_context_mix");
-    P.argmax               = sk::bindings_pso("gemma4_argmax_bf16");
+    P.argmax               = sk::bindings_pso("argmax_bf16");
     P.logit_softcap        = sk::bindings_pso("gemma4_logit_softcap");
     P.logit_descale = sk::bindings_pso("gemma4_logit_descale");
 

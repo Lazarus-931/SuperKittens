@@ -13,9 +13,9 @@
 #include <metal_stdlib>
 using namespace metal;
 
-[[host_name("gemma4_embedding_lookup_bf16")]]
+[[host_name("embedding_lookup_bf16")]]
 [[kernel]]
-void gemma4_embedding_lookup_bf16(
+void embedding_lookup_bf16(
     device const bfloat* table   [[buffer(0)]],   // (V, D)
     device const int*  ids     [[buffer(1)]],   // (N,)
     device       bfloat* out     [[buffer(2)]],   // (N, D)

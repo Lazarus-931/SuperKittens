@@ -1,4 +1,4 @@
-// gemma4_rmsnorm_bf16.metal — BF16 RMSNorm for Gemma 4.
+// rmsnorm_bf16.metal — BF16 RMSNorm for Gemma 4.
 //   y = x * rsqrt(sum(x^2)/d + eps) * gamma
 // Internal compute float32, storage bfloat.
 
@@ -9,9 +9,9 @@ namespace meow::gemma4::rmsn {
 
 enum : uint { THREADS = 128, ROWS_PER_GRP = 4 };
 
-[[host_name("gemma4_rmsnorm_bf16")]]
+[[host_name("rmsnorm_bf16")]]
 [[kernel, max_total_threads_per_threadgroup(THREADS)]]
-void gemma4_rmsnorm_bf16(
+void rmsnorm_bf16(
     device const bfloat* x      [[buffer(0)]],
     device const bfloat* gamma  [[buffer(1)]],
     device bfloat* y            [[buffer(2)]],

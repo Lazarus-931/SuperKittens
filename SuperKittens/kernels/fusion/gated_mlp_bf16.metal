@@ -41,9 +41,9 @@ inline float gelu_approx(float x) {
     return 0.5f * x * (1.0f + metal::precise::tanh(u));
 }
 
-[[host_name("gemma4_gated_mlp_bf16")]]
+[[host_name("gated_mlp_bf16")]]
 [[kernel, max_total_threads_per_threadgroup(THREADS)]]
-void gemma4_gated_mlp_bf16(
+void gated_mlp_bf16(
     device const bfloat* x,          // (M, K)
     device const bfloat* w_gate,     // (K, N_int)
     device const bfloat* w_up,       // (K, N_int)

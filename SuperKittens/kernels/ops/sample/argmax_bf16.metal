@@ -1,13 +1,13 @@
-// gemma4_argmax_bf16.metal — BF16 argmax for Gemma 4.
+// argmax_bf16.metal — BF16 argmax for Gemma 4.
 
 #include <metal_stdlib>
 using namespace metal;
 
 namespace meow::gemma4::argmaxbf {
 
-[[host_name("gemma4_argmax_bf16")]]
+[[host_name("argmax_bf16")]]
 [[kernel, max_total_threads_per_threadgroup(1024)]]
-void gemma4_argmax_bf16(
+void argmax_bf16(
     device const bfloat* logits  [[buffer(0)]],
     device       int*    out     [[buffer(1)]],
     constant uint&       V       [[buffer(2)]],

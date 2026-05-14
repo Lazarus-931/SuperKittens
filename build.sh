@@ -34,7 +34,8 @@ while IFS= read -r -d '' metal_file; do
     fi
 done < <(find "$KERNELS_DIR" "$MODELS_DIR" -name "*.metal" \
     -not -path "*/paged_attn/*" \
-    -not -path "*/utils/rmsnorm/*" \
+    -not -name "rms_norm.metal" \
+    -not -path "*/utils/rmsnorm/baseline/*" \
     -print0 2>/dev/null)
 
 echo "=== linking metallib ==="

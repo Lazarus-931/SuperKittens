@@ -15,9 +15,9 @@ enum : uint { BM = 32, BN = 64, BK = 32, MR = 2, MC = 8 };
 }
 using namespace meow::gemma4::gemm_bf16;
 
-[[host_name("gemma4_gemm_bf16")]]
+[[host_name("gemm_bf16")]]
 [[kernel]]
-void gemma4_gemm_bf16(
+void gemm_bf16(
     device const bfloat* A     [[buffer(0)]],
     device const bfloat* B     [[buffer(1)]],
     device bfloat* C           [[buffer(2)]],
