@@ -69,6 +69,7 @@ inline float ds_compute_yarn_mscale(float factor, float mscale_all_dim) {
 
 struct LayerPSOs {
     MTL::ComputePipelineState* rmsnorm;
+    MTL::ComputePipelineState* rmsnorm_t1 = nullptr;  // optional T=1 fast path
     MTL::ComputePipelineState* gemm;
     MTL::ComputePipelineState* rope_tail;
     MTL::ComputePipelineState* rope_interleave;   // V3 GPT-J-style pair RoPE
@@ -182,18 +183,25 @@ inline void encode_cast(
 inline void encode_rmsnorm(
     MTL::CommandBuffer* cmd, MTL::ComputePipelineState* pso,
     MTL::Buffer* x, MTL::Buffer* gamma, size_t off_gamma,
-    MTL::Buffer* out, uint32_t rows, uint32_t n, float eps)
+    MTL::Buffer* out, uint32_t rows, uint32_t n, float eps,
+    MTL::ComputePipelineState* pso_t1 = nullptr)
 {
+    const bool use_t1 = (pso_t1 != nullptr) && (rows == 1u);
     auto* enc = cmd->computeCommandEncoder();
-    enc->setComputePipelineState(pso);
+    enc->setComputePipelineState(use_t1 ? pso_t1 : pso);
     enc->setBuffer(x,     0,         0);
     enc->setBuffer(gamma, off_gamma, 1);
     enc->setBuffer(out,   0,         2);
     enc->setBytes(&rows, 4, 3);
     enc->setBytes(&n,    4, 4);
     enc->setBytes(&eps,  4, 5);
-    enc->dispatchThreadgroups(MTL::Size(1, (rows + 3) / 4, 1),
-                              MTL::Size(128, 1, 1));
+    if (use_t1) {
+        enc->dispatchThreadgroups(MTL::Size(1, rows, 1),
+                                  MTL::Size(256, 1, 1));
+    } else {
+        enc->dispatchThreadgroups(MTL::Size(1, (rows + 3) / 4, 1),
+                                  MTL::Size(128, 1, 1));
+    }
     enc->endEncoding();
 }
 
@@ -216,13 +224,13 @@ inline void dispatch_attn(
     const size_t off_w_o         = (size_t)L * p.n_heads * p.v_head_dim * p.d_model * 2;
 
     encode_rmsnorm(cmd, P.rmsnorm, B.x, B.w_pre_attn_norm, off_norm,
-                   B.x_norm, T, p.d_model, p.eps);
+                   B.x_norm, T, p.d_model, p.eps, P.rmsnorm_t1);
 
     if (p.has_q_lora) {
         encode_gemm(cmd, P.gemm, B.x_norm, 0, B.w_q_a, off_w_q_a, B.q_a,
                     T, p.q_lora_rank, p.d_model);
         encode_rmsnorm(cmd, P.rmsnorm, B.q_a, B.w_q_a_norm, off_w_q_a_norm,
-                       B.q_a, T, p.q_lora_rank, p.eps);
+                       B.q_a, T, p.q_lora_rank, p.eps, P.rmsnorm_t1);
         encode_gemm(cmd, P.gemm, B.q_a, 0, B.w_q_b, off_w_q_b, B.q_packed,
                     T, p.n_heads * dk, p.q_lora_rank);
     } else {
@@ -251,7 +259,7 @@ inline void dispatch_attn(
     }
 
     encode_rmsnorm(cmd, P.rmsnorm, B.c_kv, B.w_kv_a_norm, off_w_kv_a_norm,
-                   B.c_kv, T, p.kv_lora_rank, p.eps);
+                   B.c_kv, T, p.kv_lora_rank, p.eps, P.rmsnorm_t1);
 
     {
         // Pack args for Q.
@@ -951,7 +959,7 @@ inline void dispatch_model(
     }
 
     encode_rmsnorm(cmd, P.layer.rmsnorm, cur, W.w_final_norm, 0,
-                   nxt, T, M.d_model, M.eps);
+                   nxt, T, M.d_model, M.eps, P.layer.rmsnorm_t1);
 
     {
         auto* enc = cmd->computeCommandEncoder();
