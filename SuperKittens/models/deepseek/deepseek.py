@@ -1,27 +1,4 @@
-"""deepseek.py — clean Python API for DeepSeek V4 Flash inference.
-
-Usage:
-
-    from models.deepseek.deepseek import DeepSeek
-
-    # 1) Preset (most common)
-    with DeepSeek("v4_flash") as m:
-        m.load_weights(state_dict)             # dict mapping weight_name → np.ndarray
-        tokens = m.generate([1, 2, 3], max_new_tokens=64)
-
-    # 2) Tiny test config (no weights needed for API exercise)
-    with DeepSeek.test_config() as m:
-        m.load_random_weights(seed=0)
-        token_id = m.forward([1, 2, 3])
-
-    # 3) Explicit prefill/decode loop
-    with DeepSeek("v4_flash") as m:
-        m.load_weights(state_dict)
-        m.prefill([1, 2, 3])                   # extends KV cache, returns last token
-        for _ in range(64):
-            next_tok = m.decode_step()
-            print(next_tok)
-"""
+"""DeepSeek V3 / V4 Flash inference handle."""
 from __future__ import annotations
 import ctypes, os
 import numpy as np
@@ -207,7 +184,6 @@ class DeepSeek(Model):
     # ─── weight loading ───
     def load_weights(self, weights: dict[str, np.ndarray] | None = None,
                      **kw_weights: np.ndarray) -> None:
-        """Pass weights as a dict or kwargs. All 18 weights are required."""
         if weights is None: weights = {}
         weights = {**weights, **kw_weights}
         keep: list[np.ndarray] = []
@@ -224,7 +200,6 @@ class DeepSeek(Model):
         if rc: raise RuntimeError(f"sk_deepseek_load_weights failed: {rc}")
 
     def load_random_weights(self, seed: int = 0, scale: float = 0.02) -> None:
-        """Fill all weights with small random fp16 values. For API/perf testing."""
         c = self.cfg
         dk = c.dk
         rng = np.random.default_rng(seed)
@@ -263,7 +238,6 @@ class DeepSeek(Model):
 
     # ─── inference ───
     def _forward(self, input_ids: np.ndarray) -> np.ndarray:
-        """Model-base contract: int32 ids in, (batch,) int32 argmax out."""
         ids = np.ascontiguousarray(np.asarray(input_ids, dtype=np.int32)).reshape(-1)
         seq = ids.size // self.cfg.batch
         out = np.empty((self.cfg.batch,), dtype=np.int32)
@@ -277,13 +251,10 @@ class DeepSeek(Model):
         return out
 
     def forward(self, input_ids) -> int:
-        """Backwards-compat wrapper returning the argmax token id."""
         return int(self._forward(input_ids)[0])
 
     # ── tokenizer + chat API ─────────────────────────────────────────
     def attach_tokenizer(self, tokenizer) -> "DeepSeek":
-        """Attach a tokenizer (DeepSeekTokenizer or any object with
-        encode/decode/is_eos methods). Enables tokenize/detokenize/chat."""
         self._tok = tokenizer
         return self
 
@@ -298,10 +269,6 @@ class DeepSeek(Model):
         return self._tok.decode(list(ids))
 
     def chat(self, text: str | list, *, max_new_tokens: int = 64) -> str:
-        """One-shot chat. `text` is either a user-message string or a list of
-        `{role, content}` dicts. Returns the assistant's reply as text.
-
-        Greedy decoding. Use generate() directly if you want full control."""
         if self._tok is None:
             raise RuntimeError("attach_tokenizer() first")
         msgs = [{"role": "user", "content": text}] if isinstance(text, str) else text
