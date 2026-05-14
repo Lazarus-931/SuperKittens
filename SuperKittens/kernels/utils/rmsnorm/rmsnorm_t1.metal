@@ -1,17 +1,4 @@
-//
-//  rmsnorm_t1.metal — single-row RMSNorm fast-path for T=1 decode.
-//
-//  The default `rmsnorm` kernel stripes ROWS=4 simdgroups across rows; for
-//  rows==1 only 32 of the 128 threads contribute. This variant uses
-//  256 threads / 8 simdgroups all collaborating on the single row's reduction
-//  and elementwise pass. Bit-exact vs the default kernel at d divisible by 4.
-//
-//  Bench (lexie M4, d=4096, rows=1): 11.02 µs/dispatch → 4.07 µs/dispatch.
-//
-//  ABI matches `rmsnorm` exactly: it can be substituted purely at the host
-//  pipeline-state level. Grid: dispatchThreadgroups(MTL::Size(1, rows, 1),
-//                                                    MTL::Size(256, 1, 1)).
-//
+
 
 #include <metal_stdlib>
 using namespace metal;
