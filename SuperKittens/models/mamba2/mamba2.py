@@ -14,12 +14,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from SuperKittens.inference.c_binder import bind
+from SuperKittens.inference.c_binder import bind, CtypesConfig
 from SuperKittens.inference.generation import Model
 
 
 @dataclass
-class Mamba2Config:
+class Mamba2Config(CtypesConfig):
     batch: int = 1
     seq_max: int = 2048
     n_layers: int = 24
@@ -100,12 +100,7 @@ class Mamba2Model(Model):
         self._lib = bind("mamba2", self._ABI)
         self._destroy_fn = self._lib.sk_mamba2_destroy
 
-        c_cfg = _CConfig(
-            cfg.batch, cfg.seq_max, cfg.n_layers, cfg.d_model, cfg.intermediate,
-            cfg.n_heads, cfg.head_dim, cfg.state_size, cfg.n_groups, cfg.conv_kernel,
-            cfg.chunk_size, cfg.vocab_size, cfg.rms_eps,
-            cfg.time_step_min, cfg.time_step_max, cfg.tie_word_embeddings,
-        )
+        c_cfg = cfg.to_c(_CConfig)
         self._h = self._lib.sk_mamba2_create(ctypes.byref(c_cfg))
         if not self._h:
             raise RuntimeError("sk_mamba2_create returned NULL")

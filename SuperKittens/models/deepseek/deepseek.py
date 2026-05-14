@@ -26,9 +26,9 @@ from __future__ import annotations
 import ctypes, os
 import numpy as np
 from pathlib import Path
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 
-from SuperKittens.inference.c_binder import bind
+from SuperKittens.inference.c_binder import bind, CtypesConfig
 from SuperKittens.inference.generation import Model
 
 
@@ -112,7 +112,7 @@ def _load():
 # ─── Config ─────────────────────────────────────────────────────────────────
 
 @dataclass
-class Config:
+class Config(CtypesConfig):
     """Model dimensions. Use `Config.preset(name)` for known variants."""
     n_layers: int       = 60
     d_model: int        = 7168
@@ -169,11 +169,6 @@ class Config:
                        vocab_size=1024, seq_max=16, cache_max=64)
         raise ValueError(f"unknown DeepSeek preset: {name!r}")
 
-    def _to_c(self) -> _Config:
-        cs = _Config()
-        for k, v in asdict(self).items(): setattr(cs, k, v)
-        return cs
-
     @property
     def dk(self) -> int: return self.qk_nope_dim + self.qk_rope_dim
 
@@ -195,7 +190,7 @@ class DeepSeek(Model):
             self.cfg = config
         lib = _load()
         self._destroy_fn = lib.sk_deepseek_destroy
-        self._cstruct = self.cfg._to_c()
+        self._cstruct = self.cfg.to_c(_Config)
         self._h = lib.sk_deepseek_create(ctypes.byref(self._cstruct))
         if not self._h:
             raise RuntimeError("sk_deepseek_create failed (likely missing PSO or "

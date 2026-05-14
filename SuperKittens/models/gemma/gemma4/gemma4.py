@@ -5,7 +5,7 @@ import numpy as np
 from pathlib import Path
 from dataclasses import dataclass
 
-from SuperKittens.inference.c_binder import bind, optional
+from SuperKittens.inference.c_binder import bind, optional, CtypesConfig
 from SuperKittens.inference.generation import Model
 
 
@@ -80,7 +80,7 @@ def _load():
 
 
 @dataclass
-class Gemma4Config:
+class Gemma4Config(CtypesConfig):
     n_layers: int
     local_period: int
     d_model: int
@@ -151,29 +151,7 @@ def _preset(name: str) -> Gemma4Config:
 
 
 def _to_cstruct(c: Gemma4Config) -> _Config:
-    cs = _Config()
-    cs.batch              = c.batch
-    cs.seq_max            = c.seq_max
-    cs.cache_max          = c.cache_max
-    cs.n_layers           = c.n_layers
-    cs.local_period       = c.local_period
-    cs.d_model            = c.d_model
-    cs.n_int              = c.n_int
-    cs.n_heads            = c.n_heads
-    cs.n_kv_heads_local   = c.n_kv_heads_local
-    cs.n_kv_heads_global  = c.n_kv_heads_global
-    cs.head_dim_local     = c.head_dim_local
-    cs.head_dim_global    = c.head_dim_global
-    cs.window             = c.window
-    cs.prope_p_pairs      = c.prope_p_pairs
-    cs.vocab_size         = c.vocab_size
-    cs.ple_dim            = c.ple_dim
-    cs.has_ple            = 1 if c.has_ple else 0
-    cs.eps                = c.eps
-    cs.final_logit_softcap = float(c.final_logit_softcap)
-    cs.use_double_wide_mlp  = 1 if c.use_double_wide_mlp else 0
-    cs.num_kv_shared_layers = int(c.num_kv_shared_layers)
-    return cs
+    return c.to_c(_Config)
 
 
 class Gemma4(Model):

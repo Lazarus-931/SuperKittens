@@ -10,10 +10,10 @@ from __future__ import annotations
 import ctypes, os
 import numpy as np
 from pathlib import Path
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 
 from SuperKittens.inference.generation import Model
-from SuperKittens.inference.c_binder import bind, optional
+from SuperKittens.inference.c_binder import bind, optional, CtypesConfig
 
 
 class _Config(ctypes.Structure):
@@ -83,7 +83,7 @@ def _load():
 
 
 @dataclass
-class Config:
+class Config(CtypesConfig):
     # Qwen3-32B dense defaults (per HF config.json).
     n_layers: int       = 64
     d_model: int        = 5120
@@ -120,11 +120,6 @@ class Config:
                        rope_freq_base=1_000_000.0, rope_n_ctx_orig=64)
         raise ValueError(f"unknown Qwen preset: {name!r}")
 
-    def _to_c(self) -> _Config:
-        cs = _Config()
-        for k, v in asdict(self).items(): setattr(cs, k, v)
-        return cs
-
 
 class Qwen(Model):
     """Stateful Qwen3 (dense) inference handle."""
@@ -138,7 +133,7 @@ class Qwen(Model):
         else: self.cfg = config
         lib = _load()
         self._destroy_fn = lib.sk_qwen_destroy
-        self._cstruct = self.cfg._to_c()
+        self._cstruct = self.cfg.to_c(_Config)
         self._h = lib.sk_qwen_create(ctypes.byref(self._cstruct))
         if not self._h:
             raise RuntimeError("sk_qwen_create failed (missing PSO or wrong dims)")
