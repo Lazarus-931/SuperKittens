@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Optional
 
 from SuperKittens.inference.c_binder import bind
+from SuperKittens.inference.generation import Model
 
 
 @dataclass
@@ -78,7 +79,7 @@ class _CConfig(ctypes.Structure):
     ]
 
 
-class Mamba2Model:
+class Mamba2Model(Model):
     """ctypes binding for libSuperKittens Mamba 2 C ABI."""
 
     _ABI = {
@@ -97,6 +98,7 @@ class Mamba2Model:
         if lib_path is not None:
             os.environ.setdefault("SK_DYLIB", lib_path)
         self._lib = bind("mamba2", self._ABI)
+        self._destroy_fn = self._lib.sk_mamba2_destroy
 
         c_cfg = _CConfig(
             cfg.batch, cfg.seq_max, cfg.n_layers, cfg.d_model, cfg.intermediate,
@@ -165,13 +167,6 @@ class Mamba2Model:
 
     def reset(self) -> None:
         self._lib.sk_mamba2_reset(self._h)
-
-    def __del__(self):
-        try:
-            if getattr(self, "_h", None):
-                self._lib.sk_mamba2_destroy(self._h)
-        except Exception:
-            pass
 
 
 # Registry entry — kept import-light.

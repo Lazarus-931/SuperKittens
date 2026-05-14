@@ -13,10 +13,46 @@ class Model:
         _last_logits() -> np.ndarray             # (vocab,) fp16 of last position
         reset()                                  # reset per-sequence cursor
         tokenizer                                # optional, attached by from_pretrained
+
+    Lifecycle (close/__enter__/__exit__/__del__/__repr__) is provided here.
+    Subclasses set:
+        _destroy_fn — callable(handle) destroying the native handle (required for close)
+        _handle_attr — name of the instance attribute holding the handle (default "_h")
+        _repr_fields — optional tuple of (label, attr) for __repr__ (else uses cfg fields)
     """
 
     cfg: Any
     tokenizer: Optional[Any] = None
+    _destroy_fn = None
+    _handle_attr: str = "_h"
+    _repr_fields: tuple = ()
+
+    def close(self) -> None:
+        h = getattr(self, self._handle_attr, None)
+        if h and self._destroy_fn is not None:
+            self._destroy_fn(h)
+            setattr(self, self._handle_attr, None)
+            if hasattr(self, "_w_keep"):
+                self._w_keep = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def __repr__(self) -> str:
+        cls = type(self).__name__
+        if self._repr_fields:
+            parts = [f"{label}={getattr(self.cfg, attr, '?')}" for label, attr in self._repr_fields]
+            return f"{cls}({', '.join(parts)})"
+        return f"{cls}(cfg={type(self.cfg).__name__})"
 
     def _forward(self, input_ids: np.ndarray) -> np.ndarray:
         raise NotImplementedError

@@ -129,11 +129,15 @@ class Config:
 class Qwen(Model):
     """Stateful Qwen3 (dense) inference handle."""
 
+    _repr_fields = (("L", "n_layers"), ("D", "d_model"), ("H", "n_heads"),
+                    ("hd", "head_dim"), ("n_int", "n_int"))
+
     def __init__(self, config: Config | str | None = None):
         if config is None: self.cfg = Config()
         elif isinstance(config, str): self.cfg = Config.preset(config)
         else: self.cfg = config
         lib = _load()
+        self._destroy_fn = lib.sk_qwen_destroy
         self._cstruct = self.cfg._to_c()
         self._h = lib.sk_qwen_create(ctypes.byref(self._cstruct))
         if not self._h:
@@ -285,19 +289,3 @@ class Qwen(Model):
             raise RuntimeError("decode_step called before prefill/forward")
         return self.forward([self._last_token])
 
-    def close(self) -> None:
-        if self._h:
-            _load().sk_qwen_destroy(self._h)
-            self._h = None
-            self._w_keep = None
-
-    def __enter__(self): return self
-    def __exit__(self, *_): self.close()
-    def __del__(self):
-        try: self.close()
-        except Exception: pass
-
-    def __repr__(self) -> str:
-        c = self.cfg
-        return (f"Qwen(L={c.n_layers}, D={c.d_model}, H={c.n_heads}/"
-                f"{c.n_kv_heads}KV, hd={c.head_dim}, n_int={c.n_int})")

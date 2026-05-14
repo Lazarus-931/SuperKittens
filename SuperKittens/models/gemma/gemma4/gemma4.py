@@ -6,6 +6,7 @@ from pathlib import Path
 from dataclasses import dataclass
 
 from SuperKittens.inference.c_binder import bind, optional
+from SuperKittens.inference.generation import Model
 
 
 _VARIANT_TO_DIR = {
@@ -175,14 +176,18 @@ def _to_cstruct(c: Gemma4Config) -> _Config:
     return cs
 
 
-class Gemma4:
+class Gemma4(Model):
     """Stateful Gemma 4 inference handle. Holds KV cache between forwards."""
+
+    _repr_fields = (("L", "n_layers"), ("D", "d_model"), ("H", "n_heads"),
+                    ("n_int", "n_int"))
 
     def __init__(self, variant_or_config):
         cfg = _preset(variant_or_config) if isinstance(variant_or_config, str) else variant_or_config
         self.cfg = cfg
         self._cstruct = _to_cstruct(cfg)
         lib = _load()
+        self._destroy_fn = lib.sk_gemma4_destroy
         self._h = lib.sk_gemma4_create(ctypes.byref(self._cstruct))
         if not self._h:
             raise RuntimeError("sk_gemma4_create failed")
@@ -457,12 +462,3 @@ class Gemma4:
                 print(f"[gemma4] hf-json attach failed: {e}")
         return m
 
-    def close(self):
-        if self._h:
-            _load().sk_gemma4_destroy(self._h)
-            self._h = None
-            self._w_keep = None
-
-    def __del__(self):
-        try: self.close()
-        except Exception: pass

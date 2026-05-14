@@ -29,6 +29,7 @@ from pathlib import Path
 from dataclasses import dataclass, asdict
 
 from SuperKittens.inference.c_binder import bind
+from SuperKittens.inference.generation import Model
 
 
 # ─── C ABI ──────────────────────────────────────────────────────────────────
@@ -179,8 +180,11 @@ class Config:
 
 # ─── Main handle ────────────────────────────────────────────────────────────
 
-class DeepSeek:
+class DeepSeek(Model):
     """Stateful DeepSeek V4 Flash inference handle."""
+
+    _repr_fields = (("L", "n_layers"), ("D", "d_model"), ("H", "n_heads"),
+                    ("E", "n_expert"), ("top_k", "top_k"))
 
     def __init__(self, config: Config | str | None = None):
         if config is None:
@@ -190,6 +194,7 @@ class DeepSeek:
         else:
             self.cfg = config
         lib = _load()
+        self._destroy_fn = lib.sk_deepseek_destroy
         self._cstruct = self.cfg._to_c()
         self._h = lib.sk_deepseek_create(ctypes.byref(self._cstruct))
         if not self._h:
@@ -334,20 +339,3 @@ class DeepSeek:
         # Strip the prompt prefix; only return the newly generated portion.
         return self._tok.decode(out_ids[len(ids):] if len(out_ids) > len(ids) else out_ids)
 
-    # ─── lifecycle ───
-    def close(self) -> None:
-        if self._h:
-            _load().sk_deepseek_destroy(self._h)
-            self._h = None
-            self._w_keep = None
-
-    def __enter__(self): return self
-    def __exit__(self, *_): self.close()
-    def __del__(self):
-        try: self.close()
-        except Exception: pass
-
-    def __repr__(self) -> str:
-        c = self.cfg
-        return (f"DeepSeek(L={c.n_layers}, D={c.d_model}, H={c.n_heads}, "
-                f"dk={c.dk}, dv={c.v_head_dim}, E={c.n_expert}, top_k={c.top_k})")
