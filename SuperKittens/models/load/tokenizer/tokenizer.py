@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, ClassVar, List, Optional, Sequence
 
-from .chat_templates import CHAT_TEMPLATES, gemma_template, qwen_template, deepseek_template
+from .chat_templates import CHAT_TEMPLATES, gemma_template, gemma4_template, qwen_template, deepseek_template
 
 
 _BACKEND_SP = "sentencepiece"
@@ -24,6 +24,7 @@ class Tokenizer:
     chat_template: Callable[[Sequence[dict], bool], str] = field(default=qwen_template, repr=False)
     family: str = "qwen"
     _special_ids: set = field(default_factory=set, repr=False)
+    _eos_ids: set = field(default_factory=set, repr=False)
     _gguf_vocab: Optional[List[str]] = field(default=None, repr=False)
     _gguf_lookup: Optional[dict] = field(default=None, repr=False)
 
@@ -31,7 +32,11 @@ class Tokenizer:
     # Adding a new model family means one row here — no heuristic edits elsewhere.
     _FAMILY_SPECIALS: ClassVar[dict] = {
         "qwen3":   {"bos": ("<|im_start|>",),            "eos": ("<|im_end|>", "<|endoftext|>"), "pad": ("<|endoftext|>", "<pad>")},
-        "gemma4":  {"bos": ("<bos>",),                   "eos": ("<end_of_turn>", "<eos>"),       "pad": ("<pad>",)},
+        # Gemma 4 uses a new turn-marker scheme: <|turn>...<turn|>. <end_of_turn> does NOT
+        # exist in this vocab (would split into sub-pieces and never fire). <eos> (id 1) is
+        # the canonical stop; <turn|> (id 106) is the secondary stop emitted after a model
+        # turn in instruction-tuned variants.
+        "gemma4":  {"bos": ("<bos>",),                   "eos": ("<eos>", "<turn|>"),             "pad": ("<pad>",)},
         "gemma":   {"bos": ("<bos>",),                   "eos": ("<end_of_turn>", "<eos>"),       "pad": ("<pad>",)},
         "llama":   {"bos": ("<s>", "<|begin_of_text|>"), "eos": ("</s>", "<|end_of_text|>", "<|eot_id|>"), "pad": ("<pad>",)},
         "mistral": {"bos": ("<s>",),                     "eos": ("</s>",),                        "pad": ("<pad>",)},
@@ -79,11 +84,17 @@ class Tokenizer:
 
         bos_id = eos_id = pad_id = unk_id = None
         specials = set()
+        eos_ids: set = set()
         family_map = cls._FAMILY_SPECIALS.get(family, cls._DEFAULT_SPECIALS)
+        # Collect every eos candidate that resolves to a real id, not just the first.
+        # The decode loop terminates on any of them; eos_id (singular) stays as the
+        # first hit for back-compat callers (gen_kwargs.eos_id default).
         for name in family_map["eos"]:
             tid = hf.token_to_id(name)
             if tid is not None:
-                eos_id = tid; specials.add(tid); break
+                if eos_id is None:
+                    eos_id = tid
+                eos_ids.add(tid); specials.add(tid)
         for name in family_map["bos"]:
             tid = hf.token_to_id(name)
             if tid is not None:
@@ -107,6 +118,7 @@ class Tokenizer:
             chat_template=CHAT_TEMPLATES.get(family, qwen_template),
             family=family,
             _special_ids=specials,
+            _eos_ids=eos_ids,
         )
 
     @classmethod
@@ -188,7 +200,15 @@ class Tokenizer:
         return self.encode(prompt, bos=bos, eos=False)
 
     def is_eos(self, token_id: int) -> bool:
-        return self.eos_id is not None and int(token_id) == self.eos_id
+        tid = int(token_id)
+        if self._eos_ids:
+            return tid in self._eos_ids
+        return self.eos_id is not None and tid == self.eos_id
+
+    @property
+    def eos_ids(self) -> set:
+        """All ids that should terminate generation (multi-EOS families)."""
+        return set(self._eos_ids) if self._eos_ids else ({self.eos_id} if self.eos_id is not None else set())
 
 
 # ---- helpers ----

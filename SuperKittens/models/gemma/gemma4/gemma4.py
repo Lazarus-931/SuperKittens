@@ -266,37 +266,47 @@ class Gemma4(Model):
     def generate(self, input_ids, *, max_new_tokens: int = 64,
                  temperature: float = 0.0, top_p: float = 1.0,
                  top_k: int | None = None, eos_id: int | None = None,
+                 eos_ids: set | None = None,
                  seed: int = 0) -> list:
         rng = np.random.default_rng(seed)
         ids = np.asarray(input_ids, dtype=np.int32).reshape(-1)
+        stops: set = set()
+        if eos_ids:
+            stops |= {int(x) for x in eos_ids}
+        if eos_id is not None:
+            stops.add(int(eos_id))
         self.reset()
         argmax_first = self.forward(ids)
-        if temperature <= 0.0 and (top_p >= 1.0 or top_p <= 0.0) and not top_k:
-            first = int(argmax_first[0])
-        else:
-            first = self._sample(self.last_logits(), temperature, top_p, top_k, rng)
+        greedy = temperature <= 0.0 and (top_p >= 1.0 or top_p <= 0.0) and not top_k
+        first = int(argmax_first[0]) if greedy else self._sample(
+            self.last_logits(), temperature, top_p, top_k, rng)
         out = [first]
-        if eos_id is not None and first == eos_id:
+        if first in stops:
             return out
         last = first
         for _ in range(max_new_tokens - 1):
             arg = self.forward(np.array([last], dtype=np.int32))
-            if temperature <= 0.0 and (top_p >= 1.0 or top_p <= 0.0) and not top_k:
-                last = int(arg[0])
-            else:
-                last = self._sample(self.last_logits(), temperature, top_p, top_k, rng)
+            last = int(arg[0]) if greedy else self._sample(
+                self.last_logits(), temperature, top_p, top_k, rng)
             out.append(last)
-            if eos_id is not None and last == eos_id:
+            if last in stops:
                 break
         return out
 
-    def chat(self, prompt: str, **gen_kwargs) -> str:
+    def chat(self, prompt, **gen_kwargs) -> str:
+        """Apply Gemma 4 chat template (<|turn>role\\n...<turn|>\\n with leading <bos>)
+        and decode the model's reply with special tokens stripped.
+        Accepts a string (single user turn) or list of role/content dicts.
+        """
         if not getattr(self, "tokenizer", None):
             raise RuntimeError("no tokenizer attached. use from_pretrained or set .tokenizer")
-        ids = self.tokenizer.encode(prompt)
+        messages = [{"role": "user", "content": prompt}] if isinstance(prompt, str) else list(prompt)
+        ids = self.tokenizer.chat(messages, bos=True)
+        eos_ids = gen_kwargs.pop("eos_ids", getattr(self.tokenizer, "eos_ids", None))
         eos = gen_kwargs.pop("eos_id", getattr(self.tokenizer, "eos_id", None))
-        out_ids = self.generate(np.array(ids, dtype=np.int32), eos_id=eos, **gen_kwargs)
-        return self.tokenizer.decode(out_ids)
+        out_ids = self.generate(np.array(ids, dtype=np.int32),
+                                eos_id=eos, eos_ids=eos_ids, **gen_kwargs)
+        return self.tokenizer.decode(out_ids, skip_special=True)
 
     def attach_ple_table(self, ple_table: np.ndarray):
         """Hold reference to the (vocab_size, ple_dim) PLE lookup table for per-token gather."""
@@ -360,7 +370,7 @@ class Gemma4(Model):
     @classmethod
     def _build(cls, variant: str, dir_name: str, *,
                config_path: str | None = "text_config",
-               tokenizer_family: str | None = "gemma",
+               tokenizer_family: str | None = "gemma4",
                **cfg_overrides):
         root = Path(__file__).resolve().parents[4] / "SuperKittens" / "model_weights" / dir_name
         if not root.exists():

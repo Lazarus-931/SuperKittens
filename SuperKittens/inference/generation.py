@@ -92,16 +92,28 @@ class Model:
     def generate(self, input_ids, *, max_new_tokens: int = 64,
                  temperature: float = 0.0, top_p: float = 1.0,
                  top_k: Optional[int] = None, eos_id: Optional[int] = None,
+                 eos_ids: Optional[set] = None,
                  seed: int = 0) -> list[int]:
         rng = np.random.default_rng(seed)
         ids = np.asarray(input_ids, dtype=np.int32).reshape(-1)
+        # Resolve the full stop-set: explicit eos_ids wins, else fall back to
+        # tokenizer.eos_ids (multi-stop), else single eos_id.
+        stops: set = set()
+        if eos_ids:
+            stops |= {int(x) for x in eos_ids}
+        if eos_id is not None:
+            stops.add(int(eos_id))
+        if not stops and self.tokenizer is not None:
+            t_eos = getattr(self.tokenizer, "eos_ids", None)
+            if t_eos:
+                stops |= {int(x) for x in t_eos}
         self.reset()
         argmax_first = self._forward(ids)
         greedy = temperature <= 0.0 and (top_p >= 1.0 or top_p <= 0.0) and not top_k
         first = int(argmax_first[0]) if greedy else self._sample(
             self._last_logits(), temperature, top_p, top_k, rng)
         out = [first]
-        if eos_id is not None and first == eos_id:
+        if first in stops:
             return out
         last = first
         for _ in range(max_new_tokens - 1):
@@ -109,17 +121,28 @@ class Model:
             last = int(arg[0]) if greedy else self._sample(
                 self._last_logits(), temperature, top_p, top_k, rng)
             out.append(last)
-            if eos_id is not None and last == eos_id:
+            if last in stops:
                 break
         return out
 
-    def chat(self, prompt: str, **gen_kwargs) -> str:
+    def chat(self, prompt, **gen_kwargs) -> str:
+        """Apply the tokenizer's chat template (with BOS) and decode the response.
+
+        `prompt` may be a string (treated as a single user message) or a list of
+        chat-format dicts ([{"role":..., "content":...}, ...]).
+        """
         if self.tokenizer is None:
             raise RuntimeError("no tokenizer attached")
-        ids = self.tokenizer.encode(prompt)
+        messages = [{"role": "user", "content": prompt}] if isinstance(prompt, str) else list(prompt)
+        ids = self.tokenizer.chat(messages, bos=True)
+        prompt_len = len(ids)
+        eos_ids = gen_kwargs.pop("eos_ids", getattr(self.tokenizer, "eos_ids", None))
         eos = gen_kwargs.pop("eos_id", getattr(self.tokenizer, "eos_id", None))
-        out_ids = self.generate(np.array(ids, dtype=np.int32), eos_id=eos, **gen_kwargs)
-        return self.tokenizer.decode(out_ids)
+        out_ids = self.generate(np.array(ids, dtype=np.int32),
+                                eos_id=eos, eos_ids=eos_ids, **gen_kwargs)
+        # Decode only the newly generated tail, skipping specials so trailing
+        # <turn|>/<eos> never leak into the user-visible string.
+        return self.tokenizer.decode(out_ids, skip_special=True)
 
 
 def resolve_weights_dir(name: str, variant_to_dir: dict[str, str]) -> Path:
