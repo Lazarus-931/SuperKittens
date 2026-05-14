@@ -67,8 +67,9 @@ QWEN_ABI = {
                           ctypes.c_uint32, ctypes.POINTER(ctypes.c_int32)], ctypes.c_int),
     "reset":            ([ctypes.c_void_p], None),
     "destroy":          ([ctypes.c_void_p], None),
-    "load_safetensors": ([ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int),
-    "load_gguf":        optional([ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int),
+    "load_safetensors":       ([ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int),
+    "load_safetensors_index": optional([ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int),
+    "load_gguf":              optional([ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int),
     "set_rope_tables":  optional([ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p], ctypes.c_int),
     "get_last_logits":  optional([ctypes.c_void_p, ctypes.c_void_p], ctypes.c_int),
 }
