@@ -873,6 +873,10 @@ struct ModelPSOs {
     MTL::ComputePipelineState* argmax;
     MTL::ComputePipelineState* logit_softcap;
     MTL::ComputePipelineState* logit_descale;
+    // Optional 2-pass bf16 argmax PSOs. When both non-null, dispatch_model
+    // uses the parallel block-reduce variant (≈5.9× faster at V=262144).
+    MTL::ComputePipelineState* argmax_bf16_partial = nullptr;
+    MTL::ComputePipelineState* argmax_reduce       = nullptr;
 };
 
 // Caller-allocated cache buffers, one pair per layer. The launcher manages
@@ -947,6 +951,10 @@ struct ModelBuffers {
 
     // Dump stash (optional). Big fp16 blob, see ModelParams.dump_enabled.
     MTL::Buffer* dump_stash = nullptr;
+
+    // 2-pass argmax scratch (ceil(vocab_size/16384) entries each).
+    MTL::Buffer* argmax_val_buf = nullptr;
+    MTL::Buffer* argmax_idx_buf = nullptr;
 };
 
 // Helper: blit-copy the last position's d_model fp16 row from `src`
@@ -1429,14 +1437,43 @@ inline void dispatch_model(
     // OOB-write past the buffer for T>1. Offset the logits view by (T-1) rows
     // and run a single threadgroup so out[0] = argmax(logits[last_row, :]).
     {
-        auto* enc = cmd->computeCommandEncoder();
-        enc->setComputePipelineState(P.argmax);
         const size_t last_row_off = (size_t)(T - 1u) * (size_t)M.vocab_size * sizeof(uint16_t);
-        enc->setBuffer(B.logits,    last_row_off, 0);
-        enc->setBuffer(B.output_id, 0,            1);
-        enc->setBytes(&M.vocab_size, 4, 2);
-        enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(1024, 1, 1));
-        enc->endEncoding();
+        const bool can_2pass = P.argmax_bf16_partial && P.argmax_reduce
+                            && B.argmax_val_buf && B.argmax_idx_buf;
+        if (can_2pass) {
+            constexpr uint32_t ELTS_PER_TG = 16384u;
+            const uint32_t n_blocks = (M.vocab_size + ELTS_PER_TG - 1u) / ELTS_PER_TG;
+            {
+                auto* enc = cmd->computeCommandEncoder();
+                enc->setComputePipelineState(P.argmax_bf16_partial);
+                enc->setBuffer(B.logits,         last_row_off, 0);
+                enc->setBuffer(B.argmax_val_buf, 0,            1);
+                enc->setBuffer(B.argmax_idx_buf, 0,            2);
+                enc->setBytes(&M.vocab_size,     4, 3);
+                enc->dispatchThreadgroups(MTL::Size(n_blocks, 1, 1),
+                                          MTL::Size(1024, 1, 1));
+                enc->endEncoding();
+            }
+            {
+                auto* enc = cmd->computeCommandEncoder();
+                enc->setComputePipelineState(P.argmax_reduce);
+                enc->setBuffer(B.argmax_val_buf, 0, 0);
+                enc->setBuffer(B.argmax_idx_buf, 0, 1);
+                enc->setBuffer(B.output_id,      0, 2);
+                enc->setBytes(&n_blocks,         4, 3);
+                enc->dispatchThreadgroups(MTL::Size(1, 1, 1),
+                                          MTL::Size(1024, 1, 1));
+                enc->endEncoding();
+            }
+        } else {
+            auto* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(P.argmax);
+            enc->setBuffer(B.logits,    last_row_off, 0);
+            enc->setBuffer(B.output_id, 0,            1);
+            enc->setBytes(&M.vocab_size, 4, 2);
+            enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(1024, 1, 1));
+            enc->endEncoding();
+        }
     }
 }
 

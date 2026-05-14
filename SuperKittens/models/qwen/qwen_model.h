@@ -549,6 +549,11 @@ struct ModelPSOs {
     LayerPSOs layer;
     MTL::ComputePipelineState* embedding_lookup;
     MTL::ComputePipelineState* argmax;
+    // Optional 2-pass argmax PSOs. When both non-null AND T==1, dispatch_model
+    // uses the 2-pass parallel reduce (≈3.7–5.9× faster at large V). Falls
+    // back to single-pass `argmax` if either is nullptr.
+    MTL::ComputePipelineState* argmax_partial = nullptr;  // fp16 partial
+    MTL::ComputePipelineState* argmax_reduce  = nullptr;  // partials → out
 };
 
 struct LayerCache {
@@ -623,6 +628,11 @@ struct ModelBuffers {
     MTL::Buffer* k_th;
     MTL::Buffer* v_th;
     MTL::Buffer* attn_out_seq;
+
+    // 2-pass argmax scratch (n_blocks partials). Sized at handle-creation
+    // time as ceil(vocab_size / 16384). May be nullptr when 2-pass disabled.
+    MTL::Buffer* argmax_val_buf = nullptr;
+    MTL::Buffer* argmax_idx_buf = nullptr;
 };
 
 inline void dispatch_model(
@@ -804,7 +814,41 @@ inline void dispatch_model(
     }
 
     // E. Argmax → output_id
-    {
+    //
+    // Fast path: T==1 (decode) + 2-pass PSOs available → parallel block-reduce
+    // argmax (≈3.7× faster at V=151936 on M4). Otherwise fall back to the
+    // single-TG `argmax` PSO that handles arbitrary T.
+    const bool can_2pass = (T == 1u)
+                        && P.argmax_partial && P.argmax_reduce
+                        && B.argmax_val_buf && B.argmax_idx_buf;
+    if (can_2pass) {
+        constexpr uint32_t ELTS_PER_TG = 16384u;
+        const uint32_t n_blocks = (M.vocab_size + ELTS_PER_TG - 1u) / ELTS_PER_TG;
+        // Pass 1: per-tile partials.
+        {
+            auto* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(P.argmax_partial);
+            enc->setBuffer(B.logits,         0, 0);
+            enc->setBuffer(B.argmax_val_buf, 0, 1);
+            enc->setBuffer(B.argmax_idx_buf, 0, 2);
+            enc->setBytes(&M.vocab_size,     4, 3);
+            enc->dispatchThreadgroups(MTL::Size(n_blocks, 1, 1),
+                                      MTL::Size(1024, 1, 1));
+            enc->endEncoding();
+        }
+        // Pass 2: reduce partials → out[0].
+        {
+            auto* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(P.argmax_reduce);
+            enc->setBuffer(B.argmax_val_buf, 0, 0);
+            enc->setBuffer(B.argmax_idx_buf, 0, 1);
+            enc->setBuffer(B.output_id,      0, 2);
+            enc->setBytes(&n_blocks,         4, 3);
+            enc->dispatchThreadgroups(MTL::Size(1, 1, 1),
+                                      MTL::Size(1024, 1, 1));
+            enc->endEncoding();
+        }
+    } else {
         auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(P.argmax);
         enc->setBuffer(B.logits,    0, 0);

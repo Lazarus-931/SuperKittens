@@ -64,6 +64,9 @@ static bool resolve_psos(ModelPSOs& P) {
     P.ple_lookup           = sk::bindings_pso("gemma4_ple_lookup");
     P.ple_context_mix      = sk::bindings_pso("gemma4_ple_context_mix");
     P.argmax               = sk::bindings_pso("argmax_bf16");
+    // Optional 2-pass argmax (nullable; both must be non-null to engage).
+    P.argmax_bf16_partial  = sk::bindings_pso("argmax_bf16_partial");
+    P.argmax_reduce        = sk::bindings_pso("argmax_reduce");
     P.logit_softcap        = sk::bindings_pso("gemma4_logit_softcap");
     P.logit_descale = sk::bindings_pso("gemma4_logit_descale");
 
@@ -314,6 +317,14 @@ extern "C" sk_gemma4_handle* sk_gemma4_create(const sk_gemma4_config* cfg) {
         h->bufs.ple_gate_out     = nullptr;
         h->bufs.ple_gated        = nullptr;
         h->bufs.ple_proj_back    = nullptr;
+    }
+
+    // 2-pass argmax scratch (ceil(vocab_size / 16384) partials).
+    {
+        constexpr uint32_t ELTS_PER_TG = 16384u;
+        const uint32_t n_blocks = (cfg->vocab_size + ELTS_PER_TG - 1u) / ELTS_PER_TG;
+        h->bufs.argmax_val_buf = alloc_zero(dev, (size_t)n_blocks * sizeof(float));
+        h->bufs.argmax_idx_buf = alloc_zero(dev, (size_t)n_blocks * sizeof(int32_t));
     }
 
     return reinterpret_cast<sk_gemma4_handle*>(h);
@@ -597,6 +608,7 @@ extern "C" void sk_gemma4_destroy(sk_gemma4_handle* hp) {
     rel(h->bufs.per_layer_inputs); rel(h->bufs.ple_ctx_proj); rel(h->bufs.ple_gate_out);
     rel(h->bufs.ple_gated); rel(h->bufs.ple_proj_back);
     rel(h->bufs.dump_stash);
+    rel(h->bufs.argmax_val_buf); rel(h->bufs.argmax_idx_buf);
 
     delete h;
 }
