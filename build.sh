@@ -69,7 +69,7 @@ done < <(find "$KERNELS_DIR" "$MODELS_DIR" "SuperKittens/inference" -name "*.c++
 
 echo "=== linking dylib ==="
 clang++ -std=gnu++20 -arch arm64 \
-    -framework Metal -framework Foundation -framework QuartzCore \
+    -framework Metal -framework Foundation -framework QuartzCore -framework Accelerate \
     -dynamiclib "${OBJ_FILES[@]}" -o "$BUILD_DIR/libsk.dylib" 2>/dev/null \
     && echo "  → build/libsk.dylib" \
     || echo "  ⚠ dylib link failed — use Xcode project for full build"
