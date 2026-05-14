@@ -7,6 +7,7 @@
 #include "../load/safetensor/safetensor.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -402,16 +403,26 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
             // Zero-copy: alias the LM-head tensor in the mmap'd GGUF directly
             // as the Metal buffer for w_lm_head, with a byte offset into the
             // file. Saves the ~600 MB memcpy on Qwen3-8B Q8_0.
-            const uint8_t* tdata = (const uint8_t*)v->data;
-            if (tdata < mmap_base || tdata + bytes > mmap_base + mmap_size) {
-                std::fprintf(stderr, "gguf: %s tensor not inside mmap region\n", tname);
+            //
+            // We can't pointer-subtract v->data because gmodel and our
+            // MmapBuffer are two independent mmaps of the same file. Use
+            // the absolute byte offset GGUF records instead.
+            size_t tensor_off = (size_t)-1;
+            for (const auto& ti : gmodel.tensors) {
+                if (ti.name == tname) { tensor_off = (size_t)ti.abs_offset; break; }
+            }
+            if (tensor_off == (size_t)-1 ||
+                tensor_off > mmap_size || bytes > mmap_size - tensor_off) {
+                std::fprintf(stderr, "gguf: %s tensor offset out of mmap (off=%zu bytes=%zu mmap=%zu)\n",
+                             tname, tensor_off, bytes, mmap_size);
                 return -17;
             }
-            const size_t tensor_off = (size_t)(tdata - mmap_base);
             // setBuffer:offset alignment is 4B on Apple Silicon (M1+) for
             // compute. Q8_0 block size is 34B → tensor_off is at least 4-aligned
             // by GGUF's 32-byte tensor alignment. Verify defensively.
-            if (tensor_off % 4 != 0) {
+            // SK_NO_MMAP_LMHEAD=1 forces the legacy memcpy path for A/B testing.
+            const bool disable_mmap = std::getenv("SK_NO_MMAP_LMHEAD") != nullptr;
+            if (disable_mmap || tensor_off % 4 != 0) {
                 std::fprintf(stderr, "gguf: %s offset %zu not 4B-aligned — falling back to memcpy\n",
                              tname, tensor_off);
                 if (h->weights.w_lm_head) h->weights.w_lm_head->release();
