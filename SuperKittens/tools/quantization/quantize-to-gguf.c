@@ -1,5 +1,11 @@
 // quantize-to-gguf.c
-// HF safetensors -> GGUF (Q8_0 or F16) for Qwen3.
+// HF safetensors -> GGUF (Q8_0 or F16). Architecture is detected from
+// config.json:architectures[0]. Supported families:
+//   * Qwen3   (Qwen3ForCausalLM)               -> gguf arch "qwen3"   [validated]
+//   * Gemma   (Gemma3ForCausalLM / Gemma4...)  -> gguf arch "gemma3"  [validated on small fixtures]
+//   * Mamba2  (Mamba2ForCausalLM)              -> gguf arch "mamba2"  [validated on small fixtures]
+//   * DeepSeek (DeepseekV2/V3ForCausalLM)      -> gguf arch "deepseek2" [code-only, no local weights]
+//
 // Build:
 //   clang -O3 -ffast-math -framework Accelerate -pthread \
 //         -o quantize-to-gguf quantize-to-gguf.c
@@ -411,30 +417,214 @@ static void kv_bool(gw* g, const char* k, int v){
     gw_str(g,k); gw_u32(g,GGUF_TYPE_BOOL); uint8_t b = v?1:0; gw_write(g,&b,1);
 }
 
-// ---------------- name mapping HF -> GGUF (Qwen3) ----------------
-// Returns malloc'd string, or NULL if tensor should be skipped.
-static char* hf_to_gguf_name(const char* hf){
-    char buf[256];
-    if(strcmp(hf,"model.embed_tokens.weight")==0) return xstrdup("token_embd.weight");
-    if(strcmp(hf,"lm_head.weight")==0)            return xstrdup("output.weight");
-    if(strcmp(hf,"model.norm.weight")==0)         return xstrdup("output_norm.weight");
-    int blk; char rest[200];
-    if(sscanf(hf,"model.layers.%d.%199s", &blk, rest)==2){
-        const char* sub = NULL;
-        if(strcmp(rest,"input_layernorm.weight")==0)         sub="attn_norm.weight";
-        else if(strcmp(rest,"post_attention_layernorm.weight")==0) sub="ffn_norm.weight";
-        else if(strcmp(rest,"self_attn.q_proj.weight")==0)  sub="attn_q.weight";
-        else if(strcmp(rest,"self_attn.k_proj.weight")==0)  sub="attn_k.weight";
-        else if(strcmp(rest,"self_attn.v_proj.weight")==0)  sub="attn_v.weight";
-        else if(strcmp(rest,"self_attn.o_proj.weight")==0)  sub="attn_output.weight";
-        else if(strcmp(rest,"self_attn.q_norm.weight")==0)  sub="attn_q_norm.weight";
-        else if(strcmp(rest,"self_attn.k_norm.weight")==0)  sub="attn_k_norm.weight";
-        else if(strcmp(rest,"mlp.gate_proj.weight")==0)     sub="ffn_gate.weight";
-        else if(strcmp(rest,"mlp.up_proj.weight")==0)       sub="ffn_up.weight";
-        else if(strcmp(rest,"mlp.down_proj.weight")==0)     sub="ffn_down.weight";
-        else return NULL;
-        snprintf(buf,sizeof(buf),"blk.%d.%s",blk,sub);
-        return xstrdup(buf);
+// ---------------- name mapping HF -> GGUF (table-driven, per family) ----------------
+//
+// Each row maps a HuggingFace tensor name pattern to its GGUF equivalent.
+// Patterns may use %d (layer index) and %%d (literal '%d', for double-indexed
+// expert tensors). The `n_indices` field describes how many `%d` slots to fill:
+//   0 -> global tensor (no indices in pattern)
+//   1 -> layer-indexed: model.layers.%d.X  ->  blk.%d.Y
+//   2 -> layer + expert: model.layers.%d.mlp.experts.%d.X -> blk.%d.Z.%d.W
+//
+// Matching is performed by sscanf with the corresponding number of %d
+// placeholders. The first matching row wins.
+
+typedef struct {
+    const char* hf_pat;
+    const char* gguf_pat;
+    int n_indices;
+} tensor_rename_t;
+
+// ---- Qwen3 ----
+static const tensor_rename_t QWEN3_RENAMES[] = {
+    {"model.embed_tokens.weight", "token_embd.weight",   0},
+    {"model.norm.weight",         "output_norm.weight",  0},
+    {"lm_head.weight",            "output.weight",       0},
+    {"model.layers.%d.input_layernorm.weight",          "blk.%d.attn_norm.weight",    1},
+    {"model.layers.%d.post_attention_layernorm.weight", "blk.%d.ffn_norm.weight",     1},
+    {"model.layers.%d.self_attn.q_proj.weight",         "blk.%d.attn_q.weight",       1},
+    {"model.layers.%d.self_attn.k_proj.weight",         "blk.%d.attn_k.weight",       1},
+    {"model.layers.%d.self_attn.v_proj.weight",         "blk.%d.attn_v.weight",       1},
+    {"model.layers.%d.self_attn.o_proj.weight",         "blk.%d.attn_output.weight",  1},
+    {"model.layers.%d.self_attn.q_norm.weight",         "blk.%d.attn_q_norm.weight",  1},
+    {"model.layers.%d.self_attn.k_norm.weight",         "blk.%d.attn_k_norm.weight",  1},
+    {"model.layers.%d.mlp.gate_proj.weight",            "blk.%d.ffn_gate.weight",     1},
+    {"model.layers.%d.mlp.up_proj.weight",              "blk.%d.ffn_up.weight",       1},
+    {"model.layers.%d.mlp.down_proj.weight",            "blk.%d.ffn_down.weight",     1},
+    {NULL, NULL, 0}
+};
+
+// ---- Gemma3/Gemma4 ----
+// HF Gemma3 conditional-generation tensors are nested under model.language_model.*
+// for multimodal checkpoints; text-only checkpoints use model.* directly. We
+// accept both prefixes by listing them. Gemma3 attention has q_norm and k_norm.
+static const tensor_rename_t GEMMA4_RENAMES[] = {
+    {"model.embed_tokens.weight",         "token_embd.weight",  0},
+    {"model.norm.weight",                 "output_norm.weight", 0},
+    {"lm_head.weight",                    "output.weight",      0},
+    // Multimodal-wrapped variants (Gemma3 text tower under language_model)
+    {"language_model.model.embed_tokens.weight", "token_embd.weight",  0},
+    {"language_model.model.norm.weight",         "output_norm.weight", 0},
+    {"language_model.lm_head.weight",            "output.weight",      0},
+    // Per-block (text-only path)
+    {"model.layers.%d.input_layernorm.weight",            "blk.%d.attn_norm.weight",      1},
+    {"model.layers.%d.post_attention_layernorm.weight",   "blk.%d.post_attention_norm.weight", 1},
+    {"model.layers.%d.pre_feedforward_layernorm.weight",  "blk.%d.ffn_norm.weight",       1},
+    {"model.layers.%d.post_feedforward_layernorm.weight", "blk.%d.post_ffw_norm.weight",  1},
+    {"model.layers.%d.self_attn.q_proj.weight",           "blk.%d.attn_q.weight",         1},
+    {"model.layers.%d.self_attn.k_proj.weight",           "blk.%d.attn_k.weight",         1},
+    {"model.layers.%d.self_attn.v_proj.weight",           "blk.%d.attn_v.weight",         1},
+    {"model.layers.%d.self_attn.o_proj.weight",           "blk.%d.attn_output.weight",    1},
+    {"model.layers.%d.self_attn.q_norm.weight",           "blk.%d.attn_q_norm.weight",    1},
+    {"model.layers.%d.self_attn.k_norm.weight",           "blk.%d.attn_k_norm.weight",    1},
+    {"model.layers.%d.mlp.gate_proj.weight",              "blk.%d.ffn_gate.weight",       1},
+    {"model.layers.%d.mlp.up_proj.weight",                "blk.%d.ffn_up.weight",         1},
+    {"model.layers.%d.mlp.down_proj.weight",              "blk.%d.ffn_down.weight",       1},
+    // Multimodal-wrapped per-block
+    {"language_model.model.layers.%d.input_layernorm.weight",            "blk.%d.attn_norm.weight",           1},
+    {"language_model.model.layers.%d.post_attention_layernorm.weight",   "blk.%d.post_attention_norm.weight", 1},
+    {"language_model.model.layers.%d.pre_feedforward_layernorm.weight",  "blk.%d.ffn_norm.weight",            1},
+    {"language_model.model.layers.%d.post_feedforward_layernorm.weight", "blk.%d.post_ffw_norm.weight",       1},
+    {"language_model.model.layers.%d.self_attn.q_proj.weight",           "blk.%d.attn_q.weight",              1},
+    {"language_model.model.layers.%d.self_attn.k_proj.weight",           "blk.%d.attn_k.weight",              1},
+    {"language_model.model.layers.%d.self_attn.v_proj.weight",           "blk.%d.attn_v.weight",              1},
+    {"language_model.model.layers.%d.self_attn.o_proj.weight",           "blk.%d.attn_output.weight",         1},
+    {"language_model.model.layers.%d.self_attn.q_norm.weight",           "blk.%d.attn_q_norm.weight",         1},
+    {"language_model.model.layers.%d.self_attn.k_norm.weight",           "blk.%d.attn_k_norm.weight",         1},
+    {"language_model.model.layers.%d.mlp.gate_proj.weight",              "blk.%d.ffn_gate.weight",            1},
+    {"language_model.model.layers.%d.mlp.up_proj.weight",                "blk.%d.ffn_up.weight",              1},
+    {"language_model.model.layers.%d.mlp.down_proj.weight",              "blk.%d.ffn_down.weight",            1},
+    {NULL, NULL, 0}
+};
+
+// ---- Mamba2 ----
+// Mamba2 SSM tensors live under backbone.layers.N.mixer.*. The norm preceding
+// the mixer is mixer.norm. Final norm is backbone.norm_f. Embedding lives at
+// backbone.embeddings; lm_head is tied in most checkpoints.
+static const tensor_rename_t MAMBA2_RENAMES[] = {
+    {"backbone.embeddings.weight",  "token_embd.weight",   0},
+    {"backbone.embedding.weight",   "token_embd.weight",   0},  // alt spelling
+    {"backbone.norm_f.weight",      "output_norm.weight",  0},
+    {"lm_head.weight",              "output.weight",       0},
+    {"backbone.layers.%d.norm.weight",            "blk.%d.attn_norm.weight",   1},
+    {"backbone.layers.%d.mixer.in_proj.weight",   "blk.%d.ssm_in.weight",      1},
+    {"backbone.layers.%d.mixer.conv1d.weight",    "blk.%d.ssm_conv1d.weight",  1},
+    {"backbone.layers.%d.mixer.conv1d.bias",      "blk.%d.ssm_conv1d.bias",    1},
+    {"backbone.layers.%d.mixer.dt_bias",          "blk.%d.ssm_dt.bias",        1},
+    {"backbone.layers.%d.mixer.A_log",            "blk.%d.ssm_a",              1},
+    {"backbone.layers.%d.mixer.D",                "blk.%d.ssm_d",              1},
+    {"backbone.layers.%d.mixer.norm.weight",      "blk.%d.ssm_norm.weight",    1},
+    {"backbone.layers.%d.mixer.out_proj.weight",  "blk.%d.ssm_out.weight",     1},
+    {NULL, NULL, 0}
+};
+
+// ---- DeepSeek V2/V3 ----
+// MLA: q is decomposed (q_a_proj + q_a_layernorm + q_b_proj) for some configs,
+// or single q_proj for smaller variants. KV is always decomposed
+// (kv_a_proj_with_mqa + kv_a_layernorm + kv_b_proj).
+// MoE: per-layer router + (optional) shared experts + N routed experts.
+// Per-expert tensors are kept as separate GGUF tensors here (one per expert),
+// using the `blk.%d.ffn_*_exps.%d.weight` naming. NOTE: llama.cpp's canonical
+// loader expects experts pre-stacked into a single `blk.%d.ffn_*_exps.weight`
+// of shape [n_experts, d_in, d_out]; that repacking is *not* implemented here.
+// This map is sufficient for tooling that consumes per-expert tensors directly;
+// downstream consumers needing the stacked layout must restack as a post-pass.
+static const tensor_rename_t DEEPSEEK_RENAMES[] = {
+    {"model.embed_tokens.weight", "token_embd.weight",   0},
+    {"model.norm.weight",         "output_norm.weight",  0},
+    {"lm_head.weight",            "output.weight",       0},
+    // Norms
+    {"model.layers.%d.input_layernorm.weight",          "blk.%d.attn_norm.weight",    1},
+    {"model.layers.%d.post_attention_layernorm.weight", "blk.%d.ffn_norm.weight",     1},
+    // MLA attention
+    {"model.layers.%d.self_attn.q_proj.weight",           "blk.%d.attn_q.weight",          1},
+    {"model.layers.%d.self_attn.q_a_proj.weight",         "blk.%d.attn_q_a.weight",        1},
+    {"model.layers.%d.self_attn.q_a_layernorm.weight",    "blk.%d.attn_q_a_norm.weight",   1},
+    {"model.layers.%d.self_attn.q_b_proj.weight",         "blk.%d.attn_q_b.weight",        1},
+    {"model.layers.%d.self_attn.kv_a_proj_with_mqa.weight","blk.%d.attn_kv_a_mqa.weight",  1},
+    {"model.layers.%d.self_attn.kv_a_layernorm.weight",   "blk.%d.attn_kv_a_norm.weight",  1},
+    {"model.layers.%d.self_attn.kv_b_proj.weight",        "blk.%d.attn_kv_b.weight",       1},
+    {"model.layers.%d.self_attn.o_proj.weight",           "blk.%d.attn_output.weight",     1},
+    // Dense MLP (first few layers in V2/V3 are dense, not MoE)
+    {"model.layers.%d.mlp.gate_proj.weight",            "blk.%d.ffn_gate.weight",     1},
+    {"model.layers.%d.mlp.up_proj.weight",              "blk.%d.ffn_up.weight",       1},
+    {"model.layers.%d.mlp.down_proj.weight",            "blk.%d.ffn_down.weight",     1},
+    // MoE router + optional bias (V3 adds e_score_correction_bias)
+    {"model.layers.%d.mlp.gate.weight",                       "blk.%d.ffn_gate_inp.weight",       1},
+    {"model.layers.%d.mlp.gate.e_score_correction_bias",      "blk.%d.exp_probs_b.bias",          1},
+    // Shared experts (V2/V3)
+    {"model.layers.%d.mlp.shared_experts.gate_proj.weight",   "blk.%d.ffn_gate_shexp.weight",     1},
+    {"model.layers.%d.mlp.shared_experts.up_proj.weight",     "blk.%d.ffn_up_shexp.weight",       1},
+    {"model.layers.%d.mlp.shared_experts.down_proj.weight",   "blk.%d.ffn_down_shexp.weight",     1},
+    // Per-expert (two indices: layer + expert)
+    {"model.layers.%d.mlp.experts.%d.gate_proj.weight",       "blk.%d.ffn_gate_exps.%d.weight",   2},
+    {"model.layers.%d.mlp.experts.%d.up_proj.weight",         "blk.%d.ffn_up_exps.%d.weight",     2},
+    {"model.layers.%d.mlp.experts.%d.down_proj.weight",       "blk.%d.ffn_down_exps.%d.weight",   2},
+    {NULL, NULL, 0}
+};
+
+// ---- arch enum + dispatch ----
+typedef enum {
+    ARCH_UNKNOWN = 0,
+    ARCH_QWEN3,
+    ARCH_GEMMA4,
+    ARCH_MAMBA2,
+    ARCH_DEEPSEEK,
+} arch_kind_t;
+
+typedef struct {
+    arch_kind_t kind;
+    const char* gguf_arch_key;        // e.g. "qwen3"
+    const char* pre_tokenizer;        // e.g. "qwen2"
+    const tensor_rename_t* renames;
+    int file_type_q8;                 // GGUF file_type code for Q8_0 (== 7)
+    int file_type_f16;                // for F16 (== 1)
+} arch_handler_t;
+
+static const arch_handler_t ARCH_HANDLERS[] = {
+    { ARCH_QWEN3,    "qwen3",     "qwen2",   QWEN3_RENAMES,    7, 1 },
+    { ARCH_GEMMA4,   "gemma3",    "default", GEMMA4_RENAMES,   7, 1 },
+    { ARCH_MAMBA2,   "mamba2",    "default", MAMBA2_RENAMES,   7, 1 },
+    { ARCH_DEEPSEEK, "deepseek2", "deepseek-llm", DEEPSEEK_RENAMES, 7, 1 },
+};
+
+static const arch_handler_t* arch_from_hf(const char* hf_arch){
+    if(!hf_arch) return NULL;
+    if(strstr(hf_arch,"Qwen3"))    return &ARCH_HANDLERS[0];
+    if(strstr(hf_arch,"Gemma3") || strstr(hf_arch,"Gemma4")) return &ARCH_HANDLERS[1];
+    if(strstr(hf_arch,"Mamba2"))   return &ARCH_HANDLERS[2];
+    if(strstr(hf_arch,"Deepseek") || strstr(hf_arch,"DeepSeek")) return &ARCH_HANDLERS[3];
+    return NULL;
+}
+
+// Apply a rename table. Returns malloc'd GGUF name or NULL if no rule matches.
+static char* hf_to_gguf_name_for(const tensor_rename_t* tbl, const char* hf){
+    char buf[384];
+    for(const tensor_rename_t* r = tbl; r->hf_pat; r++){
+        if(r->n_indices == 0){
+            if(strcmp(hf, r->hf_pat) == 0) return xstrdup(r->gguf_pat);
+        } else if(r->n_indices == 1){
+            int a;
+            // sscanf is "permissive" — guard against partial matches by also
+            // requiring the formatted string to round-trip back to `hf`.
+            if(sscanf(hf, r->hf_pat, &a) == 1){
+                char check[384];
+                snprintf(check, sizeof(check), r->hf_pat, a);
+                if(strcmp(check, hf) != 0) continue;
+                snprintf(buf, sizeof(buf), r->gguf_pat, a);
+                return xstrdup(buf);
+            }
+        } else if(r->n_indices == 2){
+            int a, b;
+            if(sscanf(hf, r->hf_pat, &a, &b) == 2){
+                char check[384];
+                snprintf(check, sizeof(check), r->hf_pat, a, b);
+                if(strcmp(check, hf) != 0) continue;
+                // gguf_pat takes (layer, expert) in same order
+                snprintf(buf, sizeof(buf), r->gguf_pat, a, b);
+                return xstrdup(buf);
+            }
+        }
     }
     return NULL;
 }
@@ -444,10 +634,15 @@ static char* hf_to_gguf_name(const char* hf){
 //   - token_embd, output  -> Q8_0
 //   - others (2D)         -> Q8_0
 // (Convert F16 mode keeps everything F16 except 1D as F32.)
-static uint32_t pick_dst_type(const char* gguf_name, int ndim, int mode_q8) {
+static uint32_t pick_dst_type(const char* gguf_name, int ndim, int mode_q8, arch_kind_t arch) {
     if (ndim == 1) return GGML_TYPE_F32;
+    // Mamba2: SSM scalar/conv tensors must stay F32 (precision critical).
+    if (arch == ARCH_MAMBA2 && gguf_name){
+        if (strstr(gguf_name, ".ssm_a") || strstr(gguf_name, ".ssm_d")
+            || strstr(gguf_name, ".ssm_conv1d") || strstr(gguf_name, ".ssm_dt"))
+            return GGML_TYPE_F32;
+    }
     if (!mode_q8)  return GGML_TYPE_F16;
-    (void)gguf_name;
     return GGML_TYPE_Q8_0;
 }
 
@@ -849,22 +1044,80 @@ int main(int argc, char** argv){
     char path[1024];
     snprintf(path,sizeof(path),"%s/config.json",dir);
     size_t cfg_len; char* cfg = read_file(path,&cfg_len);
+
+    // 1a. Detect architecture from architectures[0].
+    char hf_arch[128] = {0};
+    {
+        const char* p = memmem(cfg,cfg_len,"\"architectures\"",15);
+        if(p){
+            const char* q = p+15;
+            while(q < cfg+cfg_len && *q!='[') q++;
+            while(q < cfg+cfg_len && *q!='"') q++;
+            if(q < cfg+cfg_len){
+                q++; size_t i=0;
+                while(q < cfg+cfg_len && *q!='"' && i+1 < sizeof(hf_arch)) hf_arch[i++]=*q++;
+                hf_arch[i]=0;
+            }
+        }
+    }
+    const arch_handler_t* ah = arch_from_hf(hf_arch);
+    if(!ah){
+        fprintf(stderr,"fatal: unsupported architecture '%s' (config.json:architectures[0]). "
+                       "Supported: Qwen3*, Gemma3*/Gemma4*, Mamba2*, Deepseek*\n",
+                hf_arch[0]?hf_arch:"(missing)");
+        return 2;
+    }
+    fprintf(stderr,"arch: hf='%s' -> gguf='%s'\n", hf_arch, ah->gguf_arch_key);
+
+    // 1b. Gemma3 nests its hidden/heads/ff under "text_config". Locate that
+    // sub-object if present and parse from it; fall back to top-level.
+    const char* cfg_scope = cfg;
+    size_t cfg_scope_len = cfg_len;
+    size_t tc_len = 0;
+    const char* tc_start = NULL;
+    if(ah->kind == ARCH_GEMMA4){
+        tc_start = find_kv_block(cfg, cfg_len, "text_config", &tc_len, '{', '}');
+        if(tc_start){ cfg_scope = tc_start; cfg_scope_len = tc_len; }
+    }
+
     long long n_layers=0, hidden=0, n_heads=0, n_kv=0, head_dim=0, ff=0, ctx=0, vocab=0, bos=0, eos=0;
-    double rope_theta=10000.0, rms_eps=1e-6;
-    json_find_int(cfg,cfg_len,"num_hidden_layers",&n_layers);
-    json_find_int(cfg,cfg_len,"hidden_size",&hidden);
-    json_find_int(cfg,cfg_len,"num_attention_heads",&n_heads);
-    json_find_int(cfg,cfg_len,"num_key_value_heads",&n_kv);
-    json_find_int(cfg,cfg_len,"head_dim",&head_dim);
-    json_find_int(cfg,cfg_len,"intermediate_size",&ff);
-    json_find_int(cfg,cfg_len,"max_position_embeddings",&ctx);
-    json_find_int(cfg,cfg_len,"vocab_size",&vocab);
+    long long n_experts=0, n_experts_used=0, moe_intermediate=0, n_shared_experts=0, first_k_dense=0;
+    long long kv_lora_rank=0, q_lora_rank=0, qk_nope_dim=0, qk_rope_dim=0, v_head_dim=0;
+    long long ssm_d_state=0, ssm_d_conv=0, ssm_expand=0, ssm_n_groups=0, ssm_n_heads=0;
+    double rope_theta=10000.0, rms_eps=1e-6, routed_scaling=1.0;
+    json_find_int(cfg_scope,cfg_scope_len,"num_hidden_layers",&n_layers);
+    json_find_int(cfg_scope,cfg_scope_len,"hidden_size",&hidden);
+    json_find_int(cfg_scope,cfg_scope_len,"num_attention_heads",&n_heads);
+    json_find_int(cfg_scope,cfg_scope_len,"num_key_value_heads",&n_kv);
+    json_find_int(cfg_scope,cfg_scope_len,"head_dim",&head_dim);
+    json_find_int(cfg_scope,cfg_scope_len,"intermediate_size",&ff);
+    json_find_int(cfg_scope,cfg_scope_len,"max_position_embeddings",&ctx);
+    json_find_int(cfg_scope,cfg_scope_len,"vocab_size",&vocab);
+    // Top-level (always)
     json_find_int(cfg,cfg_len,"bos_token_id",&bos);
     json_find_int(cfg,cfg_len,"eos_token_id",&eos);
-    json_find_float(cfg,cfg_len,"rope_theta",&rope_theta);
-    json_find_float(cfg,cfg_len,"rms_norm_eps",&rms_eps);
+    json_find_float(cfg_scope,cfg_scope_len,"rope_theta",&rope_theta);
+    json_find_float(cfg_scope,cfg_scope_len,"rms_norm_eps",&rms_eps);
+    // DeepSeek MoE / MLA
+    json_find_int(cfg_scope,cfg_scope_len,"n_routed_experts",&n_experts);
+    json_find_int(cfg_scope,cfg_scope_len,"num_experts_per_tok",&n_experts_used);
+    json_find_int(cfg_scope,cfg_scope_len,"moe_intermediate_size",&moe_intermediate);
+    json_find_int(cfg_scope,cfg_scope_len,"n_shared_experts",&n_shared_experts);
+    json_find_int(cfg_scope,cfg_scope_len,"first_k_dense_replace",&first_k_dense);
+    json_find_int(cfg_scope,cfg_scope_len,"kv_lora_rank",&kv_lora_rank);
+    json_find_int(cfg_scope,cfg_scope_len,"q_lora_rank",&q_lora_rank);
+    json_find_int(cfg_scope,cfg_scope_len,"qk_nope_head_dim",&qk_nope_dim);
+    json_find_int(cfg_scope,cfg_scope_len,"qk_rope_head_dim",&qk_rope_dim);
+    json_find_int(cfg_scope,cfg_scope_len,"v_head_dim",&v_head_dim);
+    json_find_float(cfg_scope,cfg_scope_len,"routed_scaling_factor",&routed_scaling);
+    // Mamba2
+    json_find_int(cfg_scope,cfg_scope_len,"state_size",&ssm_d_state);
+    json_find_int(cfg_scope,cfg_scope_len,"conv_kernel",&ssm_d_conv);
+    json_find_int(cfg_scope,cfg_scope_len,"expand",&ssm_expand);
+    json_find_int(cfg_scope,cfg_scope_len,"n_groups",&ssm_n_groups);
+    json_find_int(cfg_scope,cfg_scope_len,"num_heads",&ssm_n_heads);
     if(!head_dim && n_heads) head_dim = hidden/n_heads;
-    // tied embeddings?
+    // tied embeddings? (top-level)
     int tie = 0;
     const char* tieKey = memmem(cfg,cfg_len,"\"tie_word_embeddings\"",21);
     if(tieKey){
@@ -873,9 +1126,12 @@ int main(int argc, char** argv){
         q++; q=skip_ws(q);
         if(*q=='t'||*q=='T') tie=1;
     }
-    free(cfg);
+    // Mamba2 has no lm_head most of the time -> tie defaults true for those.
+    if(ah->kind == ARCH_MAMBA2 && !tieKey) tie = 1;
+
     fprintf(stderr,"config: layers=%lld hidden=%lld n_heads=%lld n_kv=%lld head_dim=%lld ff=%lld vocab=%lld tie=%d\n",
             n_layers,hidden,n_heads,n_kv,head_dim,ff,vocab,tie);
+    free(cfg);
 
     // 2. Open safetensors
     snprintf(path,sizeof(path),"%s/model.safetensors",dir);
@@ -888,7 +1144,7 @@ int main(int argc, char** argv){
     for(size_t i=0;i<db.n;i++){
         st_tensor* t = &db.t[i];
         if(tie && strcmp(t->name,"lm_head.weight")==0) continue;
-        char* gn = hf_to_gguf_name(t->name);
+        char* gn = hf_to_gguf_name_for(ah->renames, t->name);
         if(!gn){ fprintf(stderr,"skip (no mapping): %s\n", t->name); continue; }
         plan_t* p = &plans[np++];
         memset(p,0,sizeof(*p));
@@ -897,8 +1153,13 @@ int main(int argc, char** argv){
         // GGUF ne is reversed from row-major: shape [a,b] (PyTorch [out, in]) -> GGUF ne=[in, out]
         p->n_dims = t->ndim;
         for(int d=0; d<t->ndim; d++) p->ne[d] = t->shape[t->ndim-1-d];
-        p->dst_type = pick_dst_type(gn, t->ndim, mode_q8);
+        p->dst_type = pick_dst_type(gn, t->ndim, mode_q8, ah->kind);
         size_t nel = st_nelem(t);
+        // Q8_0 requires the contiguous (innermost) dim to be a multiple of 32;
+        // if it isn't (e.g. mamba2 conv kernels) fall back to F32.
+        if (p->dst_type == GGML_TYPE_Q8_0 && (p->ne[0] % QK8)) {
+            p->dst_type = GGML_TYPE_F32;
+        }
         p->nbytes = gguf_type_size(p->dst_type, p->ne[0], nel);
     }
     fprintf(stderr,"plan: %zu tensors will be written\n", np);
@@ -958,27 +1219,61 @@ int main(int argc, char** argv){
     uint64_t nkv = 0;
     #define KV(fn, ...) do{ fn(&mg, __VA_ARGS__); nkv++; }while(0)
 
-    KV(kv_str, "general.architecture", "qwen3");
-    KV(kv_str, "general.name", "Qwen3-0.6B");
-    KV(kv_u32, "general.file_type", mode_q8 ? 7 : 1); // 7=Q8_0, 1=MOSTLY_F16 per llama.cpp enum
+    KV(kv_str, "general.architecture", ah->gguf_arch_key);
+    KV(kv_str, "general.name", hf_arch);
+    KV(kv_u32, "general.file_type", mode_q8 ? (uint32_t)ah->file_type_q8 : (uint32_t)ah->file_type_f16);
     KV(kv_u32, "general.quantization_version", 2);
 
-    // qwen3.* keys
-    KV(kv_u32, "qwen3.block_count",        (uint32_t)n_layers);
-    KV(kv_u32, "qwen3.context_length",     (uint32_t)ctx);
-    KV(kv_u32, "qwen3.embedding_length",   (uint32_t)hidden);
-    KV(kv_u32, "qwen3.feed_forward_length",(uint32_t)ff);
-    KV(kv_u32, "qwen3.attention.head_count",    (uint32_t)n_heads);
-    KV(kv_u32, "qwen3.attention.head_count_kv", (uint32_t)n_kv);
-    KV(kv_u32, "qwen3.attention.key_length",    (uint32_t)head_dim);
-    KV(kv_u32, "qwen3.attention.value_length",  (uint32_t)head_dim);
-    KV(kv_f32, "qwen3.attention.layer_norm_rms_epsilon", (float)rms_eps);
-    KV(kv_f32, "qwen3.rope.freq_base", (float)rope_theta);
-    KV(kv_u32, "qwen3.rope.dimension_count", (uint32_t)head_dim);
+    // Per-architecture KVs. We construct keys with the arch prefix so the same
+    // emitter works for qwen3/gemma3/mamba2/deepseek2.
+    #define AK(suffix) ({ static char _kbuf[128]; snprintf(_kbuf,sizeof(_kbuf),"%s.%s", ah->gguf_arch_key, suffix); _kbuf; })
+
+    KV(kv_u32, AK("block_count"),        (uint32_t)n_layers);
+    if(ctx > 0) KV(kv_u32, AK("context_length"),     (uint32_t)ctx);
+    KV(kv_u32, AK("embedding_length"),   (uint32_t)hidden);
+    if(ff > 0) KV(kv_u32, AK("feed_forward_length"),(uint32_t)ff);
+
+    if(ah->kind == ARCH_QWEN3 || ah->kind == ARCH_GEMMA4){
+        KV(kv_u32, AK("attention.head_count"),    (uint32_t)n_heads);
+        KV(kv_u32, AK("attention.head_count_kv"), (uint32_t)(n_kv?n_kv:n_heads));
+        KV(kv_u32, AK("attention.key_length"),    (uint32_t)head_dim);
+        KV(kv_u32, AK("attention.value_length"),  (uint32_t)head_dim);
+        KV(kv_f32, AK("attention.layer_norm_rms_epsilon"), (float)rms_eps);
+        KV(kv_f32, AK("rope.freq_base"), (float)rope_theta);
+        KV(kv_u32, AK("rope.dimension_count"), (uint32_t)head_dim);
+    } else if(ah->kind == ARCH_DEEPSEEK){
+        KV(kv_u32, AK("attention.head_count"),    (uint32_t)n_heads);
+        KV(kv_u32, AK("attention.head_count_kv"), (uint32_t)(n_kv?n_kv:n_heads));
+        KV(kv_f32, AK("attention.layer_norm_rms_epsilon"), (float)rms_eps);
+        KV(kv_f32, AK("rope.freq_base"), (float)rope_theta);
+        // MLA dims
+        if(kv_lora_rank > 0)   KV(kv_u32, AK("attention.kv_lora_rank"), (uint32_t)kv_lora_rank);
+        if(q_lora_rank  > 0)   KV(kv_u32, AK("attention.q_lora_rank"),  (uint32_t)q_lora_rank);
+        if(qk_nope_dim  > 0)   KV(kv_u32, AK("attention.key_length"),   (uint32_t)(qk_nope_dim + qk_rope_dim));
+        if(v_head_dim   > 0)   KV(kv_u32, AK("attention.value_length"), (uint32_t)v_head_dim);
+        if(qk_rope_dim  > 0)   KV(kv_u32, AK("rope.dimension_count"),   (uint32_t)qk_rope_dim);
+        // MoE
+        if(n_experts        > 0) KV(kv_u32, AK("expert_count"),        (uint32_t)n_experts);
+        if(n_experts_used   > 0) KV(kv_u32, AK("expert_used_count"),   (uint32_t)n_experts_used);
+        if(moe_intermediate > 0) KV(kv_u32, AK("expert_feed_forward_length"), (uint32_t)moe_intermediate);
+        if(n_shared_experts > 0) KV(kv_u32, AK("expert_shared_count"), (uint32_t)n_shared_experts);
+        if(first_k_dense    > 0) KV(kv_u32, AK("leading_dense_block_count"), (uint32_t)first_k_dense);
+        KV(kv_f32, AK("expert_weights_scale"), (float)routed_scaling);
+    } else if(ah->kind == ARCH_MAMBA2){
+        // SSM-specific. No attention KVs.
+        if(ssm_d_conv  > 0) KV(kv_u32, AK("ssm.conv_kernel"),    (uint32_t)ssm_d_conv);
+        if(ssm_d_state > 0) KV(kv_u32, AK("ssm.state_size"),     (uint32_t)ssm_d_state);
+        if(ssm_n_heads > 0) KV(kv_u32, AK("ssm.head_count"),     (uint32_t)ssm_n_heads);
+        if(ssm_n_groups> 0) KV(kv_u32, AK("ssm.group_count"),    (uint32_t)ssm_n_groups);
+        if(ssm_expand  > 0) KV(kv_u32, AK("ssm.inner_size"),     (uint32_t)(ssm_expand * hidden));
+        KV(kv_f32, AK("ssm.layer_norm_rms_epsilon"), (float)rms_eps);
+    }
+
+    #undef AK
 
     // Tokenizer
     KV(kv_str, "tokenizer.ggml.model", "gpt2");
-    KV(kv_str, "tokenizer.ggml.pre",   "qwen2");
+    KV(kv_str, "tokenizer.ggml.pre",   ah->pre_tokenizer);
     // tokens array
     { gw_str(&mg,"tokenizer.ggml.tokens"); gw_u32(&mg,GGUF_TYPE_ARRAY); gw_u32(&mg,GGUF_TYPE_STRING); gw_u64(&mg,tk.ntok);
       for(size_t i=0;i<tk.ntok;i++){
