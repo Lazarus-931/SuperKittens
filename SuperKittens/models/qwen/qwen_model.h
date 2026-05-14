@@ -7,6 +7,7 @@
 #include <cstdint>
 
 #include "../../inference/weight_store.h"
+#include "../../inference/silicon/icb_recorder.h"
 
 namespace meow {
 namespace qwen {
@@ -543,6 +544,15 @@ struct ModelPSOs {
     // back to single-pass `argmax` if either is nullptr.
     MTL::ComputePipelineState* argmax_partial = nullptr;  // fp16 partial
     MTL::ComputePipelineState* argmax_reduce  = nullptr;  // partials → out
+
+    // Optional ICB-compatible copies of the 2-pass argmax PSOs. Same kernels,
+    // built with setSupportIndirectCommandBuffers(true). When non-null and the
+    // recorder + args buffers in ModelBuffers are also non-null, the tail
+    // 2-pass argmax executes via a pre-recorded MTLIndirectCommandBuffer in
+    // one executeCommandsInBuffer call (skips two computeCommandEncoder
+    // setup/teardown cycles per decoded token).
+    MTL::ComputePipelineState* argmax_partial_icb = nullptr;
+    MTL::ComputePipelineState* argmax_reduce_icb  = nullptr;
 };
 
 struct LayerCache {
@@ -617,6 +627,16 @@ struct ModelBuffers {
     // time as ceil(vocab_size / 16384). May be nullptr when 2-pass disabled.
     MTL::Buffer* argmax_val_buf = nullptr;
     MTL::Buffer* argmax_idx_buf = nullptr;
+
+    // ICB-tail wiring (decode T=1 only). All three are non-null together or
+    // all null. argmax_args holds two uint32_t scalars laid out as
+    //   [0..4)  : vocab_size  (read by argmax_partial at buffer(3))
+    //   [4..8)  : n_blocks    (read by argmax_reduce  at buffer(3))
+    // setBytes is forbidden inside ICB-recorded commands, so kernel scalars
+    // come from this real MTL::Buffer instead. Values are written once at
+    // sk_qwen_create() time (vocab_size and n_blocks are model-static).
+    MTL::Buffer*                argmax_args = nullptr;
+    sk::silicon::IcbRecorder*   argmax_icb  = nullptr;
 };
 
 inline void dispatch_model(
@@ -803,7 +823,21 @@ inline void dispatch_model(
     const bool can_2pass = (T == 1u)
                         && P.argmax_partial && P.argmax_reduce
                         && B.argmax_val_buf && B.argmax_idx_buf;
-    if (can_2pass) {
+    const bool can_icb_tail = can_2pass
+                        && P.argmax_partial_icb && P.argmax_reduce_icb
+                        && B.argmax_args && B.argmax_icb;
+    if (can_icb_tail) {
+        // Pre-recorded ICB: two dispatches (argmax_partial → argmax_reduce)
+        // in a single executeCommandsInBuffer call. Producer/consumer
+        // ordering relies on IcbRecorder::record's default barrier_before=true
+        // on slot 1 (which reads val/idx written by slot 0).
+        auto* enc = cmd->computeCommandEncoder();
+        B.argmax_icb->execute(enc, 0, 2);
+        // logits and output_id are encoder-touched resources for this graph;
+        // the recorder's tracked list already includes them via mark_resource
+        // at record time.
+        enc->endEncoding();
+    } else if (can_2pass) {
         constexpr uint32_t ELTS_PER_TG = 16384u;
         const uint32_t n_blocks = (M.vocab_size + ELTS_PER_TG - 1u) / ELTS_PER_TG;
         // Pass 1: per-tile partials.
