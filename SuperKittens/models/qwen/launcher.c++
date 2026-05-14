@@ -67,6 +67,12 @@ static bool resolve_psos(ModelPSOs& P) {
     // Optional 2-pass argmax (nullable; T==1 fast path).
     P.argmax_partial       = sk::bindings_pso("argmax_partial");
     P.argmax_reduce        = sk::bindings_pso("argmax_reduce");
+    // ICB-compatible copies (separate cache; setSupportIndirectCommandBuffers=true).
+    // Nullable: if the ICB recorder fails to allocate (e.g. on a platform that
+    // doesn't support compute ICBs), dispatch_model falls back to the
+    // non-ICB 2-pass path.
+    P.argmax_partial_icb   = sk::bindings_pso_icb("argmax_partial");
+    P.argmax_reduce_icb    = sk::bindings_pso_icb("argmax_reduce");
 
     #define _CK(name, val) if (!(val)) { std::fprintf(stderr, "qwen launcher: missing PSO " name "\n"); return false; }
     _CK("rmsnorm",          P.layer.rmsnorm);
@@ -187,6 +193,52 @@ extern "C" sk_qwen_handle* sk_qwen_create(const sk_qwen_config* cfg) {
         const uint32_t n_blocks = (cfg->vocab_size + ELTS_PER_TG - 1u) / ELTS_PER_TG;
         h->bufs.argmax_val_buf = alloc_zero(dev, (size_t)n_blocks * sizeof(float));
         h->bufs.argmax_idx_buf = alloc_zero(dev, (size_t)n_blocks * sizeof(int32_t));
+
+        // ICB-tail wiring. Three preconditions: both ICB PSOs resolved, the
+        // IcbRecorder allocates, and the args buffer allocates. If any fails,
+        // dispatch_model silently falls back to the non-ICB 2-pass path.
+        if (h->psos.argmax_partial_icb && h->psos.argmax_reduce_icb) {
+            h->bufs.argmax_args = alloc_zero(dev, 2 * sizeof(uint32_t));
+            uint32_t* args = (uint32_t*)h->bufs.argmax_args->contents();
+            args[0] = cfg->vocab_size;  // read by argmax_partial @ buffer(3)
+            args[1] = n_blocks;         // read by argmax_reduce  @ buffer(3)
+
+            auto* rec = sk::silicon::IcbRecorder::create(dev,
+                /*max_slots=*/2u, /*max_buffer_bindings=*/4u);
+            if (rec && h->bufs.argmax_args) {
+                // Slot 0: argmax_partial(logits, val_buf, idx_buf, args[vocab_size])
+                {
+                    const MTL::Buffer* bufs[4] = {
+                        h->bufs.logits, h->bufs.argmax_val_buf,
+                        h->bufs.argmax_idx_buf, h->bufs.argmax_args };
+                    NS::UInteger offs[4] = { 0, 0, 0, /*vocab_size at byte 0*/ 0 };
+                    MTL::Size grid(n_blocks, 1, 1);
+                    MTL::Size tg(1024, 1, 1);
+                    rec->record(0, h->psos.argmax_partial_icb,
+                                bufs, offs, 4, grid, tg, /*barrier_before=*/false);
+                }
+                // Slot 1: argmax_reduce(val_buf, idx_buf, output_id, args[n_blocks])
+                {
+                    const MTL::Buffer* bufs[4] = {
+                        h->bufs.argmax_val_buf, h->bufs.argmax_idx_buf,
+                        h->bufs.output_id, h->bufs.argmax_args };
+                    // n_blocks lives at byte 4 of argmax_args.
+                    NS::UInteger offs[4] = { 0, 0, 0, sizeof(uint32_t) };
+                    MTL::Size grid(1, 1, 1);
+                    MTL::Size tg(1024, 1, 1);
+                    rec->record(1, h->psos.argmax_reduce_icb,
+                                bufs, offs, 4, grid, tg, /*barrier_before=*/true);
+                }
+                rec->mark_resource(h->bufs.logits);
+                rec->mark_resource(h->bufs.argmax_val_buf);
+                rec->mark_resource(h->bufs.argmax_idx_buf);
+                rec->mark_resource(h->bufs.output_id);
+                rec->mark_resource(h->bufs.argmax_args);
+                h->bufs.argmax_icb = rec;
+            } else if (rec) {
+                delete rec;
+            }
+        }
     }
 
     return reinterpret_cast<sk_qwen_handle*>(h);
@@ -372,5 +424,7 @@ extern "C" void sk_qwen_destroy(sk_qwen_handle* hp) {
     rel(h->bufs.gate_buf); rel(h->bufs.up_buf);
     rel(h->bufs.q_th); rel(h->bufs.k_th); rel(h->bufs.v_th); rel(h->bufs.attn_out_seq);
     rel(h->bufs.argmax_val_buf); rel(h->bufs.argmax_idx_buf);
+    rel(h->bufs.argmax_args);
+    if (h->bufs.argmax_icb) { delete h->bufs.argmax_icb; h->bufs.argmax_icb = nullptr; }
     delete h;
 }
