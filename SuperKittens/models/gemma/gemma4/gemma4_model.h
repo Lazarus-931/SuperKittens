@@ -13,6 +13,7 @@
 #include <Metal/Metal.hpp>
 #include <cstdint>
 #include <cmath>
+#include <cstdlib>
 
 namespace meow {
 namespace gemma4 {
@@ -93,6 +94,11 @@ struct LayerPSOs {
     MTL::ComputePipelineState* ple_gate_act_fp32; // fp32 gate, bf16 ple → fp32 gated
     MTL::ComputePipelineState* ple_inject_fp32;   // fp32 proj_back → bf16 residual
     MTL::ComputePipelineState* ple_inject_fused_t1; // single-dispatch PLE inject (T=1 decode fast path)
+
+    // T=1 decode fast paths (nullable; only used when seq==1).
+    MTL::ComputePipelineState* gemv_geglu_bf16_m1 = nullptr; // fused gate+up+gelu+mul -> m_int
+    MTL::ComputePipelineState* gemv_bf16_m1       = nullptr; // M=1 bf16 GEMV (down projection etc.)
+    MTL::ComputePipelineState* qkv_norm_rope_partial_t1 = nullptr; // fused qkv-split + per-head rmsnorm + partial RoPE (global layers)
 };
 
 struct LayerBuffers {
@@ -156,6 +162,7 @@ struct LayerBuffers {
     MTL::Buffer* m_in;
     MTL::Buffer* m_out;
     MTL::Buffer* y_out;
+    MTL::Buffer* m_int_scratch = nullptr; // (T, N_int) bf16 — used by gemv_geglu_bf16_m1 fast path
 
     // PLE scratch
     MTL::Buffer* ple_gate_out;       // (T, PLE_dim)
@@ -206,28 +213,43 @@ inline void dispatch_layer(
 
     // 2. QKV projection
     {
-        auto* enc = E.get();
-        enc->setComputePipelineState(P.gemm);
         const uint32_t M = p.batch * p.seq;
         const uint32_t K_v = p.d_model;
         const uint32_t N_v = (p.n_heads + 2 * p.n_kv_heads) * p.head_dim;
-        uint32_t ldA = K_v, ldB = N_v, ldC = N_v;
-        int transA = 0, transB = 0, has_bias = 0;
-        enc->setBuffer(B.x_norm,    0,       0);
-        enc->setBuffer(B.w_qkv,     off_qkv, 1);
-        enc->setBuffer(B.qkv_packed,0,       2);
-        enc->setBytes(&M,        4, 3);
-        enc->setBytes(&N_v,      4, 4);
-        enc->setBytes(&K_v,      4, 5);
-        enc->setBytes(&ldA,      4, 6);
-        enc->setBytes(&ldB,      4, 7);
-        enc->setBytes(&ldC,      4, 8);
-        enc->setBytes(&transA,   4, 9);
-        enc->setBytes(&transB,   4, 10);
-        enc->setBytes(&has_bias, 4, 11);
-        enc->setBuffer(B.qkv_packed, 0, 12);
-        enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M + 63) / 64, 1),
-                                  MTL::Size(64, 1, 1));
+        // T=1 decode fast path: bf16 M=1 GEMV. Threshold guard N<=32768 — at
+        // larger N the in-tree tile-MMA wins (per lab REPORT.md).
+        static bool _disable_m1 = (std::getenv("SK_DISABLE_GEMV_M1") != nullptr);
+        if (!_disable_m1 && M == 1 && N_v <= 32768u && P.gemv_bf16_m1 != nullptr) {
+            auto* enc = E.get();
+            enc->setComputePipelineState(P.gemv_bf16_m1);
+            enc->setBuffer(B.x_norm,     0,       0);
+            enc->setBuffer(B.w_qkv,      off_qkv, 1);
+            enc->setBuffer(B.qkv_packed, 0,       2);
+            enc->setBytes(&N_v, 4, 3);
+            enc->setBytes(&K_v, 4, 4);
+            enc->dispatchThreadgroups(MTL::Size((N_v + 127) / 128, 1, 1),
+                                      MTL::Size(128, 1, 1));
+        } else {
+            auto* enc = E.get();
+            enc->setComputePipelineState(P.gemm);
+            uint32_t ldA = K_v, ldB = N_v, ldC = N_v;
+            int transA = 0, transB = 0, has_bias = 0;
+            enc->setBuffer(B.x_norm,    0,       0);
+            enc->setBuffer(B.w_qkv,     off_qkv, 1);
+            enc->setBuffer(B.qkv_packed,0,       2);
+            enc->setBytes(&M,        4, 3);
+            enc->setBytes(&N_v,      4, 4);
+            enc->setBytes(&K_v,      4, 5);
+            enc->setBytes(&ldA,      4, 6);
+            enc->setBytes(&ldB,      4, 7);
+            enc->setBytes(&ldC,      4, 8);
+            enc->setBytes(&transA,   4, 9);
+            enc->setBytes(&transB,   4, 10);
+            enc->setBytes(&has_bias, 4, 11);
+            enc->setBuffer(B.qkv_packed, 0, 12);
+            enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M + 63) / 64, 1),
+                                      MTL::Size(64, 1, 1));
+        }
     }
 
     // DUMP (L1 only): qkv_packed last-token row (post-GEMM, pre-split).
@@ -243,8 +265,45 @@ inline void dispatch_layer(
         blit->endEncoding();
     }
 
-    // 3. QKV split + per-head RMSNorm (V no γ)
-    {
+    // 3. QKV split + per-head RMSNorm (V no γ).
+    // T=1 decode fast path for global (partial-RoPE) layers: fuse split +
+    // per-head rmsnorm + partial RoPE for Q,K into a single dispatch. V is
+    // normed (no γ) and written straight to v_tmp by the same kernel.
+    // Skipped when dump_enabled (the dump blits between qkv_norm and rope
+    // require the un-rotated q/k_normed to still be in q_norm/k_tmp).
+    static bool _disable_qkv_fused = (std::getenv("SK_DISABLE_QKV_FUSED_T1") != nullptr);
+    const bool use_qkv_fused =
+        !_disable_qkv_fused &&
+        (p.batch * p.seq == 1) &&
+        p.is_global &&
+        (P.qkv_norm_rope_partial_t1 != nullptr) &&
+        (B.dump_stash_extra == nullptr || p.layer_idx != 0);
+
+    if (use_qkv_fused) {
+        auto* enc = E.get();
+        enc->setComputePipelineState(P.qkv_norm_rope_partial_t1);
+        uint32_t rot_dims = p.rot_dims
+                            ? p.rot_dims
+                            : (uint32_t)(p.head_dim * 0.25f);
+        enc->setBuffer(B.qkv_packed, 0,         0);
+        enc->setBuffer(B.gamma_q,    off_gamma, 1);
+        enc->setBuffer(B.gamma_k,    off_gamma, 2);
+        enc->setBuffer(B.cos,        0,         3);
+        enc->setBuffer(B.sin,        0,         4);
+        enc->setBuffer(B.q_norm,     0,         5);
+        enc->setBuffer(B.k_tmp,      0,         6);
+        enc->setBuffer(B.v_tmp,      0,         7);
+        enc->setBytes(&p.n_heads,    4, 8);
+        enc->setBytes(&p.n_kv_heads, 4, 9);
+        enc->setBytes(&p.head_dim,   4, 10);
+        enc->setBytes(&rot_dims,     4, 11);
+        enc->setBytes(&p.write_pos,  4, 12);
+        enc->setBytes(&p.eps,        4, 13);
+        const uint32_t slots = p.n_heads + 2u * p.n_kv_heads;
+        enc->dispatchThreadgroups(MTL::Size(slots, 1, 1),
+                                  MTL::Size(p.head_dim, 1, 1));
+        // Fall through past the legacy qkv_norm + rope blocks below.
+    } else {
         auto* enc = E.get();
         enc->setComputePipelineState(P.qkv_norm);
         enc->setBuffer(B.qkv_packed, 0,         0);
@@ -285,7 +344,9 @@ inline void dispatch_layer(
     }
 
     // 4. RoPE / p-RoPE on Q and the in-flight K (k_tmp), in-place.
-    {
+    // Skipped when the fused qkv_norm+rope kernel above already produced the
+    // rotated Q,K (T=1 global decode path).
+    if (!use_qkv_fused) {
         auto* enc = E.get();
         if (p.is_global) {
             // Gemma4 full_attention uses standard partial RoPE (HF
@@ -431,28 +492,41 @@ inline void dispatch_layer(
 
     // 6. Output projection
     {
-        auto* enc = E.get();
-        enc->setComputePipelineState(P.gemm);
         const uint32_t M = p.batch * p.seq;
         const uint32_t K_v = p.n_heads * p.head_dim;
         const uint32_t N_v = p.d_model;
-        uint32_t ldA = K_v, ldB = N_v, ldC = N_v;
-        int transA = 0, transB = 0, has_bias = 0;
-        enc->setBuffer(B.attn_out, 0,         0);
-        enc->setBuffer(B.w_out,    off_w_out, 1);
-        enc->setBuffer(B.o_proj,   0,         2);
-        enc->setBytes(&M,        4, 3);
-        enc->setBytes(&N_v,      4, 4);
-        enc->setBytes(&K_v,      4, 5);
-        enc->setBytes(&ldA,      4, 6);
-        enc->setBytes(&ldB,      4, 7);
-        enc->setBytes(&ldC,      4, 8);
-        enc->setBytes(&transA,   4, 9);
-        enc->setBytes(&transB,   4, 10);
-        enc->setBytes(&has_bias, 4, 11);
-        enc->setBuffer(B.o_proj, 0, 12);
-        enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M + 63) / 64, 1),
-                                  MTL::Size(64, 1, 1));
+        static bool _disable_m1_o = (std::getenv("SK_DISABLE_GEMV_M1") != nullptr);
+        if (!_disable_m1_o && M == 1 && N_v <= 32768u && P.gemv_bf16_m1 != nullptr) {
+            auto* enc = E.get();
+            enc->setComputePipelineState(P.gemv_bf16_m1);
+            enc->setBuffer(B.attn_out, 0,         0);
+            enc->setBuffer(B.w_out,    off_w_out, 1);
+            enc->setBuffer(B.o_proj,   0,         2);
+            enc->setBytes(&N_v, 4, 3);
+            enc->setBytes(&K_v, 4, 4);
+            enc->dispatchThreadgroups(MTL::Size((N_v + 127) / 128, 1, 1),
+                                      MTL::Size(128, 1, 1));
+        } else {
+            auto* enc = E.get();
+            enc->setComputePipelineState(P.gemm);
+            uint32_t ldA = K_v, ldB = N_v, ldC = N_v;
+            int transA = 0, transB = 0, has_bias = 0;
+            enc->setBuffer(B.attn_out, 0,         0);
+            enc->setBuffer(B.w_out,    off_w_out, 1);
+            enc->setBuffer(B.o_proj,   0,         2);
+            enc->setBytes(&M,        4, 3);
+            enc->setBytes(&N_v,      4, 4);
+            enc->setBytes(&K_v,      4, 5);
+            enc->setBytes(&ldA,      4, 6);
+            enc->setBytes(&ldB,      4, 7);
+            enc->setBytes(&ldC,      4, 8);
+            enc->setBytes(&transA,   4, 9);
+            enc->setBytes(&transB,   4, 10);
+            enc->setBytes(&has_bias, 4, 11);
+            enc->setBuffer(B.o_proj, 0, 12);
+            enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M + 63) / 64, 1),
+                                      MTL::Size(64, 1, 1));
+        }
     }
 
     // 7. Post-attn RMSNorm
@@ -487,23 +561,70 @@ inline void dispatch_layer(
     }
 
     // 10. Dense GeGLU MLP.
+    // T=1 decode fast path: replace the monolithic tile-MMA GEMM-3 fusion with
+    //   gemv_geglu_bf16_m1(W_gate, W_up, x_norm) -> m_int_scratch
+    //   gemv_bf16_m1     (W_down, m_int_scratch) -> m_out
+    // The lab measured ~36x speedup at M=1 (E2B decode, Apple M4). The original
+    // gemma4_gated_mlp_bf16 stays as the prefill (T>1) path.
     {
-        auto* enc = E.get();
-        enc->setComputePipelineState(P.gated_mlp_gelu);
-        enc->setBuffer(B.m_in,   0,          0);
-        enc->setBuffer(B.w_gate, off_w_gate, 1);
-        enc->setBuffer(B.w_up,   off_w_gate, 2);
-        enc->setBuffer(B.w_down, off_w_down, 3);
-        enc->setBuffer(B.m_out,  0,          4);
-        uint32_t M = p.batch * p.seq;
-        uint32_t N_v = p.d_model;
-        uint32_t K_v = p.d_model;
-        enc->setBytes(&M,        4, 5);
-        enc->setBytes(&N_v,      4, 6);
-        enc->setBytes(&K_v,      4, 7);
-        enc->setBytes(&p.n_int,  4, 8);
-        enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M + 63) / 64, 1),
-                                  MTL::Size(128, 1, 1));
+        const uint32_t T_mlp = p.batch * p.seq;
+        static bool _disable_mlp_fast = (std::getenv("SK_DISABLE_MLP_FAST_T1") != nullptr);
+        const bool use_fast =
+            !_disable_mlp_fast &&
+            (T_mlp == 1) &&
+            (P.gemv_geglu_bf16_m1 != nullptr) &&
+            (P.gemv_bf16_m1       != nullptr) &&
+            (B.m_int_scratch      != nullptr);
+
+        if (use_fast) {
+            // 10a: fused gate+up+gelu+mul -> m_int_scratch (1, n_int).
+            {
+                auto* enc = E.get();
+                enc->setComputePipelineState(P.gemv_geglu_bf16_m1);
+                enc->setBuffer(B.m_in,          0,          0);
+                enc->setBuffer(B.w_gate,        off_w_gate, 1);
+                enc->setBuffer(B.w_up,          off_w_gate, 2);
+                enc->setBuffer(B.m_int_scratch, 0,          3);
+                uint32_t N_int_v = p.n_int;
+                uint32_t K_v     = p.d_model;
+                enc->setBytes(&N_int_v, 4, 4);
+                enc->setBytes(&K_v,     4, 5);
+                enc->dispatchThreadgroups(MTL::Size((N_int_v + 7) / 8, 1, 1),
+                                          MTL::Size(256, 1, 1));
+            }
+            // 10b: down projection m_out = m_int_scratch @ W_down.
+            // W_down is (N_int, d_model) row-major; for gemv_bf16_m1 treat K=N_int, N=d_model.
+            {
+                auto* enc = E.get();
+                enc->setComputePipelineState(P.gemv_bf16_m1);
+                enc->setBuffer(B.m_int_scratch, 0,          0);
+                enc->setBuffer(B.w_down,        off_w_down, 1);
+                enc->setBuffer(B.m_out,         0,          2);
+                uint32_t N_v = p.d_model;
+                uint32_t K_v = p.n_int;
+                enc->setBytes(&N_v, 4, 3);
+                enc->setBytes(&K_v, 4, 4);
+                enc->dispatchThreadgroups(MTL::Size((N_v + 127) / 128, 1, 1),
+                                          MTL::Size(128, 1, 1));
+            }
+        } else {
+            auto* enc = E.get();
+            enc->setComputePipelineState(P.gated_mlp_gelu);
+            enc->setBuffer(B.m_in,   0,          0);
+            enc->setBuffer(B.w_gate, off_w_gate, 1);
+            enc->setBuffer(B.w_up,   off_w_gate, 2);
+            enc->setBuffer(B.w_down, off_w_down, 3);
+            enc->setBuffer(B.m_out,  0,          4);
+            uint32_t M = p.batch * p.seq;
+            uint32_t N_v = p.d_model;
+            uint32_t K_v = p.d_model;
+            enc->setBytes(&M,        4, 5);
+            enc->setBytes(&N_v,      4, 6);
+            enc->setBytes(&K_v,      4, 7);
+            enc->setBytes(&p.n_int,  4, 8);
+            enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M + 63) / 64, 1),
+                                      MTL::Size(128, 1, 1));
+        }
     }
 
     // 11. Post-MLP RMSNorm
@@ -594,29 +715,42 @@ inline void dispatch_ple_inject(
 
     // 1. per_layer_input_gate: (T, d_model) @ (d_model, PLE_dim) → (T, PLE_dim) bf16
     {
-        auto* enc = cmd->computeCommandEncoder();
-        enc->setComputePipelineState(P.gemm);
         const uint32_t M = T;
         const uint32_t K_v = p.d_model;
         const uint32_t N_v = p.ple_dim;
-        uint32_t ldA = K_v, ldB = N_v, ldC = N_v;
-        int transA = 0, transB = 0, has_bias = 0;
-        enc->setBuffer(B.residual,                0,        0);
-        enc->setBuffer(B.w_per_layer_input_gate,  off_gate, 1);
-        enc->setBuffer(B.ple_gate_out,            0,        2);
-        enc->setBytes(&M,        4, 3);
-        enc->setBytes(&N_v,      4, 4);
-        enc->setBytes(&K_v,      4, 5);
-        enc->setBytes(&ldA,      4, 6);
-        enc->setBytes(&ldB,      4, 7);
-        enc->setBytes(&ldC,      4, 8);
-        enc->setBytes(&transA,   4, 9);
-        enc->setBytes(&transB,   4, 10);
-        enc->setBytes(&has_bias, 4, 11);
-        enc->setBuffer(B.ple_gate_out, 0, 12);
-        enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M + 63) / 64, 1),
-                                  MTL::Size(64, 1, 1));
-        enc->endEncoding();
+        if (M == 1 && N_v <= 32768u && P.gemv_bf16_m1 != nullptr) {
+            auto* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(P.gemv_bf16_m1);
+            enc->setBuffer(B.residual,                0,        0);
+            enc->setBuffer(B.w_per_layer_input_gate,  off_gate, 1);
+            enc->setBuffer(B.ple_gate_out,            0,        2);
+            enc->setBytes(&N_v, 4, 3);
+            enc->setBytes(&K_v, 4, 4);
+            enc->dispatchThreadgroups(MTL::Size((N_v + 127) / 128, 1, 1),
+                                      MTL::Size(128, 1, 1));
+            enc->endEncoding();
+        } else {
+            auto* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(P.gemm);
+            uint32_t ldA = K_v, ldB = N_v, ldC = N_v;
+            int transA = 0, transB = 0, has_bias = 0;
+            enc->setBuffer(B.residual,                0,        0);
+            enc->setBuffer(B.w_per_layer_input_gate,  off_gate, 1);
+            enc->setBuffer(B.ple_gate_out,            0,        2);
+            enc->setBytes(&M,        4, 3);
+            enc->setBytes(&N_v,      4, 4);
+            enc->setBytes(&K_v,      4, 5);
+            enc->setBytes(&ldA,      4, 6);
+            enc->setBytes(&ldB,      4, 7);
+            enc->setBytes(&ldC,      4, 8);
+            enc->setBytes(&transA,   4, 9);
+            enc->setBytes(&transB,   4, 10);
+            enc->setBytes(&has_bias, 4, 11);
+            enc->setBuffer(B.ple_gate_out, 0, 12);
+            enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M + 63) / 64, 1),
+                                      MTL::Size(64, 1, 1));
+            enc->endEncoding();
+        }
     }
 
     // 2. ple_gate_act (bf16 in/out — unchanged path).
@@ -797,6 +931,7 @@ struct ModelBuffers {
     MTL::Buffer* m_in;
     MTL::Buffer* m_out;
     MTL::Buffer* y_out;
+    MTL::Buffer* m_int_scratch = nullptr; // (T, max_N_int) bf16 — gemv_geglu_bf16_m1 T=1 fast path
 
     // PLE scratch
     MTL::Buffer* per_layer_inputs;   // (T, n_layers, PLE_dim)
@@ -1073,6 +1208,7 @@ inline void dispatch_model(
         lb.y_attn     = B.y_attn;
         lb.m_in       = B.m_in;
         lb.m_out      = B.m_out;
+        lb.m_int_scratch = B.m_int_scratch;
         lb.y_out      = nxt;
 
         dispatch_layer(cmd, P.layer, lb, lp);
@@ -1257,13 +1393,19 @@ inline void dispatch_model(
     }
 
     // E. argmax → output_id
+    //
+    // Only the LAST token's argmax matters for decode; output_id is sized
+    // batch*sizeof(int32_t) (one slot), so dispatching T threadgroups would
+    // OOB-write past the buffer for T>1. Offset the logits view by (T-1) rows
+    // and run a single threadgroup so out[0] = argmax(logits[last_row, :]).
     {
         auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(P.argmax);
-        enc->setBuffer(B.logits,   0, 0);
-        enc->setBuffer(B.output_id,0, 1);
+        const size_t last_row_off = (size_t)(T - 1u) * (size_t)M.vocab_size * sizeof(uint16_t);
+        enc->setBuffer(B.logits,    last_row_off, 0);
+        enc->setBuffer(B.output_id, 0,            1);
         enc->setBytes(&M.vocab_size, 4, 2);
-        enc->dispatchThreadgroups(MTL::Size(T, 1, 1), MTL::Size(1024, 1, 1));
+        enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(1024, 1, 1));
         enc->endEncoding();
     }
 }

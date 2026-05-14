@@ -53,7 +53,12 @@ void gated_mlp_bf16(
     uint simd [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
     uint2 gid [[threadgroup_position_in_grid]])
 {
+    // `row` here is used as the simd-local OUTPUT base row for the MMA fragment
+    // and the activation write. The cooperative-load helpers below recompute
+    // the threadgroup-local base via `gid.y * BM`, NOT this value, so that all
+    // simdgroups cooperate on a single shared tile.
     const uint row = gid.y * BM + simd * 16;
+    const uint tg_row = gid.y * BM;   // TG-wide base row for cooperative loads
     const uint col = gid.x * BN;
     const uint tid = simd * 32 + lane;
 
@@ -78,7 +83,7 @@ void gated_mlp_bf16(
         for (uint bk = 0; bk < K; bk += BK) {
             for (uint i = tid; i < (BM * BK) / 4; i += THREADS) {
                 uint r = (i * 4) / BK, c = (i * 4) % BK;
-                uint gr = row + r, gc = bk + c;
+                uint gr = tg_row + r, gc = bk + c;
                 reinterpret_cast<threadgroup bfloat4*>(As)[i] =
                     (gr < M && gc < K) ? x4[(gr * K + gc) / 4] : bfloat4(0);
             }
@@ -107,7 +112,7 @@ void gated_mlp_bf16(
         for (uint bk = 0; bk < K; bk += BK) {
             for (uint i = tid; i < (BM * BK) / 4; i += THREADS) {
                 uint r = (i * 4) / BK, c = (i * 4) % BK;
-                uint gr = row + r, gc = bk + c;
+                uint gr = tg_row + r, gc = bk + c;
                 reinterpret_cast<threadgroup bfloat4*>(As)[i] =
                     (gr < M && gc < K) ? x4[(gr * K + gc) / 4] : bfloat4(0);
             }
@@ -163,7 +168,7 @@ void gated_mlp_bf16(
         for (uint bk = 0; bk < BN; bk += BK) {
             for (uint i = tid; i < (BM * BK) / 4; i += THREADS) {
                 uint r = (i * 4) / BK, c = (i * 4) % BK;
-                uint gr_local = (row % BM) + r;
+                uint gr_local = r;   // TG-wide cooperative load: tile row == r.
                 // Column within the BN-wide intermediate is bk + c.
                 reinterpret_cast<threadgroup bfloat4*>(As)[i] =
                     (gr_local < BM)

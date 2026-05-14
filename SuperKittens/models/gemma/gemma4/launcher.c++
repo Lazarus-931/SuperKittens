@@ -55,6 +55,10 @@ static bool resolve_psos(ModelPSOs& P) {
     P.layer.ple_gate_act_fp32 = sk::bindings_pso("gemma4_ple_gate_act_fp32");
     P.layer.ple_inject_fp32   = sk::bindings_pso("gemma4_ple_inject_fp32");
     P.layer.ple_inject_fused_t1 = sk::bindings_pso("gemma4_ple_inject_fused_t1");
+    // Optional T=1 decode fast-path PSOs (nullable; gated by null-check in dispatch_layer).
+    P.layer.gemv_geglu_bf16_m1 = sk::bindings_pso("gemv_geglu_bf16_m1");
+    P.layer.gemv_bf16_m1       = sk::bindings_pso("gemv_bf16_m1");
+    P.layer.qkv_norm_rope_partial_t1 = sk::bindings_pso("gemma4_qkv_norm_rope_partial_t1");
     P.embedding_lookup     = sk::bindings_pso("embedding_lookup_bf16");
     P.ple_lookup           = sk::bindings_pso("gemma4_ple_lookup");
     P.ple_context_mix      = sk::bindings_pso("gemma4_ple_context_mix");
@@ -248,6 +252,14 @@ extern "C" sk_gemma4_handle* sk_gemma4_create(const sk_gemma4_config* cfg) {
     h->bufs.y_attn     = alloc_zero(dev, x_bytes);
     h->bufs.m_in       = alloc_zero(dev, x_bytes);
     h->bufs.m_out      = alloc_zero(dev, x_bytes);
+    // m_int_scratch: (T_max, max_N_int) bf16 — used by gemv_geglu_bf16_m1 fast path.
+    {
+        uint32_t max_n_int = 0;
+        for (uint32_t L = 0; L < cfg->n_layers; ++L) {
+            if (h->n_int_per_layer[L] > max_n_int) max_n_int = h->n_int_per_layer[L];
+        }
+        h->bufs.m_int_scratch = alloc_zero(dev, (size_t)T_max * max_n_int * 2);
+    }
     h->bufs.y_out      = alloc_zero(dev, x_bytes);
 
     // Dump stash: (1 + 4*nL + 1) * d_model + vocab_size fp16 elements,
