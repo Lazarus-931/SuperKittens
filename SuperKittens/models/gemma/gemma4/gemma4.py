@@ -360,14 +360,14 @@ class Gemma4(Model):
             except Exception:
                 ids = None
             if ids is None:
-                # Fallback: minimal in-repo gemma chat template.
+                # Fallback: minimal in-repo gemma4 chat template (<|turn>/<turn|>).
                 role_map = {"user": "user", "assistant": "model",
-                            "model": "model", "system": "user"}
+                            "model": "model", "system": "system"}
                 parts = []
                 for m in messages:
                     role = role_map.get(m.get("role", "user").lower(), "user")
-                    parts.append(f"<start_of_turn>{role}\n{m.get('content','')}<end_of_turn>\n")
-                parts.append("<start_of_turn>model\n")
+                    parts.append(f"<|turn>{role}\n{m.get('content','')}<turn|>\n")
+                parts.append("<|turn>model\n")
                 wrapped = "".join(parts)
                 ids = self.tokenizer.encode(wrapped, bos=True)
         else:
@@ -506,7 +506,7 @@ class Gemma4(Model):
                 print(f"[gemma4] sentencepiece attach failed: {e}")
         if m.tokenizer is None and json_path.exists():
             try:
-                m.tokenizer = Tokenizer.from_hf_json(str(json_path), family="gemma")
+                m.tokenizer = Tokenizer.from_hf_json(str(json_path), family="gemma4")
             except Exception as e:
                 print(f"[gemma4] hf-json attach failed: {e}")
         return m

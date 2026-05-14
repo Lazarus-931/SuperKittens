@@ -39,6 +39,18 @@ def gemma_template(messages: Sequence[dict], add_generation_prompt: bool = True)
     return "".join(parts)
 
 
+def gemma4_template(messages: Sequence[dict], add_generation_prompt: bool = True) -> str:
+    """Gemma 4 turn markers: <|turn>role\\n...<turn|>\\n then <|turn>model\\n."""
+    role_map = {"user": "user", "assistant": "model", "model": "model", "system": "system"}
+    parts = []
+    for m in messages:
+        role = role_map.get(m.get("role", "user").lower(), "user")
+        parts.append(f"<|turn>{role}\n{m.get('content','')}<turn|>\n")
+    if add_generation_prompt:
+        parts.append("<|turn>model\n")
+    return "".join(parts)
+
+
 CHAT_TEMPLATES = {
     "deepseek": deepseek_template,
     "ds4": deepseek_template,
@@ -46,5 +58,5 @@ CHAT_TEMPLATES = {
     "qwen3": qwen_template,
     "chatml": qwen_template,
     "gemma": gemma_template,
-    "gemma4": gemma_template,
+    "gemma4": gemma4_template,
 }

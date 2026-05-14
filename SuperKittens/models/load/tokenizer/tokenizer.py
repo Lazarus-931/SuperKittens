@@ -64,8 +64,8 @@ class Tokenizer:
 
         bos_id = eos_id = pad_id = unk_id = None
         specials = set()
-        eos_candidates = ("<|im_end|>", "<end_of_turn>", "<eos>", "<|endoftext|>")
-        bos_candidates = ("<|im_start|>", "<start_of_turn>", "<bos>", "<|startoftext|>", "<s>")
+        eos_candidates = ("<|im_end|>", "<end_of_turn>", "<turn|>", "<eos>", "<|endoftext|>")
+        bos_candidates = ("<|im_start|>", "<start_of_turn>", "<bos>", "<|turn>", "<|startoftext|>", "<s>")
         pad_candidates = ("<pad>", "<|pad|>", "<|endoftext|>")
         for name in eos_candidates:
             tid = hf.token_to_id(name)
