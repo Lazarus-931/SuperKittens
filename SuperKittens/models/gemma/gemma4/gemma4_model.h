@@ -13,6 +13,7 @@
 #include <Metal/Metal.hpp>
 #include <cstdint>
 #include <cmath>
+#include <cstdlib>
 
 namespace meow {
 namespace gemma4 {
@@ -217,7 +218,8 @@ inline void dispatch_layer(
         const uint32_t N_v = (p.n_heads + 2 * p.n_kv_heads) * p.head_dim;
         // T=1 decode fast path: bf16 M=1 GEMV. Threshold guard N<=32768 — at
         // larger N the in-tree tile-MMA wins (per lab REPORT.md).
-        if (M == 1 && N_v <= 32768u && P.gemv_bf16_m1 != nullptr) {
+        static bool _disable_m1 = (std::getenv("SK_DISABLE_GEMV_M1") != nullptr);
+        if (!_disable_m1 && M == 1 && N_v <= 32768u && P.gemv_bf16_m1 != nullptr) {
             auto* enc = E.get();
             enc->setComputePipelineState(P.gemv_bf16_m1);
             enc->setBuffer(B.x_norm,     0,       0);
@@ -269,7 +271,9 @@ inline void dispatch_layer(
     // normed (no γ) and written straight to v_tmp by the same kernel.
     // Skipped when dump_enabled (the dump blits between qkv_norm and rope
     // require the un-rotated q/k_normed to still be in q_norm/k_tmp).
+    static bool _disable_qkv_fused = (std::getenv("SK_DISABLE_QKV_FUSED_T1") != nullptr);
     const bool use_qkv_fused =
+        !_disable_qkv_fused &&
         (p.batch * p.seq == 1) &&
         p.is_global &&
         (P.qkv_norm_rope_partial_t1 != nullptr) &&
@@ -491,7 +495,8 @@ inline void dispatch_layer(
         const uint32_t M = p.batch * p.seq;
         const uint32_t K_v = p.n_heads * p.head_dim;
         const uint32_t N_v = p.d_model;
-        if (M == 1 && N_v <= 32768u && P.gemv_bf16_m1 != nullptr) {
+        static bool _disable_m1_o = (std::getenv("SK_DISABLE_GEMV_M1") != nullptr);
+        if (!_disable_m1_o && M == 1 && N_v <= 32768u && P.gemv_bf16_m1 != nullptr) {
             auto* enc = E.get();
             enc->setComputePipelineState(P.gemv_bf16_m1);
             enc->setBuffer(B.attn_out, 0,         0);
@@ -563,7 +568,9 @@ inline void dispatch_layer(
     // gemma4_gated_mlp_bf16 stays as the prefill (T>1) path.
     {
         const uint32_t T_mlp = p.batch * p.seq;
+        static bool _disable_mlp_fast = (std::getenv("SK_DISABLE_MLP_FAST_T1") != nullptr);
         const bool use_fast =
+            !_disable_mlp_fast &&
             (T_mlp == 1) &&
             (P.gemv_geglu_bf16_m1 != nullptr) &&
             (P.gemv_bf16_m1       != nullptr) &&
