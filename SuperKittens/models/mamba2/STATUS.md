@@ -1,5 +1,18 @@
 # Mamba 2 SK port — STATUS
 
+## KNOWN BROKEN
+
+`mamba2_ssd.metal` is numerically incorrect and is **not** used by the launcher.
+Missing: softplus(dt + dt_bias), `dt * B * x` input gating, `D * x` skip,
+n_groups sharing for B/C. Signature takes `(Q, K, V, A_log[B,H,L])` — does not
+match HF Mamba2 SSD.
+
+The launcher routes around it to `mamba2_ssd_ref.metal` / `mamba2_step_ref.metal`
+(per-token recurrence, signature-correct). The chunked `mamba2_ssd.metal` needs
+a full rewrite before it can replace the ref path.
+
+---
+
 Branch: `dev-mamba2`. Target model: **`AntonV/mamba2-130m-hf`** (`model_type: mamba2`, `Mamba2ForCausalLM`).
 
 ## Architecture confirmed (from `config.json`)

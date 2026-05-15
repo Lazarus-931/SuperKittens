@@ -1,91 +1,39 @@
-# Kernel Library
+# Kernel Index
 
-Each directory in `kernels/` is a self-contained GPU operation with:
-- `.metal` — Metal shader source
-- `.h` / `.c++` — host-side C++ dispatch
-- `baseline/*.py` — MLX reference implementation
-- Benchmarks live in `benchmark/` (not inside `kernels/`)
+Each kernel dir under `SuperKittens/kernels/` ships `.metal` source, `.h`/`.c++`
+host dispatch, and (where relevant) MLX baselines under `baseline/`.
 
-## activation
-| Kernel | Description | Host name |
-|---|---|---|
-| GELU | x * Φ(x) via tanh approximation | `gelu` |
-| SiLU | x / (1 + exp(-x)) | `silu` |
-| ReLU | max(0, x) | `relu` |
+Canonical perf numbers: `best.md` (repo root).
 
-128 threads, 4 SIMD groups, half4 vectorized. Zero barriers.
+## kernels/
 
-## attn
-| Kernel | Description | Host name |
-|---|---|---|
-| FA d=64 | Flash Attention, 1024 threads, simd_sum dot | `fa_causal_64`, `fa_noncausal_64` |
-| MHA d=128 | Row-per-SIMD online softmax, half4 fast path | `mha_causal`, `mha_noncausal` |
-| MHA generic | Scalar fallback, any head_dim | `mha_causal`, `mha_noncausal` |
-
-Auto-dispatch via `attn.h`: `head_dim == 64` → FA, else → MHA.
-
-## conv
-| Kernel | Description |
+| Dir | Contents |
 |---|---|
-| conv1d | Causal depthwise convolution |
-| conv1d_silu | Conv1d + SiLU fused |
-| conv2d | Im2col + simdgroup GEMM (tiled) |
-| conv3d | 3D convolution |
+| `activation` | GELU, SiLU, ReLU (half4, no barriers) |
+| `attn` | MHA d=64 / d=128 (prefill, Br=4 queries/TG) |
+| `flash_attn` | ds4-derived flash attn, dk/dv up to 512 (decode, MLA) |
+| `paged_attn` | Paged KV-cache attention |
+| `conv` | conv1d, conv1d_silu, conv2d, conv3d |
+| `fusion` | rms_rope, rms_residual, add_rmsnorm, gemm_bias_act, gemm_res_norm, gated_mlp (+ bf16/geglu variants), gemv_bf16_m1, gemv_swiglu_m1, kv_up_pair, silu_mul |
+| `gemm` | fp16 (`fp16/gemm.metal`), fp8 (`fp8/gemm.metal`, M5+) |
+| `moe` | router, router_v3, down_scatter, swiglu_pair (+ Q2K / IQ2XXS quantized) |
+| `ops` | add, cast, causal_mask, kv_cache, sample, split, transpose |
+| `rotary` | RoPE on Q/K (standalone path; usually fused via `fusion/rms_rope`) |
+| `swiglu` | fused_swiglu: `silu(gate) * up` |
+| `utils` | rmsnorm, layernorm, embedding |
 
-Kernel sizes hardcoded for 3×3 kernel, C_in=64, C_out=64.
+Auto-dispatch: `attn.h` routes `head_dim==64` → FA64, else MHA.
 
-## fusion
-Fused kernel compositions — two or more ops in one launch.
+## models/
 
-| Kernel | Fusion |
+Per-model orchestration (weights loader, launcher C ABI, Python ctypes wrapper,
+model-specific kernels):
+
+| Dir | Model family |
 |---|---|
-| `rms_residual` | RMSNorm(x + residual) |
-| `gemm_bias_act` | GEMM + bias + GELU/SiLU/ReLU |
-| `rms_rope` | RMSNorm(Q) + RMSNorm(K) + RoPE |
-| `gemm_res_norm` | GEMM + residual add + RMSNorm |
-| `gated_mlp` | SiLU(gate) * up → down (3 GEMMs fused) |
-
-## gemm
-| Variant | Path |
-|---|---|
-| fp16 | `fp16/gemm.metal` |
-| fp8 | `fp8/gemm.metal` (M5+) |
-
-Host dispatch in `gemm_host.h`, implementation helpers in `gemm_impl.h`.
-
-## mamba
-State space model kernels.
-
-### mamba2
-| Kernel | Description |
-|---|---|
-| mamba2_ssd | Selective scan, 128 threads, half4 vectorized |
-| conv1d_silu | Causal depthwise conv + SiLU |
-| gate_norm | Gating + RMSNorm |
-
-### mamba3
-| Kernel | Description |
-|---|---|
-| mamba3_ssm | Selective scan with trap discretization + rotary |
-| pre_ssm | Fused RMSNorm(Q/K/B) + RoPE |
-| post_ssm | SiLU gate: `silu(z) * ssm_out` |
-
-Block orchestration in `mamba3_block.h`.
-
-## rotary
-| Kernel | Description | Host name |
-|---|---|---|
-| RoPE | Rotary position embedding on Q and K | `rope_qk` |
-
-256 threads, half4 vectorized, in-place. cos/sin precomputed on host.
-
-## swiglu
-| Kernel | Description |
-|---|---|
-| fused_swiglu | SiLU-gated activation: `silu(x_gate) * x_up` |
-
-## utils
-| Kernel | Description |
-|---|---|
-| layernorm | LayerNorm: (x - μ) / σ * γ + β |
-| rmsnorm | RMSNorm: x * γ / rms(x) |
+| `qwen` | Qwen3 (0.6B canonical, ICB decode) |
+| `gemma` | Gemma 2/3/4 (incl. gemma4 SWA attn at d=256/512) |
+| `deepseek` | DeepSeek (MLA via flash_attn dk=dv=512) |
+| `mamba2` | Mamba2 SSD (see `mamba2/STATUS.md`) |
+| `mamba3` | Mamba3 SSM (pre_ssm RMSNorm+RoPE, mamba3_ssm, post_ssm gate) |
+| `load` | Shared HF safetensors loader |
