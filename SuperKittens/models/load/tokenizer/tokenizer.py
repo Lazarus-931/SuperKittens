@@ -40,6 +40,10 @@ class Tokenizer:
         "gemma":   {"bos": ("<bos>",),                   "eos": ("<end_of_turn>", "<eos>"),       "pad": ("<pad>",)},
         "llama":   {"bos": ("<s>", "<|begin_of_text|>"), "eos": ("</s>", "<|end_of_text|>", "<|eot_id|>"), "pad": ("<pad>",)},
         "mistral": {"bos": ("<s>",),                     "eos": ("</s>",),                        "pad": ("<pad>",)},
+        # DeepSeek V2/V3 use full-width tokens for BOS/EOS in the trained vocab.
+        "deepseek": {"bos": ("<｜begin▁of▁sentence｜>",),
+                     "eos": ("<｜end▁of▁sentence｜>",),
+                     "pad": ("<｜end▁of▁sentence｜>",)},
     }
     _DEFAULT_SPECIALS: ClassVar[dict] = {
         "bos": ("<|im_start|>", "<bos>", "<s>", "<|startoftext|>"),

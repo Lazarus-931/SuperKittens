@@ -268,6 +268,113 @@ class DeepSeek(Model):
             raise RuntimeError("No tokenizer attached. Call attach_tokenizer() first.")
         return self._tok.decode(list(ids))
 
+    # ── factory: build from a central-registry ModelSpec ─────────────
+    @classmethod
+    def from_spec(cls, spec, **overrides) -> "DeepSeek":
+        """Build a DeepSeek-V2-Lite model from a central-registry ModelSpec.
+
+        STATUS (2026-05-14): scaffolding only. The underlying C ABI takes
+        flat host-pointer arrays for every weight tensor in `_WEIGHT_FIELDS`.
+        Materialising V2-Lite (~31 GB bf16) as in-Python numpy buffers is
+        memory-feasible on derek (64 GB) but several SPEC items remain
+        broken before argmax-match is achievable; see
+        ``SuperKittens/models/deepseek/SPEC.md`` "wrong-form-needs-fix" and
+        "missing" tables. Current blockers for argmax-match:
+
+          - RoPE interleave wiring through ``dispatch_attn`` (already present
+            behind ``rope_interleave``; needs validation against HF's
+            ``apply_rotary_pos_emb_interleave``).
+          - LM head untied (``w_lm_head`` separate buffer; the C side already
+            falls back to ``w_embed`` if ``w_lm_head`` is null — V2-Lite
+            requires the dedicated path).
+          - ``first_k_dense_replace=1``: layer 0 must dispatch dense MLP
+            into the shared-expert slot; this branch exists in
+            ``dispatch_layer`` (see ``is_moe_layer`` gate) but the loader
+            still needs to pack the layer-0 dense MLP into the shared-expert
+            slot at d_model -> intermediate_size=10944 width (not
+            shared_n_int=2816). This is a config-layout mismatch.
+          - MoE router: sigmoid (no softmax) + ``e_score_correction_bias``
+            handling in ``moe_router_v3`` PSO. V2-Lite needs sigmoid-then-
+            top-k with no bias.
+
+        This factory raises ``NotImplementedError`` with a pointer to the
+        SPEC items above. A follow-up commit will wire the safetensors->
+        packed-numpy weight pipeline once the SPEC items above are landed
+        and verified end-to-end.
+        """
+        import json
+        from dataclasses import fields
+        sk_root = Path(__file__).resolve().parents[3]
+        snap = Path(overrides.pop("snapshot", None)
+                    or (sk_root / "SuperKittens" / "model_weights" / spec.weight_dir))
+
+        d = dict(spec.dims)
+        cfg_json = snap / "config.json"
+        if cfg_json.exists():
+            j = json.loads(cfg_json.read_text())
+            # Map HF V2 config keys into our Config dataclass.
+            d.update(
+                n_layers      = j.get("num_hidden_layers", d.get("n_layers")),
+                d_model       = j.get("hidden_size",       d.get("d_model")),
+                n_heads       = j.get("num_attention_heads", d.get("n_heads")),
+                qk_nope_dim   = j.get("qk_nope_head_dim",  d.get("qk_nope_dim")),
+                qk_rope_dim   = j.get("qk_rope_head_dim",  d.get("qk_rope_dim")),
+                v_head_dim    = j.get("v_head_dim",        d.get("v_head_dim")),
+                q_lora_rank   = (j.get("q_lora_rank") or 0),
+                kv_lora_rank  = j.get("kv_lora_rank",      d.get("kv_lora_rank")),
+                n_int         = j.get("moe_intermediate_size", d.get("n_int")),
+                shared_n_int  = (j.get("n_shared_experts", 0)
+                                 * j.get("moe_intermediate_size", 0)
+                                 or d.get("shared_n_int")),
+                n_expert      = j.get("n_routed_experts",  d.get("n_expert")),
+                top_k         = j.get("num_experts_per_tok", d.get("top_k")),
+                vocab_size    = j.get("vocab_size",        d.get("vocab_size")),
+                eps           = j.get("rms_norm_eps",      d.get("eps", 1e-6)),
+                first_k_dense_replace = j.get("first_k_dense_replace",
+                                              d.get("first_k_dense_replace", 1)),
+            )
+            # RoPE scaling.
+            rs = j.get("rope_scaling") or {}
+            if rs:
+                d["rope_scaling_factor"] = float(rs.get("factor", d.get("rope_scaling_factor", 1.0)))
+                d["mscale_all_dim"]      = float(rs.get("mscale_all_dim",
+                                                        d.get("mscale_all_dim", 1.0)))
+                d["rope_n_ctx_orig"]     = int(rs.get("original_max_position_embeddings",
+                                                      d.get("rope_n_ctx_orig", 4096)))
+            d["rope_freq_base"] = float(j.get("rope_theta", d.get("rope_freq_base", 10000.0)))
+            d["has_q_lora"]      = 1 if (j.get("q_lora_rank") or 0) > 0 else 0
+            d["norm_topk_prob"]  = int(bool(j.get("norm_topk_prob", False)))
+            d["routed_scaling_factor"] = float(j.get("routed_scaling_factor", 1.0))
+            d["router_has_bias"] = 0  # V2-Lite has no e_score_correction_bias
+            d["rope_interleave"] = 1  # V2/V3 both use interleaved RoPE
+            d["n_group"]         = int(j.get("n_group") or 0)
+            d["topk_group"]      = int(j.get("topk_group") or 0)
+
+        for k in ("seq_max", "cache_max"):
+            if k in overrides:
+                d[k] = overrides.pop(k)
+
+        allowed = {f.name for f in fields(Config)}
+        cfg = Config(**{k: v for k, v in d.items() if k in allowed and v is not None})
+        for k, v in overrides.items():
+            if hasattr(cfg, k):
+                setattr(cfg, k, v)
+
+        raise NotImplementedError(
+            "DeepSeek.from_spec: end-to-end V2-Lite inference is not yet wired.\n"
+            "Registry + Config + tokenizer family are in place; remaining blockers\n"
+            "live in SuperKittens/models/deepseek/SPEC.md (see the 'wrong-form-\n"
+            "needs-fix' and 'missing' tables). Specifically:\n"
+            "  - Dense MLP layer-0 packing into the shared-expert slot (the\n"
+            "    intermediate width for L=0 differs from shared_n_int).\n"
+            "  - Safetensors->packed-numpy loader is not implemented; the C\n"
+            "    `sk_deepseek_load_weights` ABI expects flat host arrays.\n"
+            "  - RoPE interleave kernel needs validation vs HF's\n"
+            "    apply_rotary_pos_emb_interleave.\n"
+            "  - MoE router sigmoid-then-top-k path needs validation.\n"
+            "Track progress in the SPEC porting-order checklist."
+        )
+
     def chat(self, text: str | list, *, max_new_tokens: int = 64) -> str:
         if self._tok is None:
             raise RuntimeError("attach_tokenizer() first")
