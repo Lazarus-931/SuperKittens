@@ -1,1 +1,40 @@
-# todo
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build libsk
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Select Xcode toolchain
+        run: |
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          xcrun -f metallib
+          xcodebuild -version
+
+      - name: Build libsk
+        run: |
+          chmod +x ./build.sh
+          ./build.sh
+
+      - name: Verify build artifacts
+        run: |
+          set -euo pipefail
+          test -f build/libsk.dylib    || { echo "missing build/libsk.dylib";    exit 1; }
+          test -f build/libsk.metallib || { echo "missing build/libsk.metallib"; exit 1; }
+          file build/libsk.dylib
+          file build/libsk.metallib
