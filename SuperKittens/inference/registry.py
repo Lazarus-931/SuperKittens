@@ -88,7 +88,7 @@ SPECS: dict[str, ModelSpec] = {
     ),
     "mamba2-130m": ModelSpec(
         family="mamba2",
-        adapter="SuperKittens.models.mamba2.mamba2:Mamba2Model",
+        adapter="SuperKittens.models.ssm.mamba2.mamba2:Mamba2Model",
         hf_repo="AntonV/mamba2-130m-hf",
         weight_dir="mamba2-130m-hf",
         default_quant=None,

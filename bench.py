@@ -20,7 +20,7 @@ def bench_sk(spec: str, prompt: str, n_tokens: int) -> tuple[float, str]:
     elif family == "qwen3":
         import SuperKittens.models.qwen.qwen
     elif family == "mamba2":
-        import SuperKittens.models.mamba2.mamba2
+        import SuperKittens.models.ssm.mamba2.mamba2
     m = sk.load(spec)
     if not getattr(m, "tokenizer", None):
         raise RuntimeError("no tokenizer attached; SK side cannot bench without tokens")

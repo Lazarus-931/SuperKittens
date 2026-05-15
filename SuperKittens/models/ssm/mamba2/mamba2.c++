@@ -1,5 +1,5 @@
 #include "mamba2.h"
-#include "../../kernels/runtime_bindings.h"
+#include "../../../kernels/runtime_bindings.h"
 
 int sk_mamba2_ssd_state(void* Q, void* K, void* V, void* A_log, void* y,
                         void* h_state_in, void* h_state_out,

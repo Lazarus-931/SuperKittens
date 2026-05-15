@@ -12,8 +12,8 @@
 
 #include "weights.h"
 #include "mamba2_model.h"
-#include "../../inference/weight_store.h"
-#include "../load/safetensor/safetensor.h"
+#include "../../../inference/weight_store.h"
+#include "../../load/safetensor/safetensor.h"
 
 #include <cstdio>
 #include <cstring>

@@ -1,5 +1,5 @@
 #include "mamba3.h"
-#include "../../kernels/runtime_bindings.h"
+#include "../../../kernels/runtime_bindings.h"
 
 int sk_mamba3_pre_ssm(void* xBC, void* dt, void* angle, void* norm_w,
                       void* Q_out, void* K_out, void* V_out,

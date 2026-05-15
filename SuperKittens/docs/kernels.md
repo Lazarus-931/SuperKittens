@@ -34,6 +34,6 @@ model-specific kernels):
 | `qwen` | Qwen3 (0.6B canonical, ICB decode) |
 | `gemma` | Gemma 2/3/4 (incl. gemma4 SWA attn at d=256/512) |
 | `deepseek` | DeepSeek (MLA via flash_attn dk=dv=512) |
-| `mamba2` | Mamba2 SSD (see `mamba2/STATUS.md`) |
-| `mamba3` | Mamba3 SSM (pre_ssm RMSNorm+RoPE, mamba3_ssm, post_ssm gate) |
+| `ssm/mamba2` | Mamba2 SSD (see `ssm/mamba2/STATUS.md`) |
+| `ssm/mamba3` | Mamba3 SSM (pre_ssm RMSNorm+RoPE, mamba3_ssm, post_ssm gate) |
 | `load` | Shared HF safetensors loader |

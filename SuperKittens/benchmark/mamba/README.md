@@ -1,7 +1,7 @@
 # Mamba Benchmarks
 
 Thin runners for Mamba kernel benches. Canonical Metal kernels live under
-`SuperKittens/models/mamba2/` and `SuperKittens/models/mamba3/`.
+`SuperKittens/models/ssm/mamba2/` and `SuperKittens/models/ssm/mamba3/`.
 
 ## mamba2/
 - `mamba2_smoke_test.cpp` — CPU-vs-GPU smoke bench for the Metal Mamba-2 forward kernel.

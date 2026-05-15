@@ -2,7 +2,7 @@
 
 Mirrors `SuperKittens/models/qwen/qwen.py`. Currently only handles weight load
 and metadata; `forward` is wired through the C ABI but raises NotImplementedError
-until the SSD kernel rewrite lands (see `models/mamba2/STATUS.md`).
+until the SSD kernel rewrite lands (see `models/ssm/mamba2/STATUS.md`).
 """
 
 from __future__ import annotations

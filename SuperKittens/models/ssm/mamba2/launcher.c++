@@ -6,7 +6,7 @@
 
 #include "launcher.h"
 #include "mamba2_model.h"
-#include "../../kernels/runtime_bindings.h"
+#include "../../../kernels/runtime_bindings.h"
 
 #include <cstring>
 #include <cstdlib>
