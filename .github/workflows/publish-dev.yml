@@ -51,6 +51,9 @@ jobs:
           file build/libsk.metallib
 
       - name: Build wheel
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '14.0'
+          _PYTHON_HOST_PLATFORM: macosx-14.0-arm64
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
