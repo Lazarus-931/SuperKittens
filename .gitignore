@@ -45,6 +45,9 @@ __pycache__/
 # Python env / packaging
 .venv/
 *.egg-info/
+dist/
+SuperKittens/_libs/libsk.dylib
+SuperKittens/_libs/libsk.metallib
 
 # Weights / activation dumps
 *.gguf

@@ -1,0 +1,106 @@
+name: Publish dev wheel
+
+# Every push to main republishes the floating `dev-latest` GitHub Release with a
+# fresh macOS arm64 wheel built off HEAD. Team installs via gh release download.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-dev-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publish-dev-wheel:
+    name: Build and publish dev wheel
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          # setuptools_scm needs full history to derive versions.
+          fetch-depth: 0
+
+      - name: Select Xcode toolchain
+        run: |
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          xcrun -f metallib
+          xcodebuild -version
+          clang --version
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build libsk
+        run: |
+          chmod +x ./build.sh
+          ./build.sh
+
+      - name: Verify build artifacts
+        run: |
+          set -euo pipefail
+          test -f build/libsk.dylib    || { echo "missing build/libsk.dylib"; exit 1; }
+          test -f build/libsk.metallib || { echo "missing build/libsk.metallib"; exit 1; }
+          file build/libsk.dylib
+          file build/libsk.metallib
+
+      - name: Build wheel
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install build
+          python -m build --wheel
+          ls -lh dist/
+
+      - name: Validate wheel installs and loads dylib
+        run: |
+          set -euo pipefail
+          python -m venv /tmp/sk-validate
+          source /tmp/sk-validate/bin/activate
+          pip install --upgrade pip
+          pip install numpy
+          pip install dist/*.whl
+          # Run from /tmp so we don't import the source tree by accident.
+          cd /tmp
+          python -c "
+          import os, ctypes
+          import SuperKittens
+          print('version:', SuperKittens.__version__)
+          dy = os.environ['SK_DYLIB']
+          ml = os.environ['SK_METALLIB']
+          assert os.path.exists(dy), dy
+          assert os.path.exists(ml), ml
+          ctypes.CDLL(dy)
+          print('wheel validates ok')
+          "
+
+      - name: Move dev-latest tag to HEAD
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Recreate the floating tag locally and push; --force is intentional.
+          git tag -f dev-latest "$GITHUB_SHA"
+          git push origin -f "refs/tags/dev-latest"
+          # Delete prior release (tag is preserved by softprops/action-gh-release).
+          gh release delete dev-latest --yes --repo "$GITHUB_REPOSITORY" || true
+
+      - name: Publish dev-latest release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: dev-latest
+          name: SuperKittens dev-latest
+          prerelease: true
+          make_latest: false
+          fail_on_unmatched_files: true
+          body: |
+            Floating dev wheel built from `main` @ ${{ github.sha }}.
+            Install: `gh release download dev-latest -p '*.whl' -R Lazarus-931/SuperKittens && pip install superkittens-*.whl`
+          files: |
+            dist/*.whl

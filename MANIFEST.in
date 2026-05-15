@@ -1,0 +1,9 @@
+graft SuperKittens/_libs
+include SuperKittens/_libs/libsk.dylib
+include SuperKittens/_libs/libsk.metallib
+prune SuperKittens/temp
+prune SuperKittens/benchmark
+prune SuperKittens/tools
+prune SuperKittens/docs
+prune SuperKittens/include
+prune SuperKittens/kernels

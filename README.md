@@ -42,6 +42,22 @@ much faster kernels that are still performant.
 
 ## Quickstart
 
+### Install (team, private wheel)
+
+Wheels are published as GitHub Release assets on the private repo. Auth via `gh` (preferred) or a fine-grained `GH_TOKEN` with `repo:read` scope.
+
+```bash
+# preferred — uses your gh auth, no token plumbing
+gh release download dev-latest -p '*.whl' -R Lazarus-931/SuperKittens && pip install superkittens-*.whl
+
+# or with a token
+pip install "https://${GH_TOKEN}@github.com/Lazarus-931/SuperKittens/releases/download/dev-latest/superkittens-<version>-cp312-cp312-macosx_<ver>_arm64.whl"
+```
+
+Pinned versions live under tags (`v0.1.0`, ...) once cut; `dev-latest` floats on `main`.
+
+### Build from source
+
 ```bash
 git clone https://github.com/Lazarus-931/SuperKittens.git
 cd SuperKittens
