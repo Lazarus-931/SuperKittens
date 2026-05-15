@@ -1,14 +1,14 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=68", "setuptools_scm>=8", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "superkittens"
-version = "0.1.0"
 description = "Metal kernel library for transformer (and SSM) inference on Apple Silicon"
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
+dynamic = ["version"]
 dependencies = [
     "numpy>=1.26",
 ]
@@ -22,8 +22,43 @@ dev      = ["pytest>=8", "torch>=2.4"]
 Homepage = "https://github.com/Lazarus-931/SuperKittens"
 
 [tool.setuptools]
-packages = ["SuperKittens", "SuperKittens.inference", "SuperKittens.api", "SuperKittens.models", "SuperKittens.models.load", "SuperKittens.models.load.tokenizer"]
+# Native artifacts are declared in [tool.setuptools.package-data]; setuptools_scm
+# would otherwise sweep every git-tracked file into the wheel.
 include-package-data = false
 
+[tool.setuptools.packages.find]
+# Restricted to __init__-bearing dirs to keep temp/tools/benchmark out of the wheel.
+include = ["SuperKittens*"]
+exclude = [
+    "SuperKittens.benchmark*",
+    "SuperKittens.temp*",
+    "SuperKittens.tools*",
+    "SuperKittens.docs*",
+    "SuperKittens.include*",
+    "SuperKittens.kernels*",
+]
+namespaces = false
+
 [tool.setuptools.package-data]
-"SuperKittens" = ["**/*.metallib"]
+# Native artifacts are copied into SuperKittens/_libs/ by setup.py at build time.
+"SuperKittens._libs" = ["libsk.dylib", "libsk.metallib"]
+
+[tool.setuptools.exclude-package-data]
+# setuptools_scm's git file_finder otherwise sweeps every tracked file into the
+# wheel as package_data; explicitly drop noisy unused trees.
+"*" = [
+    "temp/*", "temp/**/*",
+    "tools/*", "tools/**/*",
+    "benchmark/*", "benchmark/**/*",
+    "docs/*", "docs/**/*",
+    "include/*", "include/**/*",
+    "kernels/*", "kernels/**/*",
+    "*.c++", "*.cpp", "*.h", "*.hpp", "*.metal", "*.air", "*.o",
+    "*.md", "*.sh", "*.gguf", "*.npz",
+]
+
+[tool.setuptools_scm]
+# dev wheels off main get versions like 0.1.0.dev123+gabcdef0
+version_scheme = "no-guess-dev"
+local_scheme = "node-and-date"
+fallback_version = "0.0.0+unknown"

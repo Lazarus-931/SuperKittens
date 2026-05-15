@@ -39,6 +39,11 @@ jobs:
           file build/libsk.dylib
           file build/libsk.metallib
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - name: Package tarball
         id: pkg
         run: |
@@ -50,6 +55,32 @@ jobs:
           cat "dist/${TARBALL}.sha256"
           echo "tarball=dist/${TARBALL}" >> "$GITHUB_OUTPUT"
           echo "sha256=dist/${TARBALL}.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Build Python wheel
+        id: wheel
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install build
+          python -m build --wheel
+          ls -lh dist/
+
+      - name: Validate wheel
+        run: |
+          set -euo pipefail
+          python -m venv /tmp/sk-validate
+          source /tmp/sk-validate/bin/activate
+          pip install --upgrade pip
+          pip install numpy
+          pip install dist/*.whl
+          cd /tmp
+          python -c "
+          import os, ctypes
+          import SuperKittens
+          print('version:', SuperKittens.__version__)
+          ctypes.CDLL(os.environ['SK_DYLIB'])
+          print('wheel validates ok')
+          "
 
       - name: Determine release channel
         id: channel
@@ -74,3 +105,4 @@ jobs:
           files: |
             ${{ steps.pkg.outputs.tarball }}
             ${{ steps.pkg.outputs.sha256 }}
+            dist/*.whl
