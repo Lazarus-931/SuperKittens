@@ -1,14 +1,19 @@
 # Mamba Benchmarks
 
-This directory collects Mamba benchmarking entrypoints in one place.
+Thin runners for Mamba kernel benches. Canonical Metal kernels live under
+`SuperKittens/models/mamba2/` and `SuperKittens/models/mamba3/`.
 
-Files:
-- `mamba2_smoke_test.cpp`: CPU-vs-GPU smoke benchmark for the Metal Mamba-2 forward kernel.
-- `mamba2_mlx.py`: MLX baseline sweep for Mamba-2.
-- `mamba3_smoke_test.cpp`: CPU-vs-GPU smoke benchmark for the Metal Mamba-3 SISO/MIMO forward kernels.
-- `mamba3_mlx.py`: MLX baseline sweep for Mamba-3 helpers.
-- `run_smoke_sweeps.py`: convenience runner for Mamba-3 SISO/MIMO smoke sweeps.
+## mamba2/
+- `mamba2_smoke_test.cpp` — CPU-vs-GPU smoke bench for the Metal Mamba-2 forward kernel.
+- `mamba2_parallel_bench.cpp` — parallel-scan SSD bench.
+- `mamba2_siso_bwd_smoke_test.cpp` — backward smoke bench.
+- `mamba2_mlx.py` — MLX baseline sweep.
 
-Notes:
-- The canonical Metal kernels still live under `SuperKittens/kernels/mamba/...`.
-- These benchmark entrypoints are thin runners so benchmarking is organized separately from kernel code.
+## mamba3/
+- `mamba3_smoke_test.cpp` — CPU-vs-GPU smoke bench for SISO/MIMO forward kernels.
+- `mamba3_siso_bwd_smoke_test.cpp` — backward smoke bench.
+- `mamba3_mlx.py` — MLX baseline sweep.
+- `mamba3_siso_bwd_mlx.py` — MLX backward baseline.
+
+## Top-level
+- `run_smoke_sweeps.py` — convenience runner for Mamba-3 SISO/MIMO smoke sweeps.
