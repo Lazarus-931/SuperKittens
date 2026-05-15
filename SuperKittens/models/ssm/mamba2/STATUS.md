@@ -103,7 +103,7 @@ Need (mirroring qwen/qwen_model.h, qwen/launcher.{h,c++}, qwen/weights.{h,c++}):
 ## Layout
 
 ```
-SuperKittens/models/mamba2/
+SuperKittens/models/ssm/mamba2/
 ├── conv1d_silu.metal      # usable
 ├── gate_norm.metal        # usable
 ├── mamba2_ssd.metal       # signature wrong (needs rewrite per HF L398-586)
@@ -125,7 +125,7 @@ SuperKittens/temp/mamba2_validate/
   `leliuga/mamba-2.8b-hf-GGUF` exist). Public llama.cpp Mamba 2 ecosystem for
   small/130m model is absent; baseline skipped, HF fp32 14.48 tok/s remains
   the sole reference.
-- Scaffolding written under `models/mamba2/`:
+- Scaffolding written under `models/ssm/mamba2/`:
     - `launcher.h` / `launcher.c++` — C ABI (`sk_mamba2_{create,forward,
       reset,dump_layer,destroy}`), allocates fused weights + per-layer
       `LayerState{conv_state, ssm_state}`. `forward()` is `ENOSYS` until SSD
