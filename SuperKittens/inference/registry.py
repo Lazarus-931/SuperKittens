@@ -98,18 +98,42 @@ SPECS: dict[str, ModelSpec] = {
                   chunk_size=256, vocab_size=50288, rms_eps=1e-5,
                   tie_word_embeddings=1),
     ),
-    # DeepSeek inference isn't wired end-to-end yet (no Python adapter exposing
-    # from_spec; ctypes launcher exists but no working factory). Once the
-    # adapter lands, uncomment and point .adapter at it.
-    #
-    # "deepseek-v2-lite": ModelSpec(
-    #     family="deepseek",
-    #     adapter="SuperKittens.models.deepseek.deepseek:DeepSeek",
-    #     hf_repo="deepseek-ai/DeepSeek-V2-Lite",
-    #     weight_dir="DeepSeek-V2-Lite",
-    #     tokenizer_family="deepseek",
-    #     dims=dict(...),
-    # ),
+    # DeepSeek-V2-Lite: 27 layers, 16 heads, 64 routed + 2 shared experts, top-6.
+    # No Q-LoRA (q_proj is direct dense), no group routing, first_k_dense_replace=1.
+    # See SuperKittens/models/deepseek/SPEC.md for the full architecture spec and
+    # the list of SPEC items still in flight (RoPE interleave, untied LM head,
+    # MoE router sigmoid/bias, etc.).
+    "deepseek-v2-lite": ModelSpec(
+        family="deepseek",
+        adapter="SuperKittens.models.deepseek.deepseek:DeepSeek",
+        hf_repo="deepseek-ai/DeepSeek-V2-Lite",
+        weight_dir="DeepSeek-V2-Lite",
+        default_quant=None,
+        tokenizer_family="deepseek",
+        dims=dict(
+            n_layers=27, d_model=2048, n_heads=16,
+            qk_nope_dim=128, qk_rope_dim=64, v_head_dim=128,
+            q_lora_rank=0,           # V2-Lite: no Q-LoRA
+            kv_lora_rank=512,
+            n_int=1408,              # moe_intermediate_size
+            shared_n_int=2816,       # n_shared_experts (2) * moe_intermediate_size (1408)
+            n_expert=64, top_k=6,
+            vocab_size=102400,
+            eps=1e-6,
+            rope_freq_base=10000.0,
+            rope_n_ctx_orig=4096,
+            rope_scaling_factor=40.0,
+            mscale_all_dim=0.0707,   # V2-Lite YaRN mscale_all_dim
+            has_q_lora=0,
+            router_has_bias=0,
+            rope_interleave=1,
+            norm_topk_prob=0,
+            n_group=0,
+            topk_group=0,
+            routed_scaling_factor=1.0,
+            first_k_dense_replace=1,
+        ),
+    ),
     "qwen3-8b": ModelSpec(
         family="qwen3",
         adapter="SuperKittens.models.qwen.qwen:Qwen",
