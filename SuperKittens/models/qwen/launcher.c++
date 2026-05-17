@@ -241,6 +241,13 @@ extern "C" sk_qwen_handle* sk_qwen_create(const sk_qwen_config* cfg) {
         }
     }
 
+    // WHY: ICB-blocker plumbing — one shared 32 B MTL::Buffer holding
+    // sk::TokenArgs, host-patched via memcpy per token (no encoder, ICB-safe).
+    // Per-token kernel migration to read from this slot is deferred to a
+    // follow-up to avoid breaking shared-kernel signatures used by deepseek
+    // and mamba; see SuperKittens/inference/icb/PHASE2_INVENTORY.md.
+    h->bufs.token_args = alloc_zero(dev, sizeof(sk::TokenArgs));
+
     return reinterpret_cast<sk_qwen_handle*>(h);
 }
 
@@ -425,6 +432,7 @@ extern "C" void sk_qwen_destroy(sk_qwen_handle* hp) {
     rel(h->bufs.q_th); rel(h->bufs.k_th); rel(h->bufs.v_th); rel(h->bufs.attn_out_seq);
     rel(h->bufs.argmax_val_buf); rel(h->bufs.argmax_idx_buf);
     rel(h->bufs.argmax_args);
+    rel(h->bufs.token_args);
     if (h->bufs.argmax_icb) { delete h->bufs.argmax_icb; h->bufs.argmax_icb = nullptr; }
     delete h;
 }

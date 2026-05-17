@@ -8,6 +8,7 @@
 
 #include "../../inference/weight_store.h"
 #include "../../inference/silicon/icb_recorder.h"
+#include "../../inference/icb/token_args.h"
 
 namespace meow {
 namespace qwen {
@@ -637,6 +638,14 @@ struct ModelBuffers {
     // sk_qwen_create() time (vocab_size and n_blocks are model-static).
     MTL::Buffer*                argmax_args = nullptr;
     sk::silicon::IcbRecorder*   argmax_icb  = nullptr;
+
+    // WHY: ICB cannot use setBytes; per-token scalars (current_pos, kv_idx_base,
+    // token_id, layer_idx) live in this shared 32-byte sk::TokenArgs buffer.
+    // Host patches via memcpy on .contents() once per token; kernels bind it as
+    // `constant TokenArgs& [[buffer(N)]]`. See inference/icb/token_args.h.
+    // Full-decode ICB recording of the layer stack is deferred (REQUIRES BENCH);
+    // see SuperKittens/inference/icb/PHASE2_INVENTORY.md.
+    MTL::Buffer*                token_args  = nullptr;
 };
 
 inline void dispatch_model(
