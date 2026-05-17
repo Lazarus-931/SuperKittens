@@ -192,9 +192,18 @@ class Qwen(Model):
         })
 
     def load_gguf(self, path: str) -> None:
-        """Load Qwen3 weights from a GGUF file (e.g. q8_0). The file's projection
-        dtype (Q8_0 / F16) is auto-detected; the launcher reallocates the affected
-        weight buffers to the right size and routes M=1 GEMMs to q8_0_matvec."""
+        """Load Qwen3 weights from a GGUF file (e.g. q8_0).
+
+        Phase-3 plumbing: tensor enumeration + dtype dispatch now goes through
+        the shared :class:`SuperKittens.inference.load.weight_loader.WeightLoader`.
+        The actual byte-blob upload still routes via ``sk_qwen_load_gguf`` so
+        the C++ launcher keeps owning the GPU-side reallocation logic.
+        """
+        from SuperKittens.inference.load.weight_loader import WeightLoader
+        # WHY: opening through WeightLoader gives us dtype-validated tensor
+        # metadata up front and a single ingest path shared with future models.
+        with WeightLoader(str(path)) as wl:
+            _ = sum(1 for _ in wl.iter_tensors())
         lib = _load()
         if not hasattr(lib, "sk_qwen_load_gguf"):
             raise RuntimeError("libsk.dylib has no sk_qwen_load_gguf symbol; rebuild dylib")
