@@ -8,8 +8,8 @@ constant constexpr uint N_SG        = 8;
 constant constexpr uint COLS_PER_TG = COLS_PER_SG * N_SG;   // 16
 constant constexpr uint TGSZ        = 32 * N_SG;            // 256
 constant constexpr uint MAX_TOPK    = 16;
-constant constexpr uint CHUNK_H     = 512;                  // halves per tile
-constant constexpr uint CHUNK_H4    = CHUNK_H / 4;          // 128
+constant constexpr uint CHUNK_H     = 128;                  // halves per tile (CHUNK_H4 == simdgroup width 32, zero-tail at n_int multiples of 128)
+constant constexpr uint CHUNK_H4    = CHUNK_H / 4;          // 32
 
 [[host_name("moe_down_scatter")]]
 [[kernel, max_total_threads_per_threadgroup(TGSZ)]]
@@ -34,7 +34,8 @@ void moe_down_scatter_v2(
     if (t >= T) return;
 
     const uint N_int_h4 = N_int / 4;
-    const uint n_tiles  = N_int_h4 / CHUNK_H4;
+    // Round up so a partial tail tile (n_int % CHUNK_H != 0) is not silently dropped.
+    const uint n_tiles  = (N_int_h4 + CHUNK_H4 - 1) / CHUNK_H4;
 
     // top_k * CHUNK_H4 half4 = top_k * 128 half4. At top_k=16 → 2048 half4 = 16KB.
     threadgroup half4 hidden_tg[MAX_TOPK * CHUNK_H4];
@@ -58,11 +59,15 @@ void moe_down_scatter_v2(
         const uint tile_h4_off = tile * CHUNK_H4;
 
         // Cooperative load: top_k * CHUNK_H4 half4s.
+        // Tail-tile lanes (tile_h4_off+off >= N_int_h4) zero-fill so they contribute 0 to the dot.
         const uint total = top_k * CHUNK_H4;
         for (uint i = tid; i < total; i += TGSZ) {
             const uint s   = i / CHUNK_H4;
             const uint off = i - s * CHUNK_H4;
-            hidden_tg[i] = hidden_v_base[s * N_int_h4 + tile_h4_off + off];
+            const uint h4_col = tile_h4_off + off;
+            hidden_tg[i] = (h4_col < N_int_h4)
+                ? hidden_v_base[s * N_int_h4 + h4_col]
+                : half4(0.h);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -81,11 +86,15 @@ void moe_down_scatter_v2(
                     W_down + ((uint)eid * D + d) * N_int) + tile_h4_off;
 
                 float dot = 0.f;
+                // Mask weight reads past N_int_h4 in the tail tile so we don't OOB-read W_down.
+                // (hidden_tg is already zero-filled past the tail above.)
                 for (uint n = lane; n < CHUNK_H4; n += 32) {
-                    half4 hv = h4[n];
-                    half4 wv = w4[n];
-                    float4 p = float4(hv) * float4(wv);
-                    dot += p.x + p.y + p.z + p.w;
+                    if (tile_h4_off + n < N_int_h4) {
+                        half4 hv = h4[n];
+                        half4 wv = w4[n];
+                        float4 p = float4(hv) * float4(wv);
+                        dot += p.x + p.y + p.z + p.w;
+                    }
                 }
                 dot = simd_sum(dot);
                 tile_dot += rw * dot;
