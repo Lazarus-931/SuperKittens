@@ -93,7 +93,25 @@ class Model:
                  temperature: float = 0.0, top_p: float = 1.0,
                  top_k: Optional[int] = None, eos_id: Optional[int] = None,
                  eos_ids: Optional[set] = None,
-                 seed: int = 0) -> list[int]:
+                 seed: int = 0,
+                 sampler: Optional[Any] = None) -> list[int]:
+        # `sampler` is a SuperKittens.inference.sampling.Sampler. When set, its
+        # policy overrides the temperature/top_p/seed kwargs so callers can pass
+        # one composable object instead of loose floats. None preserves the
+        # legacy greedy-by-default behavior — regression-free.
+        if sampler is not None:
+            mode = getattr(sampler, "mode", "greedy")
+            seed = int(getattr(sampler, "seed", seed) or seed)
+            if mode == "greedy":
+                temperature, top_p = 0.0, 1.0
+            elif mode == "top_p":
+                temperature = float(sampler.temp); top_p = float(sampler.p)
+            elif mode == "min_p":
+                # min-p has no direct numpy fallback; approximate with full
+                # multinomial at the given temperature so the API is honored.
+                temperature = float(sampler.temp); top_p = 1.0
+            elif mode == "multinomial":
+                temperature = float(sampler.temp); top_p = 1.0
         rng = np.random.default_rng(seed)
         ids = np.asarray(input_ids, dtype=np.int32).reshape(-1)
         # Resolve the full stop-set: explicit eos_ids wins, else fall back to
