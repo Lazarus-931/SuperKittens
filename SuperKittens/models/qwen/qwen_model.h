@@ -9,6 +9,7 @@
 #include "../../inference/weight_store.h"
 #include "../../inference/silicon/icb_recorder.h"
 #include "../../inference/icb/token_args.h"
+#include "../../inference/executor/executor.h"
 
 namespace meow {
 namespace qwen {
