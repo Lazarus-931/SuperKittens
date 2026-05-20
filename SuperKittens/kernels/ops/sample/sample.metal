@@ -220,4 +220,153 @@ void multinomial(
     }
 }
 
+// top_p_mask / min_p_mask host_names added for the Sampler pipeline: the C++
+// Sampler composes softmax_temp -> {top_p_mask|min_p_mask} -> multinomial, so
+// truncation runs on-GPU instead of a CPU roundtrip on the post-softmax probs.
+
+// ─── top-p (nucleus) truncation + renormalize ─────────────────────────
+// Zero every prob outside the smallest set whose mass ≥ p, then rescale to 1.
+// One TG/row. We avoid a full sort: a binary search over a threshold τ such
+// that Σ probs[probs ≥ τ] is just ≥ p. 32 iterations gives ~1e-9 resolution.
+
+[[host_name("top_p_mask")]]
+[[kernel, max_total_threads_per_threadgroup(1024)]]
+void top_p_mask(
+    device       half* probs    [[buffer(0)]],   // (rows, V) in/out, normalized
+    constant uint&  V           [[buffer(1)]],
+    constant float& p           [[buffer(2)]],
+    uint  row    [[threadgroup_position_in_grid]],
+    uint  tid    [[thread_index_in_threadgroup]],
+    uint  tcount [[threads_per_threadgroup]])
+{
+    const size_t row_off = (size_t)row * V;
+
+    // Row max (upper bound for threshold).
+    float local_max = 0.0f;
+    for (uint i = tid; i < V; i += tcount) {
+        float v = (float)probs[row_off + i];
+        if (v > local_max) local_max = v;
+    }
+    threadgroup float scratch[32];
+    const uint sg = tid / 32;
+    const uint ln = tid % 32;
+    float sg_max = simd_max(local_max);
+    if (ln == 0) scratch[sg] = sg_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        const uint n_sg = (tcount + 31) / 32;
+        float t = (ln < n_sg) ? scratch[ln] : 0.0f;
+        t = simd_max(t);
+        if (ln == 0) scratch[0] = t;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float hi = scratch[0];
+    float lo = 0.0f;
+
+    // Bisect threshold τ ∈ [0, hi] s.t. mass(probs ≥ τ) ≈ p (smallest such τ).
+    for (uint it = 0; it < 32; ++it) {
+        float mid = 0.5f * (lo + hi);
+        float local = 0.0f;
+        for (uint i = tid; i < V; i += tcount) {
+            float v = (float)probs[row_off + i];
+            if (v >= mid) local += v;
+        }
+        float sg_sum = simd_sum(local);
+        if (ln == 0) scratch[sg] = sg_sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float total = 0.0f;
+        if (sg == 0) {
+            const uint n_sg = (tcount + 31) / 32;
+            float t = (ln < n_sg) ? scratch[ln] : 0.0f;
+            t = simd_sum(t);
+            if (ln == 0) scratch[0] = t;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        total = scratch[0];
+        if (total >= p) lo = mid; else hi = mid;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float tau = lo;
+
+    // Zero below threshold, accumulate kept mass.
+    float keep_local = 0.0f;
+    for (uint i = tid; i < V; i += tcount) {
+        float v = (float)probs[row_off + i];
+        if (v < tau) { probs[row_off + i] = (half)0.0f; }
+        else         { keep_local += v; }
+    }
+    float sg_sum = simd_sum(keep_local);
+    if (ln == 0) scratch[sg] = sg_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        const uint n_sg = (tcount + 31) / 32;
+        float t = (ln < n_sg) ? scratch[ln] : 0.0f;
+        t = simd_sum(t);
+        if (ln == 0) scratch[0] = t;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv = 1.0f / max(scratch[0], 1e-30f);
+    for (uint i = tid; i < V; i += tcount) {
+        probs[row_off + i] = (half)((float)probs[row_off + i] * inv);
+    }
+}
+
+// ─── min-p truncation + renormalize ───────────────────────────────────
+// Keep probs ≥ p · max(probs); zero the rest; renormalize. One pass to find
+// max, one to mask+sum, one to scale. Cheaper than top-p (no bisection).
+
+[[host_name("min_p_mask")]]
+[[kernel, max_total_threads_per_threadgroup(1024)]]
+void min_p_mask(
+    device       half* probs    [[buffer(0)]],
+    constant uint&  V           [[buffer(1)]],
+    constant float& p           [[buffer(2)]],
+    uint  row    [[threadgroup_position_in_grid]],
+    uint  tid    [[thread_index_in_threadgroup]],
+    uint  tcount [[threads_per_threadgroup]])
+{
+    const size_t row_off = (size_t)row * V;
+
+    float local_max = 0.0f;
+    for (uint i = tid; i < V; i += tcount) {
+        float v = (float)probs[row_off + i];
+        if (v > local_max) local_max = v;
+    }
+    threadgroup float scratch[32];
+    const uint sg = tid / 32;
+    const uint ln = tid % 32;
+    float sg_max = simd_max(local_max);
+    if (ln == 0) scratch[sg] = sg_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        const uint n_sg = (tcount + 31) / 32;
+        float t = (ln < n_sg) ? scratch[ln] : 0.0f;
+        t = simd_max(t);
+        if (ln == 0) scratch[0] = t;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float tau = scratch[0] * p;
+
+    float keep_local = 0.0f;
+    for (uint i = tid; i < V; i += tcount) {
+        float v = (float)probs[row_off + i];
+        if (v < tau) { probs[row_off + i] = (half)0.0f; }
+        else         { keep_local += v; }
+    }
+    float sg_sum = simd_sum(keep_local);
+    if (ln == 0) scratch[sg] = sg_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        const uint n_sg = (tcount + 31) / 32;
+        float t = (ln < n_sg) ? scratch[ln] : 0.0f;
+        t = simd_sum(t);
+        if (ln == 0) scratch[0] = t;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv = 1.0f / max(scratch[0], 1e-30f);
+    for (uint i = tid; i < V; i += tcount) {
+        probs[row_off + i] = (half)((float)probs[row_off + i] * inv);
+    }
+}
+
 } // namespace meow::ops::sample

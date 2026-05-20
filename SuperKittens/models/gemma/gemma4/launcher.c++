@@ -328,6 +328,13 @@ extern "C" sk_gemma4_handle* sk_gemma4_create(const sk_gemma4_config* cfg) {
         h->bufs.argmax_idx_buf = alloc_zero(dev, (size_t)n_blocks * sizeof(int32_t));
     }
 
+    // WHY: ICB-blocker plumbing — one shared 32 B MTL::Buffer holding
+    // sk::TokenArgs, host-patched via memcpy per token. Kernels read it as
+    // `constant TokenArgs& [[buffer(N)]]` (slot bound at ICB record time by
+    // the per-model ICB launch path, deferred to a follow-up that forks
+    // shared-kernel signatures). See SuperKittens/inference/icb/token_args.h.
+    h->bufs.token_args = alloc_zero(dev, sizeof(sk::TokenArgs));
+
     return reinterpret_cast<sk_gemma4_handle*>(h);
 }
 
@@ -610,6 +617,7 @@ extern "C" void sk_gemma4_destroy(sk_gemma4_handle* hp) {
     rel(h->bufs.ple_gated); rel(h->bufs.ple_proj_back);
     rel(h->bufs.dump_stash);
     rel(h->bufs.argmax_val_buf); rel(h->bufs.argmax_idx_buf);
+    rel(h->bufs.token_args);
 
     delete h;
 }

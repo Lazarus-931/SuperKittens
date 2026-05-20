@@ -11,6 +11,8 @@ license = { text = "MIT" }
 dynamic = ["version"]
 dependencies = [
     "numpy>=1.26",
+    "gguf>=0.5",
+    "safetensors>=0.4",
 ]
 
 [project.optional-dependencies]
