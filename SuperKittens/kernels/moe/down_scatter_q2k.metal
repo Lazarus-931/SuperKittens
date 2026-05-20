@@ -40,8 +40,14 @@ void moe_down_scatter_q2k(
     const uint col_base = gid.x * COLS_PER_TG;
     if (t >= T) return;
 
-    const uint nb = N_int / QK_K;          // # Q2_K blocks per row
-    const ulong row_bytes = (ulong)nb * sizeof(block_q2_K);   // 84*nb
+    // n_int MUST be a multiple of QK_K (256) — Q2_K's atomic quant block size.
+    // If a future model exposes a non-multiple n_int, this int-divide silently
+    // truncates the tail (same class of bug as the fp16 down_scatter prior to
+    // its tile round-up fix). All current SK targets (DSv2-Lite n_int=1408,
+    // Qwen3-MoE-A3B n_int=768) divide cleanly. Keeping as a divide for now;
+    // if you add a model where N_int % 256 != 0 you must rework the tail.
+    const uint nb = N_int / QK_K;
+    const ulong row_bytes = (ulong)nb * sizeof(block_q2_K);
 
     // Cache exp_ids / route_w in tgmem.
     threadgroup int   exp_tg[MAX_TOPK];
