@@ -554,9 +554,24 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
     }
 
     // ── Inspect dtype of layer-0 projections to decide allocation sizes. ──
-    auto* v0_q = store.get("blk.0.attn_q.weight");
+    // WHY: Q4_K_M GGUFs mix Q4_K (q/k/o/gate/up) with Q6_K (v/down). The
+    // launcher's QKV slab requires one uniform dtype; we don't have a Q6_K
+    // matvec kernel. When we detect any Q6_K projection, force the slow path:
+    // dequant every projection to FP16 on host at load time. Pure Q4_K (no
+    // Q6_K) and pure Q8_0 still take the fast in-place matvec route.
+    auto* v0_q  = store.get("blk.0.attn_q.weight");
+    auto* v0_v  = store.get("blk.0.attn_v.weight");
+    auto* v0_dn = store.get("blk.0.ffn_down.weight");
     if (!v0_q) { std::fprintf(stderr, "gguf: missing blk.0.attn_q.weight\n"); return -20; }
-    const sk::Dtype dt_proj = v0_q->dtype;
+    sk::Dtype dt_proj = v0_q->dtype;
+    const bool mixed_q6k =
+        (v0_v  && v0_v->dtype  == sk::Dtype::Q6_K) ||
+        (v0_dn && v0_dn->dtype == sk::Dtype::Q6_K);
+    if (mixed_q6k) {
+        std::fprintf(stderr,
+            "gguf: mixed Q4_K/Q6_K projections — dequantizing all to FP16\n");
+        dt_proj = sk::Dtype::F16;
+    }
     if (dt_proj != sk::Dtype::Q8_0 && dt_proj != sk::Dtype::Q4_K &&
         dt_proj != sk::Dtype::F16  && dt_proj != sk::Dtype::BF16) {
         std::fprintf(stderr, "gguf: unsupported projection dtype %d\n", (int)dt_proj);
@@ -616,9 +631,25 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
     // Try to mmap a single-GGUF-tensor span into a per-layer MTL::Buffer.
     // Falls back to a fresh MTL::Buffer + memcpy on failure or when disabled.
     auto load_single_tensor = [&](const char* name, size_t expect_bytes,
-                                  MTL::Buffer** out_buf, size_t* out_off) -> bool {
+                                  MTL::Buffer** out_buf, size_t* out_off,
+                                  size_t n_elems) -> bool {
         auto* v = store.get(name);
         if (!v) { std::fprintf(stderr, "gguf: missing %s\n", name); return false; }
+        // Mixed-quant fallback path: dequant any non-F16 source into a fresh
+        // FP16 MTL::Buffer. Used when dt_proj was forced to F16 above.
+        if (dt_proj == sk::Dtype::F16 && v->dtype != sk::Dtype::F16) {
+            auto* b = dev->newBuffer(expect_bytes, MTL::ResourceStorageModeShared);
+            if (!b) return false;
+            if (!read_to_fp16((uint16_t*)b->contents(), v, n_elems)) {
+                std::fprintf(stderr, "gguf: dequant %s failed (dtype %d)\n",
+                             name, (int)v->dtype);
+                b->release();
+                return false;
+            }
+            *out_buf = b;
+            *out_off = 0;
+            return true;
+        }
         if (v->dtype != dt_proj) {
             std::fprintf(stderr, "gguf: dtype mismatch %s (got %d)\n", name, (int)v->dtype);
             return false;
@@ -671,6 +702,22 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
 
         auto* qv = store.get(qn); auto* kv = store.get(kn); auto* vv = store.get(vn);
         if (!qv || !kv || !vv) { std::fprintf(stderr, "gguf: qkv miss L=%u\n", L); return false; }
+        // Mixed-quant fallback: dequant Q/K/V each into the [Nq+Nkv+Nkv, dm]
+        // FP16 slab. dtype_bytes(F16, ...) was used above, so qb/kb/vb size the
+        // slab correctly in FP16.
+        if (dt_proj == sk::Dtype::F16 &&
+            (qv->dtype != sk::Dtype::F16 || kv->dtype != sk::Dtype::F16 ||
+             vv->dtype != sk::Dtype::F16)) {
+            auto* b = dev->newBuffer(total, MTL::ResourceStorageModeShared);
+            if (!b) return false;
+            uint16_t* dst = (uint16_t*)b->contents();
+            if (!read_to_fp16(dst,                 qv, Nq  * dm)) { b->release(); return false; }
+            if (!read_to_fp16(dst + Nq * dm,       kv, Nkv * dm)) { b->release(); return false; }
+            if (!read_to_fp16(dst + (Nq+Nkv) * dm, vv, Nkv * dm)) { b->release(); return false; }
+            h->weights.w_qkv[L]     = b;
+            h->weights.w_qkv_off[L] = 0;
+            return true;
+        }
         if (qv->nbytes != qb || kv->nbytes != kb || vv->nbytes != vb ||
             qv->dtype != dt_proj || kv->dtype != dt_proj || vv->dtype != dt_proj) {
             std::fprintf(stderr, "gguf: qkv shape/dtype mismatch L=%u\n", L);
@@ -731,16 +778,20 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
 
         std::snprintf(nbuf, sizeof(nbuf), "blk.%u.attn_output.weight", L);
         if (!load_single_tensor(nbuf, o_layer_bytes,
-                                &h->weights.w_o[L], &h->weights.w_o_off[L])) return -53;
+                                &h->weights.w_o[L], &h->weights.w_o_off[L],
+                                Nq * dm)) return -53;
         std::snprintf(nbuf, sizeof(nbuf), "blk.%u.ffn_gate.weight", L);
         if (!load_single_tensor(nbuf, ffn_layer_bytes,
-                                &h->weights.w_gate[L], &h->weights.w_gate_off[L])) return -54;
+                                &h->weights.w_gate[L], &h->weights.w_gate_off[L],
+                                dm * ni)) return -54;
         std::snprintf(nbuf, sizeof(nbuf), "blk.%u.ffn_up.weight", L);
         if (!load_single_tensor(nbuf, ffn_layer_bytes,
-                                &h->weights.w_up[L], &h->weights.w_up_off[L])) return -55;
+                                &h->weights.w_up[L], &h->weights.w_up_off[L],
+                                dm * ni)) return -55;
         std::snprintf(nbuf, sizeof(nbuf), "blk.%u.ffn_down.weight", L);
         if (!load_single_tensor(nbuf, down_layer_bytes,
-                                &h->weights.w_down[L], &h->weights.w_down_off[L])) return -56;
+                                &h->weights.w_down[L], &h->weights.w_down_off[L],
+                                ni * dm)) return -56;
     }
 
     return 0;
