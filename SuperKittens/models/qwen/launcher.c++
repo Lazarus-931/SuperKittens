@@ -59,6 +59,7 @@ static bool resolve_psos(ModelPSOs& P) {
     P.layer.gemv_swiglu_m1 = sk::bindings_pso("gemv_swiglu_fp16_m1");
     P.layer.gemv_t_m1      = sk::bindings_pso("gemv_t_fp16_m1");
     P.layer.q8_0_matvec    = sk::bindings_pso("q8_0_matvec");  // optional; nullptr OK
+    P.layer.q4k_matvec     = sk::bindings_pso("q4k_matvec");   // optional; nullptr OK
     P.layer.split_packed   = sk::bindings_pso("split_packed");
     P.layer.rope_qk        = sk::bindings_pso("qwen_rope_qk");
     P.layer.attn           = sk::bindings_pso("mha_causal");

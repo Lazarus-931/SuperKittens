@@ -48,6 +48,7 @@ struct LayerPSOs {
     MTL::ComputePipelineState* gemv_swiglu_m1;    // fused gate+up+silu_mul GEMV (M=1)
     MTL::ComputePipelineState* gemv_t_m1;         // M=1 matvec w/ transposed weight (LM-head)
     MTL::ComputePipelineState* q8_0_matvec;       // M=1 matvec with Q8_0 weight (decode)
+    MTL::ComputePipelineState* q4k_matvec = nullptr; // M=1 matvec with Q4_K weight (decode)
     MTL::ComputePipelineState* split_packed;      // (T, A+B) → (T, A) + (T, B)
     MTL::ComputePipelineState* rope_qk;           // split-half RoPE on Q, K
     MTL::ComputePipelineState* attn;              // mha_causal (d=128, GQA)
@@ -151,7 +152,8 @@ inline void encode_gemm_qaware(
     MTL::Buffer* A, size_t off_A,            // activation (T,K) fp16
     MTL::Buffer* W, size_t off_W,            // weight
     MTL::Buffer* C,                          // output (T,N) fp16
-    uint32_t M, uint32_t N, uint32_t K);
+    uint32_t M, uint32_t N, uint32_t K,
+    MTL::ComputePipelineState* pso_q4k = nullptr);
 
 inline void encode_gemm(
     MTL::CommandBuffer* cmd, MTL::ComputePipelineState* pso,
@@ -202,8 +204,25 @@ inline void encode_gemm_qaware(
     MTL::Buffer* A, size_t off_A,
     MTL::Buffer* W, size_t off_W,
     MTL::Buffer* C,
-    uint32_t M, uint32_t N, uint32_t K)
+    uint32_t M, uint32_t N, uint32_t K,
+    MTL::ComputePipelineState* pso_q4k)
 {
+    if (dt_w == sk::Dtype::Q4_K && pso_q4k != nullptr) {
+        // q4k_matvec: one TG per output row, 32 threads (1 simdgroup).
+        struct { uint32_t D, N; } args{ K, N };
+        for (uint32_t m = 0; m < M; ++m) {
+            const size_t off_A_row = off_A + (size_t)m * K * 2;
+            auto* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(pso_q4k);
+            enc->setBytes(&args, sizeof(args), 0);
+            enc->setBuffer(A, off_A_row,         1);
+            enc->setBuffer(W, off_W,             2);
+            enc->setBuffer(C, (size_t)m * N * 2, 3);
+            enc->dispatchThreadgroups(MTL::Size(N, 1, 1), MTL::Size(32, 1, 1));
+            enc->endEncoding();
+        }
+        return;
+    }
     if (dt_w == sk::Dtype::Q8_0 && pso_q8_0 != nullptr) {
 
         for (uint32_t m = 0; m < M; ++m) {
@@ -341,7 +360,7 @@ inline void dispatch_layer(
     // 2. QKV-pack GEMM: x_norm → qkv_packed (T × (qN + 2*kvN)).
     encode_gemm_qaware(cmd, P.gemm, P.gemv_m1, P.q8_0_matvec, B.dt_qkv,
                        B.x_norm, 0, B.w_qkv, off_w_qkv,
-                       B.qkv_packed, T, qkv_N, p.d_model);
+                       B.qkv_packed, T, qkv_N, p.d_model, P.q4k_matvec);
 
     // 3a. Split qkv_packed → q (T, qN) + kv_pack (T, 2*kvN).
     encode_split(cmd, P.split_packed, B.qkv_packed, B.q, B.kv_pack,
@@ -435,7 +454,7 @@ inline void dispatch_layer(
     // 8. O-projection GEMM: attn_out_seq → o_proj.
     encode_gemm_qaware(cmd, P.gemm, P.gemv_m1, P.q8_0_matvec, B.dt_o,
                        attn_o_in, 0, B.w_o, off_w_o, B.o_proj,
-                       T, p.d_model, p.n_heads * hd);
+                       T, p.d_model, p.n_heads * hd, P.q4k_matvec);
 
     // 9. Fused residual + pre-MLP RMSNorm.
     {
@@ -454,7 +473,8 @@ inline void dispatch_layer(
     }
 
     const bool mlp_is_q8 = (B.dt_gate == sk::Dtype::Q8_0 || B.dt_up == sk::Dtype::Q8_0);
-    if (T == 1 && P.gemv_swiglu_m1 != nullptr && !mlp_is_q8) {
+    const bool mlp_is_q4k = (B.dt_gate == sk::Dtype::Q4_K || B.dt_up == sk::Dtype::Q4_K);
+    if (T == 1 && P.gemv_swiglu_m1 != nullptr && !mlp_is_q8 && !mlp_is_q4k) {
         // Fused gate+up+silu_mul matvec (one dispatch, one m_in read).
         auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(P.gemv_swiglu_m1);
@@ -472,10 +492,10 @@ inline void dispatch_layer(
     } else {
         encode_gemm_qaware(cmd, P.gemm, P.gemv_m1, P.q8_0_matvec, B.dt_gate,
                            B.m_in, 0, B.w_gate, off_w_gate,
-                           B.gate_buf, T, p.n_int, p.d_model);
+                           B.gate_buf, T, p.n_int, p.d_model, P.q4k_matvec);
         encode_gemm_qaware(cmd, P.gemm, P.gemv_m1, P.q8_0_matvec, B.dt_up,
                            B.m_in, 0, B.w_up, off_w_up,
-                           B.up_buf, T, p.n_int, p.d_model);
+                           B.up_buf, T, p.n_int, p.d_model, P.q4k_matvec);
         auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(P.silu_mul);
         enc->setBuffer(B.gate_buf, 0, 0);
@@ -489,7 +509,7 @@ inline void dispatch_layer(
     }
     encode_gemm_qaware(cmd, P.gemm, P.gemv_m1, P.q8_0_matvec, B.dt_down,
                        B.up_buf, 0, B.w_down, off_w_down,
-                       B.mlp_out, T, p.d_model, p.n_int);
+                       B.mlp_out, T, p.d_model, p.n_int, P.q4k_matvec);
 
     // 11. Final residual: y_out = y_attn + mlp_out.
     {
@@ -787,6 +807,20 @@ inline void dispatch_model(
                 enc->setBytes(&K_v, 4, 3);
                 enc->setBytes(&N_v, 4, 4);
                 enc->dispatchThreadgroups(MTL::Size((N_v + 1) / 2, 1, 1), MTL::Size(128, 1, 1));
+                enc->endEncoding();
+            }
+        } else
+        if (W.dt_lm_head == sk::Dtype::Q4_K && W.w_lm_head &&
+            P.layer.q4k_matvec != nullptr) {
+            struct { uint32_t D, N; } args{ K_v, N_v };
+            for (uint32_t m = 0; m < M_v; ++m) {
+                auto* enc = cmd->computeCommandEncoder();
+                enc->setComputePipelineState(P.layer.q4k_matvec);
+                enc->setBytes(&args, sizeof(args),                  0);
+                enc->setBuffer(nxt,         (size_t)m * K_v * 2,    1);
+                enc->setBuffer(W.w_lm_head, W.off_w_lm_head,        2);
+                enc->setBuffer(B.logits,    (size_t)m * N_v * 2,    3);
+                enc->dispatchThreadgroups(MTL::Size(N_v, 1, 1), MTL::Size(32, 1, 1));
                 enc->endEncoding();
             }
         } else

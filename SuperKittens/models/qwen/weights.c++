@@ -302,6 +302,106 @@ void dequant_q8_0_to_fp16(uint16_t* dst, const uint8_t* src, size_t n_elems) {
     }
 }
 
+// fp16-bits → float helper for host dequant scales.
+inline float fp16_bits_to_f32(uint16_t s) {
+    uint32_t sign = (uint32_t)(s & 0x8000u) << 16;
+    uint32_t exp  = (s >> 10) & 0x1fu;
+    uint32_t mant = s & 0x3ffu;
+    float out;
+    uint32_t v;
+    if (exp == 0) {
+        if (mant == 0) { v = sign; }
+        else {
+            exp = 1;
+            while ((mant & 0x400u) == 0) { mant <<= 1; exp -= 1; }
+            mant &= 0x3ffu;
+            v = sign | ((exp + 112) << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        v = sign | 0x7f800000u | (mant << 13);
+    } else {
+        v = sign | ((exp + 112) << 23) | (mant << 13);
+    }
+    std::memcpy(&out, &v, 4);
+    return out;
+}
+
+// Q4_K: super-block of 256 weights, 144 B.
+//   layout: half d; half dmin; uint8_t scales[12]; uint8_t qs[128];
+//   12-byte scales pack (sc6, m6) for 8 sub-blocks of 32 weights each via the
+//   kmask{1,2,3} bit-tangle (same as llama.cpp's get_scale_min_k4).
+struct host_q4_K_block { uint16_t d; uint16_t dmin; uint8_t scales[12]; uint8_t qs[128]; };
+
+inline void q4k_get_scale_min(int j, const uint8_t* q, uint8_t& sc, uint8_t& m) {
+    if (j < 4) {
+        sc = q[j] & 63;            m = q[j + 4] & 63;
+    } else {
+        sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        m  = (q[j + 4] >>  4) | ((q[j    ] >> 6) << 4);
+    }
+}
+
+void dequant_q4_K_to_fp16(uint16_t* dst, const uint8_t* src, size_t n_elems) {
+    const size_t nb = n_elems / 256;
+    for (size_t b = 0; b < nb; ++b) {
+        const auto* p = reinterpret_cast<const host_q4_K_block*>(src + b * 144);
+        const float d    = fp16_bits_to_f32(p->d);
+        const float dmin = fp16_bits_to_f32(p->dmin);
+        const uint8_t* qs = p->qs;
+        for (int j = 0; j < 8; ++j) {
+            uint8_t sc, mn;
+            q4k_get_scale_min(j, p->scales, sc, mn);
+            const float sd = d * sc;
+            const float sm = dmin * mn;
+            const uint8_t* q = qs + 32 * (j / 2);
+            const int shift = (j & 1) ? 4 : 0;
+            for (int i = 0; i < 32; ++i) {
+                float f = sd * (float)((q[i] >> shift) & 0xF) - sm;
+                uint32_t fb; std::memcpy(&fb, &f, 4);
+                dst[b * 256 + j * 32 + i] = fp32_bits_to_fp16(fb);
+            }
+        }
+    }
+}
+
+// Q6_K: super-block of 256 weights, 210 B.
+//   layout: uint8_t ql[128]; uint8_t qh[64]; int8_t scales[16]; half d;
+//   16 sub-blocks of 16 weights. Per weight q = (ql4 | qh2<<4) - 32 (signed 6-bit).
+struct host_q6_K_block { uint8_t ql[128]; uint8_t qh[64]; int8_t scales[16]; uint16_t d; };
+
+void dequant_q6_K_to_fp16(uint16_t* dst, const uint8_t* src, size_t n_elems) {
+    const size_t nb = n_elems / 256;
+    for (size_t b = 0; b < nb; ++b) {
+        const auto* p = reinterpret_cast<const host_q6_K_block*>(src + b * 210);
+        const float d = fp16_bits_to_f32(p->d);
+        // llama.cpp's dequantize_row_q6_K: two halves of 128 weights, each
+        // half has 4 groups × 32, 4 subgroups; we use the explicit per-weight
+        // form for clarity since this only runs once at load.
+        for (int n = 0; n < 2; ++n) {
+            const uint8_t* ql = p->ql + 64 * n;
+            const uint8_t* qh = p->qh + 32 * n;
+            const int8_t*  sc = p->scales + 8 * n;
+            for (int l = 0; l < 32; ++l) {
+                int is = l / 16;
+                int8_t q1 = (int8_t)(((ql[l +  0] & 0xF) | (((qh[l] >> 0) & 3) << 4))) - 32;
+                int8_t q2 = (int8_t)(((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4))) - 32;
+                int8_t q3 = (int8_t)(((ql[l +  0] >> 4)  | (((qh[l] >> 4) & 3) << 4))) - 32;
+                int8_t q4 = (int8_t)(((ql[l + 32] >> 4)  | (((qh[l] >> 6) & 3) << 4))) - 32;
+                float f1 = d * sc[is + 0] * q1;
+                float f2 = d * sc[is + 2] * q2;
+                float f3 = d * sc[is + 4] * q3;
+                float f4 = d * sc[is + 6] * q4;
+                size_t base = b * 256 + n * 128;
+                uint32_t fb;
+                std::memcpy(&fb, &f1, 4); dst[base + l +  0] = fp32_bits_to_fp16(fb);
+                std::memcpy(&fb, &f2, 4); dst[base + l + 32] = fp32_bits_to_fp16(fb);
+                std::memcpy(&fb, &f3, 4); dst[base + l + 64] = fp32_bits_to_fp16(fb);
+                std::memcpy(&fb, &f4, 4); dst[base + l + 96] = fp32_bits_to_fp16(fb);
+            }
+        }
+    }
+}
+
 // F32 → FP16.
 void f32_to_fp16(uint16_t* dst, const float* src, size_t n) {
     for (size_t i = 0; i < n; ++i) {
@@ -332,6 +432,14 @@ bool read_to_fp16(uint16_t* out, const sk::TensorView* v, size_t n_elems) {
     }
     if (v->dtype == sk::Dtype::Q8_0) {
         dequant_q8_0_to_fp16(out, (const uint8_t*)v->data, n_elems);
+        return true;
+    }
+    if (v->dtype == sk::Dtype::Q4_K) {
+        dequant_q4_K_to_fp16(out, (const uint8_t*)v->data, n_elems);
+        return true;
+    }
+    if (v->dtype == sk::Dtype::Q6_K) {
+        dequant_q6_K_to_fp16(out, (const uint8_t*)v->data, n_elems);
         return true;
     }
     return false;
@@ -388,8 +496,9 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
         const char* tname = c.tie_word_embeddings ? "token_embd.weight" : "output.weight";
         auto* v = store.get(tname);
         if (!v) { std::fprintf(stderr, "gguf: missing %s\n", tname); return -14; }
-        if (v->dtype == sk::Dtype::Q8_0) {
-            const size_t bytes = sk::dtype_bytes(sk::Dtype::Q8_0, (size_t)c.vocab_size * dm);
+        if (v->dtype == sk::Dtype::Q8_0 || v->dtype == sk::Dtype::Q4_K) {
+            const sk::Dtype dt_h = v->dtype;
+            const size_t bytes = sk::dtype_bytes(dt_h, (size_t)c.vocab_size * dm);
             if (v->nbytes != bytes) {
                 std::fprintf(stderr, "gguf: %s size %zu != expected %zu\n",
                              tname, v->nbytes, bytes);
@@ -437,7 +546,7 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
                 h->weights.w_lm_head     = lmh_map->buffer();
                 h->weights.off_w_lm_head = inner_off;
             }
-            h->weights.dt_lm_head = sk::Dtype::Q8_0;
+            h->weights.dt_lm_head = dt_h;
         } else if (!c.tie_word_embeddings && h->weights.w_lm_head) {
             if (!read_to_fp16((uint16_t*)h->weights.w_lm_head->contents(), v,
                               (size_t)c.vocab_size * dm)) return -15;
@@ -448,7 +557,8 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
     auto* v0_q = store.get("blk.0.attn_q.weight");
     if (!v0_q) { std::fprintf(stderr, "gguf: missing blk.0.attn_q.weight\n"); return -20; }
     const sk::Dtype dt_proj = v0_q->dtype;
-    if (dt_proj != sk::Dtype::Q8_0 && dt_proj != sk::Dtype::F16 && dt_proj != sk::Dtype::BF16) {
+    if (dt_proj != sk::Dtype::Q8_0 && dt_proj != sk::Dtype::Q4_K &&
+        dt_proj != sk::Dtype::F16  && dt_proj != sk::Dtype::BF16) {
         std::fprintf(stderr, "gguf: unsupported projection dtype %d\n", (int)dt_proj);
         return -21;
     }

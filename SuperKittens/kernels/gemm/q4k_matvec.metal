@@ -25,6 +25,7 @@ struct q4k_mv_args {
 //   ir = it % 4    (0..3)  selects which quartet of 8 floats within the 64-block
 // We iterate ib over [ix, nb, step=4]. Inside, load 16 activation entries
 // at positions y[ib*256 + 64*iq + 8*ir + {0..7, 32..39, 128..135, 160..167}].
+[[host_name("q4k_matvec")]]
 kernel void gemm_q4k_mv(
         constant q4k_mv_args & args [[buffer(0)]],
         device const half    * x    [[buffer(1)]],   // [D] fp16
