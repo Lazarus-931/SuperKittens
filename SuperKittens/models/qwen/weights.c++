@@ -402,6 +402,12 @@ void dequant_q6_K_to_fp16(uint16_t* dst, const uint8_t* src, size_t n_elems) {
     }
 }
 
+// Dequant `[N, K]` row-major source into `[K, N]` fp16. Used by the mixed
+// Q4_K/Q6_K fallback so the resulting fp16 weights match the layout that
+// `gemv_fp16_m1` / `gemm_fp16` expect (K-major).
+bool read_to_fp16_transposed(uint16_t* dst, const sk::TensorView* v,
+                             size_t N, size_t K);
+
 // F32 → FP16.
 void f32_to_fp16(uint16_t* dst, const float* src, size_t n) {
     for (size_t i = 0; i < n; ++i) {
@@ -443,6 +449,20 @@ bool read_to_fp16(uint16_t* out, const sk::TensorView* v, size_t n_elems) {
         return true;
     }
     return false;
+}
+
+bool read_to_fp16_transposed(uint16_t* dst, const sk::TensorView* v,
+                             size_t N, size_t K) {
+    if (!v) return false;
+    std::vector<uint16_t> tmp(N * K);
+    if (!read_to_fp16(tmp.data(), v, N * K)) return false;
+    for (size_t n = 0; n < N; ++n) {
+        const uint16_t* row = tmp.data() + n * K;
+        for (size_t k = 0; k < K; ++k) {
+            dst[k * N + n] = row[k];
+        }
+    }
+    return true;
 }
 
 }  // namespace
@@ -632,15 +652,16 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
     // Falls back to a fresh MTL::Buffer + memcpy on failure or when disabled.
     auto load_single_tensor = [&](const char* name, size_t expect_bytes,
                                   MTL::Buffer** out_buf, size_t* out_off,
-                                  size_t n_elems) -> bool {
+                                  size_t N_rows, size_t K_cols) -> bool {
         auto* v = store.get(name);
         if (!v) { std::fprintf(stderr, "gguf: missing %s\n", name); return false; }
         // Mixed-quant fallback path: dequant any non-F16 source into a fresh
-        // FP16 MTL::Buffer. Used when dt_proj was forced to F16 above.
+        // FP16 MTL::Buffer. GGUF stores weights as [N, K]; gemv_fp16_m1 and
+        // gemm_fp16 expect [K, N] — transpose during dequant.
         if (dt_proj == sk::Dtype::F16 && v->dtype != sk::Dtype::F16) {
             auto* b = dev->newBuffer(expect_bytes, MTL::ResourceStorageModeShared);
             if (!b) return false;
-            if (!read_to_fp16((uint16_t*)b->contents(), v, n_elems)) {
+            if (!read_to_fp16_transposed((uint16_t*)b->contents(), v, N_rows, K_cols)) {
                 std::fprintf(stderr, "gguf: dequant %s failed (dtype %d)\n",
                              name, (int)v->dtype);
                 b->release();
@@ -702,18 +723,28 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
 
         auto* qv = store.get(qn); auto* kv = store.get(kn); auto* vv = store.get(vn);
         if (!qv || !kv || !vv) { std::fprintf(stderr, "gguf: qkv miss L=%u\n", L); return false; }
-        // Mixed-quant fallback: dequant Q/K/V each into the [Nq+Nkv+Nkv, dm]
-        // FP16 slab. dtype_bytes(F16, ...) was used above, so qb/kb/vb size the
-        // slab correctly in FP16.
+        // Mixed-quant fallback: dequant Q/K/V into one FP16 slab of layout
+        // [K=dm, N=qN+2*kvN] row-major (K-major), as gemv_fp16_m1 / gemm_fp16
+        // require. Per-channel columns concat: [Q | K | V].
         if (dt_proj == sk::Dtype::F16 &&
             (qv->dtype != sk::Dtype::F16 || kv->dtype != sk::Dtype::F16 ||
              vv->dtype != sk::Dtype::F16)) {
             auto* b = dev->newBuffer(total, MTL::ResourceStorageModeShared);
             if (!b) return false;
             uint16_t* dst = (uint16_t*)b->contents();
-            if (!read_to_fp16(dst,                 qv, Nq  * dm)) { b->release(); return false; }
-            if (!read_to_fp16(dst + Nq * dm,       kv, Nkv * dm)) { b->release(); return false; }
-            if (!read_to_fp16(dst + (Nq+Nkv) * dm, vv, Nkv * dm)) { b->release(); return false; }
+            const size_t N_tot = Nq + 2 * Nkv;
+            std::vector<uint16_t> tmpQ(Nq  * dm);
+            std::vector<uint16_t> tmpK(Nkv * dm);
+            std::vector<uint16_t> tmpV(Nkv * dm);
+            if (!read_to_fp16(tmpQ.data(), qv, Nq  * dm)) { b->release(); return false; }
+            if (!read_to_fp16(tmpK.data(), kv, Nkv * dm)) { b->release(); return false; }
+            if (!read_to_fp16(tmpV.data(), vv, Nkv * dm)) { b->release(); return false; }
+            for (size_t k = 0; k < dm; ++k) {
+                uint16_t* drow = dst + k * N_tot;
+                for (size_t n = 0; n < Nq;  ++n) drow[n]               = tmpQ[n * dm + k];
+                for (size_t n = 0; n < Nkv; ++n) drow[Nq + n]          = tmpK[n * dm + k];
+                for (size_t n = 0; n < Nkv; ++n) drow[Nq + Nkv + n]    = tmpV[n * dm + k];
+            }
             h->weights.w_qkv[L]     = b;
             h->weights.w_qkv_off[L] = 0;
             return true;
@@ -779,19 +810,19 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
         std::snprintf(nbuf, sizeof(nbuf), "blk.%u.attn_output.weight", L);
         if (!load_single_tensor(nbuf, o_layer_bytes,
                                 &h->weights.w_o[L], &h->weights.w_o_off[L],
-                                Nq * dm)) return -53;
+                                dm, Nq)) return -53;
         std::snprintf(nbuf, sizeof(nbuf), "blk.%u.ffn_gate.weight", L);
         if (!load_single_tensor(nbuf, ffn_layer_bytes,
                                 &h->weights.w_gate[L], &h->weights.w_gate_off[L],
-                                dm * ni)) return -54;
+                                ni, dm)) return -54;
         std::snprintf(nbuf, sizeof(nbuf), "blk.%u.ffn_up.weight", L);
         if (!load_single_tensor(nbuf, ffn_layer_bytes,
                                 &h->weights.w_up[L], &h->weights.w_up_off[L],
-                                dm * ni)) return -55;
+                                ni, dm)) return -55;
         std::snprintf(nbuf, sizeof(nbuf), "blk.%u.ffn_down.weight", L);
         if (!load_single_tensor(nbuf, down_layer_bytes,
                                 &h->weights.w_down[L], &h->weights.w_down_off[L],
-                                ni * dm)) return -56;
+                                dm, ni)) return -56;
     }
 
     return 0;
