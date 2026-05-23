@@ -120,50 +120,58 @@ struct LayerBuffers {
     sk::Dtype dt_down = sk::Dtype::F16;
 };
 
+// WHY: All encoder helpers below take an externally-owned encoder so a single
+// computeCommandEncoder can be shared across an entire dispatch_layer. Each
+// helper inserts memoryBarrierWithScope(Buffers) before its dispatch to honor
+// the producer→consumer dep on the previous helper's output. Collapsing the
+// per-layer encoder count from ~10 to 1 removes the dominant Apple-Silicon
+// encoder-setup overhead at decode (T=1).
+
+inline void enc_barrier(MTL::ComputeCommandEncoder* enc) {
+    enc->memoryBarrier(MTL::BarrierScopeBuffers);
+}
+
 // Encode a Q8_0 matvec: B (fp16 [K]) × A (q8_0 [N,K] row-major) → C (fp16 [N]).
 inline void encode_q8_0_matvec(
-    MTL::CommandBuffer* cmd, MTL::ComputePipelineState* pso,
+    MTL::ComputeCommandEncoder* enc, MTL::ComputePipelineState* pso,
     MTL::Buffer* A, size_t off_A,
     MTL::Buffer* B, size_t off_B,
     MTL::Buffer* C,
     uint32_t N, uint32_t K)
 {
-    auto* enc = cmd->computeCommandEncoder();
+    enc_barrier(enc);
     enc->setComputePipelineState(pso);
-    enc->setBuffer(B, off_B, 0);  // activation (fp16 [K])
-    enc->setBuffer(A, off_A, 1);  // q8_0 weight [N,K]
+    enc->setBuffer(B, off_B, 0);
+    enc->setBuffer(A, off_A, 1);
     enc->setBuffer(C, 0,     2);
     enc->setBytes(&K, 4, 3);
     enc->setBytes(&N, 4, 4);
-    // Q8_NSG=4, Q8_NR0=2, 32 lanes per simdgroup → 128 threads/TG, 8 rows/TG.
-    const uint32_t rows_per_tg = 2;  // kernel writes NR0=2 rows per TG (all 4 SGs cooperate over K)
+    const uint32_t rows_per_tg = 2;
     enc->dispatchThreadgroups(MTL::Size((N + rows_per_tg - 1) / rows_per_tg, 1, 1),
                               MTL::Size(128, 1, 1));
-    enc->endEncoding();
 }
 
 
 inline void encode_gemm_qaware(
-    MTL::CommandBuffer* cmd, MTL::ComputePipelineState* pso_gemm,
+    MTL::ComputeCommandEncoder* enc, MTL::ComputePipelineState* pso_gemm,
     MTL::ComputePipelineState* pso_gemv_m1,
     MTL::ComputePipelineState* pso_q8_0,
     sk::Dtype                  dt_w,
-    MTL::Buffer* A, size_t off_A,            // activation (T,K) fp16
-    MTL::Buffer* W, size_t off_W,            // weight
-    MTL::Buffer* C,                          // output (T,N) fp16
+    MTL::Buffer* A, size_t off_A,
+    MTL::Buffer* W, size_t off_W,
+    MTL::Buffer* C,
     uint32_t M, uint32_t N, uint32_t K);
 
 inline void encode_gemm(
-    MTL::CommandBuffer* cmd, MTL::ComputePipelineState* pso,
+    MTL::ComputeCommandEncoder* enc, MTL::ComputePipelineState* pso,
     MTL::Buffer* A, size_t off_A,
     MTL::Buffer* B, size_t off_B,
     MTL::Buffer* C,
     uint32_t M, uint32_t N, uint32_t K,
     MTL::ComputePipelineState* pso_gemv_m1 = nullptr)
 {
-    // Decode hot path: M==1 → specialized matvec (2–6× tile GEMM at typical decode shapes).
+    enc_barrier(enc);
     if (M == 1 && pso_gemv_m1 != nullptr) {
-        auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(pso_gemv_m1);
         enc->setBuffer(A, off_A, 0);
         enc->setBuffer(B, off_B, 1);
@@ -173,10 +181,8 @@ inline void encode_gemm(
         const uint32_t BN = 128;
         enc->dispatchThreadgroups(MTL::Size((N + BN - 1) / BN, 1, 1),
                                   MTL::Size(BN, 1, 1));
-        enc->endEncoding();
         return;
     }
-    auto* enc = cmd->computeCommandEncoder();
     enc->setComputePipelineState(pso);
     uint32_t ldA = K, ldB = N, ldC = N;
     int transA = 0, transB = 0, has_bias = 0;
@@ -191,11 +197,10 @@ inline void encode_gemm(
     enc->setBuffer(C, 0, 12);
     enc->dispatchThreadgroups(MTL::Size((N + 63) / 64, (M + 63) / 64, 1),
                               MTL::Size(64, 1, 1));
-    enc->endEncoding();
 }
 
 inline void encode_gemm_qaware(
-    MTL::CommandBuffer* cmd, MTL::ComputePipelineState* pso_gemm,
+    MTL::ComputeCommandEncoder* enc, MTL::ComputePipelineState* pso_gemm,
     MTL::ComputePipelineState* pso_gemv_m1,
     MTL::ComputePipelineState* pso_q8_0,
     sk::Dtype                  dt_w,
@@ -205,36 +210,32 @@ inline void encode_gemm_qaware(
     uint32_t M, uint32_t N, uint32_t K)
 {
     if (dt_w == sk::Dtype::Q8_0 && pso_q8_0 != nullptr) {
-
         for (uint32_t m = 0; m < M; ++m) {
-            const size_t off_A_row = off_A + (size_t)m * K * 2;        // fp16 activation row
-
-            auto* enc = cmd->computeCommandEncoder();
+            const size_t off_A_row = off_A + (size_t)m * K * 2;
+            enc_barrier(enc);
             enc->setComputePipelineState(pso_q8_0);
             enc->setBuffer(W, off_W, 1);
             enc->setBuffer(A, off_A_row, 0);
             enc->setBuffer(C, (size_t)m * N * 2, 2);
             enc->setBytes(&K, 4, 3);
             enc->setBytes(&N, 4, 4);
-            const uint32_t rows_per_tg = 2;  // kernel writes NR0=2 rows per TG (all 4 SGs cooperate over K)
+            const uint32_t rows_per_tg = 2;
             enc->dispatchThreadgroups(MTL::Size((N + rows_per_tg - 1) / rows_per_tg, 1, 1),
                                       MTL::Size(128, 1, 1));
-            enc->endEncoding();
         }
         return;
     }
-    encode_gemm(cmd, pso_gemm, A, off_A, W, off_W, C, M, N, K, pso_gemv_m1);
+    encode_gemm(enc, pso_gemm, A, off_A, W, off_W, C, M, N, K, pso_gemv_m1);
 }
 
 inline void encode_rmsnorm(
-    MTL::CommandBuffer* cmd, MTL::ComputePipelineState* pso,
+    MTL::ComputeCommandEncoder* enc, MTL::ComputePipelineState* pso,
     MTL::Buffer* x, MTL::Buffer* gamma, size_t off_gamma,
     MTL::Buffer* out, uint32_t rows, uint32_t n, float eps,
     MTL::ComputePipelineState* pso_t1 = nullptr)
 {
-
+    enc_barrier(enc);
     const bool use_t1 = (pso_t1 != nullptr) && (rows == 1u);
-    auto* enc = cmd->computeCommandEncoder();
     enc->setComputePipelineState(use_t1 ? pso_t1 : pso);
     enc->setBuffer(x,     0,         0);
     enc->setBuffer(gamma, off_gamma, 1);
@@ -249,16 +250,14 @@ inline void encode_rmsnorm(
         enc->dispatchThreadgroups(MTL::Size(1, (rows + 3) / 4, 1),
                                   MTL::Size(128, 1, 1));
     }
-    enc->endEncoding();
 }
 
-// split_packed: (T, A+B) fp16 → (T, A) + (T, B). One thread per (t, c).
 inline void encode_split(
-    MTL::CommandBuffer* cmd, MTL::ComputePipelineState* pso,
+    MTL::ComputeCommandEncoder* enc, MTL::ComputePipelineState* pso,
     MTL::Buffer* src, MTL::Buffer* outA, MTL::Buffer* outB,
     uint32_t T, uint32_t A, uint32_t B)
 {
-    auto* enc = cmd->computeCommandEncoder();
+    enc_barrier(enc);
     enc->setComputePipelineState(pso);
     enc->setBuffer(src,  0, 0);
     enc->setBuffer(outA, 0, 1);
@@ -267,15 +266,14 @@ inline void encode_split(
     enc->setBytes(&A, 4, 4);
     enc->setBytes(&B, 4, 5);
     enc->dispatchThreads(MTL::Size(A + B, T, 1), MTL::Size(128, 1, 1));
-    enc->endEncoding();
 }
 
 inline void encode_transpose(
-    MTL::CommandBuffer* cmd, MTL::ComputePipelineState* pso,
+    MTL::ComputeCommandEncoder* enc, MTL::ComputePipelineState* pso,
     MTL::Buffer* src, MTL::Buffer* dst,
     uint32_t T, uint32_t H, uint32_t D)
 {
-    auto* enc = cmd->computeCommandEncoder();
+    enc_barrier(enc);
     enc->setComputePipelineState(pso);
     enc->setBuffer(src, 0, 0);
     enc->setBuffer(dst, 0, 1);
@@ -283,17 +281,16 @@ inline void encode_transpose(
     enc->setBytes(&H, 4, 3);
     enc->setBytes(&D, 4, 4);
     enc->dispatchThreads(MTL::Size(D, T, H), MTL::Size(32, 1, 1));
-    enc->endEncoding();
 }
 
 inline void encode_rope_qk_inplace(
-    MTL::CommandBuffer* cmd, MTL::ComputePipelineState* pso,
+    MTL::ComputeCommandEncoder* enc, MTL::ComputePipelineState* pso,
     MTL::Buffer* x,
     MTL::Buffer* cos_tbl, size_t cos_off,
     MTL::Buffer* sin_tbl, size_t sin_off,
     uint32_t seq, uint32_t n_heads, uint32_t head_dim)
 {
-    auto* enc = cmd->computeCommandEncoder();
+    enc_barrier(enc);
     enc->setComputePipelineState(pso);
     enc->setBuffer(x,       0,       0);
     enc->setBuffer(x,       0,       1);
@@ -308,7 +305,6 @@ inline void encode_rope_qk_inplace(
     enc->dispatchThreadgroups(
         MTL::Size(n_heads, row_blocks, 1),
         MTL::Size(hd4, rows_per_tg, 1));
-    enc->endEncoding();
 }
 
 inline void dispatch_layer(
@@ -334,79 +330,81 @@ inline void dispatch_layer(
     const size_t off_w_up     = B.w_up_inner_off;
     const size_t off_w_down   = B.w_down_inner_off;
 
+    // WHY: One encoder for the entire layer (was ~10). Each helper inserts a
+    // buffer-scope memory barrier before its dispatch. Encoder-setup cost on
+    // Apple Silicon is ~0.1 ms per encoder; at 36 layers × 9 saved encoders
+    // that's ~32 ms/token of pure overhead removed.
+    auto* enc = cmd->computeCommandEncoder();
+
     // 1. Pre-attn RMSNorm.
-    encode_rmsnorm(cmd, P.rmsnorm, B.x, B.w_pre_attn_norm, off_norm,
+    encode_rmsnorm(enc, P.rmsnorm, B.x, B.w_pre_attn_norm, off_norm,
                    B.x_norm, T, p.d_model, p.eps, P.rmsnorm_t1);
 
-    // 2. QKV-pack GEMM: x_norm → qkv_packed (T × (qN + 2*kvN)).
-    encode_gemm_qaware(cmd, P.gemm, P.gemv_m1, P.q8_0_matvec, B.dt_qkv,
+    // 2. QKV-pack GEMM.
+    encode_gemm_qaware(enc, P.gemm, P.gemv_m1, P.q8_0_matvec, B.dt_qkv,
                        B.x_norm, 0, B.w_qkv, off_w_qkv,
                        B.qkv_packed, T, qkv_N, p.d_model);
 
-    // 3a. Split qkv_packed → q (T, qN) + kv_pack (T, 2*kvN).
-    encode_split(cmd, P.split_packed, B.qkv_packed, B.q, B.kv_pack,
+    // 3. Splits.
+    encode_split(enc, P.split_packed, B.qkv_packed, B.q, B.kv_pack,
                  T, qN, 2 * kvN);
-    // 3b. Split kv_pack → k_tmp (T, kvN) + v_tmp (T, kvN).
-    encode_split(cmd, P.split_packed, B.kv_pack, B.k_tmp, B.v_tmp,
+    encode_split(enc, P.split_packed, B.kv_pack, B.k_tmp, B.v_tmp,
                  T, kvN, kvN);
 
-    // 4. Per-head Q-norm and K-norm. Each row of length hd is one head's
-    //    vector. Q has T*n_heads such rows; K has T*n_kv_heads.
-    encode_rmsnorm(cmd, P.rmsnorm, B.q, B.w_q_norm, off_w_q_norm,
+    // 4. Per-head Q/K-norm.
+    encode_rmsnorm(enc, P.rmsnorm, B.q, B.w_q_norm, off_w_q_norm,
                    B.q, T * p.n_heads, hd, p.eps);
-    encode_rmsnorm(cmd, P.rmsnorm, B.k_tmp, B.w_k_norm, off_w_k_norm,
+    encode_rmsnorm(enc, P.rmsnorm, B.k_tmp, B.w_k_norm, off_w_k_norm,
                    B.k_tmp, T * p.n_kv_heads, hd, p.eps);
 
-    // 5. RoPE on Q and K (in-place, seq-major (T,H,D) layout).
+    // 5. RoPE on Q and K.
     {
         const size_t cs_off = (size_t)p.write_pos * (hd / 2) * 2;
-        encode_rope_qk_inplace(cmd, P.rope_qk, B.q,
+        encode_rope_qk_inplace(enc, P.rope_qk, B.q,
                                B.cos_tbl, cs_off, B.sin_tbl, cs_off,
                                p.seq, p.n_heads, hd);
-        encode_rope_qk_inplace(cmd, P.rope_qk, B.k_tmp,
+        encode_rope_qk_inplace(enc, P.rope_qk, B.k_tmp,
                                B.cos_tbl, cs_off, B.sin_tbl, cs_off,
                                p.seq, p.n_kv_heads, hd);
     }
-
 
     MTL::Buffer* q_in = B.q;
     MTL::Buffer* k_in = B.k_tmp;
     MTL::Buffer* v_in = B.v_tmp;
     if (p.seq > 1) {
-        encode_transpose(cmd, P.t_seq_to_head, B.q,     B.q_th, p.seq, p.n_heads,    hd);
-        encode_transpose(cmd, P.t_seq_to_head, B.k_tmp, B.k_th, p.seq, p.n_kv_heads, hd);
-        encode_transpose(cmd, P.t_seq_to_head, B.v_tmp, B.v_th, p.seq, p.n_kv_heads, hd);
+        encode_transpose(enc, P.t_seq_to_head, B.q,     B.q_th, p.seq, p.n_heads,    hd);
+        encode_transpose(enc, P.t_seq_to_head, B.k_tmp, B.k_th, p.seq, p.n_kv_heads, hd);
+        encode_transpose(enc, P.t_seq_to_head, B.v_tmp, B.v_th, p.seq, p.n_kv_heads, hd);
         q_in = B.q_th; k_in = B.k_th; v_in = B.v_th;
     }
 
-    // 6. KV cache write: k_th, v_th → k_cache, v_cache at write_pos.
+    // 6. KV cache write.
+    enc_barrier(enc);
+    enc->setComputePipelineState(P.kv_cache_write);
+    enc->setBuffer(k_in,     0, 0);
+    enc->setBuffer(v_in,     0, 1);
+    enc->setBuffer(B.k_cache, 0, 2);
+    enc->setBuffer(B.v_cache, 0, 3);
+    enc->setBytes(&p.batch,       4, 4);
+    enc->setBytes(&p.n_kv_heads,  4, 5);
+    enc->setBytes(&hd,            4, 6);
+    enc->setBytes(&p.seq,         4, 7);
+    enc->setBytes(&p.write_pos,   4, 8);
+    enc->setBytes(&p.cache_size,  4, 9);
     {
-        auto* enc = cmd->computeCommandEncoder();
-        enc->setComputePipelineState(P.kv_cache_write);
-        enc->setBuffer(k_in,     0, 0);
-        enc->setBuffer(v_in,     0, 1);
-        enc->setBuffer(B.k_cache, 0, 2);
-        enc->setBuffer(B.v_cache, 0, 3);
-        enc->setBytes(&p.batch,       4, 4);
-        enc->setBytes(&p.n_kv_heads,  4, 5);
-        enc->setBytes(&hd,            4, 6);
-        enc->setBytes(&p.seq,         4, 7);
-        enc->setBytes(&p.write_pos,   4, 8);
-        enc->setBytes(&p.cache_size,  4, 9);
         const uint32_t D4 = hd / 4;
         enc->dispatchThreads(MTL::Size(D4, p.seq, p.batch * p.n_kv_heads),
                              MTL::Size(32, 4, 1));
-        enc->endEncoding();
     }
 
-    //    Reads Q (post-RoPE, head-major) and the full K/V caches.
+    // 7. Attention.
+    enc_barrier(enc);
+    enc->setComputePipelineState(P.attn);
+    enc->setBuffer(q_in,       0, 0);
+    enc->setBuffer(B.k_cache,  0, 1);
+    enc->setBuffer(B.v_cache,  0, 2);
+    enc->setBuffer(B.attn_out, 0, 3);
     {
-        auto* enc = cmd->computeCommandEncoder();
-        enc->setComputePipelineState(P.attn);
-        enc->setBuffer(q_in,       0, 0);
-        enc->setBuffer(B.k_cache,  0, 1);
-        enc->setBuffer(B.v_cache,  0, 2);
-        enc->setBuffer(B.attn_out, 0, 3);
         const uint32_t kv_len = p.kv_len;
         const uint32_t cache_stride = p.cache_size;
         enc->setBytes(&p.seq,         4, 4);
@@ -414,49 +412,40 @@ inline void dispatch_layer(
         enc->setBytes(&p.n_kv_heads,  4, 6);
         enc->setBytes(&kv_len,        4, 7);
         enc->setBytes(&cache_stride,  4, 8);
-        // mha_causal dispatch: GQA-aware. Grid (n_kv_heads, ceil(seq/2), batch),
-        // TG Hg*2*32 where Hg = n_heads/n_kv_heads.
         const uint32_t Hg_attn = p.n_heads / p.n_kv_heads;
         enc->dispatchThreadgroups(
             MTL::Size(p.n_kv_heads, (p.seq + 1) / 2, p.batch),
             MTL::Size(Hg_attn * 2 * 32, 1, 1));
-        enc->endEncoding();
     }
 
-
-    // At T==1 layouts coincide → skip and feed attn_out directly.
     MTL::Buffer* attn_o_in = B.attn_out;
     if (p.seq > 1) {
-        encode_transpose(cmd, P.t_head_to_seq, B.attn_out, B.attn_out_seq,
+        encode_transpose(enc, P.t_head_to_seq, B.attn_out, B.attn_out_seq,
                          p.seq, p.n_heads, hd);
         attn_o_in = B.attn_out_seq;
     }
 
-    // 8. O-projection GEMM: attn_out_seq → o_proj.
-    encode_gemm_qaware(cmd, P.gemm, P.gemv_m1, P.q8_0_matvec, B.dt_o,
+    // 8. O-projection.
+    encode_gemm_qaware(enc, P.gemm, P.gemv_m1, P.q8_0_matvec, B.dt_o,
                        attn_o_in, 0, B.w_o, off_w_o, B.o_proj,
                        T, p.d_model, p.n_heads * hd);
 
     // 9. Fused residual + pre-MLP RMSNorm.
-    {
-        auto* enc = cmd->computeCommandEncoder();
-        enc->setComputePipelineState(P.add_rmsnorm);
-        enc->setBuffer(B.x,               0,        0);
-        enc->setBuffer(B.o_proj,          0,        1);
-        enc->setBuffer(B.w_pre_mlp_norm,  off_norm, 2);
-        enc->setBuffer(B.y_attn,          0,        3);
-        enc->setBuffer(B.m_in,            0,        4);
-        enc->setBytes(&T,         4, 5);
-        enc->setBytes(&p.d_model, 4, 6);
-        enc->setBytes(&p.eps,     4, 7);
-        enc->dispatchThreadgroups(MTL::Size(1, T, 1), MTL::Size(128, 1, 1));
-        enc->endEncoding();
-    }
+    enc_barrier(enc);
+    enc->setComputePipelineState(P.add_rmsnorm);
+    enc->setBuffer(B.x,               0,        0);
+    enc->setBuffer(B.o_proj,          0,        1);
+    enc->setBuffer(B.w_pre_mlp_norm,  off_norm, 2);
+    enc->setBuffer(B.y_attn,          0,        3);
+    enc->setBuffer(B.m_in,            0,        4);
+    enc->setBytes(&T,         4, 5);
+    enc->setBytes(&p.d_model, 4, 6);
+    enc->setBytes(&p.eps,     4, 7);
+    enc->dispatchThreadgroups(MTL::Size(1, T, 1), MTL::Size(128, 1, 1));
 
     const bool mlp_is_q8 = (B.dt_gate == sk::Dtype::Q8_0 || B.dt_up == sk::Dtype::Q8_0);
     if (T == 1 && P.gemv_swiglu_m1 != nullptr && !mlp_is_q8) {
-        // Fused gate+up+silu_mul matvec (one dispatch, one m_in read).
-        auto* enc = cmd->computeCommandEncoder();
+        enc_barrier(enc);
         enc->setComputePipelineState(P.gemv_swiglu_m1);
         enc->setBuffer(B.m_in,    0,          0);
         enc->setBuffer(B.w_gate,  off_w_gate, 1);
@@ -468,15 +457,14 @@ inline void dispatch_layer(
         const uint32_t BN = 128;
         enc->dispatchThreadgroups(MTL::Size((N_v + BN - 1) / BN, 1, 1),
                                   MTL::Size(BN, 1, 1));
-        enc->endEncoding();
     } else {
-        encode_gemm_qaware(cmd, P.gemm, P.gemv_m1, P.q8_0_matvec, B.dt_gate,
+        encode_gemm_qaware(enc, P.gemm, P.gemv_m1, P.q8_0_matvec, B.dt_gate,
                            B.m_in, 0, B.w_gate, off_w_gate,
                            B.gate_buf, T, p.n_int, p.d_model);
-        encode_gemm_qaware(cmd, P.gemm, P.gemv_m1, P.q8_0_matvec, B.dt_up,
+        encode_gemm_qaware(enc, P.gemm, P.gemv_m1, P.q8_0_matvec, B.dt_up,
                            B.m_in, 0, B.w_up, off_w_up,
                            B.up_buf, T, p.n_int, p.d_model);
-        auto* enc = cmd->computeCommandEncoder();
+        enc_barrier(enc);
         enc->setComputePipelineState(P.silu_mul);
         enc->setBuffer(B.gate_buf, 0, 0);
         enc->setBuffer(B.up_buf,   0, 1);
@@ -485,26 +473,26 @@ inline void dispatch_layer(
         enc->setBytes(&N_total, 4, 3);
         enc->dispatchThreadgroups(MTL::Size((N_total + 255) / 256, 1, 1),
                                   MTL::Size(256, 1, 1));
-        enc->endEncoding();
     }
-    encode_gemm_qaware(cmd, P.gemm, P.gemv_m1, P.q8_0_matvec, B.dt_down,
+    encode_gemm_qaware(enc, P.gemm, P.gemv_m1, P.q8_0_matvec, B.dt_down,
                        B.up_buf, 0, B.w_down, off_w_down,
                        B.mlp_out, T, p.d_model, p.n_int);
 
-    // 11. Final residual: y_out = y_attn + mlp_out.
+    // 11. Final residual.
+    enc_barrier(enc);
+    enc->setComputePipelineState(P.add);
+    enc->setBuffer(B.y_attn,  0, 0);
+    enc->setBuffer(B.mlp_out, 0, 1);
+    enc->setBuffer(B.y_out,   0, 2);
     {
-        auto* enc = cmd->computeCommandEncoder();
-        enc->setComputePipelineState(P.add);
-        enc->setBuffer(B.y_attn,  0, 0);
-        enc->setBuffer(B.mlp_out, 0, 1);
-        enc->setBuffer(B.y_out,   0, 2);
         uint32_t n = T * p.d_model;
         enc->setBytes(&n, 4, 3);
         uint32_t total = (n / 4u) + (n & 3u);
         enc->dispatchThreadgroups(MTL::Size((total + 127) / 128, 1, 1),
                                   MTL::Size(128, 1, 1));
-        enc->endEncoding();
     }
+
+    enc->endEncoding();
 }
 
 // ─── Model level ─────────────────────────────────────────────────────
@@ -767,9 +755,13 @@ inline void dispatch_model(
         MTL::Buffer* tmp = cur; cur = nxt; nxt = tmp;
     }
 
-    // C. Final RMSNorm
-    encode_rmsnorm(cmd, P.layer.rmsnorm, cur, W.w_final_norm, 0,
-                   nxt, T, M.d_model, M.eps, P.layer.rmsnorm_t1);
+    // C. Final RMSNorm — own encoder (single helper, not worth fusing here).
+    {
+        auto* enc = cmd->computeCommandEncoder();
+        encode_rmsnorm(enc, P.layer.rmsnorm, cur, W.w_final_norm, 0,
+                       nxt, T, M.d_model, M.eps, P.layer.rmsnorm_t1);
+        enc->endEncoding();
+    }
 
     // D. LM-head GEMM (tied → reuse embedding; untied → use w_lm_head). Both (V,D) row-major → transB=1.
     {
