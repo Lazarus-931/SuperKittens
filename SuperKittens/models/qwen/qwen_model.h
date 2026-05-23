@@ -47,6 +47,7 @@ struct LayerPSOs {
     MTL::ComputePipelineState* gemv_m1;           // fp16 GEMV M=1 fast-path (decode)
     MTL::ComputePipelineState* gemv_swiglu_m1;    // fused gate+up+silu_mul GEMV (M=1)
     MTL::ComputePipelineState* gemv_t_m1;         // M=1 matvec w/ transposed weight (LM-head)
+    MTL::ComputePipelineState* gemv_t_2dtile_m1 = nullptr;  // 2D-tile variant (preferred when non-null)
     MTL::ComputePipelineState* q8_0_matvec;       // M=1 matvec with Q8_0 weight (decode)
     MTL::ComputePipelineState* split_packed;      // (T, A+B) → (T, A) + (T, B)
     MTL::ComputePipelineState* rope_qk;           // split-half RoPE on Q, K
@@ -783,18 +784,29 @@ inline void dispatch_model(
             }
         } else
         if (M_v == 1 && P.layer.gemv_t_m1 != nullptr) {
-            // Decode fast path: M=1 transposed-weight matvec.
+            // Decode fast path: M=1 transposed-weight matvec. Prefer 2D-tile
+            // variant when registered; same buffer signature, different grid/TG.
             const size_t off_head = (w_head == W.w_lm_head) ? W.off_w_lm_head : 0;
             auto* enc = cmd->computeCommandEncoder();
-            enc->setComputePipelineState(P.layer.gemv_t_m1);
+            const bool use_2d = (P.layer.gemv_t_2dtile_m1 != nullptr);
+            enc->setComputePipelineState(use_2d ? P.layer.gemv_t_2dtile_m1
+                                                : P.layer.gemv_t_m1);
             enc->setBuffer(nxt,      0,        0);
             enc->setBuffer(w_head,   off_head, 1);
             enc->setBuffer(B.logits, 0,        2);
             enc->setBytes(&N_v, 4, 3);
             enc->setBytes(&K_v, 4, 4);
-            const uint32_t BN = 128;
-            enc->dispatchThreadgroups(MTL::Size((N_v + BN - 1) / BN, 1, 1),
-                                      MTL::Size(BN, 1, 1));
+            if (use_2d) {
+                // SG_ROWS=16, TOR=4 → 64 outputs / TG; TG = (32, 16, 1) = 512 threads.
+                const uint32_t OUT_ROWS_PER_TG = 64;
+                enc->dispatchThreadgroups(
+                    MTL::Size((N_v + OUT_ROWS_PER_TG - 1) / OUT_ROWS_PER_TG, 1, 1),
+                    MTL::Size(32, 16, 1));
+            } else {
+                const uint32_t BN = 128;
+                enc->dispatchThreadgroups(MTL::Size((N_v + BN - 1) / BN, 1, 1),
+                                          MTL::Size(BN, 1, 1));
+            }
             enc->endEncoding();
         } else {
             const size_t off_head = (w_head == W.w_lm_head) ? W.off_w_lm_head : 0;
