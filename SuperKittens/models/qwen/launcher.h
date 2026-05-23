@@ -55,6 +55,13 @@ sk_qwen_handle* sk_qwen_create(const sk_qwen_config* cfg);
 int  sk_qwen_load_weights(sk_qwen_handle* h, const sk_qwen_weights* w);
 int  sk_qwen_forward(sk_qwen_handle* h,
                      const int* input_ids, uint32_t seq, int* output_id);
+// WHY: per-token decode loop kept in C; avoids ctypes round-trip + np alloc
+// per step. Greedy only. Returns count of tokens written into out_tokens
+// (<= n_tokens; stops early on eos_id when eos_id >= 0).
+int  sk_qwen_generate_n(sk_qwen_handle* h,
+                        const int* prompt_ids, uint32_t prompt_seq,
+                        int* out_tokens, uint32_t n_tokens,
+                        int32_t eos_id);
 void sk_qwen_reset(sk_qwen_handle* h);
 void sk_qwen_destroy(sk_qwen_handle* h);
 

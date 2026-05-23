@@ -65,6 +65,9 @@ QWEN_ABI = {
     "load_weights":     ([ctypes.c_void_p, ctypes.POINTER(_Weights)], ctypes.c_int),
     "forward":          ([ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
                           ctypes.c_uint32, ctypes.POINTER(ctypes.c_int32)], ctypes.c_int),
+    "generate_n":       optional([ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
+                                  ctypes.c_uint32, ctypes.POINTER(ctypes.c_int32),
+                                  ctypes.c_uint32, ctypes.c_int32], ctypes.c_int),
     "reset":            ([ctypes.c_void_p], None),
     "destroy":          ([ctypes.c_void_p], None),
     "load_safetensors":       ([ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int),
@@ -241,6 +244,54 @@ class Qwen(Model):
         if rc: raise RuntimeError(f"forward failed: {rc}")
         self._last_token = int(out[0])
         return out
+
+    def generate(self, input_ids, *, max_new_tokens: int = 64,
+                 temperature: float = 0.0, top_p: float = 1.0,
+                 top_k=None, eos_id=None, eos_ids=None,
+                 seed: int = 0, sampler=None):
+        # WHY: keep the entire per-token decode loop in C when the request is
+        # plain greedy. Falls back to the Python base-class loop for sampling.
+        lib = _load()
+        greedy = (sampler is None
+                  and temperature <= 0.0
+                  and (top_p >= 1.0 or top_p <= 0.0)
+                  and not top_k)
+        if not (greedy and hasattr(lib, "sk_qwen_generate_n") and self.cfg.batch == 1):
+            return super().generate(input_ids, max_new_tokens=max_new_tokens,
+                                    temperature=temperature, top_p=top_p,
+                                    top_k=top_k, eos_id=eos_id, eos_ids=eos_ids,
+                                    seed=seed, sampler=sampler)
+        stops = set()
+        if eos_ids:
+            stops |= {int(x) for x in eos_ids}
+        if eos_id is not None:
+            stops.add(int(eos_id))
+        if not stops and self.tokenizer is not None:
+            t_eos = getattr(self.tokenizer, "eos_ids", None)
+            if t_eos: stops |= {int(x) for x in t_eos}
+        eos_single = int(next(iter(stops))) if len(stops) == 1 else -1
+
+        ids = np.ascontiguousarray(np.asarray(input_ids, dtype=np.int32)).reshape(-1)
+        out = np.empty((int(max_new_tokens),), dtype=np.int32)
+        self.reset()
+        n = lib.sk_qwen_generate_n(
+            self._h,
+            ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            ctypes.c_uint32(ids.size),
+            out.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            ctypes.c_uint32(int(max_new_tokens)),
+            ctypes.c_int32(eos_single))
+        if n < 0:
+            raise RuntimeError(f"sk_qwen_generate_n failed: {n}")
+        toks = out[:n].tolist()
+        # Multi-stop: enforce in Python by truncating at first hit.
+        if len(stops) > 1:
+            for i, t in enumerate(toks):
+                if t in stops:
+                    toks = toks[:i+1]
+                    break
+        self._last_token = toks[-1] if toks else None
+        return toks
 
     def _last_logits(self) -> np.ndarray:
         out = np.empty((self.cfg.vocab_size,), dtype=np.float16)

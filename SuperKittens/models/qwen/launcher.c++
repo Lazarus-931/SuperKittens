@@ -316,24 +316,11 @@ extern "C" void sk_qwen_reset(sk_qwen_handle* hp) {
     reinterpret_cast<meow::qwen::Handle*>(hp)->current_pos = 0;
 }
 
-extern "C" int sk_qwen_forward(sk_qwen_handle* hp,
-                               const int* input_ids, uint32_t seq,
-                               int* output_id) {
-    if (!hp || !input_ids || !output_id) return -1;
-    auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
-    if (seq == 0 || seq > h->cfg.seq_max) return -2;
-    if (h->current_pos + seq > h->cfg.cache_max) return -4;
-
-    auto* q = sk::bindings_queue();
-    if (!q) return -3;
-
-    std::memcpy(h->bufs.input_ids->contents(), input_ids,
-                (size_t)h->cfg.batch * seq * sizeof(int32_t));
-
-    int32_t* pos = (int32_t*)h->bufs.rope_pos->contents();
-    for (uint32_t i = 0; i < seq; ++i) pos[i] = (int32_t)(h->current_pos + i);
-
-    meow::qwen::ModelParams mp;
+namespace meow { namespace qwen {
+// WHY: one-step driver shared between sk_qwen_forward and the in-C decode
+// loop. Caller has already memcpy'd input_ids + rope_pos for `seq` tokens.
+static int run_step(Handle* h, MTL::CommandQueue* q, uint32_t seq) {
+    ModelParams mp;
     mp.batch          = h->cfg.batch;
     mp.seq            = seq;
     mp.n_layers       = h->cfg.n_layers;
@@ -358,15 +345,84 @@ extern "C" int sk_qwen_forward(sk_qwen_handle* hp,
     h->last_seq        = seq;
 
     auto* cmd = q->commandBuffer();
-    meow::qwen::dispatch_model(cmd, h->psos, h->weights, h->bufs, mp);
+    dispatch_model(cmd, h->psos, h->weights, h->bufs, mp);
     cmd->commit();
     cmd->waitUntilCompleted();
     cmd->release();
-
     h->current_pos += seq;
+    return 0;
+}
+}}  // namespace meow::qwen
+
+extern "C" int sk_qwen_forward(sk_qwen_handle* hp,
+                               const int* input_ids, uint32_t seq,
+                               int* output_id) {
+    if (!hp || !input_ids || !output_id) return -1;
+    auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
+    if (seq == 0 || seq > h->cfg.seq_max) return -2;
+    if (h->current_pos + seq > h->cfg.cache_max) return -4;
+
+    auto* q = sk::bindings_queue();
+    if (!q) return -3;
+
+    std::memcpy(h->bufs.input_ids->contents(), input_ids,
+                (size_t)h->cfg.batch * seq * sizeof(int32_t));
+
+    int32_t* pos = (int32_t*)h->bufs.rope_pos->contents();
+    for (uint32_t i = 0; i < seq; ++i) pos[i] = (int32_t)(h->current_pos + i);
+
+    int rc = meow::qwen::run_step(h, q, seq);
+    if (rc) return rc;
+
     std::memcpy(output_id, h->bufs.output_id->contents(),
                 (size_t)h->cfg.batch * sizeof(int32_t));
     return 0;
+}
+
+extern "C" int sk_qwen_generate_n(sk_qwen_handle* hp,
+                                  const int* prompt_ids, uint32_t prompt_seq,
+                                  int* out_tokens, uint32_t n_tokens,
+                                  int32_t eos_id) {
+    if (!hp || !prompt_ids || !out_tokens) return -1;
+    auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
+    if (prompt_seq == 0 || prompt_seq > h->cfg.seq_max) return -2;
+    if (n_tokens == 0) return 0;
+    if (h->current_pos + prompt_seq > h->cfg.cache_max) return -4;
+    if (h->cfg.batch != 1) return -5;  // greedy multi-token loop is batch=1
+
+    auto* q = sk::bindings_queue();
+    if (!q) return -3;
+
+    // Prefill on the prompt: produces argmax for next token in output_id.
+    std::memcpy(h->bufs.input_ids->contents(), prompt_ids,
+                (size_t)prompt_seq * sizeof(int32_t));
+    {
+        int32_t* pos = (int32_t*)h->bufs.rope_pos->contents();
+        for (uint32_t i = 0; i < prompt_seq; ++i)
+            pos[i] = (int32_t)(h->current_pos + i);
+    }
+    if (int rc = meow::qwen::run_step(h, q, prompt_seq)) return rc;
+
+    int32_t* in_ids  = (int32_t*)h->bufs.input_ids->contents();
+    int32_t* rope    = (int32_t*)h->bufs.rope_pos->contents();
+    const int32_t* out_id_buf = (const int32_t*)h->bufs.output_id->contents();
+
+    int32_t first = out_id_buf[0];
+    out_tokens[0] = first;
+    if (eos_id >= 0 && first == eos_id) return 1;
+    uint32_t written = 1;
+    int32_t last = first;
+
+    while (written < n_tokens) {
+        if (h->current_pos + 1 > h->cfg.cache_max) break;
+        in_ids[0] = last;
+        rope[0]   = (int32_t)h->current_pos;
+        if (int rc = meow::qwen::run_step(h, q, 1)) return rc;
+        last = out_id_buf[0];
+        out_tokens[written++] = last;
+        if (eos_id >= 0 && last == eos_id) break;
+    }
+    return (int)written;
 }
 
 extern "C" int sk_qwen_set_rope_tables(sk_qwen_handle* hp, const void* cos, const void* sin) {
