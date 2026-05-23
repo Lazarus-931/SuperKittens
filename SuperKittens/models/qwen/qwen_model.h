@@ -49,6 +49,7 @@ struct LayerPSOs {
     MTL::ComputePipelineState* gemv_t_m1;         // M=1 matvec w/ transposed weight (LM-head)
     MTL::ComputePipelineState* gemv_t_2dtile_m1 = nullptr;  // 2D-tile variant (preferred when non-null)
     MTL::ComputePipelineState* q8_0_matvec;       // M=1 matvec with Q8_0 weight (decode)
+    MTL::ComputePipelineState* q8_0_swiglu_m1 = nullptr;  // fused Q8_0 gate+up+SiLU·mul (M=1)
     MTL::ComputePipelineState* split_packed;      // (T, A+B) → (T, A) + (T, B)
     MTL::ComputePipelineState* rope_qk;           // split-half RoPE on Q, K
     MTL::ComputePipelineState* attn;              // mha_causal (d=128, GQA)
@@ -445,7 +446,22 @@ inline void dispatch_layer(
     enc->dispatchThreadgroups(MTL::Size(1, T, 1), MTL::Size(128, 1, 1));
 
     const bool mlp_is_q8 = (B.dt_gate == sk::Dtype::Q8_0 || B.dt_up == sk::Dtype::Q8_0);
-    if (T == 1 && P.gemv_swiglu_m1 != nullptr && !mlp_is_q8) {
+    const bool mlp_both_q8 = (B.dt_gate == sk::Dtype::Q8_0 && B.dt_up == sk::Dtype::Q8_0);
+    if (T == 1 && mlp_both_q8 && P.q8_0_swiglu_m1 != nullptr) {
+        // WHY: collapse 3 dispatches (gate matvec, up matvec, silu*mul) into 1.
+        enc_barrier(enc);
+        enc->setComputePipelineState(P.q8_0_swiglu_m1);
+        enc->setBuffer(B.m_in,   0,          0);
+        enc->setBuffer(B.w_gate, off_w_gate, 1);
+        enc->setBuffer(B.w_up,   off_w_up,   2);
+        enc->setBuffer(B.up_buf, 0,          3);
+        uint32_t K_v = p.d_model, N_v = p.n_int;
+        enc->setBytes(&K_v, 4, 4);
+        enc->setBytes(&N_v, 4, 5);
+        const uint32_t rows_per_tg = 2;
+        enc->dispatchThreadgroups(MTL::Size((N_v + rows_per_tg - 1) / rows_per_tg, 1, 1),
+                                  MTL::Size(128, 1, 1));
+    } else if (T == 1 && P.gemv_swiglu_m1 != nullptr && !mlp_is_q8) {
         enc_barrier(enc);
         enc->setComputePipelineState(P.gemv_swiglu_m1);
         enc->setBuffer(B.m_in,    0,          0);
