@@ -10,6 +10,7 @@
 #include "../../inference/silicon/icb_recorder.h"
 #include "../../inference/icb/token_args.h"
 #include "../../inference/executor/executor.h"
+#include "../../inference/profile/profile.h"  // PROFILING — REMOVE BEFORE MERGE
 
 namespace meow {
 namespace qwen {
@@ -336,28 +337,36 @@ inline void dispatch_layer(
     // buffer-scope memory barrier before its dispatch. Encoder-setup cost on
     // Apple Silicon is ~0.1 ms per encoder; at 36 layers × 9 saved encoders
     // that's ~32 ms/token of pure overhead removed.
-    auto* enc = cmd->computeCommandEncoder();
+    // PROFILING — when active, each SK_PROF_SPLIT ends the current encoder
+    // and opens a new one with attached counter-sample slots. In non-profile
+    // mode open_profiled_encoder = cmd->computeCommandEncoder and SPLIT = no-op,
+    // so the layer still uses ONE encoder.
+    auto* enc = sk::profile::open_profiled_encoder(cmd, "rmsnorm_pre_attn");
 
     // 1. Pre-attn RMSNorm.
     encode_rmsnorm(enc, P.rmsnorm, B.x, B.w_pre_attn_norm, off_norm,
                    B.x_norm, T, p.d_model, p.eps, P.rmsnorm_t1);
+    SK_PROF_SPLIT(cmd, &enc, "qkv_matvec");
 
     // 2. QKV-pack GEMM.
     encode_gemm_qaware(enc, P.gemm, P.gemv_m1, P.q8_0_matvec, B.dt_qkv,
                        B.x_norm, 0, B.w_qkv, off_w_qkv,
                        B.qkv_packed, T, qkv_N, p.d_model);
+    SK_PROF_SPLIT(cmd, &enc, "split_qkv");
 
     // 3. Splits.
     encode_split(enc, P.split_packed, B.qkv_packed, B.q, B.kv_pack,
                  T, qN, 2 * kvN);
     encode_split(enc, P.split_packed, B.kv_pack, B.k_tmp, B.v_tmp,
                  T, kvN, kvN);
+    SK_PROF_SPLIT(cmd, &enc, "qk_norm");
 
     // 4. Per-head Q/K-norm.
     encode_rmsnorm(enc, P.rmsnorm, B.q, B.w_q_norm, off_w_q_norm,
                    B.q, T * p.n_heads, hd, p.eps);
     encode_rmsnorm(enc, P.rmsnorm, B.k_tmp, B.w_k_norm, off_w_k_norm,
                    B.k_tmp, T * p.n_kv_heads, hd, p.eps);
+    SK_PROF_SPLIT(cmd, &enc, "rope");
 
     // 5. RoPE on Q and K.
     {
@@ -369,6 +378,7 @@ inline void dispatch_layer(
                                B.cos_tbl, cs_off, B.sin_tbl, cs_off,
                                p.seq, p.n_kv_heads, hd);
     }
+    SK_PROF_SPLIT(cmd, &enc, "kv_cache_write");
 
     MTL::Buffer* q_in = B.q;
     MTL::Buffer* k_in = B.k_tmp;
@@ -398,6 +408,7 @@ inline void dispatch_layer(
         enc->dispatchThreads(MTL::Size(D4, p.seq, p.batch * p.n_kv_heads),
                              MTL::Size(32, 4, 1));
     }
+    SK_PROF_SPLIT(cmd, &enc, "flash_attn");
 
     // 7. Attention.
     enc_barrier(enc);
@@ -419,6 +430,7 @@ inline void dispatch_layer(
             MTL::Size(p.n_kv_heads, (p.seq + 1) / 2, p.batch),
             MTL::Size(Hg_attn * 2 * 32, 1, 1));
     }
+    SK_PROF_SPLIT(cmd, &enc, "o_matvec");
 
     MTL::Buffer* attn_o_in = B.attn_out;
     if (p.seq > 1) {
@@ -431,6 +443,7 @@ inline void dispatch_layer(
     encode_gemm_qaware(enc, P.gemm, P.gemv_m1, P.q8_0_matvec, B.dt_o,
                        attn_o_in, 0, B.w_o, off_w_o, B.o_proj,
                        T, p.d_model, p.n_heads * hd);
+    SK_PROF_SPLIT(cmd, &enc, "add_rmsnorm_pre_mlp");
 
     // 9. Fused residual + pre-MLP RMSNorm.
     enc_barrier(enc);
@@ -444,6 +457,7 @@ inline void dispatch_layer(
     enc->setBytes(&p.d_model, 4, 6);
     enc->setBytes(&p.eps,     4, 7);
     enc->dispatchThreadgroups(MTL::Size(1, T, 1), MTL::Size(128, 1, 1));
+    SK_PROF_SPLIT(cmd, &enc, "gate_up_swiglu");
 
     const bool mlp_is_q8 = (B.dt_gate == sk::Dtype::Q8_0 || B.dt_up == sk::Dtype::Q8_0);
     const bool mlp_both_q8 = (B.dt_gate == sk::Dtype::Q8_0 && B.dt_up == sk::Dtype::Q8_0);
@@ -491,9 +505,11 @@ inline void dispatch_layer(
         enc->dispatchThreadgroups(MTL::Size((N_total + 255) / 256, 1, 1),
                                   MTL::Size(256, 1, 1));
     }
+    SK_PROF_SPLIT(cmd, &enc, "down_matvec");
     encode_gemm_qaware(enc, P.gemm, P.gemv_m1, P.q8_0_matvec, B.dt_down,
                        B.up_buf, 0, B.w_down, off_w_down,
                        B.mlp_out, T, p.d_model, p.n_int);
+    SK_PROF_SPLIT(cmd, &enc, "residual_add");
 
     // 11. Final residual.
     enc_barrier(enc);
@@ -665,7 +681,7 @@ inline void dispatch_model(
 
     // A. Embedding lookup → x_a
     {
-        auto* enc = cmd->computeCommandEncoder();
+        auto* enc = sk::profile::open_profiled_encoder(cmd, "embedding_lookup");
         enc->setComputePipelineState(P.embedding_lookup);
         enc->setBuffer(W.w_embed,   0, 0);
         enc->setBuffer(B.input_ids, 0, 1);
@@ -774,7 +790,7 @@ inline void dispatch_model(
 
     // C. Final RMSNorm — own encoder (single helper, not worth fusing here).
     {
-        auto* enc = cmd->computeCommandEncoder();
+        auto* enc = sk::profile::open_profiled_encoder(cmd, "final_rmsnorm");
         encode_rmsnorm(enc, P.layer.rmsnorm, cur, W.w_final_norm, 0,
                        nxt, T, M.d_model, M.eps, P.layer.rmsnorm_t1);
         enc->endEncoding();
@@ -788,7 +804,7 @@ inline void dispatch_model(
         if (W.dt_lm_head == sk::Dtype::Q8_0 && W.w_lm_head &&
             P.layer.q8_0_matvec != nullptr) {
             for (uint32_t m = 0; m < M_v; ++m) {
-                auto* enc = cmd->computeCommandEncoder();
+                auto* enc = sk::profile::open_profiled_encoder(cmd, "lm_head_matvec");
                 enc->setComputePipelineState(P.layer.q8_0_matvec);
                 enc->setBuffer(nxt,           (size_t)m * K_v * 2,  0);
                 enc->setBuffer(W.w_lm_head,   W.off_w_lm_head,      1);
@@ -803,7 +819,7 @@ inline void dispatch_model(
             // Decode fast path: M=1 transposed-weight matvec. Prefer 2D-tile
             // variant when registered; same buffer signature, different grid/TG.
             const size_t off_head = (w_head == W.w_lm_head) ? W.off_w_lm_head : 0;
-            auto* enc = cmd->computeCommandEncoder();
+            auto* enc = sk::profile::open_profiled_encoder(cmd, "lm_head_matvec");
             const bool use_2d = (P.layer.gemv_t_2dtile_m1 != nullptr);
             enc->setComputePipelineState(use_2d ? P.layer.gemv_t_2dtile_m1
                                                 : P.layer.gemv_t_m1);
@@ -826,7 +842,7 @@ inline void dispatch_model(
             enc->endEncoding();
         } else {
             const size_t off_head = (w_head == W.w_lm_head) ? W.off_w_lm_head : 0;
-            auto* enc = cmd->computeCommandEncoder();
+            auto* enc = sk::profile::open_profiled_encoder(cmd, "lm_head_matvec");
             enc->setComputePipelineState(P.layer.gemm);
             uint32_t ldA = K_v, ldB = K_v, ldC = N_v;
             int transA = 0, transB = 1, has_bias = 0;
@@ -861,7 +877,7 @@ inline void dispatch_model(
         // in a single executeCommandsInBuffer call. Producer/consumer
         // ordering relies on IcbRecorder::record's default barrier_before=true
         // on slot 1 (which reads val/idx written by slot 0).
-        auto* enc = cmd->computeCommandEncoder();
+        auto* enc = sk::profile::open_profiled_encoder(cmd, "argmax_icb");
         B.argmax_icb->execute(enc, 0, 2);
         // logits and output_id are encoder-touched resources for this graph;
         // the recorder's tracked list already includes them via mark_resource
@@ -872,7 +888,7 @@ inline void dispatch_model(
         const uint32_t n_blocks = (M.vocab_size + ELTS_PER_TG - 1u) / ELTS_PER_TG;
         // Pass 1: per-tile partials.
         {
-            auto* enc = cmd->computeCommandEncoder();
+            auto* enc = sk::profile::open_profiled_encoder(cmd, "argmax_partial");
             enc->setComputePipelineState(P.argmax_partial);
             enc->setBuffer(B.logits,         0, 0);
             enc->setBuffer(B.argmax_val_buf, 0, 1);
@@ -884,7 +900,7 @@ inline void dispatch_model(
         }
         // Pass 2: reduce partials → out[0].
         {
-            auto* enc = cmd->computeCommandEncoder();
+            auto* enc = sk::profile::open_profiled_encoder(cmd, "argmax_reduce");
             enc->setComputePipelineState(P.argmax_reduce);
             enc->setBuffer(B.argmax_val_buf, 0, 0);
             enc->setBuffer(B.argmax_idx_buf, 0, 1);
@@ -895,7 +911,7 @@ inline void dispatch_model(
             enc->endEncoding();
         }
     } else {
-        auto* enc = cmd->computeCommandEncoder();
+        auto* enc = sk::profile::open_profiled_encoder(cmd, "argmax");
         enc->setComputePipelineState(P.argmax);
         enc->setBuffer(B.logits,    0, 0);
         enc->setBuffer(B.output_id, 0, 1);

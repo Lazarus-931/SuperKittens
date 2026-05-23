@@ -4,6 +4,7 @@
 #include "qwen_model.h"
 #include "../../kernels/runtime_bindings.h"
 #include "../../inference/silicon/mmap_buffer.h"
+#include "../../inference/profile/profile.h"  // PROFILING — REMOVE BEFORE MERGE
 
 #include <cstring>
 #include <cstdlib>
@@ -357,10 +358,19 @@ extern "C" int sk_qwen_forward(sk_qwen_handle* hp,
     mp.capture_layer   = h->capture_layer;
     h->last_seq        = seq;
 
+    // PROFILING — REMOVE BEFORE MERGE
+    if (sk::profile::enabled()) {
+        // 12 encoders/layer × 2 samples + 5 framing encoders × 2.
+        const uint32_t cap = (h->cfg.n_layers * 12u + 5u) * 2u + 16u;
+        sk::profile::begin_token(sk::bindings_device(), cap);
+    }
+
     auto* cmd = q->commandBuffer();
     meow::qwen::dispatch_model(cmd, h->psos, h->weights, h->bufs, mp);
     cmd->commit();
     cmd->waitUntilCompleted();
+
+    if (sk::profile::enabled()) sk::profile::end_token();
     cmd->release();
 
     h->current_pos += seq;
