@@ -10,6 +10,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace meow { namespace qwen {
 struct Handle {
@@ -355,12 +357,18 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
         return rc;
     }
 
-    // We use per-tensor range mmaps below (sk::silicon::MmapBuffer::from_file_range)
-    // for the bulk Q8_0 weights (lm_head + per-layer qkv/o/gate/up/down), so
-    // that the resident set is just those bytes rather than the full multi-GB
-    // GGUF. The handle stores all owning MmapBuffer pointers in
-    // h->tensor_mmaps (plus h->gguf_mmap for the historical lm_head slot);
-    // sk_qwen_destroy releases them en masse.
+    // We use per-tensor range mmaps below for the bulk Q8_0 weights
+    // (lm_head + per-layer qkv/o/gate/up/down). Open the GGUF file ONCE and
+    // hand the fd to every mmap call — opening per tensor pushes 250+ fds for
+    // a 36-layer 4B model and trips the default `ulimit -n 256` on lexie,
+    // silently falling back to memcpy and tanking decode tok/s. The mmaps
+    // survive `close(fd)` (Darwin/POSIX retains a vnode reference per mapping),
+    // so we close the fd at end of load.
+    int gguf_fd = ::open(path, O_RDONLY);
+    if (gguf_fd < 0) {
+        std::fprintf(stderr, "sk_qwen_load_gguf: open('%s') failed\n", path);
+        return -3;
+    }
 
     const size_t dm   = c.d_model;
     const size_t hd   = c.head_dim;
@@ -418,8 +426,8 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
             sk::silicon::MmapBuffer* lmh_map = nullptr;
             size_t inner_off = 0;
             if (!disable_mmap) {
-                lmh_map = sk::silicon::MmapBuffer::from_file_range(
-                    dev, path, tensor_off, bytes, &inner_off);
+                lmh_map = sk::silicon::MmapBuffer::from_fd_range(
+                    dev, gguf_fd, tensor_off, bytes, &inner_off);
             }
             if (!lmh_map) {
                 if (!disable_mmap) {
@@ -525,8 +533,8 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
         }
         if (!disable_mmap) {
             size_t inner = 0;
-            auto* mb = sk::silicon::MmapBuffer::from_file_range(
-                dev, path, (size_t)abs_off, (size_t)nb, &inner);
+            auto* mb = sk::silicon::MmapBuffer::from_fd_range(
+                dev, gguf_fd, (size_t)abs_off, (size_t)nb, &inner);
             if (mb) {
                 h->tensor_mmaps.push_back(mb);
                 *out_buf = mb->buffer();
@@ -577,8 +585,8 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
             koff == qoff + qn_ && voff_ == koff + kn_) {
             // Q, K, V are file-adjacent → mmap one combined range.
             size_t inner = 0;
-            auto* mb = sk::silicon::MmapBuffer::from_file_range(
-                dev, path, (size_t)qoff, total, &inner);
+            auto* mb = sk::silicon::MmapBuffer::from_fd_range(
+                dev, gguf_fd, (size_t)qoff, total, &inner);
             if (mb) {
                 h->tensor_mmaps.push_back(mb);
                 h->weights.w_qkv[L]     = mb->buffer();
@@ -633,5 +641,6 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
                                 &h->weights.w_down[L], &h->weights.w_down_off[L])) return -56;
     }
 
+    ::close(gguf_fd);
     return 0;
 }
