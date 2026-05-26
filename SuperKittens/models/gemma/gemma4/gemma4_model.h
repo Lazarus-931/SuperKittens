@@ -15,7 +15,6 @@
 #include <cmath>
 #include <cstdlib>
 
-#include "../../../inference/icb/token_args.h"
 
 namespace meow {
 namespace gemma4 {
@@ -977,11 +976,6 @@ struct ModelBuffers {
     MTL::Buffer* argmax_val_buf = nullptr;
     MTL::Buffer* argmax_idx_buf = nullptr;
 
-    // WHY: ICB cannot use setBytes; per-token scalars (current_pos, kv_idx_base,
-    // token_id, layer_idx) live in this shared 32-byte sk::TokenArgs buffer.
-    // Host patches via memcpy on .contents() once per token; kernels bind it as
-    // `constant TokenArgs& [[buffer(N)]]`. See inference/icb/token_args.h.
-    MTL::Buffer* token_args = nullptr;
 };
 
 // Helper: blit-copy the last position's d_model fp16 row from `src`
