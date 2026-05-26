@@ -48,6 +48,7 @@ struct LayerPSOs {
     MTL::ComputePipelineState* gemv_t_2dtile_m1 = nullptr;  // 2D-tile variant (preferred when non-null)
     MTL::ComputePipelineState* q8_0_matvec;       // M=1 matvec with Q8_0 weight (decode)
     MTL::ComputePipelineState* q8_0_swiglu_m1 = nullptr;  // fused Q8_0 gate+up+SiLU·mul (M=1)
+    MTL::ComputePipelineState* q8_0_swiglu_prenorm_m1 = nullptr;  // fused residual+rmsnorm+swiglu (M=1)
     MTL::ComputePipelineState* split_packed;      // (T, A+B) → (T, A) + (T, B)
     MTL::ComputePipelineState* rope_qk;           // split-half RoPE on Q, K
     MTL::ComputePipelineState* attn;              // mha_causal (d=128, GQA)
@@ -435,22 +436,45 @@ inline void dispatch_layer(
                              B.o_proj, T, p.d_model, p.n_heads * hd);
     }
 
-    // 9. Fused residual + pre-MLP RMSNorm.
-    enc_barrier(enc);
-    enc->setComputePipelineState(P.add_rmsnorm);
-    enc->setBuffer(B.x,               0,        0);
-    enc->setBuffer(B.o_proj,          0,        1);
-    enc->setBuffer(B.w_pre_mlp_norm,  off_norm, 2);
-    enc->setBuffer(B.y_attn,          0,        3);
-    enc->setBuffer(B.m_in,            0,        4);
-    enc->setBytes(&T,         4, 5);
-    enc->setBytes(&p.d_model, 4, 6);
-    enc->setBytes(&p.eps,     4, 7);
-    enc->dispatchThreadgroups(MTL::Size(1, T, 1), MTL::Size(128, 1, 1));
-
+    // 9. Residual + pre-MLP RMSNorm. Fused with swiglu when prenorm path
+    // is available (saves 1 dispatch + 1 fence per layer at decode).
     const bool mlp_is_q8 = (B.dt_gate == sk::Dtype::Q8_0 || B.dt_up == sk::Dtype::Q8_0);
     const bool mlp_both_q8 = (B.dt_gate == sk::Dtype::Q8_0 && B.dt_up == sk::Dtype::Q8_0);
-    if (T == 1 && mlp_both_q8 && P.q8_0_swiglu_m1 != nullptr) {
+    const bool use_prenorm_fused = (T == 1 && mlp_both_q8 && P.q8_0_swiglu_prenorm_m1 != nullptr);
+    if (!use_prenorm_fused) {
+        enc_barrier(enc);
+        enc->setComputePipelineState(P.add_rmsnorm);
+        enc->setBuffer(B.x,               0,        0);
+        enc->setBuffer(B.o_proj,          0,        1);
+        enc->setBuffer(B.w_pre_mlp_norm,  off_norm, 2);
+        enc->setBuffer(B.y_attn,          0,        3);
+        enc->setBuffer(B.m_in,            0,        4);
+        enc->setBytes(&T,         4, 5);
+        enc->setBytes(&p.d_model, 4, 6);
+        enc->setBytes(&p.eps,     4, 7);
+        enc->dispatchThreadgroups(MTL::Size(1, T, 1), MTL::Size(128, 1, 1));
+    }
+
+    if (use_prenorm_fused) {
+        // WHY: 1 dispatch for residual+rmsnorm+gate+up+silu*mul. Writes
+        // y_attn[K] (from TG0) and up_buf[N].
+        enc_barrier(enc);
+        enc->setComputePipelineState(P.q8_0_swiglu_prenorm_m1);
+        enc->setBuffer(B.x,               0,        0);
+        enc->setBuffer(B.o_proj,          0,        1);
+        enc->setBuffer(B.w_pre_mlp_norm,  off_norm, 2);
+        enc->setBuffer(B.w_gate,          off_w_gate, 3);
+        enc->setBuffer(B.w_up,            off_w_up,   4);
+        enc->setBuffer(B.y_attn,          0,        5);
+        enc->setBuffer(B.up_buf,          0,        6);
+        uint32_t K_v = p.d_model, N_v = p.n_int;
+        enc->setBytes(&K_v,    4, 7);
+        enc->setBytes(&N_v,    4, 8);
+        enc->setBytes(&p.eps,  4, 9);
+        const uint32_t rows_per_tg = 2;
+        enc->dispatchThreadgroups(MTL::Size((N_v + rows_per_tg - 1) / rows_per_tg, 1, 1),
+                                  MTL::Size(128, 1, 1));
+    } else if (T == 1 && mlp_both_q8 && P.q8_0_swiglu_m1 != nullptr) {
         // WHY: collapse 3 dispatches (gate matvec, up matvec, silu*mul) into 1.
         enc_barrier(enc);
         enc->setComputePipelineState(P.q8_0_swiglu_m1);
