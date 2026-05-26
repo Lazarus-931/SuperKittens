@@ -231,9 +231,10 @@ inline void encode_rmsnorm(
     MTL::ComputeCommandEncoder* enc, MTL::ComputePipelineState* pso,
     MTL::Buffer* x, MTL::Buffer* gamma, size_t off_gamma,
     MTL::Buffer* out, uint32_t rows, uint32_t n, float eps,
-    MTL::ComputePipelineState* pso_t1 = nullptr)
+    MTL::ComputePipelineState* pso_t1 = nullptr,
+    bool barrier_before = true)
 {
-    enc_barrier(enc);
+    if (barrier_before) enc_barrier(enc);
     const bool use_t1 = (pso_t1 != nullptr) && (rows == 1u);
     enc->setComputePipelineState(use_t1 ? pso_t1 : pso);
     enc->setBuffer(x,     0,         0);
@@ -287,9 +288,10 @@ inline void encode_rope_qk_inplace(
     MTL::Buffer* x,
     MTL::Buffer* cos_tbl, size_t cos_off,
     MTL::Buffer* sin_tbl, size_t sin_off,
-    uint32_t seq, uint32_t n_heads, uint32_t head_dim)
+    uint32_t seq, uint32_t n_heads, uint32_t head_dim,
+    bool barrier_before = true)
 {
-    enc_barrier(enc);
+    if (barrier_before) enc_barrier(enc);
     enc->setComputePipelineState(pso);
     enc->setBuffer(x,       0,       0);
     enc->setBuffer(x,       0,       1);
@@ -354,13 +356,18 @@ inline void dispatch_layer(
     encode_split(enc, P.split_packed, B.kv_pack, B.k_tmp, B.v_tmp,
                  T, kvN, kvN);
 
-    // 4. Per-head Q/K-norm.
+    // 4. Per-head Q/K-norm. K-norm writes a distinct buffer from Q-norm
+    // (B.k_tmp vs B.q); its dep on split-2 is honored transitively by the
+    // barrier before Q-norm (Metal buffer-scope barriers are full fences),
+    // so skip the redundant barrier here.
     encode_rmsnorm(enc, P.rmsnorm, B.q, B.w_q_norm, off_w_q_norm,
                    B.q, T * p.n_heads, hd, p.eps);
     encode_rmsnorm(enc, P.rmsnorm, B.k_tmp, B.w_k_norm, off_w_k_norm,
-                   B.k_tmp, T * p.n_kv_heads, hd, p.eps);
+                   B.k_tmp, T * p.n_kv_heads, hd, p.eps,
+                   /*pso_t1=*/nullptr, /*barrier_before=*/false);
 
-    // 5. RoPE on Q and K.
+    // 5. RoPE on Q and K. RoPE-K writes a distinct buffer from RoPE-Q;
+    // dep on K-norm is honored by the barrier before RoPE-Q.
     {
         const size_t cs_off = (size_t)p.write_pos * (hd / 2) * 2;
         encode_rope_qk_inplace(enc, P.rope_qk, B.q,
@@ -368,7 +375,8 @@ inline void dispatch_layer(
                                p.seq, p.n_heads, hd);
         encode_rope_qk_inplace(enc, P.rope_qk, B.k_tmp,
                                B.cos_tbl, cs_off, B.sin_tbl, cs_off,
-                               p.seq, p.n_kv_heads, hd);
+                               p.seq, p.n_kv_heads, hd,
+                               /*barrier_before=*/false);
     }
 
     MTL::Buffer* q_in = B.q;
