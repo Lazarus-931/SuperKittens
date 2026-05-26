@@ -55,6 +55,7 @@ static bool resolve_psos(ModelPSOs& P) {
     P.layer.q8_0_matvec    = sk::bindings_pso("q8_0_matvec");  // optional; nullptr OK
     P.layer.q8_0_swiglu_m1 = sk::bindings_pso("q8_0_swiglu_m1");  // optional; nullptr OK
     P.layer.q8_0_swiglu_prenorm_m1 = sk::bindings_pso("q8_0_swiglu_prenorm_m1");  // optional
+    P.layer.q8_0_matvec_addres = sk::bindings_pso("q8_0_matvec_addres");  // optional
     P.layer.split_packed   = sk::bindings_pso("split_packed");
     P.layer.rope_qk        = sk::bindings_pso("qwen_rope_qk");
     P.layer.attn           = sk::bindings_pso("mha_causal");

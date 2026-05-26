@@ -49,6 +49,7 @@ struct LayerPSOs {
     MTL::ComputePipelineState* q8_0_matvec;       // M=1 matvec with Q8_0 weight (decode)
     MTL::ComputePipelineState* q8_0_swiglu_m1 = nullptr;  // fused Q8_0 gate+up+SiLU·mul (M=1)
     MTL::ComputePipelineState* q8_0_swiglu_prenorm_m1 = nullptr;  // fused residual+rmsnorm+swiglu (M=1)
+    MTL::ComputePipelineState* q8_0_matvec_addres = nullptr;  // matvec + residual add (M=1)
     MTL::ComputePipelineState* split_packed;      // (T, A+B) → (T, A) + (T, B)
     MTL::ComputePipelineState* rope_qk;           // split-half RoPE on Q, K
     MTL::ComputePipelineState* attn;              // mha_causal (d=128, GQA)
@@ -526,21 +527,38 @@ inline void dispatch_layer(
         enc->dispatchThreadgroups(MTL::Size((N_total + 255) / 256, 1, 1),
                                   MTL::Size(256, 1, 1));
     }
-    if (B.dt_down == sk::Dtype::Q8_0 && P.q8_0_matvec != nullptr) {
-        encode_q8_0_gemm(enc, P.q8_0_matvec, B.up_buf, 0, B.w_down, off_w_down,
-                         B.mlp_out, T, p.d_model, p.n_int);
+    // 10/11. Down-projection + final residual. Fused when down is Q8_0 and
+    // the addres PSO is available: skips the standalone add_f16 dispatch and
+    // the L2-drain fence between mlp_out and final residual.
+    const bool use_down_addres = (T == 1
+                                  && B.dt_down == sk::Dtype::Q8_0
+                                  && P.q8_0_matvec_addres != nullptr);
+    if (use_down_addres) {
+        enc_barrier(enc);
+        enc->setComputePipelineState(P.q8_0_matvec_addres);
+        enc->setBuffer(B.up_buf,  0,          0);
+        enc->setBuffer(B.w_down,  off_w_down, 1);
+        enc->setBuffer(B.y_attn,  0,          2);
+        enc->setBuffer(B.y_out,   0,          3);
+        uint32_t K_v = p.n_int, N_v = p.d_model;
+        enc->setBytes(&K_v, 4, 4);
+        enc->setBytes(&N_v, 4, 5);
+        const uint32_t rows_per_tg = 2;
+        enc->dispatchThreadgroups(MTL::Size((N_v + rows_per_tg - 1) / rows_per_tg, 1, 1),
+                                  MTL::Size(128, 1, 1));
     } else {
-        encode_gemm_fallback(enc, P.gemm, P.gemv_m1, B.up_buf, 0, B.w_down, off_w_down,
+        if (B.dt_down == sk::Dtype::Q8_0 && P.q8_0_matvec != nullptr) {
+            encode_q8_0_gemm(enc, P.q8_0_matvec, B.up_buf, 0, B.w_down, off_w_down,
                              B.mlp_out, T, p.d_model, p.n_int);
-    }
-
-    // 11. Final residual.
-    enc_barrier(enc);
-    enc->setComputePipelineState(P.add);
-    enc->setBuffer(B.y_attn,  0, 0);
-    enc->setBuffer(B.mlp_out, 0, 1);
-    enc->setBuffer(B.y_out,   0, 2);
-    {
+        } else {
+            encode_gemm_fallback(enc, P.gemm, P.gemv_m1, B.up_buf, 0, B.w_down, off_w_down,
+                                 B.mlp_out, T, p.d_model, p.n_int);
+        }
+        enc_barrier(enc);
+        enc->setComputePipelineState(P.add);
+        enc->setBuffer(B.y_attn,  0, 0);
+        enc->setBuffer(B.mlp_out, 0, 1);
+        enc->setBuffer(B.y_out,   0, 2);
         uint32_t n = T * p.d_model;
         enc->setBytes(&n, 4, 3);
         uint32_t total = (n / 4u) + (n & 3u);
