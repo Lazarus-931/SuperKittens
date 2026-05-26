@@ -152,16 +152,6 @@ inline void encode_q8_0_matvec(
 }
 
 
-inline void encode_gemm_qaware(
-    MTL::ComputeCommandEncoder* enc, MTL::ComputePipelineState* pso_gemm,
-    MTL::ComputePipelineState* pso_gemv_m1,
-    MTL::ComputePipelineState* pso_q8_0,
-    sk::Dtype                  dt_w,
-    MTL::Buffer* A, size_t off_A,
-    MTL::Buffer* W, size_t off_W,
-    MTL::Buffer* C,
-    uint32_t M, uint32_t N, uint32_t K);
-
 inline void encode_gemm(
     MTL::ComputeCommandEncoder* enc, MTL::ComputePipelineState* pso,
     MTL::Buffer* A, size_t off_A,
@@ -199,32 +189,39 @@ inline void encode_gemm(
                               MTL::Size(64, 1, 1));
 }
 
-inline void encode_gemm_qaware(
-    MTL::ComputeCommandEncoder* enc, MTL::ComputePipelineState* pso_gemm,
-    MTL::ComputePipelineState* pso_gemv_m1,
-    MTL::ComputePipelineState* pso_q8_0,
-    sk::Dtype                  dt_w,
+// WHY: Q8_0 GEMM by per-row matvec loop. Per-layer matvec call sites use this
+// directly (qwen3 runtime weights are always Q8_0), skipping the dt_w branch.
+inline void encode_q8_0_gemm(
+    MTL::ComputeCommandEncoder* enc, MTL::ComputePipelineState* pso_q8_0,
     MTL::Buffer* A, size_t off_A,
     MTL::Buffer* W, size_t off_W,
     MTL::Buffer* C,
     uint32_t M, uint32_t N, uint32_t K)
 {
-    if (dt_w == sk::Dtype::Q8_0 && pso_q8_0 != nullptr) {
-        for (uint32_t m = 0; m < M; ++m) {
-            const size_t off_A_row = off_A + (size_t)m * K * 2;
-            enc_barrier(enc);
-            enc->setComputePipelineState(pso_q8_0);
-            enc->setBuffer(W, off_W, 1);
-            enc->setBuffer(A, off_A_row, 0);
-            enc->setBuffer(C, (size_t)m * N * 2, 2);
-            enc->setBytes(&K, 4, 3);
-            enc->setBytes(&N, 4, 4);
-            const uint32_t rows_per_tg = 2;
-            enc->dispatchThreadgroups(MTL::Size((N + rows_per_tg - 1) / rows_per_tg, 1, 1),
-                                      MTL::Size(128, 1, 1));
-        }
-        return;
+    for (uint32_t m = 0; m < M; ++m) {
+        const size_t off_A_row = off_A + (size_t)m * K * 2;
+        enc_barrier(enc);
+        enc->setComputePipelineState(pso_q8_0);
+        enc->setBuffer(W, off_W, 1);
+        enc->setBuffer(A, off_A_row, 0);
+        enc->setBuffer(C, (size_t)m * N * 2, 2);
+        enc->setBytes(&K, 4, 3);
+        enc->setBytes(&N, 4, 4);
+        const uint32_t rows_per_tg = 2;
+        enc->dispatchThreadgroups(MTL::Size((N + rows_per_tg - 1) / rows_per_tg, 1, 1),
+                                  MTL::Size(128, 1, 1));
     }
+}
+
+// WHY: fp16/Q4_K fallback for lm_head and future tied-embed paths.
+inline void encode_gemm_fallback(
+    MTL::ComputeCommandEncoder* enc, MTL::ComputePipelineState* pso_gemm,
+    MTL::ComputePipelineState* pso_gemv_m1,
+    MTL::Buffer* A, size_t off_A,
+    MTL::Buffer* W, size_t off_W,
+    MTL::Buffer* C,
+    uint32_t M, uint32_t N, uint32_t K)
+{
     encode_gemm(enc, pso_gemm, A, off_A, W, off_W, C, M, N, K, pso_gemv_m1);
 }
 
@@ -340,10 +337,14 @@ inline void dispatch_layer(
     encode_rmsnorm(enc, P.rmsnorm, B.x, B.w_pre_attn_norm, off_norm,
                    B.x_norm, T, p.d_model, p.eps, P.rmsnorm_t1);
 
-    // 2. QKV-pack GEMM.
-    encode_gemm_qaware(enc, P.gemm, P.gemv_m1, P.q8_0_matvec, B.dt_qkv,
-                       B.x_norm, 0, B.w_qkv, off_w_qkv,
-                       B.qkv_packed, T, qkv_N, p.d_model);
+    // 2. QKV-pack GEMM. (qwen3 weights are always Q8_0; inline the fast path.)
+    if (B.dt_qkv == sk::Dtype::Q8_0 && P.q8_0_matvec != nullptr) {
+        encode_q8_0_gemm(enc, P.q8_0_matvec, B.x_norm, 0, B.w_qkv, off_w_qkv,
+                         B.qkv_packed, T, qkv_N, p.d_model);
+    } else {
+        encode_gemm_fallback(enc, P.gemm, P.gemv_m1, B.x_norm, 0, B.w_qkv, off_w_qkv,
+                             B.qkv_packed, T, qkv_N, p.d_model);
+    }
 
     // 3. Splits.
     encode_split(enc, P.split_packed, B.qkv_packed, B.q, B.kv_pack,
@@ -426,9 +427,13 @@ inline void dispatch_layer(
     }
 
     // 8. O-projection.
-    encode_gemm_qaware(enc, P.gemm, P.gemv_m1, P.q8_0_matvec, B.dt_o,
-                       attn_o_in, 0, B.w_o, off_w_o, B.o_proj,
-                       T, p.d_model, p.n_heads * hd);
+    if (B.dt_o == sk::Dtype::Q8_0 && P.q8_0_matvec != nullptr) {
+        encode_q8_0_gemm(enc, P.q8_0_matvec, attn_o_in, 0, B.w_o, off_w_o,
+                         B.o_proj, T, p.d_model, p.n_heads * hd);
+    } else {
+        encode_gemm_fallback(enc, P.gemm, P.gemv_m1, attn_o_in, 0, B.w_o, off_w_o,
+                             B.o_proj, T, p.d_model, p.n_heads * hd);
+    }
 
     // 9. Fused residual + pre-MLP RMSNorm.
     enc_barrier(enc);
@@ -473,12 +478,20 @@ inline void dispatch_layer(
         enc->dispatchThreadgroups(MTL::Size((N_v + BN - 1) / BN, 1, 1),
                                   MTL::Size(BN, 1, 1));
     } else {
-        encode_gemm_qaware(enc, P.gemm, P.gemv_m1, P.q8_0_matvec, B.dt_gate,
-                           B.m_in, 0, B.w_gate, off_w_gate,
-                           B.gate_buf, T, p.n_int, p.d_model);
-        encode_gemm_qaware(enc, P.gemm, P.gemv_m1, P.q8_0_matvec, B.dt_up,
-                           B.m_in, 0, B.w_up, off_w_up,
-                           B.up_buf, T, p.n_int, p.d_model);
+        if (B.dt_gate == sk::Dtype::Q8_0 && P.q8_0_matvec != nullptr) {
+            encode_q8_0_gemm(enc, P.q8_0_matvec, B.m_in, 0, B.w_gate, off_w_gate,
+                             B.gate_buf, T, p.n_int, p.d_model);
+        } else {
+            encode_gemm_fallback(enc, P.gemm, P.gemv_m1, B.m_in, 0, B.w_gate, off_w_gate,
+                                 B.gate_buf, T, p.n_int, p.d_model);
+        }
+        if (B.dt_up == sk::Dtype::Q8_0 && P.q8_0_matvec != nullptr) {
+            encode_q8_0_gemm(enc, P.q8_0_matvec, B.m_in, 0, B.w_up, off_w_up,
+                             B.up_buf, T, p.n_int, p.d_model);
+        } else {
+            encode_gemm_fallback(enc, P.gemm, P.gemv_m1, B.m_in, 0, B.w_up, off_w_up,
+                                 B.up_buf, T, p.n_int, p.d_model);
+        }
         enc_barrier(enc);
         enc->setComputePipelineState(P.silu_mul);
         enc->setBuffer(B.gate_buf, 0, 0);
@@ -489,9 +502,13 @@ inline void dispatch_layer(
         enc->dispatchThreadgroups(MTL::Size((N_total + 255) / 256, 1, 1),
                                   MTL::Size(256, 1, 1));
     }
-    encode_gemm_qaware(enc, P.gemm, P.gemv_m1, P.q8_0_matvec, B.dt_down,
-                       B.up_buf, 0, B.w_down, off_w_down,
-                       B.mlp_out, T, p.d_model, p.n_int);
+    if (B.dt_down == sk::Dtype::Q8_0 && P.q8_0_matvec != nullptr) {
+        encode_q8_0_gemm(enc, P.q8_0_matvec, B.up_buf, 0, B.w_down, off_w_down,
+                         B.mlp_out, T, p.d_model, p.n_int);
+    } else {
+        encode_gemm_fallback(enc, P.gemm, P.gemv_m1, B.up_buf, 0, B.w_down, off_w_down,
+                             B.mlp_out, T, p.d_model, p.n_int);
+    }
 
     // 11. Final residual.
     enc_barrier(enc);
