@@ -52,3 +52,4 @@ SuperKittens/_libs/libsk.metallib
 # Weights / activation dumps
 *.gguf
 *.npz
+_perf_bench.py
