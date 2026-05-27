@@ -35,13 +35,6 @@ struct Handle {
     // Each layer's slab is a separate file-range mmap; this vector owns the
     // MmapBuffer objects so they can be destroyed alongside the handle.
     std::vector<sk::silicon::MmapBuffer*> tensor_mmaps;
-
-    // Phase-4 plumbing: shared Executor owning command queue + PSO cache +
-    // scratch pool + ICB lifecycle. Full migration of the decode graph
-    // through exec->record_token_icb is deferred (requires Phase 2 kernel
-    // signature updates); this PR only routes the tail argmax PSO compile
-    // through the Executor as a proof point.
-    sk::Executor* exec = nullptr;
 };
 
 static MTL::Buffer* alloc_zero(MTL::Device* dev, size_t bytes) {
@@ -58,7 +51,11 @@ static bool resolve_psos(ModelPSOs& P) {
     P.layer.gemv_m1        = sk::bindings_pso("gemv_fp16_m1");
     P.layer.gemv_swiglu_m1 = sk::bindings_pso("gemv_swiglu_fp16_m1");
     P.layer.gemv_t_m1      = sk::bindings_pso("gemv_t_fp16_m1");
+    P.layer.gemv_t_2dtile_m1 = sk::bindings_pso("gemv_t_fp16_2dtile_m1");  // optional; nullptr OK
     P.layer.q8_0_matvec    = sk::bindings_pso("q8_0_matvec");  // optional; nullptr OK
+    P.layer.q8_0_swiglu_m1 = sk::bindings_pso("q8_0_swiglu_m1");  // optional; nullptr OK
+    P.layer.q8_0_swiglu_prenorm_m1 = sk::bindings_pso("q8_0_swiglu_prenorm_m1");  // optional
+    P.layer.q8_0_matvec_addres = sk::bindings_pso("q8_0_matvec_addres");  // optional
     P.layer.split_packed   = sk::bindings_pso("split_packed");
     P.layer.rope_qk        = sk::bindings_pso("qwen_rope_qk");
     P.layer.attn           = sk::bindings_pso("mha_causal");
@@ -110,15 +107,7 @@ extern "C" sk_qwen_handle* sk_qwen_create(const sk_qwen_config* cfg) {
 
     auto* h = new meow::qwen::Handle();
     h->cfg = *cfg;
-    // Construct the shared Executor up-front so resolve_psos can route the
-    // argmax PSO compile through it (proof point: same PSO handle as the
-    // legacy sk::bindings_pso path, just owned by exec's cache).
-    h->exec = new sk::Executor(dev);
-    if (!meow::qwen::resolve_psos(h->psos)) { delete h->exec; delete h; return nullptr; }
-    // Route the tail argmax PSO compile through the Executor's cache. We
-    // overwrite the bindings_pso lookup with exec->pso so subsequent
-    // dispatch_model calls observe the same PSO via either route.
-    if (auto* p = h->exec->pso("argmax")) { h->psos.argmax = p; }
+    if (!meow::qwen::resolve_psos(h->psos)) { delete h; return nullptr; }
 
     using namespace meow::qwen;
     const uint32_t T_max = cfg->batch * cfg->seq_max;
@@ -256,13 +245,6 @@ extern "C" sk_qwen_handle* sk_qwen_create(const sk_qwen_config* cfg) {
         }
     }
 
-    // WHY: ICB-blocker plumbing — one shared 32 B MTL::Buffer holding
-    // sk::TokenArgs, host-patched via memcpy per token (no encoder, ICB-safe).
-    // Per-token kernel migration to read from this slot is deferred to a
-    // follow-up to avoid breaking shared-kernel signatures used by deepseek
-    // and mamba; see SuperKittens/inference/icb/PHASE2_INVENTORY.md.
-    h->bufs.token_args = alloc_zero(dev, sizeof(sk::TokenArgs));
-
     return reinterpret_cast<sk_qwen_handle*>(h);
 }
 
@@ -314,24 +296,11 @@ extern "C" void sk_qwen_reset(sk_qwen_handle* hp) {
     reinterpret_cast<meow::qwen::Handle*>(hp)->current_pos = 0;
 }
 
-extern "C" int sk_qwen_forward(sk_qwen_handle* hp,
-                               const int* input_ids, uint32_t seq,
-                               int* output_id) {
-    if (!hp || !input_ids || !output_id) return -1;
-    auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
-    if (seq == 0 || seq > h->cfg.seq_max) return -2;
-    if (h->current_pos + seq > h->cfg.cache_max) return -4;
-
-    auto* q = sk::bindings_queue();
-    if (!q) return -3;
-
-    std::memcpy(h->bufs.input_ids->contents(), input_ids,
-                (size_t)h->cfg.batch * seq * sizeof(int32_t));
-
-    int32_t* pos = (int32_t*)h->bufs.rope_pos->contents();
-    for (uint32_t i = 0; i < seq; ++i) pos[i] = (int32_t)(h->current_pos + i);
-
-    meow::qwen::ModelParams mp;
+namespace meow { namespace qwen {
+// WHY: one-step driver shared between sk_qwen_forward and the in-C decode
+// loop. Caller has already memcpy'd input_ids + rope_pos for `seq` tokens.
+static int run_step(Handle* h, MTL::CommandQueue* q, uint32_t seq) {
+    ModelParams mp;
     mp.batch          = h->cfg.batch;
     mp.seq            = seq;
     mp.n_layers       = h->cfg.n_layers;
@@ -356,15 +325,84 @@ extern "C" int sk_qwen_forward(sk_qwen_handle* hp,
     h->last_seq        = seq;
 
     auto* cmd = q->commandBuffer();
-    meow::qwen::dispatch_model(cmd, h->psos, h->weights, h->bufs, mp);
+    dispatch_model(cmd, h->psos, h->weights, h->bufs, mp);
     cmd->commit();
     cmd->waitUntilCompleted();
     cmd->release();
-
     h->current_pos += seq;
+    return 0;
+}
+}}  // namespace meow::qwen
+
+extern "C" int sk_qwen_forward(sk_qwen_handle* hp,
+                               const int* input_ids, uint32_t seq,
+                               int* output_id) {
+    if (!hp || !input_ids || !output_id) return -1;
+    auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
+    if (seq == 0 || seq > h->cfg.seq_max) return -2;
+    if (h->current_pos + seq > h->cfg.cache_max) return -4;
+
+    auto* q = sk::bindings_queue();
+    if (!q) return -3;
+
+    std::memcpy(h->bufs.input_ids->contents(), input_ids,
+                (size_t)h->cfg.batch * seq * sizeof(int32_t));
+
+    int32_t* pos = (int32_t*)h->bufs.rope_pos->contents();
+    for (uint32_t i = 0; i < seq; ++i) pos[i] = (int32_t)(h->current_pos + i);
+
+    int rc = meow::qwen::run_step(h, q, seq);
+    if (rc) return rc;
+
     std::memcpy(output_id, h->bufs.output_id->contents(),
                 (size_t)h->cfg.batch * sizeof(int32_t));
     return 0;
+}
+
+extern "C" int sk_qwen_generate_n(sk_qwen_handle* hp,
+                                  const int* prompt_ids, uint32_t prompt_seq,
+                                  int* out_tokens, uint32_t n_tokens,
+                                  int32_t eos_id) {
+    if (!hp || !prompt_ids || !out_tokens) return -1;
+    auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
+    if (prompt_seq == 0 || prompt_seq > h->cfg.seq_max) return -2;
+    if (n_tokens == 0) return 0;
+    if (h->current_pos + prompt_seq > h->cfg.cache_max) return -4;
+    if (h->cfg.batch != 1) return -5;  // greedy multi-token loop is batch=1
+
+    auto* q = sk::bindings_queue();
+    if (!q) return -3;
+
+    // Prefill on the prompt: produces argmax for next token in output_id.
+    std::memcpy(h->bufs.input_ids->contents(), prompt_ids,
+                (size_t)prompt_seq * sizeof(int32_t));
+    {
+        int32_t* pos = (int32_t*)h->bufs.rope_pos->contents();
+        for (uint32_t i = 0; i < prompt_seq; ++i)
+            pos[i] = (int32_t)(h->current_pos + i);
+    }
+    if (int rc = meow::qwen::run_step(h, q, prompt_seq)) return rc;
+
+    int32_t* in_ids  = (int32_t*)h->bufs.input_ids->contents();
+    int32_t* rope    = (int32_t*)h->bufs.rope_pos->contents();
+    const int32_t* out_id_buf = (const int32_t*)h->bufs.output_id->contents();
+
+    int32_t first = out_id_buf[0];
+    out_tokens[0] = first;
+    if (eos_id >= 0 && first == eos_id) return 1;
+    uint32_t written = 1;
+    int32_t last = first;
+
+    while (written < n_tokens) {
+        if (h->current_pos + 1 > h->cfg.cache_max) break;
+        in_ids[0] = last;
+        rope[0]   = (int32_t)h->current_pos;
+        if (int rc = meow::qwen::run_step(h, q, 1)) return rc;
+        last = out_id_buf[0];
+        out_tokens[written++] = last;
+        if (eos_id >= 0 && last == eos_id) break;
+    }
+    return (int)written;
 }
 
 extern "C" int sk_qwen_set_rope_tables(sk_qwen_handle* hp, const void* cos, const void* sin) {
@@ -447,8 +485,6 @@ extern "C" void sk_qwen_destroy(sk_qwen_handle* hp) {
     rel(h->bufs.q_th); rel(h->bufs.k_th); rel(h->bufs.v_th); rel(h->bufs.attn_out_seq);
     rel(h->bufs.argmax_val_buf); rel(h->bufs.argmax_idx_buf);
     rel(h->bufs.argmax_args);
-    rel(h->bufs.token_args);
     if (h->bufs.argmax_icb) { delete h->bufs.argmax_icb; h->bufs.argmax_icb = nullptr; }
-    if (h->exec) { delete h->exec; h->exec = nullptr; }
     delete h;
 }

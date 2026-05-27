@@ -33,6 +33,16 @@ public:
                                        std::size_t file_offset, std::size_t length,
                                        std::size_t* out_inner_off);
 
+    // Same as from_file_range, but reuses a caller-owned fd. The mapping holds
+    // no fd of its own (Darwin/POSIX: mmap retains its own reference on the
+    // backing vnode, so the caller may close `fd` once all desired mappings
+    // are created). Lets loaders open the GGUF once and mmap hundreds of
+    // tensor ranges off that single fd instead of `open()`ing per tensor —
+    // critical when n_tensors > `ulimit -n`.
+    static MmapBuffer* from_fd_range(MTL::Device* dev, int fd,
+                                     std::size_t file_offset, std::size_t length,
+                                     std::size_t* out_inner_off);
+
     ~MmapBuffer();
 
     MTL::Buffer* buffer() const { return buf_; }    // borrowed; lifetime tied to *this

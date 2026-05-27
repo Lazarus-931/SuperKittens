@@ -109,6 +109,41 @@ MmapBuffer* MmapBuffer::from_file_range(MTL::Device* dev, const std::string& pat
     return new MmapBuffer(buf, base, map_len, fd);
 }
 
+MmapBuffer* MmapBuffer::from_fd_range(MTL::Device* dev, int fd,
+                                      std::size_t file_offset, std::size_t length,
+                                      std::size_t* out_inner_off)
+{
+    if (!dev || fd < 0 || length == 0) return nullptr;
+
+    const std::size_t page = (std::size_t)::sysconf(_SC_PAGESIZE);
+    const std::size_t aligned_off = (file_offset / page) * page;
+    const std::size_t inner_off   = file_offset - aligned_off;
+    const std::size_t map_len     = inner_off + length;
+
+    void* base = ::mmap(nullptr, map_len, PROT_READ,
+                        MAP_PRIVATE | MAP_NOCACHE, fd, (off_t)aligned_off);
+    if (base == MAP_FAILED) {
+        std::fprintf(stderr, "MmapBuffer: mmap(fd=%d) failed off=%zu len=%zu: %s\n",
+                     fd, aligned_off, map_len, std::strerror(errno));
+        return nullptr;
+    }
+    ::madvise(base, map_len, MADV_WILLNEED);
+
+    MTL::Buffer* buf = dev->newBuffer(base, (NS::UInteger)map_len,
+                                      MTL::ResourceStorageModeShared,
+                                      nullptr);
+    if (!buf) {
+        std::fprintf(stderr, "MmapBuffer: newBufferWithBytesNoCopy(fd-range) failed (len=%zu)\n", map_len);
+        ::munmap(base, map_len);
+        return nullptr;
+    }
+
+    if (out_inner_off) *out_inner_off = inner_off;
+    // fd_ = -1: this MmapBuffer borrowed the fd from the caller and must not
+    // close it on destruction.
+    return new MmapBuffer(buf, base, map_len, -1);
+}
+
 MmapBuffer::~MmapBuffer() {
     if (buf_) buf_->release();
     // NOTE: we deliberately do NOT munmap/close here yet — Metal may still
