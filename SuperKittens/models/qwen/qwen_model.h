@@ -8,6 +8,7 @@
 
 #include "../../inference/weight_store.h"
 #include "../../inference/silicon/icb_recorder.h"
+#include "../../inference/decode_orchestrator.h"
 
 namespace meow {
 namespace qwen {
@@ -719,36 +720,32 @@ inline void dispatch_model(
     const ModelParams&  M)
 {
     const uint32_t T = M.batch * M.seq;
-
-    // A. Embedding lookup → x_a
-    {
-        auto* enc = cmd->computeCommandEncoder();
-        enc->setComputePipelineState(P.embedding_lookup);
-        enc->setBuffer(W.w_embed,   0, 0);
-        enc->setBuffer(B.input_ids, 0, 1);
-        enc->setBuffer(B.x_a,       0, 2);
-        enc->setBytes(&T,            4, 3);
-        enc->setBytes(&M.d_model,    4, 4);
-        enc->setBytes(&M.vocab_size, 4, 5);
-        const uint32_t D4 = M.d_model / 4;
-        enc->dispatchThreadgroups(MTL::Size((D4 + 127) / 128, T, 1),
-                                  MTL::Size(128, 1, 1));
-        enc->endEncoding();
-    }
-
-    // B. Layer stack (ping-pong x_a ↔ x_b)
-    MTL::Buffer* cur = B.x_a;
-    MTL::Buffer* nxt = B.x_b;
-
     const uint32_t n_run = (M.layers_run > 0 && M.layers_run < M.n_layers)
                            ? M.layers_run : M.n_layers;
-    for (uint32_t L = 0; L < n_run; ++L) {
-        // KV-cache addressing
-        const uint32_t total_after   = M.current_pos + M.seq;
-        const uint32_t kv_len        = (total_after < M.cache_max) ? total_after : M.cache_max;
-        const uint32_t logical_first = total_after - kv_len;
-        const uint32_t kv_buf_start  = logical_first % M.cache_max;
 
+    // KV-cache addressing is constant across layers; hoist out of the lambda.
+    const uint32_t total_after   = M.current_pos + M.seq;
+    const uint32_t kv_len        = (total_after < M.cache_max) ? total_after : M.cache_max;
+    const uint32_t logical_first = total_after - kv_len;
+    const uint32_t kv_buf_start  = logical_first % M.cache_max;
+
+    sk::DecodeOrchestratorCtx octx;
+    octx.token_in   = B.input_ids;
+    octx.x_a        = B.x_a;
+    octx.x_b        = B.x_b;
+    octx.T          = T;
+    octx.n_layers   = n_run;
+    octx.d_model    = M.d_model;
+    octx.vocab_size = M.vocab_size;
+    octx.eps        = M.eps;
+
+    sk::DecodeOrchestratorPSOs opsos;
+    opsos.embedding_lookup = P.embedding_lookup;
+    opsos.final_rmsnorm    = P.layer.rmsnorm;
+    opsos.final_rmsnorm_t1 = P.layer.rmsnorm_t1;
+
+    auto layer_fn = [&](MTL::CommandBuffer* lcmd, uint32_t L,
+                        MTL::Buffer* cur, MTL::Buffer* nxt) {
         LayerParams lp;
         lp.batch        = M.batch;
         lp.seq          = M.seq;
@@ -816,26 +813,18 @@ inline void dispatch_model(
         lb.dt_up           = W.dt_up;
         lb.dt_down         = W.dt_down;
 
-        dispatch_layer(cmd, P.layer, lb, lp);
+        dispatch_layer(lcmd, P.layer, lb, lp);
 
-        // Optional: snapshot this layer's residual output into capture buffer.
         if (B.capture && M.capture_layer >= 0 && (int32_t)L == M.capture_layer) {
-            auto* benc = cmd->blitCommandEncoder();
+            auto* benc = lcmd->blitCommandEncoder();
             benc->copyFromBuffer(nxt, 0, B.capture, 0,
                                  (size_t)T * M.d_model * 2);
             benc->endEncoding();
         }
+    };
 
-        MTL::Buffer* tmp = cur; cur = nxt; nxt = tmp;
-    }
-
-    // C. Final RMSNorm — own encoder (single helper, not worth fusing here).
-    {
-        auto* enc = cmd->computeCommandEncoder();
-        encode_rmsnorm(enc, P.layer.rmsnorm, cur, W.w_final_norm, 0,
-                       nxt, T, M.d_model, M.eps, P.layer.rmsnorm_t1);
-        enc->endEncoding();
-    }
+    MTL::Buffer* nxt = sk::encode_decode_step(
+        cmd, octx, opsos, layer_fn, W.w_embed, W.w_final_norm);
 
     // D. LM-head GEMM (tied → reuse embedding; untied → use w_lm_head). Both (V,D) row-major → transB=1.
     {
