@@ -253,6 +253,146 @@ void fa_d128(
 }
 
 
+
+template<uint MAX_HG, uint NS, uint SPLITS>
+[[kernel, max_total_threads_per_threadgroup(NS * 32)]]
+void mha_decode_split_t(
+    device const half* Q          [[buffer(0)]],
+    device const half* K          [[buffer(1)]],
+    device const half* V          [[buffer(2)]],
+    device float*      PM         [[buffer(3)]],
+    device float*      PS         [[buffer(4)]],
+    device float*      PO         [[buffer(5)]],
+    constant uint&    seq         [[buffer(6)]],
+    constant uint&   nheads       [[buffer(7)]],
+    constant uint& n_kv_heads     [[buffer(8)]],
+    constant uint& kv_len         [[buffer(9)]],
+    constant uint& cache_stride   [[buffer(10)]],
+    constant uint& n_splits       [[buffer(11)]],
+    uint3 gid  [[threadgroup_position_in_grid]],
+    uint  simd [[simdgroup_index_in_threadgroup]],
+    uint  lane [[thread_index_in_simdgroup]])
+{
+    constexpr uint D = 128;
+
+    const uint kv_head = gid.x;
+    const uint split   = gid.y;
+    const uint batch   = gid.z;
+    const uint Hg      = nheads / n_kv_heads;
+
+    // Even kv chunk per split (ceil); last split may be short or empty.
+    const uint chunk = (kv_len + n_splits - 1u) / n_splits;
+    const uint c_lo  = split * chunk;
+    const uint c_hi  = min(c_lo + chunk, kv_len);
+
+    const size_t kv_off = (size_t)(batch * n_kv_heads + kv_head) * cache_stride * D;
+    const float scale = 1.0f / sqrt(float(D));
+
+    float4 q_reg[MAX_HG];
+    for (uint g = 0; g < MAX_HG; ++g) {
+        if (g < Hg) {
+            const uint head = kv_head * Hg + g;
+            const size_t q_off = (size_t)(batch * nheads + head) * seq * D;
+            q_reg[g] = float4(
+                reinterpret_cast<const device half4*>(Q + q_off)[lane]) * scale;
+        } else {
+            q_reg[g] = float4(0.0f);
+        }
+    }
+
+    float  m_st[MAX_HG], s_st[MAX_HG];
+    float4 acc[MAX_HG];
+    for (uint g = 0; g < MAX_HG; ++g) {
+        m_st[g] = -INFINITY; s_st[g] = 0.0f; acc[g] = float4(0.0f);
+    }
+
+    // NS simdgroups split this chunk further; barrier-free key loop.
+    for (uint col = c_lo + simd; col < c_hi; col += NS) {
+        const float4 kf = float4(reinterpret_cast<const device half4*>(K + kv_off + (size_t)col * D)[lane]);
+        const float4 vf = float4(reinterpret_cast<const device half4*>(V + kv_off + (size_t)col * D)[lane]);
+        for (uint g = 0; g < Hg; ++g) {
+            const float score = simd_sum(dot(q_reg[g], kf));
+            const float new_m = max(m_st[g], score);
+            const float alpha = metal::fast::exp(m_st[g] - new_m);
+            const float beta  = metal::fast::exp(score   - new_m);
+            m_st[g] = new_m;
+            s_st[g] = fma(s_st[g], alpha, beta);
+            acc[g]  = fma(acc[g], alpha, beta * vf);
+        }
+    }
+
+    threadgroup float  m_sh[MAX_HG * NS];
+    threadgroup float  s_sh[MAX_HG * NS];
+    threadgroup float4 a_sh[MAX_HG * NS * 32];
+    for (uint g = 0; g < Hg; ++g) {
+        if (lane == 0) {
+            m_sh[g * NS + simd] = m_st[g];
+            s_sh[g * NS + simd] = s_st[g];
+        }
+        a_sh[(g * NS + simd) * 32 + lane] = acc[g];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd == 0) {
+        for (uint g = 0; g < Hg; ++g) {
+            float gm = -INFINITY;
+            for (uint p = 0; p < NS; ++p) gm = max(gm, m_sh[g * NS + p]);
+            float gs = 0.0f;
+            float4 ga = float4(0.0f);
+            for (uint p = 0; p < NS; ++p) {
+                const float w = metal::fast::exp(m_sh[g * NS + p] - gm);
+                gs += s_sh[g * NS + p] * w;
+                ga = fma(a_sh[(g * NS + p) * 32 + lane], w, ga);
+            }
+            const uint head = kv_head * Hg + g;
+            const uint idx  = (batch * nheads + head) * SPLITS + split;
+            if (lane == 0) { PM[idx] = gm; PS[idx] = gs; }
+            reinterpret_cast<device float4*>(PO + (size_t)idx * D)[lane] = ga;
+        }
+    }
+}
+
+// Combine pass: merge n_splits flash partials per (batch, head) → O.
+// Grid (nheads, 1, batch); one simdgroup (32 lanes × half4) per head. SPLITS is
+// the compile-time PM/PS/PO stride; n_splits (≤ SPLITS) is the host's launched
+// split count and must match mha_decode_split's n_splits exactly.
+template<uint SPLITS>
+[[kernel, max_total_threads_per_threadgroup(32)]]
+void mha_decode_combine_t(
+    device const float* PM        [[buffer(0)]],
+    device const float* PS        [[buffer(1)]],
+    device const float* PO        [[buffer(2)]],
+    device half*        O         [[buffer(3)]],
+    constant uint&     seq        [[buffer(4)]],
+    constant uint&    nheads      [[buffer(5)]],
+    constant uint& kv_len         [[buffer(6)]],
+    constant uint& n_splits       [[buffer(7)]],
+    uint3 gid  [[threadgroup_position_in_grid]],
+    uint  lane [[thread_index_in_simdgroup]])
+{
+    constexpr uint D = 128;
+    const uint head  = gid.x;
+    const uint batch = gid.z;
+
+    const uint active = min(n_splits, SPLITS);
+    const uint base = (batch * nheads + head) * SPLITS;
+    float gm = -INFINITY;
+    for (uint p = 0; p < active; ++p) gm = max(gm, PM[base + p]);
+
+    float gs = 0.0f;
+    float4 ga = float4(0.0f);
+    for (uint p = 0; p < active; ++p) {
+        const float w = metal::fast::exp(PM[base + p] - gm);
+        gs += PS[base + p] * w;
+        const float4 po = reinterpret_cast<const device float4*>(PO + (size_t)(base + p) * D)[lane];
+        ga = fma(po, w, ga);
+    }
+    const float inv = gs > 0.0f ? 1.0f / gs : 0.0f;
+    const size_t o_off = (size_t)(batch * nheads + head) * seq * D;
+    reinterpret_cast<device half4*>(O + o_off)[lane] = half4(ga * inv);
+}
+
+
 template [[host_name("fa_causal_64")]]
 [[kernel]] void fa_d64<true>(
     device const half*, device const half*, device const half*, device half*,
@@ -274,5 +414,24 @@ template [[host_name("mha_noncausal")]]
     device const half*, device const half*, device const half*, device half*,
     constant uint&, constant uint&, constant uint&, constant uint&, constant uint&,
     uint3, uint, uint, uint);
+
+// MAX_HG=8 covers all qwen3 variants (Hg ∈ {2,4,5,8}); NS=4 → 128 threads,
+// a_sh = 8*4*32 float4 = 16 KB (fits 32 KB with m_sh/s_sh headroom).
+// SPLITS=8 is the compile-time cap (PM/PS/PO stride); n_kv_heads(8)*8 = 64 TGs at
+// the max split count. Host sizes PM/PS/PO scratch as (batch*nheads*SPLITS)
+// floats / floats / (·*D) floats and passes a runtime n_splits ≤ SPLITS chosen
+// from kv_len; mha_decode_combine must use the identical n_splits.
+template [[host_name("mha_decode_split")]]
+[[kernel]] void mha_decode_split_t<8, 4, 8>(
+    device const half*, device const half*, device const half*,
+    device float*, device float*, device float*,
+    constant uint&, constant uint&, constant uint&, constant uint&, constant uint&,
+    constant uint&, uint3, uint, uint);
+
+template [[host_name("mha_decode_combine")]]
+[[kernel]] void mha_decode_combine_t<8>(
+    device const float*, device const float*, device const float*, device half*,
+    constant uint&, constant uint&, constant uint&, constant uint&,
+    uint3, uint);
 
 } // namespace meow::attn
