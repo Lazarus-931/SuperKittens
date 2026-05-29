@@ -75,6 +75,9 @@ QWEN_ABI = {
     "load_gguf":              optional([ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int),
     "set_rope_tables":  optional([ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p], ctypes.c_int),
     "get_last_logits":  optional([ctypes.c_void_p, ctypes.c_void_p], ctypes.c_int),
+    "get_logits_rows":  optional([ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32], ctypes.c_int),
+    "get_pos":          optional([ctypes.c_void_p], ctypes.c_int),
+    "set_pos":          optional([ctypes.c_void_p, ctypes.c_uint32], ctypes.c_int),
 }
 
 
@@ -298,6 +301,27 @@ class Qwen(Model):
         rc = _load().sk_qwen_get_last_logits(self._h, out.ctypes.data)
         if rc: raise RuntimeError(f"sk_qwen_get_last_logits failed: {rc}")
         return out
+
+    def get_logits_rows(self, n_rows: int) -> np.ndarray:
+        """Return (n_rows, vocab) fp16: per-position logits from the last forward.
+
+        Relative rows 0..n_rows-1, i.e. the first n_rows positions of the most
+        recent forward call. Needed for spec-decode verification.
+        """
+        lib = _load()
+        if not hasattr(lib, "sk_qwen_get_logits_rows"):
+            raise RuntimeError("libsk.dylib has no sk_qwen_get_logits_rows symbol; rebuild dylib")
+        out = np.empty((int(n_rows), self.cfg.vocab_size), dtype=np.float16)
+        rc = lib.sk_qwen_get_logits_rows(self._h, out.ctypes.data, ctypes.c_uint32(int(n_rows)))
+        if rc: raise RuntimeError(f"sk_qwen_get_logits_rows failed: {rc}")
+        return out
+
+    def get_pos(self) -> int:
+        return int(_load().sk_qwen_get_pos(self._h))
+
+    def set_pos(self, pos: int) -> None:
+        rc = _load().sk_qwen_set_pos(self._h, ctypes.c_uint32(int(pos)))
+        if rc: raise RuntimeError(f"sk_qwen_set_pos failed: {rc}")
 
     def set_rope_tables(self, cos: np.ndarray, sin: np.ndarray) -> None:
         c = np.ascontiguousarray(cos, dtype=np.float16)
