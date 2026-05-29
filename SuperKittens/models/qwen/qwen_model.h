@@ -51,6 +51,7 @@ struct LayerPSOs {
     MTL::ComputePipelineState* q8_0_swiglu_prenorm_m1 = nullptr;  // fused residual+rmsnorm+swiglu (M=1)
     MTL::ComputePipelineState* q8_0_matvec_addres = nullptr;  // matvec + residual add (M=1)
     MTL::ComputePipelineState* split_packed;      // (T, A+B) → (T, A) + (T, B)
+    MTL::ComputePipelineState* qkv_split_norm = nullptr;  // fused split + per-head Q/K rmsnorm
     MTL::ComputePipelineState* rope_qk;           // split-half RoPE on Q, K
     MTL::ComputePipelineState* attn;              // mha_causal (d=128, GQA)
     MTL::ComputePipelineState* kv_cache_write;
@@ -268,6 +269,35 @@ inline void encode_split(
     enc->dispatchThreads(MTL::Size(A + B, T, 1), MTL::Size(128, 1, 1));
 }
 
+// WHY: fused QKV-split + per-head Q/K RMSNorm. One simdgroup per (token, head)
+// row over all (Hq + 2*Hkv) heads; replaces 2 split_packed + 2 rmsnorm
+// dispatches (and their 4 fences) with a single dispatch.
+inline void encode_qkv_split_norm(
+    MTL::ComputeCommandEncoder* enc, MTL::ComputePipelineState* pso,
+    MTL::Buffer* qkv,
+    MTL::Buffer* q_out, MTL::Buffer* k_out, MTL::Buffer* v_out,
+    MTL::Buffer* gamma_q, size_t off_gamma_q,
+    MTL::Buffer* gamma_k, size_t off_gamma_k,
+    uint32_t T, uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim,
+    float eps)
+{
+    enc_barrier(enc);
+    enc->setComputePipelineState(pso);
+    enc->setBuffer(qkv,     0,           0);
+    enc->setBuffer(q_out,   0,           1);
+    enc->setBuffer(k_out,   0,           2);
+    enc->setBuffer(v_out,   0,           3);
+    enc->setBuffer(gamma_q, off_gamma_q, 4);
+    enc->setBuffer(gamma_k, off_gamma_k, 5);
+    enc->setBytes(&T,          4, 6);
+    enc->setBytes(&n_heads,    4, 7);
+    enc->setBytes(&n_kv_heads, 4, 8);
+    enc->setBytes(&head_dim,   4, 9);
+    enc->setBytes(&eps,        4, 10);
+    const uint32_t n_slots = n_heads + 2u * n_kv_heads;
+    enc->dispatchThreadgroups(MTL::Size(n_slots, T, 1), MTL::Size(32, 1, 1));
+}
+
 inline void encode_transpose(
     MTL::ComputeCommandEncoder* enc, MTL::ComputePipelineState* pso,
     MTL::Buffer* src, MTL::Buffer* dst,
@@ -350,21 +380,28 @@ inline void dispatch_layer(
                              B.qkv_packed, T, qkv_N, p.d_model);
     }
 
-    // 3. Splits.
-    encode_split(enc, P.split_packed, B.qkv_packed, B.q, B.kv_pack,
-                 T, qN, 2 * kvN);
-    encode_split(enc, P.split_packed, B.kv_pack, B.k_tmp, B.v_tmp,
-                 T, kvN, kvN);
-
-    // 4. Per-head Q/K-norm. K-norm writes a distinct buffer from Q-norm
-    // (B.k_tmp vs B.q); its dep on split-2 is honored transitively by the
-    // barrier before Q-norm (Metal buffer-scope barriers are full fences),
-    // so skip the redundant barrier here.
-    encode_rmsnorm(enc, P.rmsnorm, B.q, B.w_q_norm, off_w_q_norm,
-                   B.q, T * p.n_heads, hd, p.eps);
-    encode_rmsnorm(enc, P.rmsnorm, B.k_tmp, B.w_k_norm, off_w_k_norm,
-                   B.k_tmp, T * p.n_kv_heads, hd, p.eps,
-                   /*pso_t1=*/nullptr, /*barrier_before=*/false);
+    // 3+4. Fused QKV-split + per-head Q/K RMSNorm (1 dispatch). Falls back to
+    // 2 splits + 2 rmsnorms when the fused PSO is unavailable.
+    if (P.qkv_split_norm != nullptr) {
+        encode_qkv_split_norm(enc, P.qkv_split_norm, B.qkv_packed,
+                              B.q, B.k_tmp, B.v_tmp,
+                              B.w_q_norm, off_w_q_norm, B.w_k_norm, off_w_k_norm,
+                              T, p.n_heads, p.n_kv_heads, hd, p.eps);
+    } else {
+        encode_split(enc, P.split_packed, B.qkv_packed, B.q, B.kv_pack,
+                     T, qN, 2 * kvN);
+        encode_split(enc, P.split_packed, B.kv_pack, B.k_tmp, B.v_tmp,
+                     T, kvN, kvN);
+        // K-norm writes a distinct buffer from Q-norm (B.k_tmp vs B.q); its dep
+        // on split-2 is honored transitively by the barrier before Q-norm
+        // (Metal buffer-scope barriers are full fences), so skip the redundant
+        // barrier here.
+        encode_rmsnorm(enc, P.rmsnorm, B.q, B.w_q_norm, off_w_q_norm,
+                       B.q, T * p.n_heads, hd, p.eps);
+        encode_rmsnorm(enc, P.rmsnorm, B.k_tmp, B.w_k_norm, off_w_k_norm,
+                       B.k_tmp, T * p.n_kv_heads, hd, p.eps,
+                       /*pso_t1=*/nullptr, /*barrier_before=*/false);
+    }
 
     // 5. RoPE on Q and K. RoPE-K writes a distinct buffer from RoPE-Q;
     // dep on K-norm is honored by the barrier before RoPE-Q.
