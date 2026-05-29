@@ -5,6 +5,8 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cmath>
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -76,6 +78,47 @@ inline float fp16_bits_to_f32(uint16_t s) {
 inline uint16_t f32_to_fp16_bits(float f) {
     uint32_t fb; std::memcpy(&fb, &f, 4);
     return fp32_bits_to_fp16(fb);
+}
+
+// Q5_0 dequant (22 B / 32 weights). Layout: half d, uint8 qh[4] (high bits),
+// uint8 qs[16] (low 4 bits, 2 weights/byte). q = (lo | hi<<4) - 16.
+void dequant_q5_0_to_f32(float* dst, const uint8_t* src, size_t n_elems) {
+    const size_t nb = n_elems / 32;
+    for (size_t b = 0; b < nb; ++b) {
+        const uint8_t* p = src + b * 22;
+        uint16_t dh; std::memcpy(&dh, p, 2);
+        const float d = fp16_bits_to_f32(dh);
+        uint32_t qh; std::memcpy(&qh, p + 2, 4);
+        const uint8_t* qs = p + 6;
+        for (int i = 0; i < 16; ++i) {
+            const uint8_t xh0 = ((qh >> (i +  0)) << 4) & 0x10;
+            const uint8_t xh1 = ((qh >> (i + 12))     ) & 0x10;
+            const int q0 = (int)((qs[i] & 0x0F) | xh0) - 16;
+            const int q1 = (int)((qs[i] >>   4) | xh1) - 16;
+            dst[b * 32 + i]      = d * (float)q0;
+            dst[b * 32 + i + 16] = d * (float)q1;
+        }
+    }
+}
+
+// Quantize a contiguous fp32 row to Q8_0 blocks (34 B / 32 weights).
+void quantize_row_q8_0(uint8_t* dst, const float* src, size_t n_elems) {
+    const size_t nb = n_elems / 32;
+    for (size_t b = 0; b < nb; ++b) {
+        const float* x = src + b * 32;
+        float amax = 0.f;
+        for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(x[i]));
+        const float d = amax / 127.f;
+        const float id = d > 0.f ? 1.f / d : 0.f;
+        uint8_t* p = dst + b * 34;
+        const uint16_t dh = f32_to_fp16_bits(d);
+        std::memcpy(p, &dh, 2);
+        int8_t* qs = (int8_t*)(p + 2);
+        for (int i = 0; i < 32; ++i) {
+            int q = (int)std::lround(x[i] * id);
+            qs[i] = (int8_t)std::max(-127, std::min(127, q));
+        }
+    }
 }
 
 void dequant_q8_0_to_f32(float* dst, const uint8_t* src, size_t n_elems) {
@@ -164,6 +207,7 @@ bool dequant_to_f32(std::vector<float>& out, const sk::TensorView* v, size_t n_e
             return true;
         }
         case sk::Dtype::Q8_0: dequant_q8_0_to_f32(out.data(), (const uint8_t*)v->data, n_elems); return true;
+        case sk::Dtype::Q5_0: dequant_q5_0_to_f32(out.data(), (const uint8_t*)v->data, n_elems); return true;
         case sk::Dtype::Q4_K: dequant_q4_k_to_f32(out.data(), (const uint8_t*)v->data, n_elems); return true;
         case sk::Dtype::Q6_K: dequant_q6_k_to_f32(out.data(), (const uint8_t*)v->data, n_elems); return true;
         default:
@@ -247,6 +291,7 @@ extern "C" int sk_deepseek_load_from_store(sk_deepseek_handle* hp, sk::WeightSto
     const size_t down_bytes_per_layer = (size_t)E * dm * (ni / 32) * 34;
 
     for (uint32_t L = 0; L < c.n_layers; ++L) {
+        std::fprintf(stderr, "ds load: layer %u/%u\n", L, c.n_layers); std::fflush(stderr);
         const bool   dense = (L < (uint32_t)c.first_k_dense_replace);
         const size_t pre_off    = (size_t)L * dm * fp16;
         const size_t kvan_off   = (size_t)L * kvr * fp16;
@@ -282,40 +327,72 @@ extern "C" int sk_deepseek_load_from_store(sk_deepseek_handle* hp, sk::WeightSto
         }
 
         {
+            // kv_a: GEMM wants [K=d_model, N=kva_cols]; GGUF logical [kva_cols, d_model].
             const std::string nm = blk_key(L, "attn_kv_a_mqa.weight");
             auto* v = store->get(nm);
             const std::string nm2 = v ? nm : blk_key(L, "attn_kv.weight");
             if (!copy_transpose_fp16(h->weights.w_kv_a, kv_a_off, store,
-                           nm2, kva_cols, dm)) return -26;
+                           nm2, dm, kva_cols)) return -26;
         }
 
-        if (!copy_transpose_fp16(h->weights.w_kv_b, kv_b_off, store,
-                       blk_key(L, "attn_kv_b.weight"), kvbN, kvr)) return -27;
+        // kv_b: GGUF logical W is [kvbN, R] with the kvbN rows interleaved per
+        // head as [h0_knope(128), h0_v(128), h1_knope, h1_v, ...]. kv_up_pair
+        // wants two contiguous blocks w_k_up[R, n_heads*qk_nope] and
+        // w_v_up[R, n_heads*v_head], so de-interleave + transpose here.
+        {
+            std::vector<float> src;   // [kvbN, R] row-major
+            if (!dequant_to_f32(src, store->get(blk_key(L, "attn_kv_b.weight")),
+                                kvbN * kvr)) return -27;
+            const size_t k_out = nh * dkn, v_out = nh * dv;
+            uint16_t* dst = (uint16_t*)((char*)h->weights.w_kv_b->contents() + kv_b_off);
+            uint16_t* dk_up = dst;                 // [R, k_out]
+            uint16_t* dv_up = dst + kvr * k_out;   // [R, v_out]
+            for (size_t hh = 0; hh < nh; ++hh) {
+                for (size_t j = 0; j < dkn; ++j) {       // k_nope cols
+                    const size_t out_row = hh * (dkn + dv) + j;   // row in [kvbN,R]
+                    const size_t kcol = hh * dkn + j;             // col in [R,k_out]
+                    for (size_t r = 0; r < kvr; ++r)
+                        dk_up[r * k_out + kcol] = f32_to_fp16_bits(src[out_row * kvr + r]);
+                }
+                for (size_t j = 0; j < dv; ++j) {        // v cols
+                    const size_t out_row = hh * (dkn + dv) + dkn + j;
+                    const size_t vcol = hh * dv + j;
+                    for (size_t r = 0; r < kvr; ++r)
+                        dv_up[r * v_out + vcol] = f32_to_fp16_bits(src[out_row * kvr + r]);
+                }
+            }
+        }
+        // o_proj: dense GEMM wants [K=nh*dv, N=d_model]; GGUF logical is
+        // [out=d_model, in=nh*dv] → transpose to [nh*dv, d_model].
         if (!copy_transpose_fp16(h->weights.w_o, o_off, store,
-                       blk_key(L, "attn_output.weight"), dm, nh * dv)) return -28;
+                       blk_key(L, "attn_output.weight"), nh * dv, dm)) return -28;
 
         if (dense) {
             // Leading dense layer: wide gated MLP (dequant fp16) into w_dense_*.
             const size_t dg_off = (size_t)L * dm * dint * fp16;
             const size_t dd_off = (size_t)L * dint * dm * fp16;
             if (!copy_transpose_fp16(h->weights.w_dense_gate, dg_off, store,
-                           blk_key(L, "ffn_gate.weight"), dint, dm)) return -40;
+                           blk_key(L, "ffn_gate.weight"), dm, dint)) return -40;
             if (!copy_transpose_fp16(h->weights.w_dense_up, dg_off, store,
-                           blk_key(L, "ffn_up.weight"), dint, dm)) return -41;
+                           blk_key(L, "ffn_up.weight"), dm, dint)) return -41;
             if (!copy_transpose_fp16(h->weights.w_dense_down, dd_off, store,
-                           blk_key(L, "ffn_down.weight"), dm, dint)) return -42;
+                           blk_key(L, "ffn_down.weight"), dint, dm)) return -42;
             continue;
         }
 
-        // Shared experts (dequant to fp16) + router.
+        // Shared experts (dequant to fp16) + router. gated_mlp wants
+        // w_gate/up [K=d_model, N_int=sni] and w_down [N_int=sni, N=d_model];
+        // GGUF gate/up logical [sni, dm], down logical [dm, sni] → transpose.
         if (!copy_transpose_fp16(h->weights.w_shared_gate, sh_gate_off, store,
-                       blk_key(L, "ffn_gate_shexp.weight"), sni, dm)) return -30;
+                       blk_key(L, "ffn_gate_shexp.weight"), dm, sni)) return -30;
         if (!copy_transpose_fp16(h->weights.w_shared_up, sh_gate_off, store,
-                       blk_key(L, "ffn_up_shexp.weight"), sni, dm)) return -31;
+                       blk_key(L, "ffn_up_shexp.weight"), dm, sni)) return -31;
         if (!copy_transpose_fp16(h->weights.w_shared_down, sh_down_off, store,
-                       blk_key(L, "ffn_down_shexp.weight"), dm, sni)) return -32;
+                       blk_key(L, "ffn_down_shexp.weight"), sni, dm)) return -32;
+        // Router W: moe_router reads W[D,N] (logit[e]=Σ_d x[d]·W[d,e]); GGUF
+        // ffn_gate_inp logical [N=E, D] → transpose to [D, E].
         if (!copy_transpose_fp16(h->weights.w_router, router_off, store,
-                       blk_key(L, "ffn_gate_inp.weight"), E, dm)) return -33;
+                       blk_key(L, "ffn_gate_inp.weight"), dm, E)) return -33;
 
         // Routed experts: gate/up Q4_K, down Q8_0 — copy raw block bytes.
         {
@@ -330,10 +407,6 @@ extern "C" int sk_deepseek_load_from_store(sk_deepseek_handle* hp, sk::WeightSto
                 std::fprintf(stderr, "ds weights: gate/up_exps L%u not Q4_K\n", L);
                 return -35;
             }
-            if (dv2->dtype != sk::Dtype::Q8_0) {
-                std::fprintf(stderr, "ds weights: down_exps L%u not Q8_0\n", L);
-                return -36;
-            }
             const size_t gate_off = (size_t)L * gate_bytes_per_layer;
             const size_t down_off = (size_t)L * down_bytes_per_layer;
             if (gv->nbytes != gate_bytes_per_layer || uv->nbytes != gate_bytes_per_layer) {
@@ -341,14 +414,26 @@ extern "C" int sk_deepseek_load_from_store(sk_deepseek_handle* hp, sk::WeightSto
                              L, gv->nbytes, uv->nbytes, gate_bytes_per_layer);
                 return -37;
             }
-            if (dv2->nbytes != down_bytes_per_layer) {
-                std::fprintf(stderr, "ds weights: down_exps size L%u got %zu expect %zu\n",
-                             L, dv2->nbytes, down_bytes_per_layer);
-                return -38;
-            }
             std::memcpy((char*)h->weights.w_gate->contents() + gate_off, gv->data, gate_bytes_per_layer);
             std::memcpy((char*)h->weights.w_up->contents()   + gate_off, uv->data, gate_bytes_per_layer);
-            std::memcpy((char*)h->weights.w_down->contents() + down_off, dv2->data, down_bytes_per_layer);
+
+            // down_exps dtype varies per layer (Q8_0 / Q5_0 in Q4_K_M). Requantize
+            // to a uniform Q8_0 so the q8_0 per-expert matvec sees one layout.
+            {
+                const size_t n_down = (size_t)E * dm * ni;
+                std::vector<float> f32(n_down);
+                bool ok = true;
+                if (dv2->dtype == sk::Dtype::Q8_0)      dequant_q8_0_to_f32(f32.data(), (const uint8_t*)dv2->data, n_down);
+                else if (dv2->dtype == sk::Dtype::Q5_0) dequant_q5_0_to_f32(f32.data(), (const uint8_t*)dv2->data, n_down);
+                else ok = dequant_to_f32(f32, dv2, n_down);
+                if (!ok) { std::fprintf(stderr, "ds weights: down_exps L%u dequant failed\n", L); return -36; }
+                uint8_t* d = (uint8_t*)h->weights.w_down->contents() + down_off;
+                // Each of E*dm rows (length ni) -> 34*(ni/32) bytes Q8_0.
+                const size_t rows = (size_t)E * dm;
+                const size_t row_bytes = (ni / 32) * 34;
+                for (size_t r = 0; r < rows; ++r)
+                    quantize_row_q8_0(d + r * row_bytes, f32.data() + r * ni, ni);
+            }
         }
     }
 
