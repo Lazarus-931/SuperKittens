@@ -550,13 +550,18 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
                 h->weights.off_w_lm_head = inner_off;
             }
             h->weights.dt_lm_head = sk::Dtype::Q8_0;
-        } else if (v->dtype == sk::Dtype::Q6_K && !c.tie_word_embeddings) {
+        } else if (v->dtype == sk::Dtype::Q6_K) {
             // Keep the LM head in Q6_K and dispatch q6k_matvec at decode: the
             // weight is the single largest per-token read (vocab·d_model), so
             // host-dequantizing it to fp16 would stream ~2.3× the bytes
             // (fp16 vs Q6_K's 210 B / 256 weights) every step. Copy the raw
-            // Q6_K bytes into a right-sized buffer (replacing the fp16-sized
-            // one the launcher pre-allocated).
+            // Q6_K bytes into a right-sized buffer; allocate one (the launcher
+            // leaves w_lm_head null for tied models, and pre-allocates an
+            // fp16-sized one for untied). q6k_matvec reads token_embd as a
+            // [vocab, d_model] row-major matrix — the same orientation the
+            // tied transB gemm head used — so the dedicated Q6_K head is
+            // numerically identical to the prior fp16-tied head, just dequanted
+            // in-kernel. w_embed stays fp16 for the per-token embedding gather.
             const size_t bytes = sk::dtype_bytes(sk::Dtype::Q6_K, (size_t)c.vocab_size * dm);
             if (v->nbytes != bytes) {
                 std::fprintf(stderr, "gguf: %s Q6_K size %zu != expected %zu\n",
