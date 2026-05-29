@@ -182,6 +182,18 @@ SPECS: dict[str, ModelSpec] = {
                   head_dim=128, n_int=12288, vocab_size=151936,
                   eps=1e-6, rope_freq_base=1_000_000.0, tie_word_embeddings=0),
     ),
+    "qwen3-8b-q4km": ModelSpec(
+        family="qwen3",
+        adapter="SuperKittens.models.qwen.qwen:Qwen",
+        hf_repo="Qwen/Qwen3-8B",
+        weight_dir="Qwen3-8B-GGUF",
+        gguf_name="Qwen3-8B-Q4_K_M.gguf",
+        default_quant="q4_k_m",
+        tokenizer_family="qwen3",
+        dims=dict(n_layers=36, d_model=4096, n_heads=32, n_kv_heads=8,
+                  head_dim=128, n_int=12288, vocab_size=151936,
+                  eps=1e-6, rope_freq_base=1_000_000.0, tie_word_embeddings=0),
+    ),
     "qwen3-14b": ModelSpec(
         family="qwen3",
         adapter="SuperKittens.models.qwen.qwen:Qwen",
