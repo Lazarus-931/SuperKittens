@@ -304,6 +304,102 @@ void dequant_q8_0_to_fp16(uint16_t* dst, const uint8_t* src, size_t n_elems) {
     }
 }
 
+// Decode an fp16 (bits) to float. Mirrors the inline path in dequant_q8_0.
+inline float fp16_bits_to_f32(uint16_t s) {
+    uint32_t sign = (s & 0x8000u) << 16;
+    uint32_t exp  = (s >> 10) & 0x1fu;
+    uint32_t mant = s & 0x3ffu;
+    float out;
+    if (exp == 0) {
+        if (mant == 0) { uint32_t v = sign; std::memcpy(&out, &v, 4); }
+        else {
+            exp = 1;
+            while ((mant & 0x400u) == 0) { mant <<= 1; exp -= 1; }
+            mant &= 0x3ffu;
+            uint32_t v = sign | ((exp + 112) << 23) | (mant << 13);
+            std::memcpy(&out, &v, 4);
+        }
+    } else if (exp == 31) {
+        uint32_t v = sign | 0x7f800000u | (mant << 13);
+        std::memcpy(&out, &v, 4);
+    } else {
+        uint32_t v = sign | ((exp + 112) << 23) | (mant << 13);
+        std::memcpy(&out, &v, 4);
+    }
+    return out;
+}
+
+inline uint16_t f32_to_fp16_bits(float f) {
+    uint32_t fb; std::memcpy(&fb, &f, 4);
+    return fp32_bits_to_fp16(fb);
+}
+
+// Q4_K dequant (144 B / 256 elems). Layout: half d, half dmin, uint8 scales[12],
+// uint8 qs[128]. The 8 sub-blocks of 32 use 6-bit (scale, min) pairs packed in
+// scales[12] (matches llama.cpp get_scale_min_k4 / dequantize_row_q4_K).
+void dequant_q4_k_to_fp16(uint16_t* dst, const uint8_t* src, size_t n_elems) {
+    const size_t nb = n_elems / 256;
+    for (size_t b = 0; b < nb; ++b) {
+        const uint8_t* p = src + b * 144;
+        uint16_t dh, dminh;
+        std::memcpy(&dh, p, 2); std::memcpy(&dminh, p + 2, 2);
+        const float d    = fp16_bits_to_f32(dh);
+        const float dmin = fp16_bits_to_f32(dminh);
+        const uint8_t* sc = p + 4;
+        const uint8_t* qs = p + 4 + 12;
+        uint16_t* out = dst + b * 256;
+        for (int j = 0; j < 8; ++j) {
+            uint8_t scl, mn;
+            if (j < 4) {
+                scl = sc[j] & 63;
+                mn  = sc[j + 4] & 63;
+            } else {
+                scl = (sc[j + 4] & 0x0F) | ((sc[j - 4] >> 6) << 4);
+                mn  = (sc[j + 4] >>   4) | ((sc[j    ] >> 6) << 4);
+            }
+            const float d1 = d * (float)scl;
+            const float m1 = dmin * (float)mn;
+            // Each sub-block j covers 32 elems; low nibble for even j-half,
+            // high nibble for odd. qs is 128 bytes = two 32-elem nibble-planes.
+            const uint8_t* qbase = qs + (j / 2) * 32;
+            const int shift = (j & 1) ? 4 : 0;
+            for (int i = 0; i < 32; ++i) {
+                const int q = (qbase[i] >> shift) & 0x0F;
+                out[j * 32 + i] = f32_to_fp16_bits(d1 * (float)q - m1);
+            }
+        }
+    }
+}
+
+// Q6_K dequant (210 B / 256 elems). Layout: uint8 ql[128], uint8 qh[64],
+// int8 scales[16], half d. Matches llama.cpp dequantize_row_q6_K.
+void dequant_q6_k_to_fp16(uint16_t* dst, const uint8_t* src, size_t n_elems) {
+    const size_t nb = n_elems / 256;
+    for (size_t b = 0; b < nb; ++b) {
+        const uint8_t* p = src + b * 210;
+        const uint8_t* ql = p;
+        const uint8_t* qh = p + 128;
+        const int8_t*  sc = (const int8_t*)(p + 128 + 64);
+        uint16_t dh; std::memcpy(&dh, p + 128 + 64 + 16, 2);
+        const float d = fp16_bits_to_f32(dh);
+        uint16_t* out = dst + b * 256;
+        for (int n = 0; n < 256; n += 128) {
+            for (int l = 0; l < 32; ++l) {
+                const int is = l / 16;
+                const int8_t q1 = (int8_t)((ql[l +  0] & 0x0F) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                const int8_t q2 = (int8_t)((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                const int8_t q3 = (int8_t)((ql[l +  0] >>   4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                const int8_t q4 = (int8_t)((ql[l + 32] >>   4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                out[n + l +  0] = f32_to_fp16_bits(d * (float)sc[is + 0] * (float)q1);
+                out[n + l + 32] = f32_to_fp16_bits(d * (float)sc[is + 2] * (float)q2);
+                out[n + l + 64] = f32_to_fp16_bits(d * (float)sc[is + 4] * (float)q3);
+                out[n + l + 96] = f32_to_fp16_bits(d * (float)sc[is + 6] * (float)q4);
+            }
+            ql += 64; qh += 32; sc += 8;
+        }
+    }
+}
+
 // F32 → FP16.
 void f32_to_fp16(uint16_t* dst, const float* src, size_t n) {
     for (size_t i = 0; i < n; ++i) {
@@ -334,6 +430,14 @@ bool read_to_fp16(uint16_t* out, const sk::TensorView* v, size_t n_elems) {
     }
     if (v->dtype == sk::Dtype::Q8_0) {
         dequant_q8_0_to_fp16(out, (const uint8_t*)v->data, n_elems);
+        return true;
+    }
+    if (v->dtype == sk::Dtype::Q4_K) {
+        dequant_q4_k_to_fp16(out, (const uint8_t*)v->data, n_elems);
+        return true;
+    }
+    if (v->dtype == sk::Dtype::Q6_K) {
+        dequant_q6_k_to_fp16(out, (const uint8_t*)v->data, n_elems);
         return true;
     }
     return false;
@@ -452,19 +556,48 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
         }
     }
 
-    // ── Inspect dtype of layer-0 projections to decide allocation sizes. ──
-    auto* v0_q = store.get("blk.0.attn_q.weight");
-    if (!v0_q) { std::fprintf(stderr, "gguf: missing blk.0.attn_q.weight\n"); return -20; }
-    const sk::Dtype dt_proj = v0_q->dtype;
-    if (dt_proj != sk::Dtype::Q8_0 && dt_proj != sk::Dtype::F16 && dt_proj != sk::Dtype::BF16) {
-        std::fprintf(stderr, "gguf: unsupported projection dtype %d\n", (int)dt_proj);
-        return -21;
+    // ── Per-projection dtype detection (GGUF dtype is uniform across layers,
+    // but mixed *across* projections in Q4_K_M: q/k/o/gate/up=Q4_K, v/down=Q6_K).
+    // Inspect layer 0; the rest are validated per-tensor at load time. ──
+    auto proj_dtype = [&](const char* suffix, sk::Dtype* out) -> bool {
+        char nm[128];
+        std::snprintf(nm, sizeof(nm), "blk.0.%s", suffix);
+        auto* v = store.get(nm);
+        if (!v) { std::fprintf(stderr, "gguf: missing %s\n", nm); return false; }
+        *out = v->dtype;
+        return true;
+    };
+    auto supported_proj_dt = [](sk::Dtype d) {
+        return d == sk::Dtype::Q8_0 || d == sk::Dtype::Q4_K || d == sk::Dtype::Q6_K
+            || d == sk::Dtype::F16  || d == sk::Dtype::BF16;
+    };
+    sk::Dtype dt_q, dt_k, dt_v, dt_o, dt_gate, dt_up, dt_down;
+    if (!proj_dtype("attn_q.weight",      &dt_q)   ||
+        !proj_dtype("attn_k.weight",      &dt_k)   ||
+        !proj_dtype("attn_v.weight",      &dt_v)   ||
+        !proj_dtype("attn_output.weight", &dt_o)   ||
+        !proj_dtype("ffn_gate.weight",    &dt_gate)||
+        !proj_dtype("ffn_up.weight",      &dt_up)  ||
+        !proj_dtype("ffn_down.weight",    &dt_down)) return -20;
+    for (sk::Dtype d : {dt_q, dt_k, dt_v, dt_o, dt_gate, dt_up, dt_down}) {
+        if (!supported_proj_dt(d)) {
+            std::fprintf(stderr, "gguf: unsupported projection dtype %d\n", (int)d);
+            return -21;
+        }
     }
+    if (dt_q != dt_k) {
+        std::fprintf(stderr, "gguf: q/k dtype mismatch (%d vs %d) — unsupported\n",
+                     (int)dt_q, (int)dt_k);
+        return -22;
+    }
+    // QKV slab packs Q|K (same dtype). V splits off iff its dtype differs.
+    const bool v_split = (dt_v != dt_q);
+    const sk::Dtype dt_qk = dt_q;
 
-    const size_t qkv_layer_bytes  = sk::dtype_bytes(dt_proj, dm * qkvN);
-    const size_t o_layer_bytes    = sk::dtype_bytes(dt_proj, Nq * dm);
-    const size_t ffn_layer_bytes  = sk::dtype_bytes(dt_proj, dm * ni);
-    const size_t down_layer_bytes = sk::dtype_bytes(dt_proj, ni * dm);
+    const size_t o_layer_bytes    = sk::dtype_bytes(dt_o, Nq * dm);
+    const size_t ffn_layer_bytes_gate = sk::dtype_bytes(dt_gate, dm * ni);
+    const size_t ffn_layer_bytes_up   = sk::dtype_bytes(dt_up,   dm * ni);
+    const size_t down_layer_bytes = sk::dtype_bytes(dt_down, ni * dm);
 
     // Release the default fan-out buffers allocated in sk_qwen_create — we
     // are about to replace every per-layer entry with its own (mmap-backed
@@ -484,18 +617,23 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
     release_default_fanout(h->weights.w_gate);  h->weights.w_gate_off.clear();
     release_default_fanout(h->weights.w_up);    h->weights.w_up_off.clear();
     release_default_fanout(h->weights.w_down);  h->weights.w_down_off.clear();
+    release_default_fanout(h->weights.w_v);     h->weights.w_v_off.clear();
 
     h->weights.w_qkv .resize(c.n_layers, nullptr); h->weights.w_qkv_off .resize(c.n_layers, 0);
     h->weights.w_o   .resize(c.n_layers, nullptr); h->weights.w_o_off   .resize(c.n_layers, 0);
     h->weights.w_gate.resize(c.n_layers, nullptr); h->weights.w_gate_off.resize(c.n_layers, 0);
     h->weights.w_up  .resize(c.n_layers, nullptr); h->weights.w_up_off  .resize(c.n_layers, 0);
     h->weights.w_down.resize(c.n_layers, nullptr); h->weights.w_down_off.resize(c.n_layers, 0);
+    if (v_split) {
+        h->weights.w_v.resize(c.n_layers, nullptr); h->weights.w_v_off.resize(c.n_layers, 0);
+    }
 
-    h->weights.dt_qkv  = dt_proj;
-    h->weights.dt_o    = dt_proj;
-    h->weights.dt_gate = dt_proj;
-    h->weights.dt_up   = dt_proj;
-    h->weights.dt_down = dt_proj;
+    h->weights.dt_qkv  = dt_qk;
+    h->weights.dt_v    = dt_v;
+    h->weights.dt_o    = dt_o;
+    h->weights.dt_gate = dt_gate;
+    h->weights.dt_up   = dt_up;
+    h->weights.dt_down = dt_down;
 
     // Look up a tensor's absolute byte offset in the GGUF file.
     auto find_abs_off = [&](const char* name, uint64_t* out_off, uint64_t* out_nbytes) -> bool {
@@ -513,12 +651,13 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
 
     // Try to mmap a single-GGUF-tensor span into a per-layer MTL::Buffer.
     // Falls back to a fresh MTL::Buffer + memcpy on failure or when disabled.
-    auto load_single_tensor = [&](const char* name, size_t expect_bytes,
+    auto load_single_tensor = [&](const char* name, sk::Dtype want_dt, size_t expect_bytes,
                                   MTL::Buffer** out_buf, size_t* out_off) -> bool {
         auto* v = store.get(name);
         if (!v) { std::fprintf(stderr, "gguf: missing %s\n", name); return false; }
-        if (v->dtype != dt_proj) {
-            std::fprintf(stderr, "gguf: dtype mismatch %s (got %d)\n", name, (int)v->dtype);
+        if (v->dtype != want_dt) {
+            std::fprintf(stderr, "gguf: dtype mismatch %s (got %d want %d)\n",
+                         name, (int)v->dtype, (int)want_dt);
             return false;
         }
         if (v->nbytes != expect_bytes) {
@@ -552,25 +691,23 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
         return true;
     };
 
-    // For QKV we want a single per-layer Buffer holding [Q | K | V] row-concat
-    // (the dispatch reads the slab as one [Nq+Nkv+Nkv, dm] Q8_0 matrix). GGUF
-    // stores Q, K, V as 3 separate tensors. If they happen to be adjacent in
-    // file with no padding between them, we can mmap one combined range.
-    // Otherwise fall back to memcpy-pack into a fresh MTL::Buffer.
+    // QKV slab. Uniform-dtype models: one per-layer [Q|K|V] row-concat buffer
+    // (mmap'd as a single range when Q/K/V are file-adjacent). Mixed-dtype
+    // (Q4_K_M: Q/K=Q4_K, V=Q6_K): w_qkv holds [Q|K] (dt_qk), V loads separately
+    // into w_v (dt_v) — the dispatch issues two matvecs writing one packed out.
     auto load_qkv_layer = [&](uint32_t L) -> bool {
         char qn[128], kn[128], vn[128];
         std::snprintf(qn, sizeof(qn), "blk.%u.attn_q.weight", L);
         std::snprintf(kn, sizeof(kn), "blk.%u.attn_k.weight", L);
         std::snprintf(vn, sizeof(vn), "blk.%u.attn_v.weight", L);
-        const size_t qb = sk::dtype_bytes(dt_proj, Nq  * dm);
-        const size_t kb = sk::dtype_bytes(dt_proj, Nkv * dm);
-        const size_t vb = sk::dtype_bytes(dt_proj, Nkv * dm);
-        const size_t total = qb + kb + vb;
+        const size_t qb = sk::dtype_bytes(dt_qk, Nq  * dm);
+        const size_t kb = sk::dtype_bytes(dt_qk, Nkv * dm);
+        const size_t vb = sk::dtype_bytes(dt_v,  Nkv * dm);
 
         auto* qv = store.get(qn); auto* kv = store.get(kn); auto* vv = store.get(vn);
         if (!qv || !kv || !vv) { std::fprintf(stderr, "gguf: qkv miss L=%u\n", L); return false; }
         if (qv->nbytes != qb || kv->nbytes != kb || vv->nbytes != vb ||
-            qv->dtype != dt_proj || kv->dtype != dt_proj || vv->dtype != dt_proj) {
+            qv->dtype != dt_qk || kv->dtype != dt_qk || vv->dtype != dt_v) {
             std::fprintf(stderr, "gguf: qkv shape/dtype mismatch L=%u\n", L);
             return false;
         }
@@ -581,6 +718,37 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
             find_abs_off(kn, &koff, &kn_) &&
             find_abs_off(vn, &voff_, &vn_);
 
+        if (v_split) {
+            // V lives in its own buffer; pack only Q|K into w_qkv.
+            const size_t qk_total = qb + kb;
+            bool qk_done = false;
+            if (!disable_mmap && have_offs && koff == qoff + qn_) {
+                size_t inner = 0;
+                auto* mb = sk::silicon::MmapBuffer::from_fd_range(
+                    dev, gguf_fd, (size_t)qoff, qk_total, &inner);
+                if (mb) {
+                    h->tensor_mmaps.push_back(mb);
+                    h->weights.w_qkv[L]     = mb->buffer();
+                    h->weights.w_qkv_off[L] = inner;
+                    qk_done = true;
+                }
+            }
+            if (!qk_done) {
+                auto* b = dev->newBuffer(qk_total, MTL::ResourceStorageModeShared);
+                if (!b) return false;
+                char* dst = (char*)b->contents();
+                std::memcpy(dst,      qv->data, qb);
+                std::memcpy(dst + qb, kv->data, kb);
+                h->weights.w_qkv[L]     = b;
+                h->weights.w_qkv_off[L] = 0;
+            }
+            // V: own buffer (mmap range or memcpy).
+            if (!load_single_tensor(vn, dt_v, vb,
+                                    &h->weights.w_v[L], &h->weights.w_v_off[L])) return false;
+            return true;
+        }
+
+        const size_t total = qb + kb + vb;
         if (!disable_mmap && have_offs &&
             koff == qoff + qn_ && voff_ == koff + kn_) {
             // Q, K, V are file-adjacent → mmap one combined range.
@@ -628,16 +796,16 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
         if (!load_qkv_layer(L)) return -50;
 
         std::snprintf(nbuf, sizeof(nbuf), "blk.%u.attn_output.weight", L);
-        if (!load_single_tensor(nbuf, o_layer_bytes,
+        if (!load_single_tensor(nbuf, dt_o, o_layer_bytes,
                                 &h->weights.w_o[L], &h->weights.w_o_off[L])) return -53;
         std::snprintf(nbuf, sizeof(nbuf), "blk.%u.ffn_gate.weight", L);
-        if (!load_single_tensor(nbuf, ffn_layer_bytes,
+        if (!load_single_tensor(nbuf, dt_gate, ffn_layer_bytes_gate,
                                 &h->weights.w_gate[L], &h->weights.w_gate_off[L])) return -54;
         std::snprintf(nbuf, sizeof(nbuf), "blk.%u.ffn_up.weight", L);
-        if (!load_single_tensor(nbuf, ffn_layer_bytes,
+        if (!load_single_tensor(nbuf, dt_up, ffn_layer_bytes_up,
                                 &h->weights.w_up[L], &h->weights.w_up_off[L])) return -55;
         std::snprintf(nbuf, sizeof(nbuf), "blk.%u.ffn_down.weight", L);
-        if (!load_single_tensor(nbuf, down_layer_bytes,
+        if (!load_single_tensor(nbuf, dt_down, down_layer_bytes,
                                 &h->weights.w_down[L], &h->weights.w_down_off[L])) return -56;
     }
 
