@@ -56,6 +56,7 @@ static bool resolve_psos(ModelPSOs& P) {
     P.layer.q2k_matvec     = sk::bindings_pso("q2k_matvec");   // optional; nullptr OK
     P.layer.q3k_matvec     = sk::bindings_pso("q3k_matvec");   // optional; nullptr OK
     P.layer.q4k_matvec     = sk::bindings_pso("q4k_matvec");   // optional; nullptr OK
+    P.layer.q5k_matvec     = sk::bindings_pso("q5k_matvec");   // optional; nullptr OK
     P.layer.q6k_matvec     = sk::bindings_pso("q6k_matvec");   // optional; nullptr OK
     P.layer.q8_0_swiglu_m1 = sk::bindings_pso("q8_0_swiglu_m1");  // optional; nullptr OK
     P.layer.q8_0_swiglu_prenorm_m1 = sk::bindings_pso("q8_0_swiglu_prenorm_m1");  // optional

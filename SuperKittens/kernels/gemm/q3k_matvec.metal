@@ -96,21 +96,35 @@ kernel void q3k_matvec(
             device const uint8_t *qs    = ax[r][ib].qs;
 
             // Unpack the 16 signed 6-bit sub-scales (offset -32), per-block.
-            // The 110-byte block makes scales only 2-aligned on odd blocks, so
-            // assemble the three uint32 words byte-wise (device uint32* deref on
-            // an unaligned address is UB on Metal).
+            // scales[12] is 2-aligned in every block (offset 96 + 110·ib, both
+            // even), so read as uint16 and only materialize the 6 scale values
+            // this lane actually taps: scale[n>>4] for n = 32k+pos with
+            // k∈[0,8). pos∈[0,32) → n>>4 ∈ { (32k+pos)>>4 } takes the values
+            // 2k and 2k+(pos>=16). Two scale indices per group-of-4 → 8 used,
+            // but consecutive shifts in a group share one index pair, so unpack
+            // all 16 once into registers (cheap vs the per-element reshuffle).
             uint32_t aux[4];
             {
-                device const uint8_t *sb = ax[r][ib].scales;
-                uint32_t a0 = (uint32_t)sb[0] | ((uint32_t)sb[1] << 8) | ((uint32_t)sb[2] << 16) | ((uint32_t)sb[3] << 24);
-                uint32_t a1 = (uint32_t)sb[4] | ((uint32_t)sb[5] << 8) | ((uint32_t)sb[6] << 16) | ((uint32_t)sb[7] << 24);
-                uint32_t a2 = (uint32_t)sb[8] | ((uint32_t)sb[9] << 8) | ((uint32_t)sb[10] << 16) | ((uint32_t)sb[11] << 24);
+                device const uint16_t *sh = (device const uint16_t *)ax[r][ib].scales;
+                uint32_t a0 = (uint32_t)sh[0] | ((uint32_t)sh[1] << 16);
+                uint32_t a1 = (uint32_t)sh[2] | ((uint32_t)sh[3] << 16);
+                uint32_t a2 = (uint32_t)sh[4] | ((uint32_t)sh[5] << 16);
                 aux[2] = ((a0 >> 4) & kmask2) | (((a2 >> 4) & kmask1) << 4);
                 aux[3] = ((a1 >> 4) & kmask2) | (((a2 >> 6) & kmask1) << 4);
                 aux[0] = (a0 & kmask2) | (((a2 >> 0) & kmask1) << 4);
                 aux[1] = (a1 & kmask2) | (((a2 >> 2) & kmask1) << 4);
             }
-            thread const int8_t *scales = (thread const int8_t *)aux;
+            thread const int8_t *sc8 = (thread const int8_t *)aux;
+            // The two scale indices this lane uses per group (pos<16 vs >=16).
+            const short shi = pos >> 4;            // 0 or 1
+            const float sg0a = (float)(sc8[0 + shi] - 32);
+            const float sg0b = (float)(sc8[2 + shi] - 32);
+            const float sg0c = (float)(sc8[4 + shi] - 32);
+            const float sg0d = (float)(sc8[6 + shi] - 32);
+            const float sg1a = (float)(sc8[8  + shi] - 32);
+            const float sg1b = (float)(sc8[10 + shi] - 32);
+            const float sg1c = (float)(sc8[12 + shi] - 32);
+            const float sg1d = (float)(sc8[14 + shi] - 32);
 
             const uint8_t hm = hmask[pos];
             const uint8_t q0b = qs[pos];        // group 0 quants (shifts 0..3)
@@ -118,27 +132,15 @@ kernel void q3k_matvec(
 
             float bsum = 0.f;
             // group 0: n = shift*32 + pos, hmask bit (0*4 + shift) = 1<<shift
-            {
-                const int qv0 = (int)((q0b >> 0) & 3) - ((hm & 0x01) ? 0 : 4);
-                const int qv1 = (int)((q0b >> 2) & 3) - ((hm & 0x02) ? 0 : 4);
-                const int qv2 = (int)((q0b >> 4) & 3) - ((hm & 0x04) ? 0 : 4);
-                const int qv3 = (int)((q0b >> 6) & 3) - ((hm & 0x08) ? 0 : 4);
-                bsum += y0 * (float)(scales[(  0 + pos) >> 4] - 32) * (float)qv0;
-                bsum += y1 * (float)(scales[( 32 + pos) >> 4] - 32) * (float)qv1;
-                bsum += y2 * (float)(scales[( 64 + pos) >> 4] - 32) * (float)qv2;
-                bsum += y3 * (float)(scales[( 96 + pos) >> 4] - 32) * (float)qv3;
-            }
+            bsum += y0 * sg0a * (float)((int)((q0b >> 0) & 3) - ((hm & 0x01) ? 0 : 4));
+            bsum += y1 * sg0b * (float)((int)((q0b >> 2) & 3) - ((hm & 0x02) ? 0 : 4));
+            bsum += y2 * sg0c * (float)((int)((q0b >> 4) & 3) - ((hm & 0x04) ? 0 : 4));
+            bsum += y3 * sg0d * (float)((int)((q0b >> 6) & 3) - ((hm & 0x08) ? 0 : 4));
             // group 1: n = 128 + shift*32 + pos, hmask bit (1*4 + shift) = 1<<(4+shift)
-            {
-                const int qv0 = (int)((q1b >> 0) & 3) - ((hm & 0x10) ? 0 : 4);
-                const int qv1 = (int)((q1b >> 2) & 3) - ((hm & 0x20) ? 0 : 4);
-                const int qv2 = (int)((q1b >> 4) & 3) - ((hm & 0x40) ? 0 : 4);
-                const int qv3 = (int)((q1b >> 6) & 3) - ((hm & 0x80) ? 0 : 4);
-                bsum += y4 * (float)(scales[(128 + pos) >> 4] - 32) * (float)qv0;
-                bsum += y5 * (float)(scales[(160 + pos) >> 4] - 32) * (float)qv1;
-                bsum += y6 * (float)(scales[(192 + pos) >> 4] - 32) * (float)qv2;
-                bsum += y7 * (float)(scales[(224 + pos) >> 4] - 32) * (float)qv3;
-            }
+            bsum += y4 * sg1a * (float)((int)((q1b >> 0) & 3) - ((hm & 0x10) ? 0 : 4));
+            bsum += y5 * sg1b * (float)((int)((q1b >> 2) & 3) - ((hm & 0x20) ? 0 : 4));
+            bsum += y6 * sg1c * (float)((int)((q1b >> 4) & 3) - ((hm & 0x40) ? 0 : 4));
+            bsum += y7 * sg1d * (float)((int)((q1b >> 6) & 3) - ((hm & 0x80) ? 0 : 4));
             sumf[r] += bsum * (float)ax[r][ib].d;
         }
     }

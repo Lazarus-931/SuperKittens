@@ -50,6 +50,7 @@ struct LayerPSOs {
     MTL::ComputePipelineState* q2k_matvec = nullptr;  // M=1 matvec with Q2_K weight
     MTL::ComputePipelineState* q3k_matvec = nullptr;  // M=1 matvec with Q3_K weight
     MTL::ComputePipelineState* q4k_matvec = nullptr;  // M=1 matvec with Q4_K weight
+    MTL::ComputePipelineState* q5k_matvec = nullptr;  // M=1 matvec with Q5_K weight
     MTL::ComputePipelineState* q6k_matvec = nullptr;  // M=1 matvec with Q6_K weight
     MTL::ComputePipelineState* q8_0_swiglu_m1 = nullptr;  // fused Q8_0 gate+up+SiLU·mul (M=1)
     MTL::ComputePipelineState* q8_0_swiglu_prenorm_m1 = nullptr;  // fused residual+rmsnorm+swiglu (M=1)
@@ -177,6 +178,7 @@ inline MTL::ComputePipelineState* quant_matvec_pso(const LayerPSOs& P, sk::Dtype
         case sk::Dtype::Q2_K: return P.q2k_matvec;
         case sk::Dtype::Q3_K: return P.q3k_matvec;
         case sk::Dtype::Q4_K: return P.q4k_matvec;
+        case sk::Dtype::Q5_K: return P.q5k_matvec;
         case sk::Dtype::Q6_K: return P.q6k_matvec;
         default:              return nullptr;
     }

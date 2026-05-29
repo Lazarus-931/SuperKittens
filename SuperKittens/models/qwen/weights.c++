@@ -642,11 +642,11 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
     // no SK kernel still host-dequants to fp16 and dispatches the fp16 matvec.
     auto native_matvec_dt = [](sk::Dtype d) {
         return d == sk::Dtype::Q8_0 || d == sk::Dtype::Q2_K || d == sk::Dtype::Q3_K
-            || d == sk::Dtype::Q4_K || d == sk::Dtype::Q6_K;
+            || d == sk::Dtype::Q4_K || d == sk::Dtype::Q5_K || d == sk::Dtype::Q6_K;
     };
     auto supported_proj_dt = [](sk::Dtype d) {
         return d == sk::Dtype::Q8_0 || d == sk::Dtype::Q2_K || d == sk::Dtype::Q3_K
-            || d == sk::Dtype::Q4_K  || d == sk::Dtype::Q6_K
+            || d == sk::Dtype::Q4_K  || d == sk::Dtype::Q5_K || d == sk::Dtype::Q6_K
             || d == sk::Dtype::F16   || d == sk::Dtype::BF16;
     };
     // Dtype the dispatch sees + buffer is sized in: native quants keep their
