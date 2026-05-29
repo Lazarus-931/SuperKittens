@@ -550,6 +550,25 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
                 h->weights.off_w_lm_head = inner_off;
             }
             h->weights.dt_lm_head = sk::Dtype::Q8_0;
+        } else if (v->dtype == sk::Dtype::Q6_K && !c.tie_word_embeddings) {
+            // Keep the LM head in Q6_K and dispatch q6k_matvec at decode: the
+            // weight is the single largest per-token read (vocab·d_model), so
+            // host-dequantizing it to fp16 would stream ~2.3× the bytes
+            // (fp16 vs Q6_K's 210 B / 256 weights) every step. Copy the raw
+            // Q6_K bytes into a right-sized buffer (replacing the fp16-sized
+            // one the launcher pre-allocated).
+            const size_t bytes = sk::dtype_bytes(sk::Dtype::Q6_K, (size_t)c.vocab_size * dm);
+            if (v->nbytes != bytes) {
+                std::fprintf(stderr, "gguf: %s Q6_K size %zu != expected %zu\n",
+                             tname, v->nbytes, bytes);
+                return -15;
+            }
+            if (h->weights.w_lm_head) h->weights.w_lm_head->release();
+            h->weights.w_lm_head = dev->newBuffer(bytes, MTL::ResourceStorageModeShared);
+            if (!h->weights.w_lm_head) return -16;
+            std::memcpy(h->weights.w_lm_head->contents(), v->data, bytes);
+            h->weights.off_w_lm_head = 0;
+            h->weights.dt_lm_head = sk::Dtype::Q6_K;
         } else if (!c.tie_word_embeddings && h->weights.w_lm_head) {
             if (!read_to_fp16((uint16_t*)h->weights.w_lm_head->contents(), v,
                               (size_t)c.vocab_size * dm)) return -15;

@@ -1005,6 +1005,22 @@ inline void dispatch_model(
                 enc->endEncoding();
             }
         } else
+        if (W.dt_lm_head == sk::Dtype::Q6_K && W.w_lm_head &&
+            P.layer.q6k_matvec != nullptr) {
+            // Q4_K_M's output.weight is Q6_K; matvec straight from the quant
+            // bytes (vocab·d_model) instead of a host-dequanted fp16 head.
+            for (uint32_t m = 0; m < M_v; ++m) {
+                auto* enc = cmd->computeCommandEncoder();
+                enc->setComputePipelineState(P.layer.q6k_matvec);
+                enc->setBuffer(nxt,           (size_t)m * K_v * 2,  0);
+                enc->setBuffer(W.w_lm_head,   W.off_w_lm_head,      1);
+                enc->setBuffer(B.logits,      (size_t)m * N_v * 2,  2);
+                enc->setBytes(&K_v, 4, 3);
+                enc->setBytes(&N_v, 4, 4);
+                enc->dispatchThreadgroups(MTL::Size((N_v + 1) / 2, 1, 1), MTL::Size(128, 1, 1));
+                enc->endEncoding();
+            }
+        } else
         if (M_v == 1 && P.layer.gemv_t_m1 != nullptr) {
             // Decode fast path: M=1 transposed-weight matvec. Prefer 2D-tile
             // variant when registered; same buffer signature, different grid/TG.
