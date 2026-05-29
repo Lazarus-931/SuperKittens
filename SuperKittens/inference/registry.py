@@ -231,6 +231,20 @@ SPECS: dict[str, ModelSpec] = {
                   head_dim=128, n_int=17408, vocab_size=151936,
                   eps=1e-6, rope_freq_base=1_000_000.0, tie_word_embeddings=0),
     ),
+    "qwen3-14b-q3km": ModelSpec(
+        family="qwen3",
+        adapter="SuperKittens.models.qwen.qwen:Qwen",
+        # Qwen's official 14B-GGUF repo ships no Q3_K_M; bartowski's does
+        # (7.32 GB vs 9.00 GB Q4_K_M — looser 16GB fit + fewer bytes/token).
+        hf_repo="bartowski/Qwen_Qwen3-14B-GGUF",
+        weight_dir="Qwen3-14B-GGUF",
+        gguf_name="Qwen_Qwen3-14B-Q3_K_M.gguf",
+        default_quant="q3_k_m",
+        tokenizer_family="qwen3",
+        dims=dict(n_layers=40, d_model=5120, n_heads=40, n_kv_heads=8,
+                  head_dim=128, n_int=17408, vocab_size=151936,
+                  eps=1e-6, rope_freq_base=1_000_000.0, tie_word_embeddings=0),
+    ),
     "qwen3-32b": ModelSpec(
         family="qwen3",
         adapter="SuperKittens.models.qwen.qwen:Qwen",

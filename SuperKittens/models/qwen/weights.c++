@@ -634,12 +634,14 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
     // ── Per-projection dtype detection. q/k/o/gate/up are uniform across layers
     // (Q4_K in Q4_K_M); attn_v + ffn_down alternate Q4_K/Q6_K PER LAYER (the
     // "_M" variant bumps every other layer to Q6_K), so those are read per L. ──
-    // Native-matvec dtypes have a per-dtype M=1 kernel (q8_0/q2k/q4k/q6k) and
-    // stay packed. Other K-quants (e.g. Q3_K, which the standard Q2_K_M recipe
-    // uses for attn_output / ffn_down / output) have no SK matvec, so they are
-    // host-dequanted to fp16 at load and dispatched through the fp16 matvec.
+    // Native-matvec dtypes have a per-dtype M=1 kernel (q8_0/q2k/q3k/q4k/q6k)
+    // and stay packed. The Q3_K_M / Q2_K_M recipes put the biggest projections
+    // (ffn_down / attn_output / output) in Q3_K, so a native q3k_matvec keeps
+    // them packed (~3.44 bpw) instead of host-dequanting to fp16 (16 bpw) —
+    // which is the whole per-token byte saving for those quants. Any quant with
+    // no SK kernel still host-dequants to fp16 and dispatches the fp16 matvec.
     auto native_matvec_dt = [](sk::Dtype d) {
-        return d == sk::Dtype::Q8_0 || d == sk::Dtype::Q2_K
+        return d == sk::Dtype::Q8_0 || d == sk::Dtype::Q2_K || d == sk::Dtype::Q3_K
             || d == sk::Dtype::Q4_K || d == sk::Dtype::Q6_K;
     };
     auto supported_proj_dt = [](sk::Dtype d) {
