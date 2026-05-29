@@ -350,6 +350,9 @@ class Qwen(Model):
                 tie_word_embeddings = int(j.get("tie_word_embeddings", d.get("tie_word_embeddings", 1))),
             )
         # seq_max / cache_max have sensible Config defaults; allow overrides.
+        # Track whether the caller pinned cache_max so the memory-aware clamp
+        # only kicks in for the default (auto) case.
+        cache_max_pinned = "cache_max" in overrides
         for k in ("seq_max", "cache_max"):
             if k in overrides:
                 d[k] = overrides.pop(k)
@@ -361,9 +364,9 @@ class Qwen(Model):
             if hasattr(cfg, k):
                 setattr(cfg, k, v)
 
-        m = cls(cfg)
-
-        # Load weights: GGUF if spec says so, else safetensors (index or single).
+        # Resolve the canonical GGUF path early so its on-disk size can feed the
+        # memory-aware cache_max clamp before the native handle (and its KV
+        # cache) is allocated.
         gguf_path = None
         if spec.gguf_name:
             gguf_path = snap / spec.gguf_name
@@ -372,6 +375,44 @@ class Qwen(Model):
                 alt = sk_root / "SuperKittens" / "model_weights" / spec.gguf_name
                 if alt.exists():
                     gguf_path = alt
+
+        # Memory-aware cache_max: a 14B-Q4 (~9 GB) at the default cache_max of
+        # 32768 OOMs a 16 GB box (KV ~5 GB + weights + scratch). When the caller
+        # did NOT pin cache_max, clamp it to the largest value that fits.
+        if not cache_max_pinned and gguf_path and gguf_path.exists():
+            from SuperKittens.inference.generation import (
+                memory_aware_cache_max, _unified_memory_bytes)
+            weight_bytes = gguf_path.stat().st_size
+            mem = _unified_memory_bytes()
+            # Prefill scratch (esp. the seq_max·vocab logits buffer, ~0.5 GB per
+            # 2048 tokens at this vocab) scales with seq_max, not cache_max, so
+            # an 8192 default would burn ~4 GB that the KV cache wants. When
+            # weights already dominate a tight box, trim the default seq_max to
+            # 2048 so cache_max keeps real headroom. Only when seq_max was left
+            # at its Config default (caller-pinned seq_max is respected;
+            # CtypesConfig has no "was-set" flag, so compared against the default).
+            seq_default = Config.seq_max  # type: ignore[attr-defined]
+            if (mem and seq_default == cfg.seq_max
+                    and weight_bytes > 0.4 * mem and cfg.seq_max > 2048):
+                cfg.seq_max = 2048
+            fitted = memory_aware_cache_max(
+                requested_cache_max=cfg.cache_max,
+                seq_max=cfg.seq_max,
+                weight_bytes=weight_bytes,
+                n_layers=cfg.n_layers, n_kv_heads=cfg.n_kv_heads,
+                head_dim=cfg.head_dim, d_model=cfg.d_model, n_int=cfg.n_int,
+                n_heads=cfg.n_heads, vocab_size=cfg.vocab_size,
+                total_mem_bytes=mem if mem else None,
+            )
+            if fitted < cfg.cache_max:
+                print(f"[qwen] memory-aware cache_max: {cfg.cache_max} -> {fitted} "
+                      f"(weights={weight_bytes/2**30:.1f}GiB, seq_max={cfg.seq_max})")
+                cfg.cache_max = fitted
+                if cfg.seq_max > fitted:
+                    cfg.seq_max = fitted
+
+        m = cls(cfg)
+
         if gguf_path and gguf_path.exists():
             m.load_gguf(str(gguf_path))
         else:

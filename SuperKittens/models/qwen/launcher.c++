@@ -53,6 +53,8 @@ static bool resolve_psos(ModelPSOs& P) {
     P.layer.gemv_t_m1      = sk::bindings_pso("gemv_t_fp16_m1");
     P.layer.gemv_t_2dtile_m1 = sk::bindings_pso("gemv_t_fp16_2dtile_m1");  // optional; nullptr OK
     P.layer.q8_0_matvec    = sk::bindings_pso("q8_0_matvec");  // optional; nullptr OK
+    P.layer.q4k_matvec     = sk::bindings_pso("q4k_matvec");   // optional; nullptr OK
+    P.layer.q6k_matvec     = sk::bindings_pso("q6k_matvec");   // optional; nullptr OK
     P.layer.q8_0_swiglu_m1 = sk::bindings_pso("q8_0_swiglu_m1");  // optional; nullptr OK
     P.layer.q8_0_swiglu_prenorm_m1 = sk::bindings_pso("q8_0_swiglu_prenorm_m1");  // optional
     P.layer.q8_0_matvec_addres = sk::bindings_pso("q8_0_matvec_addres");  // optional
