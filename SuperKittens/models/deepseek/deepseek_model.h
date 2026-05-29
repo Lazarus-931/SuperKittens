@@ -74,7 +74,13 @@ struct LayerPSOs {
     MTL::ComputePipelineState* rope_tail;
     MTL::ComputePipelineState* rope_interleave;   // V3 GPT-J-style pair RoPE
     MTL::ComputePipelineState* router_v3;          // V3 sigmoid+bias+group+topk router
+    MTL::ComputePipelineState* router_v2;          // V2-Lite softmax+topk router (shared moe_router)
     MTL::ComputePipelineState* flash_attn_vec;
+    MTL::ComputePipelineState* mla_decode_v2;      // V2-Lite per-head MLA decode (dk=192, dv=128)
+    MTL::ComputePipelineState* mla_kv_write;       // assemble dk=192 K + dv=128 V into per-head cache
+    MTL::ComputePipelineState* moe_mv_gate;        // mul_mv_id_q4_K (routed gate/up/down)
+    MTL::ComputePipelineState* moe_swiglu_f32;     // deepseek_moe_swiglu_f32
+    MTL::ComputePipelineState* moe_scatter_add;    // deepseek_moe_scatter_add_f32
     MTL::ComputePipelineState* cast_h2f;
     MTL::ComputePipelineState* cast_f2h;
     MTL::ComputePipelineState* causal_mask_fill;
@@ -138,6 +144,11 @@ struct LayerBuffers {
     MTL::Buffer* moe_top_idx;
     MTL::Buffer* moe_top_score;
     MTL::Buffer* moe_hidden;
+    MTL::Buffer* moe_x_f32;       // routing input cast to fp32 (mul_mv_id reads fp32)
+    MTL::Buffer* moe_gate_f32;    // [top_k, n_int] fp32
+    MTL::Buffer* moe_up_f32;      // [top_k, n_int] fp32
+    MTL::Buffer* moe_mid_f32;     // [top_k, n_int] fp32
+    MTL::Buffer* moe_down_f32;    // [top_k, d_model] fp32
     MTL::Buffer* y_out;
 };
 
@@ -395,26 +406,6 @@ inline void dispatch_attn(
     }
 
     {
-        auto* enc = cmd->computeCommandEncoder();
-        enc->setComputePipelineState(P.kv_cache_write);
-        enc->setBuffer(B.kv_a_packed, 0, 0);
-        enc->setBuffer(B.kv_a_packed, 0, 1);   // (no separate V — V is decompressed)
-        enc->setBuffer(B.c_kv_cache,  0, 2);
-        enc->setBuffer(B.k_pe_cache,  0, 3);
-        const uint32_t one = 1;
-        enc->setBytes(&p.batch,        4, 4);
-        enc->setBytes(&one,            4, 5);
-        enc->setBytes(&p.kv_lora_rank, 4, 6);
-        enc->setBytes(&p.seq,          4, 7);
-        enc->setBytes(&p.write_pos,    4, 8);
-        enc->setBytes(&p.cache_size,   4, 9);
-        const uint32_t D4 = p.kv_lora_rank / 4;
-        enc->dispatchThreads(MTL::Size(D4, p.seq, p.batch),
-                             MTL::Size(32, 4, 1));
-        enc->endEncoding();
-    }
-
-    {
         const uint32_t k_out = p.n_heads * p.qk_nope_dim;
         const uint32_t v_out = p.n_heads * p.v_head_dim;
 
@@ -427,7 +418,7 @@ inline void dispatch_attn(
 
         auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(P.kv_up_pair);
-        enc->setBuffer(B.kv_a_packed, 0,           0);  // c_kv (first R cols)
+        enc->setBuffer(B.c_kv,        0,           0);  // normalized compressed-KV
         enc->setBuffer(B.w_kv_b,      off_w_k_up,  1);
         enc->setBuffer(B.w_kv_b,      off_w_v_up,  2);
         enc->setBuffer(B.k_no_pe,     0,           3);
@@ -446,8 +437,46 @@ inline void dispatch_attn(
     }
 
     {
+        // Assemble per-head K (dk=192: nope ++ shared rope) and V (dv=128) for
+        // this decode step into the per-head cache at write_pos. k_no_pe/v are
+        // the kv_up_pair outputs; k_pe is the shared rotated key (fp16).
+        {
+            auto* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(P.mla_kv_write);
+            enc->setBuffer(B.k_no_pe,    0, 0);
+            enc->setBuffer(B.k_pe,       0, 1);
+            enc->setBuffer(B.v,          0, 2);
+            enc->setBuffer(B.c_kv_cache, 0, 3);   // K cache [H, cache, 192]
+            enc->setBuffer(B.k_pe_cache, 0, 4);   // V cache [H, cache, 128]
+            enc->setBytes(&T,             4, 5);
+            enc->setBytes(&p.n_heads,     4, 6);
+            enc->setBytes(&p.qk_nope_dim, 4, 7);
+            enc->setBytes(&p.qk_rope_dim, 4, 8);
+            enc->setBytes(&p.v_head_dim,  4, 9);
+            enc->setBytes(&p.cache_size,  4, 10);
+            enc->setBytes(&p.write_pos,   4, 11);
+            enc->dispatchThreads(MTL::Size(dk, p.n_heads, T),
+                                 MTL::Size(dk < 256u ? dk : 256u, 1, 1));
+            enc->endEncoding();
+        }
+
+        // Causal mask over (q_seq, kv_len).
+        {
+            auto* mask_enc = cmd->computeCommandEncoder();
+            mask_enc->setComputePipelineState(P.causal_mask_fill);
+            mask_enc->setBuffer(B.causal_mask, 0, 0);
+            mask_enc->setBytes(&p.seq,         4, 1);
+            mask_enc->setBytes(&p.kv_len,      4, 2);
+            mask_enc->setBytes(&p.write_pos,   4, 3);
+            mask_enc->dispatchThreads(MTL::Size(p.kv_len, p.seq, 1),
+                                       MTL::Size(32, 4, 1));
+            mask_enc->endEncoding();
+        }
+
+        // kernel_mla_decode_v2 arg struct (== flash_attn_ext_vec layout). Q is
+        // fp32 [seq, head, dk]; K/V are the per-head caches [head, kv, dk|dv].
         #pragma pack(push, 8)
-        struct ArgsFAVec {
+        struct ArgsMLA {
             int32_t  ne01, ne02, ne03; char _p1[4];
             uint64_t nb01, nb02, nb03;
             int32_t  ne11, ne_12_2, ne_12_3, ns10;
@@ -462,20 +491,22 @@ inline void dispatch_attn(
             float    logit_softcap;
         };
         #pragma pack(pop)
-        static_assert(sizeof(ArgsFAVec) == 192, "FA args mismatch");
+        static_assert(sizeof(ArgsMLA) == 192, "MLA args mismatch");
 
-        ArgsFAVec a{};
+        ArgsMLA a{};
         a.ne01 = (int32_t)p.seq;     a.ne02 = (int32_t)p.n_heads; a.ne03 = (int32_t)p.batch;
-        a.nb01 = (uint64_t)dk * sizeof(float);   // Q is fp32 in DS4 path
+        a.nb01 = (uint64_t)dk * sizeof(float);   // Q fp32 row stride
         a.nb02 = a.nb01 * p.seq;
         a.nb03 = a.nb02 * p.n_heads;
         a.ne11 = (int32_t)p.kv_len;  a.ne_12_2 = (int32_t)p.n_heads; a.ne_12_3 = (int32_t)p.batch;
+        // K cache: [head, cache_max, dk]. Row stride dk*2; head stride cache_max*dk*2.
         a.nb11 = (uint64_t)dk * sizeof(uint16_t);
-        a.nb12 = a.nb11 * p.kv_len;
+        a.nb12 = (uint64_t)p.cache_size * dk * sizeof(uint16_t);
         a.nb13 = a.nb12 * p.n_heads;
         a.ns10 = (int32_t)a.nb11;
+        // V cache: [head, cache_max, dv].
         a.nb21 = (uint64_t)p.v_head_dim * sizeof(uint16_t);
-        a.nb22 = a.nb21 * p.kv_len;
+        a.nb22 = (uint64_t)p.cache_size * p.v_head_dim * sizeof(uint16_t);
         a.nb23 = a.nb22 * p.n_heads;
         a.ns20 = (int32_t)a.nb21;
         a.ne31 = (int32_t)p.seq; a.ne32 = 1; a.ne33 = 1;
@@ -483,48 +514,26 @@ inline void dispatch_attn(
         a.nb32 = a.nb31 * p.seq;
         a.nb33 = a.nb32;
         a.ne1 = (int32_t)p.n_heads; a.ne2 = (int32_t)p.seq; a.ne3 = (int32_t)p.batch;
-        // Patch B: YaRN mscale applied to attention scale (modeling_deepseek_v3.py:412-414).
         a.scale = (1.f / metal_sqrt_safe((float)dk)) * p.yarn_mscale * p.yarn_mscale;
         a.max_bias = 0.f; a.m0 = 1.f; a.m1 = 1.f;
         a.n_head_log2 = 0; a.logit_softcap = 0.f;
 
-        // K and V here come from the kv caches; flash_attn reads them as the
-        // dense decompressed full K, V. With kv_cache_write storing already-
-        // up-projected K and V (the simple "cache full" path), B.k_cache and
-        // B.v_cache are the right inputs. If MLA compressed cache is used
-        // later, decompression must happen here first OR via absorption.
-        // Fill causal mask for (q_seq, kv_len) with the current write_pos as
-        // q_offset. Run before flash_attn, in the same command buffer.
-        {
-            auto* mask_enc = cmd->computeCommandEncoder();
-            mask_enc->setComputePipelineState(P.causal_mask_fill);
-            mask_enc->setBuffer(B.causal_mask, 0, 0);
-            mask_enc->setBytes(&p.seq,         4, 1);
-            mask_enc->setBytes(&p.kv_len,      4, 2);
-            mask_enc->setBytes(&p.write_pos,   4, 3);
-            mask_enc->dispatchThreads(MTL::Size(p.kv_len, p.seq, 1),
-                                       MTL::Size(32, 4, 1));
-            mask_enc->endEncoding();
-        }
-
         auto* enc = cmd->computeCommandEncoder();
-        enc->setComputePipelineState(P.flash_attn_vec);
+        enc->setComputePipelineState(P.mla_decode_v2);
         enc->setBytes(&a, sizeof(a), 0);
-        enc->setBuffer(B.q_packed_f32, 0, 1);   // Q is fp32 in ds4 path
-        enc->setBuffer(B.k_no_pe,       0, 2);   // K (fp16)
-        enc->setBuffer(B.v,             0, 3);   // V (fp16)
-        enc->setBuffer(B.causal_mask,   0, 4);   // causal mask (fp16, -inf above)
+        enc->setBuffer(B.q_packed_f32, 0, 1);   // Q (fp32, RoPE-applied)
+        enc->setBuffer(B.c_kv_cache,    0, 2);   // K cache (fp16)
+        enc->setBuffer(B.k_pe_cache,    0, 3);   // V cache (fp16)
+        enc->setBuffer(B.causal_mask,   0, 4);   // mask (fp16)
         enc->setBuffer(B.q_packed_f32,  0, 5);   // sinks (unused)
         enc->setBuffer(B.q_packed_f32,  0, 6);   // pad   (unused)
-        enc->setBuffer(B.attn_out_f32,  0, 7);   // dst — flash_attn writes fp32
-
-        enc->setThreadgroupMemoryLength(32 * 1024, 0);
+        enc->setBuffer(B.attn_out_f32,  0, 7);   // dst (fp32 [batch, seq, head, dv])
         enc->dispatchThreadgroups(
             MTL::Size(p.seq, p.n_heads, p.batch),
-            MTL::Size(32 * 4, 1, 1));   // nsg=4
+            MTL::Size(32, 1, 1));   // one simdgroup per (q,head,batch)
         enc->endEncoding();
 
-        // Cast attn_out fp32 → fp16 so the O-proj GEMM can read it.
+        // Cast attn_out fp32 → fp16 for the O-proj GEMM.
         encode_cast(cmd, P.cast_f2h, B.attn_out_f32, B.attn_out,
                     T * p.n_heads * p.v_head_dim);
     }
@@ -631,88 +640,108 @@ inline void dispatch_layer(
         return;
     }
 
-    MoeFfnBuffers MB{};
-    MB.x         = B.m_in;            // routing input (post-norm)
-    MB.w_router  = B.w_router;
-    MB.w_gate    = B.w_gate;
-    MB.w_up      = B.w_up;
-    MB.w_down    = B.w_down;
-    MB.top_idx   = B.moe_top_idx;
-    MB.top_score = B.moe_top_score;
-    MB.hidden    = B.moe_hidden;
-    MB.residual  = B.shared_out;      // = y_attn + shared_out (precomputed above)
-    MB.out       = B.y_out;
-
-    MoeFfnParams mp{T, p.d_model, p.n_int, p.n_expert, p.top_k, p.moe_quant};
-
-    // Patch G: V3 sigmoid+bias+group router. Replace MoE's first stage.
-    // modeling_deepseek_v3.py:214-237. V2-Lite falls back via runtime flag.
+    // ── V2-Lite MoE: shared moe_router → per-expert mul_mv_id_q4_K (gate/up) →
+    //    SwiGLU → mul_mv_id_q4_K (down) → weighted scatter-add into residual. ──
+    // moe_router: x fp16 (m_in), W fp16 (w_router, [D,N]) → top_idx, top_score.
     {
-        struct RouterV3Args {
-            uint32_t T, D, N, K, n_group, topk_group;
-            float    routed_scaling;
-            uint32_t norm_topk_prob, has_bias;
-        };
-        RouterV3Args ra{};
-        ra.T = T; ra.D = p.d_model; ra.N = p.n_expert; ra.K = p.top_k;
-        ra.n_group = p.n_group; ra.topk_group = p.topk_group;
-        ra.routed_scaling = p.routed_scaling;
-        ra.norm_topk_prob = p.norm_topk_prob ? 1u : 0u;
-        ra.has_bias       = (p.router_has_bias && B.router_bias) ? 1u : 0u;
+        const size_t router_off = (size_t)L * p.d_model * p.n_expert * 2;
         auto* enc = cmd->computeCommandEncoder();
-        enc->setComputePipelineState(P.router_v3);
-        enc->setBuffer(B.m_in,        0, 0);
-        enc->setBuffer(B.w_router,    0, 1);
-        // Bias may be null on V2; the kernel checks has_bias before reading.
-        // Metal requires a bound buffer though, so reuse w_router if absent.
-        enc->setBuffer(B.router_bias ? B.router_bias : B.w_router, 0, 2);
-        enc->setBuffer(B.moe_top_idx,   0, 3);
-        enc->setBuffer(B.moe_top_score, 0, 4);
-        enc->setBytes(&ra, sizeof(ra), 5);
+        enc->setComputePipelineState(P.router_v2);
+        enc->setBuffer(B.m_in,          0,          0);
+        enc->setBuffer(B.w_router,      router_off, 1);
+        enc->setBuffer(B.moe_top_idx,   0,          2);
+        enc->setBuffer(B.moe_top_score, 0,          3);
+        enc->setBytes(&T,         4, 4);
+        enc->setBytes(&p.d_model, 4, 5);
+        enc->setBytes(&p.n_expert,4, 6);
+        enc->setBytes(&p.top_k,   4, 7);
         enc->dispatchThreadgroups(MTL::Size(T, 1, 1), MTL::Size(256, 1, 1));
         enc->endEncoding();
     }
-    // Now encode the remaining two MoE stages (swiglu_pair + down_scatter)
-    // by emitting them inline (moe_ffn.h has them together with its router).
-    {
+
+    // Routing input cast fp16 → fp32 (mul_mv_id reads fp32 activations).
+    encode_cast(cmd, P.cast_h2f, B.m_in, B.moe_x_f32, T * p.d_model);
+
+    // Q4_K per-expert matvec: ne00=in_dim, ne01=out_rows, ne02=n_expert.
+    // src0 stride: block=144 B / 256 weights. ids = top_idx (T*top_k ints).
+    struct ArgsMulMvId {
+        int32_t  nei0; int32_t nei1; uint64_t nbi1;
+        int32_t  ne00; int32_t ne01; int32_t ne02; char _p0[4];
+        uint64_t nb00; uint64_t nb01; uint64_t nb02;
+        int32_t  ne10; int32_t ne11; int32_t ne12; int32_t ne13;
+        uint64_t nb10; uint64_t nb11; uint64_t nb12;
+        int32_t  ne0; int32_t ne1; uint64_t nb1; int32_t nr0; char _p1[4];
+    };
+    const uint32_t Q4K_BLK = 144;
+    const uint32_t NR0_Q4K = 2;
+    auto encode_mv_id = [&](MTL::Buffer* w, size_t w_off, MTL::Buffer* src1,
+                            MTL::Buffer* dst, uint32_t in_dim, uint32_t out_rows) {
+        const uint64_t row_blk = (uint64_t)(in_dim / 256) * Q4K_BLK;   // nb01
+        const uint64_t slab    = (uint64_t)out_rows * row_blk;          // nb02
+        ArgsMulMvId a{};
+        a.nei0 = (int32_t)p.top_k; a.nei1 = (int32_t)T;
+        a.nbi1 = (uint64_t)p.top_k * sizeof(int32_t);
+        a.ne00 = (int32_t)in_dim; a.ne01 = (int32_t)out_rows; a.ne02 = (int32_t)p.n_expert;
+        a.nb00 = Q4K_BLK; a.nb01 = row_blk; a.nb02 = slab;
+        a.ne10 = (int32_t)in_dim; a.ne11 = 1; a.ne12 = 1; a.ne13 = 1;
+        a.nb10 = sizeof(float); a.nb11 = (uint64_t)in_dim * sizeof(float); a.nb12 = a.nb11;
+        a.ne0 = (int32_t)out_rows; a.ne1 = 1; a.nb1 = (uint64_t)out_rows * sizeof(float);
+        a.nr0 = (int32_t)NR0_Q4K;
         auto* enc = cmd->computeCommandEncoder();
-        auto* pso = (mp.quant == MoeQuant::INT2_DS4) ? P.moe.swiglu_pair_iq2xxs
-                                                    : P.moe.swiglu_pair;
-        enc->setComputePipelineState(pso);
-        enc->setBuffer(MB.x,        0, 0);
-        enc->setBuffer(MB.w_gate,   0, 1);
-        enc->setBuffer(MB.w_up,     0, 2);
-        enc->setBuffer(MB.top_idx,  0, 3);
-        enc->setBuffer(MB.hidden,   0, 4);
-        enc->setBytes(&mp.T,        4, 5);
-        enc->setBytes(&mp.top_k,    4, 6);
-        enc->setBytes(&mp.D,        4, 7);
-        enc->setBytes(&mp.n_int,    4, 8);
-        const uint32_t COLS_PER_TG = 16;
+        enc->setComputePipelineState(P.moe_mv_gate);
+        enc->setBytes(&a, sizeof(a), 0);
+        enc->setBuffer(w,    w_off, 1);
+        enc->setBuffer(src1, 0,     2);
+        enc->setBuffer(dst,  0,     3);
+        enc->setBuffer(B.moe_top_idx, 0, 4);
+        enc->setThreadgroupMemoryLength(NR0_Q4K * 32 * sizeof(float), 0);
+        // q4_K covers NSG*NR0 rows per threadgroup.x (first_row=(x*NSG+sg)*nr0).
+        const uint32_t rows_per_tg = 4u * NR0_Q4K;
         enc->dispatchThreadgroups(
-            MTL::Size((mp.n_int + COLS_PER_TG - 1) / COLS_PER_TG, mp.T * mp.top_k, 1),
-            MTL::Size(256, 1, 1));
+            MTL::Size((out_rows + rows_per_tg - 1) / rows_per_tg, 1, T * p.top_k),
+            MTL::Size(4 * 32, 1, 1));   // NSG=4
+        enc->endEncoding();
+    };
+
+    // Per-layer Q4_K byte strides (144 B / 256 weights).
+    const size_t gate_layer = (size_t)p.n_expert * p.n_int * (p.d_model / 256) * Q4K_BLK;
+    const size_t down_layer = (size_t)p.n_expert * p.d_model * (p.n_int / 256) * Q4K_BLK;
+    encode_mv_id(B.w_gate, (size_t)L * gate_layer, B.moe_x_f32, B.moe_gate_f32,
+                 p.d_model, p.n_int);
+    encode_mv_id(B.w_up,   (size_t)L * gate_layer, B.moe_x_f32, B.moe_up_f32,
+                 p.d_model, p.n_int);
+
+    // SwiGLU mid = silu(gate)*up over [top_k, n_int].
+    {
+        const uint32_t n = T * p.top_k * p.n_int;
+        auto* enc = cmd->computeCommandEncoder();
+        enc->setComputePipelineState(P.moe_swiglu_f32);
+        enc->setBuffer(B.moe_gate_f32, 0, 0);
+        enc->setBuffer(B.moe_up_f32,   0, 1);
+        enc->setBuffer(B.moe_mid_f32,  0, 2);
+        enc->setBytes(&n, 4, 3);
+        enc->dispatchThreadgroups(MTL::Size((n + 255) / 256, 1, 1),
+                                  MTL::Size(256, 1, 1));
         enc->endEncoding();
     }
+
+    encode_mv_id(B.w_down, (size_t)L * down_layer, B.moe_mid_f32, B.moe_down_f32,
+                 p.n_int, p.d_model);
+
+    // Weighted scatter-add: y_out = residual + scale * Σ score[s] * down[s].
     {
+        const float scale = p.routed_scaling;
         auto* enc = cmd->computeCommandEncoder();
-        auto* pso = (mp.quant == MoeQuant::INT2_DS4) ? P.moe.down_scatter_q2k
-                                                    : P.moe.down_scatter;
-        enc->setComputePipelineState(pso);
-        enc->setBuffer(MB.hidden,    0, 0);
-        enc->setBuffer(MB.w_down,    0, 1);
-        enc->setBuffer(MB.top_idx,   0, 2);
-        enc->setBuffer(MB.top_score, 0, 3);
-        enc->setBuffer(MB.residual ? MB.residual : MB.x, 0, 4);
-        enc->setBuffer(MB.out,       0, 5);
-        enc->setBytes(&mp.T,         4, 6);
-        enc->setBytes(&mp.top_k,     4, 7);
-        enc->setBytes(&mp.D,         4, 8);
-        enc->setBytes(&mp.n_int,     4, 9);
-        const uint32_t COLS_PER_TG = 16;
-        enc->dispatchThreadgroups(
-            MTL::Size((mp.D + COLS_PER_TG - 1) / COLS_PER_TG, mp.T, 1),
-            MTL::Size(256, 1, 1));
+        enc->setComputePipelineState(P.moe_scatter_add);
+        enc->setBuffer(B.moe_down_f32,  0, 0);
+        enc->setBuffer(B.moe_top_score, 0, 1);
+        enc->setBuffer(B.shared_out,    0, 2);   // residual = y_attn + shared
+        enc->setBuffer(B.y_out,         0, 3);
+        enc->setBytes(&p.d_model, 4, 4);
+        enc->setBytes(&p.top_k,   4, 5);
+        enc->setBytes(&scale,     4, 6);
+        enc->dispatchThreadgroups(MTL::Size((p.d_model + 255) / 256, 1, 1),
+                                  MTL::Size(256, 1, 1));
         enc->endEncoding();
     }
 }
@@ -827,6 +856,11 @@ struct ModelBuffers {
     MTL::Buffer* moe_top_idx;
     MTL::Buffer* moe_top_score;
     MTL::Buffer* moe_hidden;
+    MTL::Buffer* moe_x_f32;
+    MTL::Buffer* moe_gate_f32;
+    MTL::Buffer* moe_up_f32;
+    MTL::Buffer* moe_mid_f32;
+    MTL::Buffer* moe_down_f32;
 
     // 2-pass argmax scratch (ceil(vocab_size/16384) partials each).
     MTL::Buffer* argmax_val_buf = nullptr;
@@ -951,6 +985,11 @@ inline void dispatch_model(
         lb.moe_top_idx   = B.moe_top_idx;
         lb.moe_top_score = B.moe_top_score;
         lb.moe_hidden    = B.moe_hidden;
+        lb.moe_x_f32     = B.moe_x_f32;
+        lb.moe_gate_f32  = B.moe_gate_f32;
+        lb.moe_up_f32    = B.moe_up_f32;
+        lb.moe_mid_f32   = B.moe_mid_f32;
+        lb.moe_down_f32  = B.moe_down_f32;
         lb.y_out         = nxt;
 
         dispatch_layer(cmd, P.layer, lb, lp);

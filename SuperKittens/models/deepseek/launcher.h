@@ -32,7 +32,8 @@ typedef struct {
     uint32_t vocab_size;
 
     // MoE weight quantization for routed experts. 0 = fp16 (default),
-    // 1 = INT2_DS4 (IQ2_XXS up/gate + Q2_K down — DS4 V4 Flash production).
+    // 1 = INT2_DS4 (IQ2_XXS up/gate + Q2_K down — DS4 V4 Flash production),
+    // 2 = Q4_K (V2-Lite Q4_K_M routed experts, per-expert mul_mv_id_q4_K).
     uint32_t moe_quant;
 
     int32_t  rope_n_ctx_orig;
