@@ -159,7 +159,7 @@ def memory_aware_cache_max(
     *, requested_cache_max: int, seq_max: int,
     weight_bytes: int, n_layers: int, n_kv_heads: int, head_dim: int,
     d_model: int, n_int: int, n_heads: int, vocab_size: int,
-    headroom_gib: float = 4.0, total_mem_bytes: int | None = None,
+    headroom_gib: float = 6.0, total_mem_bytes: int | None = None,
 ) -> int:
     """Clamp ``requested_cache_max`` so weights + KV + prefill scratch fit memory.
 
@@ -171,10 +171,16 @@ def memory_aware_cache_max(
 
     Returns the largest cache_max ≤ requested that leaves ``headroom_gib`` free,
     floored at 256 and never raised above the request. If memory can't be
-    queried, returns the request unchanged. The 4 GiB default headroom keeps the
-    resident set under physical RAM on a 16 GiB box (OS/desktop ≈ 3-4 GiB);
-    smaller headroom over-commits and the box thrashes the compressor instead
-    of OOM-killing.
+    queried, returns the request unchanged.
+
+    The 6 GiB default headroom is empirical, not just "OS reserve": measured on
+    derek (M4, 16 GiB) the real resident set at cache_max=2048 was ~4.5 GiB
+    above what this byte model accounts for — OS/desktop, the Metal runtime,
+    mmap page-table slack, and page rounding all sit outside it. Smaller
+    headroom over-commits a 16 GiB box and it thrashes the VM compressor
+    (decode stalls to a crawl) instead of OOM-killing, which is worse. Keep the
+    margin conservative; the win over a hand-set cache_max is fitting at all
+    without a manual override, not squeezing the last KV slot.
     """
     total = total_mem_bytes if total_mem_bytes is not None else _unified_memory_bytes()
     if total <= 0 or weight_bytes <= 0:
