@@ -1,0 +1,20 @@
+[bench] spec=qwen3-4b-q4km snap=/Users/derek/SK_q4km/SuperKittens/model_weights/Qwen3-4B-GGUF
+[qwen] memory-aware cache_max: 32768 -> 31744 (weights=2.3GiB, seq_max=8192)
+[bench] prompt_len=15
+[bench] warmup 0: 33.38 tok/s
+[bench] warmup 1: 33.16 tok/s
+[bench] cooldown 30.0s ...
+[bench] rep 0: 33.37 tok/s
+[bench] rep 1: 33.26 tok/s
+[bench] rep 2: 33.35 tok/s
+[bench] rep 3: 33.38 tok/s
+[bench] rep 4: 33.26 tok/s
+============================================================
+[RESULT] spec=qwen3-4b-q4km median=33.35 tok/s (reps=['33.37', '33.26', '33.35', '33.38', '33.26'])
+[RESULT] nan_or_inf_logits=False frac_printable=1.000
+[RESULT] sample_text<<<
+ums
+Okay, the user wants a poem about pizza dough. Let me start by thinking about the key elements of pizza dough. It's a fundamental part of pizza, so I should highlight its role in creating the base. Maybe start with the ingredients: flour, water, yeast, salt. Those are the basics.
+
+
+>>>
