@@ -28,6 +28,7 @@ struct LayerParams {
     uint32_t kv_lora_rank   = 512;
     uint32_t n_int          = 2048;
     uint32_t shared_n_int   = 2048;
+    uint32_t dense_n_int    = 10944;
     uint32_t n_expert       = 256;
     uint32_t top_k          = 8;
     float    eps            = 1e-6f;
@@ -78,7 +79,8 @@ struct LayerPSOs {
     MTL::ComputePipelineState* flash_attn_vec;
     MTL::ComputePipelineState* mla_decode_v2;      // V2-Lite per-head MLA decode (dk=192, dv=128)
     MTL::ComputePipelineState* mla_kv_write;       // assemble dk=192 K + dv=128 V into per-head cache
-    MTL::ComputePipelineState* moe_mv_gate;        // mul_mv_id_q4_K (routed gate/up/down)
+    MTL::ComputePipelineState* moe_mv_gate;        // mul_mv_id_q4_K (routed gate/up)
+    MTL::ComputePipelineState* moe_mv_down;        // mul_mv_id_q8_0 (routed down)
     MTL::ComputePipelineState* moe_swiglu_f32;     // deepseek_moe_swiglu_f32
     MTL::ComputePipelineState* moe_scatter_add;    // deepseek_moe_scatter_add_f32
     MTL::ComputePipelineState* cast_h2f;
@@ -110,6 +112,9 @@ struct LayerBuffers {
     MTL::Buffer* w_shared_gate;
     MTL::Buffer* w_shared_up;
     MTL::Buffer* w_shared_down;
+    MTL::Buffer* w_dense_gate;
+    MTL::Buffer* w_dense_up;
+    MTL::Buffer* w_dense_down;
 
     MTL::Buffer* w_router;
     MTL::Buffer* router_bias;   // V3 e_score_correction_bias (fp32, per layer, len n_expert). May be null on V2.
@@ -585,6 +590,7 @@ inline void dispatch_layer(
     const uint32_t L = p.layer_idx;
     const size_t   off_norm = (size_t)L * p.d_model * 2;
 
+    // Residual + pre-MLP RMSNorm: y_attn = x + o_proj; m_in = rmsnorm(y_attn).
     {
         auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(P.add_rmsnorm);
@@ -600,44 +606,57 @@ inline void dispatch_layer(
         enc->endEncoding();
     }
 
-    dispatch_shared_expert(cmd, P, B, p);
-
-    {
+    // Leading dense layers (L < first_k_dense_replace): a single wide gated MLP
+    // (no shared/routed experts). y_out = y_attn + dense_mlp(m_in).
+    if (!p.is_moe_layer) {
+        const size_t off_g = (size_t)L * p.d_model * p.dense_n_int * 2;
+        const size_t off_d = (size_t)L * p.dense_n_int * p.d_model * 2;
+        {
+            auto* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(P.gated_mlp);
+            enc->setBuffer(B.m_in,        0,     0);
+            enc->setBuffer(B.w_dense_gate, off_g, 1);
+            enc->setBuffer(B.w_dense_up,   off_g, 2);
+            enc->setBuffer(B.w_dense_down, off_d, 3);
+            enc->setBuffer(B.shared_out,  0,     4);
+            uint32_t M = T, N_v = p.d_model, K_v = p.d_model;
+            enc->setBytes(&M,             4, 5);
+            enc->setBytes(&N_v,           4, 6);
+            enc->setBytes(&K_v,           4, 7);
+            enc->setBytes(&p.dense_n_int, 4, 8);
+            enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M + 63) / 64, 1),
+                                      MTL::Size(128, 1, 1));
+            enc->endEncoding();
+        }
         auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(P.add);
         enc->setBuffer(B.y_attn,     0, 0);
         enc->setBuffer(B.shared_out, 0, 1);
-        enc->setBuffer(B.shared_out, 0, 2);   // overwrite shared_out = y_attn + shared_out
+        enc->setBuffer(B.y_out,      0, 2);
         uint32_t n = T * p.d_model;
         enc->setBytes(&n, 4, 3);
         uint32_t total = (n / 4u) + (n & 3u);
         enc->dispatchThreadgroups(MTL::Size((total + 127) / 128, 1, 1),
                                   MTL::Size(128, 1, 1));
         enc->endEncoding();
+        return;
     }
 
-    // Patch E: layers 0..first_k_dense_replace-1 use plain dense MLP (no MoE).
-    // The shared-expert dispatch above already computed dense MLP into
-    // shared_out (loader puts dense gate/up/down into w_shared_* with width
-    // config.intermediate_size). Skip MoE; emit y_out = shared_out.
-    // configuration_deepseek_v3.py:90 first_k_dense_replace=3.
-    if (!p.is_moe_layer) {
+    // MoE layers: shared experts (2 fused, width shared_n_int) into shared_out,
+    // then shared_out = y_attn + shared_out (the residual the routed sum adds to).
+    dispatch_shared_expert(cmd, P, B, p);
+    {
         auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(P.add);
-        // Zero-add trick: y_out = shared_out + 0; reuse shared_out buffer slot 0,1.
-        // Simpler: a single copy via add(shared_out, shared_out, y_out) / 2 is wrong.
-        // Use add of shared_out and shared_out then divide? No — emit
-        // y_out = shared_out via memcpy-equivalent: bind shared_out twice to add
-        // then halve? No. The add kernel signature is (a, b, out, n) so we use
-        // a single add encoding with B.shared_out as one input and a zero buffer
-        // would be cleaner. Instead, just chain: enc->setBuffer copies via
-        // add(y_attn=0?). Cleanest: use blitCommandEncoder for the copy.
+        enc->setBuffer(B.y_attn,     0, 0);
+        enc->setBuffer(B.shared_out, 0, 1);
+        enc->setBuffer(B.shared_out, 0, 2);
+        uint32_t n = T * p.d_model;
+        enc->setBytes(&n, 4, 3);
+        uint32_t total = (n / 4u) + (n & 3u);
+        enc->dispatchThreadgroups(MTL::Size((total + 127) / 128, 1, 1),
+                                  MTL::Size(128, 1, 1));
         enc->endEncoding();
-        auto* blit = cmd->blitCommandEncoder();
-        blit->copyFromBuffer(B.shared_out, 0, B.y_out, 0,
-                             (size_t)T * p.d_model * 2);
-        blit->endEncoding();
-        return;
     }
 
     // ── V2-Lite MoE: shared moe_router → per-expert mul_mv_id_q4_K (gate/up) →
@@ -672,44 +691,49 @@ inline void dispatch_layer(
         uint64_t nb10; uint64_t nb11; uint64_t nb12;
         int32_t  ne0; int32_t ne1; uint64_t nb1; int32_t nr0; char _p1[4];
     };
-    const uint32_t Q4K_BLK = 144;
-    const uint32_t NR0_Q4K = 2;
-    auto encode_mv_id = [&](MTL::Buffer* w, size_t w_off, MTL::Buffer* src1,
+    const uint32_t NR0 = 2;   // N_R0 for both q4_K and q8_0
+    // is_q4k=true: Q4_K weights (block 144 B / 256), q4_K impl strides
+    //   first_row=(x*NSG+sg)*nr0 → NSG*nr0 rows per tg.x, no shmem reduce.
+    // is_q4k=false: Q8_0 weights (block 34 B / 32), q8_0 impl r0=x*nr0 → nr0
+    //   rows per tg.x, simdgroup-tree reduce via shmem.
+    auto encode_mv_id = [&](MTL::ComputePipelineState* pso, bool is_q4k,
+                            MTL::Buffer* w, size_t w_off, MTL::Buffer* src1,
                             MTL::Buffer* dst, uint32_t in_dim, uint32_t out_rows) {
-        const uint64_t row_blk = (uint64_t)(in_dim / 256) * Q4K_BLK;   // nb01
+        const uint32_t blk_w = is_q4k ? 256u : 32u;
+        const uint64_t blk_b = is_q4k ? 144u : 34u;
+        const uint64_t row_blk = (uint64_t)(in_dim / blk_w) * blk_b;    // nb01
         const uint64_t slab    = (uint64_t)out_rows * row_blk;          // nb02
         ArgsMulMvId a{};
         a.nei0 = (int32_t)p.top_k; a.nei1 = (int32_t)T;
         a.nbi1 = (uint64_t)p.top_k * sizeof(int32_t);
         a.ne00 = (int32_t)in_dim; a.ne01 = (int32_t)out_rows; a.ne02 = (int32_t)p.n_expert;
-        a.nb00 = Q4K_BLK; a.nb01 = row_blk; a.nb02 = slab;
+        a.nb00 = blk_b; a.nb01 = row_blk; a.nb02 = slab;
         a.ne10 = (int32_t)in_dim; a.ne11 = 1; a.ne12 = 1; a.ne13 = 1;
         a.nb10 = sizeof(float); a.nb11 = (uint64_t)in_dim * sizeof(float); a.nb12 = a.nb11;
         a.ne0 = (int32_t)out_rows; a.ne1 = 1; a.nb1 = (uint64_t)out_rows * sizeof(float);
-        a.nr0 = (int32_t)NR0_Q4K;
+        a.nr0 = (int32_t)NR0;
         auto* enc = cmd->computeCommandEncoder();
-        enc->setComputePipelineState(P.moe_mv_gate);
+        enc->setComputePipelineState(pso);
         enc->setBytes(&a, sizeof(a), 0);
         enc->setBuffer(w,    w_off, 1);
         enc->setBuffer(src1, 0,     2);
         enc->setBuffer(dst,  0,     3);
         enc->setBuffer(B.moe_top_idx, 0, 4);
-        enc->setThreadgroupMemoryLength(NR0_Q4K * 32 * sizeof(float), 0);
-        // q4_K covers NSG*NR0 rows per threadgroup.x (first_row=(x*NSG+sg)*nr0).
-        const uint32_t rows_per_tg = 4u * NR0_Q4K;
+        enc->setThreadgroupMemoryLength(NR0 * 32 * sizeof(float), 0);
+        const uint32_t rows_per_tg = is_q4k ? (4u * NR0) : NR0;   // NSG=4
         enc->dispatchThreadgroups(
             MTL::Size((out_rows + rows_per_tg - 1) / rows_per_tg, 1, T * p.top_k),
             MTL::Size(4 * 32, 1, 1));   // NSG=4
         enc->endEncoding();
     };
 
-    // Per-layer Q4_K byte strides (144 B / 256 weights).
-    const size_t gate_layer = (size_t)p.n_expert * p.n_int * (p.d_model / 256) * Q4K_BLK;
-    const size_t down_layer = (size_t)p.n_expert * p.d_model * (p.n_int / 256) * Q4K_BLK;
-    encode_mv_id(B.w_gate, (size_t)L * gate_layer, B.moe_x_f32, B.moe_gate_f32,
-                 p.d_model, p.n_int);
-    encode_mv_id(B.w_up,   (size_t)L * gate_layer, B.moe_x_f32, B.moe_up_f32,
-                 p.d_model, p.n_int);
+    // Per-layer byte strides: gate/up Q4_K (144 B/256), down Q8_0 (34 B/32).
+    const size_t gate_layer = (size_t)p.n_expert * p.n_int * (p.d_model / 256) * 144;
+    const size_t down_layer = (size_t)p.n_expert * p.d_model * (p.n_int / 32) * 34;
+    encode_mv_id(P.moe_mv_gate, true, B.w_gate, (size_t)L * gate_layer,
+                 B.moe_x_f32, B.moe_gate_f32, p.d_model, p.n_int);
+    encode_mv_id(P.moe_mv_gate, true, B.w_up,   (size_t)L * gate_layer,
+                 B.moe_x_f32, B.moe_up_f32,   p.d_model, p.n_int);
 
     // SwiGLU mid = silu(gate)*up over [top_k, n_int].
     {
@@ -725,8 +749,8 @@ inline void dispatch_layer(
         enc->endEncoding();
     }
 
-    encode_mv_id(B.w_down, (size_t)L * down_layer, B.moe_mid_f32, B.moe_down_f32,
-                 p.n_int, p.d_model);
+    encode_mv_id(P.moe_mv_down, false, B.w_down, (size_t)L * down_layer,
+                 B.moe_mid_f32, B.moe_down_f32, p.n_int, p.d_model);
 
     // Weighted scatter-add: y_out = residual + scale * Σ score[s] * down[s].
     {
@@ -754,6 +778,7 @@ struct ModelParams {
     uint32_t d_model        = 7168;
     uint32_t n_int          = 2048;
     uint32_t shared_n_int   = 2048;
+    uint32_t dense_n_int    = 10944;
     uint32_t n_heads        = 128;
     uint32_t qk_nope_dim    = 128;
     uint32_t qk_rope_dim    = 64;
@@ -819,6 +844,9 @@ struct ModelWeights {
     MTL::Buffer* w_shared_gate;
     MTL::Buffer* w_shared_up;
     MTL::Buffer* w_shared_down;
+    MTL::Buffer* w_dense_gate;          // leading-dense-layer MLP (V2-Lite L0, dense_n_int)
+    MTL::Buffer* w_dense_up;
+    MTL::Buffer* w_dense_down;
     MTL::Buffer* w_router;
     MTL::Buffer* router_bias;          // patch G: per-layer e_score_correction_bias concatenated (n_layers * n_expert fp32). May be null on V2.
     MTL::Buffer* w_gate;
@@ -913,6 +941,7 @@ inline void dispatch_model(
         lp.kv_lora_rank   = M.kv_lora_rank;
         lp.n_int          = M.n_int;
         lp.shared_n_int   = M.shared_n_int;
+        lp.dense_n_int    = M.dense_n_int;
         lp.n_expert       = M.n_expert;
         lp.top_k          = M.top_k;
         lp.eps            = M.eps;
@@ -955,6 +984,9 @@ inline void dispatch_model(
         lb.w_shared_gate   = W.w_shared_gate;
         lb.w_shared_up     = W.w_shared_up;
         lb.w_shared_down   = W.w_shared_down;
+        lb.w_dense_gate    = W.w_dense_gate;
+        lb.w_dense_up      = W.w_dense_up;
+        lb.w_dense_down    = W.w_dense_down;
         lb.w_router        = W.w_router;
         lb.router_bias     = W.router_bias;
         lb.w_gate          = W.w_gate;

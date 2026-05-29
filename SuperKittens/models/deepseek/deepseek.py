@@ -5,7 +5,7 @@ import numpy as np
 from pathlib import Path
 from dataclasses import dataclass
 
-from SuperKittens.inference.c_binder import bind, CtypesConfig
+from SuperKittens.inference.c_binder import bind, optional, CtypesConfig
 from SuperKittens.inference.generation import Model
 
 
@@ -49,6 +49,7 @@ class _Config(ctypes.Structure):
         ("mscale_all_dim",         ctypes.c_float),
         ("rope_scaling_factor",    ctypes.c_float),
         ("first_k_dense_replace",  ctypes.c_uint32),
+        ("dense_n_int",            ctypes.c_uint32),
     ]
 
 
@@ -71,6 +72,7 @@ class _Weights(ctypes.Structure):
 DEEPSEEK_ABI = {
     "create":       ([ctypes.POINTER(_Config)], ctypes.c_void_p),
     "load_weights": ([ctypes.c_void_p, ctypes.POINTER(_Weights)], ctypes.c_int),
+    "load_gguf":    optional([ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int),
     "forward":      ([ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
                       ctypes.c_uint32, ctypes.POINTER(ctypes.c_int32)], ctypes.c_int),
     "reset":        ([ctypes.c_void_p], None),
@@ -131,6 +133,7 @@ class Config(CtypesConfig):
     mscale_all_dim: float      = 1.0
     rope_scaling_factor: float = 40.0
     first_k_dense_replace: int = 3
+    dense_n_int: int           = 10944  # leading-dense-layer MLP width (V2-Lite)
 
     @classmethod
     def preset(cls, name: str) -> "Config":
@@ -175,6 +178,8 @@ class DeepSeek(Model):
         self._w_keep: list[np.ndarray] | None = None
         self._last_token: int | None = None
         self._tok = None
+        self.tokenizer = None
+        self.vocab_size = self.cfg.vocab_size
 
     # ─── factory shortcuts ───
     @classmethod
@@ -227,6 +232,16 @@ class DeepSeek(Model):
             "w_down":          W(c.n_layers, c.n_expert, c.d_model, c.n_int),
         })
 
+    def load_gguf(self, path: str) -> None:
+        """Load V2-Lite weights from a GGUF (dense dequant→fp16, routed experts
+        kept quantized: gate/up Q4_K, down Q8_0)."""
+        lib = _load()
+        if not hasattr(lib, "sk_deepseek_load_gguf"):
+            raise RuntimeError("libsk.dylib has no sk_deepseek_load_gguf; rebuild dylib")
+        rc = lib.sk_deepseek_load_gguf(self._h, str(path).encode())
+        if rc:
+            raise RuntimeError(f"sk_deepseek_load_gguf failed: {rc}")
+
     # ─── state ───
     def reset(self) -> None:
         _load().sk_deepseek_reset(self._h)
@@ -271,40 +286,17 @@ class DeepSeek(Model):
     # ── factory: build from a central-registry ModelSpec ─────────────
     @classmethod
     def from_spec(cls, spec, **overrides) -> "DeepSeek":
-        """Build a DeepSeek-V2-Lite model from a central-registry ModelSpec.
+        """Build a DeepSeek-V2-Lite model from a central-registry ModelSpec and a
+        Q4_K_M GGUF. Routed experts stay quantized (gate/up Q4_K, down Q8_0);
+        dense weights dequant to fp16 in the C loader. Attaches the tokenizer.
 
-        STATUS (2026-05-14): scaffolding only. The underlying C ABI takes
-        flat host-pointer arrays for every weight tensor in `_WEIGHT_FIELDS`.
-        Materialising V2-Lite (~31 GB bf16) as in-Python numpy buffers is
-        memory-feasible on derek (64 GB) but several SPEC items remain
-        broken before argmax-match is achievable; see
-        ``SuperKittens/models/deepseek/SPEC.md`` "wrong-form-needs-fix" and
-        "missing" tables. Current blockers for argmax-match:
-
-          - RoPE interleave wiring through ``dispatch_attn`` (already present
-            behind ``rope_interleave``; needs validation against HF's
-            ``apply_rotary_pos_emb_interleave``).
-          - LM head untied (``w_lm_head`` separate buffer; the C side already
-            falls back to ``w_embed`` if ``w_lm_head`` is null — V2-Lite
-            requires the dedicated path).
-          - ``first_k_dense_replace=1``: layer 0 must dispatch dense MLP
-            into the shared-expert slot; this branch exists in
-            ``dispatch_layer`` (see ``is_moe_layer`` gate) but the loader
-            still needs to pack the layer-0 dense MLP into the shared-expert
-            slot at d_model -> intermediate_size=10944 width (not
-            shared_n_int=2816). This is a config-layout mismatch.
-          - MoE router: sigmoid (no softmax) + ``e_score_correction_bias``
-            handling in ``moe_router_v3`` PSO. V2-Lite needs sigmoid-then-
-            top-k with no bias.
-
-        This factory raises ``NotImplementedError`` with a pointer to the
-        SPEC items above. A follow-up commit will wire the safetensors->
-        packed-numpy weight pipeline once the SPEC items above are landed
-        and verified end-to-end.
+        Pass ``gguf=<path>`` to point at the GGUF; otherwise the snapshot dir
+        (or ~/qwen-gguf) is scanned for ``DeepSeek-V2-Lite*Q4_K*.gguf``.
         """
         import json
         from dataclasses import fields
         sk_root = Path(__file__).resolve().parents[3]
+        gguf_override = overrides.pop("gguf", None)
         snap = Path(overrides.pop("snapshot", None)
                     or (sk_root / "SuperKittens" / "model_weights" / spec.weight_dir))
 
@@ -312,7 +304,6 @@ class DeepSeek(Model):
         cfg_json = snap / "config.json"
         if cfg_json.exists():
             j = json.loads(cfg_json.read_text())
-            # Map HF V2 config keys into our Config dataclass.
             d.update(
                 n_layers      = j.get("num_hidden_layers", d.get("n_layers")),
                 d_model       = j.get("hidden_size",       d.get("d_model")),
@@ -326,6 +317,7 @@ class DeepSeek(Model):
                 shared_n_int  = (j.get("n_shared_experts", 0)
                                  * j.get("moe_intermediate_size", 0)
                                  or d.get("shared_n_int")),
+                dense_n_int   = j.get("intermediate_size", d.get("dense_n_int", 10944)),
                 n_expert      = j.get("n_routed_experts",  d.get("n_expert")),
                 top_k         = j.get("num_experts_per_tok", d.get("top_k")),
                 vocab_size    = j.get("vocab_size",        d.get("vocab_size")),
@@ -333,7 +325,6 @@ class DeepSeek(Model):
                 first_k_dense_replace = j.get("first_k_dense_replace",
                                               d.get("first_k_dense_replace", 1)),
             )
-            # RoPE scaling.
             rs = j.get("rope_scaling") or {}
             if rs:
                 d["rope_scaling_factor"] = float(rs.get("factor", d.get("rope_scaling_factor", 1.0)))
@@ -345,11 +336,16 @@ class DeepSeek(Model):
             d["has_q_lora"]      = 1 if (j.get("q_lora_rank") or 0) > 0 else 0
             d["norm_topk_prob"]  = int(bool(j.get("norm_topk_prob", False)))
             d["routed_scaling_factor"] = float(j.get("routed_scaling_factor", 1.0))
-            d["router_has_bias"] = 0  # V2-Lite has no e_score_correction_bias
-            d["rope_interleave"] = 1  # V2/V3 both use interleaved RoPE
+            d["router_has_bias"] = 0  # V2-Lite: no e_score_correction_bias
+            d["rope_interleave"] = 1
             d["n_group"]         = int(j.get("n_group") or 0)
             d["topk_group"]      = int(j.get("topk_group") or 0)
 
+        # Routed experts are Q4_K(gate/up) + Q8_0(down) blocks → moe_quant=2.
+        d["moe_quant"] = 2
+        # Keep the KV cache modest on a 16 GB box (decode-only run).
+        d.setdefault("seq_max", 512)
+        d.setdefault("cache_max", 512)
         for k in ("seq_max", "cache_max"):
             if k in overrides:
                 d[k] = overrides.pop(k)
@@ -360,20 +356,42 @@ class DeepSeek(Model):
             if hasattr(cfg, k):
                 setattr(cfg, k, v)
 
-        raise NotImplementedError(
-            "DeepSeek.from_spec: end-to-end V2-Lite inference is not yet wired.\n"
-            "Registry + Config + tokenizer family are in place; remaining blockers\n"
-            "live in SuperKittens/models/deepseek/SPEC.md (see the 'wrong-form-\n"
-            "needs-fix' and 'missing' tables). Specifically:\n"
-            "  - Dense MLP layer-0 packing into the shared-expert slot (the\n"
-            "    intermediate width for L=0 differs from shared_n_int).\n"
-            "  - Safetensors->packed-numpy loader is not implemented; the C\n"
-            "    `sk_deepseek_load_weights` ABI expects flat host arrays.\n"
-            "  - RoPE interleave kernel needs validation vs HF's\n"
-            "    apply_rotary_pos_emb_interleave.\n"
-            "  - MoE router sigmoid-then-top-k path needs validation.\n"
-            "Track progress in the SPEC porting-order checklist."
-        )
+        # Resolve the GGUF path.
+        gguf_path = None
+        if gguf_override:
+            gguf_path = Path(gguf_override)
+        else:
+            search = [snap, sk_root / "SuperKittens" / "model_weights",
+                      Path.home() / "qwen-gguf"]
+            for base in search:
+                if not base.exists():
+                    continue
+                cands = sorted(base.glob("DeepSeek-V2-Lite*Q4_K*.gguf"))
+                if cands:
+                    gguf_path = cands[0]; break
+        if gguf_path is None or not Path(gguf_path).exists():
+            raise FileNotFoundError(
+                "DeepSeek-V2-Lite Q4_K_M GGUF not found. Pass gguf=<path> or place "
+                "DeepSeek-V2-Lite*Q4_K*.gguf under the snapshot dir or ~/qwen-gguf.")
+
+        m = cls(cfg)
+        m.load_gguf(str(gguf_path))
+
+        if spec.tokenizer_family:
+            try:
+                from SuperKittens.models.load.tokenizer import Tokenizer
+                json_path = snap / "tokenizer.json"
+                sp_path   = snap / "tokenizer.model"
+                if json_path.exists():
+                    m._tok = Tokenizer.from_hf_json(str(json_path), family=spec.tokenizer_family)
+                elif sp_path.exists():
+                    m._tok = Tokenizer.from_sentencepiece(str(sp_path), family=spec.tokenizer_family)
+                else:
+                    print(f"[deepseek] no tokenizer.json/.model in {snap}")
+            except Exception as e:
+                print(f"[deepseek] tokenizer attach failed: {e}")
+        m.tokenizer = m._tok
+        return m
 
     def chat(self, text: str | list, *, max_new_tokens: int = 64) -> str:
         if self._tok is None:

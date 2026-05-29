@@ -226,19 +226,31 @@ extern "C" int sk_deepseek_load_from_store(sk_deepseek_handle* hp, sk::WeightSto
     const size_t ni   = c.n_int;
     const size_t sni  = c.shared_n_int;
     const size_t E    = c.n_expert;
-    const bool   moe_q = (c.moe_quant == 1);
+    const bool   has_qlora  = (c.has_q_lora != 0);
 
     if (!copy_into(h->weights.w_embed, 0, store,
                    "token_embd.weight", (size_t)c.vocab_size * dm * fp16)) return -10;
     if (!copy_into(h->weights.w_final_norm, 0, store,
                    "output_norm.weight", dm * fp16)) return -11;
+    // Untied LM head (output.weight); dequant to fp16 [vocab, d_model].
+    if (store->get("output.weight")) {
+        if (!copy_into(h->weights.w_lm_head, 0, store,
+                       "output.weight", (size_t)c.vocab_size * dm * fp16)) return -12;
+    }
+
+    // q_in for the q_proj: q_lora_rank if present, else d_model (V2-Lite direct).
+    const size_t q_in = has_qlora ? qra : dm;
+    const size_t dint = c.dense_n_int ? c.dense_n_int : sni;
+
+    // Per-layer routed-expert slab byte sizes (gate/up Q4_K, down Q8_0).
+    const size_t gate_bytes_per_layer = (size_t)E * ni * (dm / 256) * 144;
+    const size_t down_bytes_per_layer = (size_t)E * dm * (ni / 32) * 34;
 
     for (uint32_t L = 0; L < c.n_layers; ++L) {
+        const bool   dense = (L < (uint32_t)c.first_k_dense_replace);
         const size_t pre_off    = (size_t)L * dm * fp16;
-        const size_t qan_off    = (size_t)L * qra * fp16;
         const size_t kvan_off   = (size_t)L * kvr * fp16;
-        const size_t q_a_off    = (size_t)L * dm * qra * fp16;
-        const size_t q_b_off    = (size_t)L * qra * qbN * fp16;
+        const size_t q_b_off    = (size_t)L * q_in * qbN * fp16;
         const size_t kv_a_off   = (size_t)L * dm * kva_cols * fp16;
         const size_t kv_b_off   = (size_t)L * kvr * kvbN * fp16;
         const size_t o_off      = (size_t)L * nh * dv * dm * fp16;
@@ -250,15 +262,24 @@ extern "C" int sk_deepseek_load_from_store(sk_deepseek_handle* hp, sk::WeightSto
                        blk_key(L, "attn_norm.weight"), dm * fp16)) return -20;
         if (!copy_into(h->weights.w_pre_mlp_norm, pre_off, store,
                        blk_key(L, "ffn_norm.weight"), dm * fp16)) return -21;
-        if (!copy_into(h->weights.w_q_a_norm, qan_off, store,
-                       blk_key(L, "attn_q_a_norm.weight"), qra * fp16)) return -22;
         if (!copy_into(h->weights.w_kv_a_norm, kvan_off, store,
                        blk_key(L, "attn_kv_a_norm.weight"), kvr * fp16)) return -23;
 
-        if (!copy_transpose_fp16(h->weights.w_q_a, q_a_off, store,
-                       blk_key(L, "attn_q_a.weight"), qra, dm)) return -24;
-        if (!copy_transpose_fp16(h->weights.w_q_b, q_b_off, store,
-                       blk_key(L, "attn_q_b.weight"), qbN, qra)) return -25;
+        // Q projection. V2-Lite: direct q_proj (attn_q). V3: q_a/q_a_norm/q_b.
+        if (has_qlora) {
+            const size_t qan_off = (size_t)L * qra * fp16;
+            const size_t q_a_off = (size_t)L * dm * qra * fp16;
+            if (!copy_into(h->weights.w_q_a_norm, qan_off, store,
+                           blk_key(L, "attn_q_a_norm.weight"), qra * fp16)) return -22;
+            if (!copy_transpose_fp16(h->weights.w_q_a, q_a_off, store,
+                           blk_key(L, "attn_q_a.weight"), qra, dm)) return -24;
+            if (!copy_transpose_fp16(h->weights.w_q_b, q_b_off, store,
+                           blk_key(L, "attn_q_b.weight"), qbN, qra)) return -25;
+        } else {
+            // attn_q: GGUF [in=dm, out=qbN] → dense GEMM wants [in=dm, out=qbN].
+            if (!copy_transpose_fp16(h->weights.w_q_b, q_b_off, store,
+                           blk_key(L, "attn_q.weight"), dm, qbN)) return -25;
+        }
 
         {
             const std::string nm = blk_key(L, "attn_kv_a_mqa.weight");
@@ -273,65 +294,61 @@ extern "C" int sk_deepseek_load_from_store(sk_deepseek_handle* hp, sk::WeightSto
         if (!copy_transpose_fp16(h->weights.w_o, o_off, store,
                        blk_key(L, "attn_output.weight"), dm, nh * dv)) return -28;
 
+        if (dense) {
+            // Leading dense layer: wide gated MLP (dequant fp16) into w_dense_*.
+            const size_t dg_off = (size_t)L * dm * dint * fp16;
+            const size_t dd_off = (size_t)L * dint * dm * fp16;
+            if (!copy_transpose_fp16(h->weights.w_dense_gate, dg_off, store,
+                           blk_key(L, "ffn_gate.weight"), dint, dm)) return -40;
+            if (!copy_transpose_fp16(h->weights.w_dense_up, dg_off, store,
+                           blk_key(L, "ffn_up.weight"), dint, dm)) return -41;
+            if (!copy_transpose_fp16(h->weights.w_dense_down, dd_off, store,
+                           blk_key(L, "ffn_down.weight"), dm, dint)) return -42;
+            continue;
+        }
+
+        // Shared experts (dequant to fp16) + router.
         if (!copy_transpose_fp16(h->weights.w_shared_gate, sh_gate_off, store,
                        blk_key(L, "ffn_gate_shexp.weight"), sni, dm)) return -30;
         if (!copy_transpose_fp16(h->weights.w_shared_up, sh_gate_off, store,
                        blk_key(L, "ffn_up_shexp.weight"), sni, dm)) return -31;
         if (!copy_transpose_fp16(h->weights.w_shared_down, sh_down_off, store,
                        blk_key(L, "ffn_down_shexp.weight"), dm, sni)) return -32;
-
         if (!copy_transpose_fp16(h->weights.w_router, router_off, store,
                        blk_key(L, "ffn_gate_inp.weight"), E, dm)) return -33;
 
+        // Routed experts: gate/up Q4_K, down Q8_0 — copy raw block bytes.
         {
-            const std::string gname = blk_key(L, "ffn_gate_exps.weight");
-            const std::string uname = blk_key(L, "ffn_up_exps.weight");
-            const std::string dname = blk_key(L, "ffn_down_exps.weight");
-            auto* gv = store->get(gname);
-            auto* uv = store->get(uname);
-            auto* dv2 = store->get(dname);
+            auto* gv  = store->get(blk_key(L, "ffn_gate_exps.weight"));
+            auto* uv  = store->get(blk_key(L, "ffn_up_exps.weight"));
+            auto* dv2 = store->get(blk_key(L, "ffn_down_exps.weight"));
             if (!gv || !uv || !dv2) {
-                std::fprintf(stderr, "ds4 weights: missing routed expert tensors layer %u\n", L);
+                std::fprintf(stderr, "ds weights: missing routed expert tensors L%u\n", L);
                 return -34;
             }
-            const bool gv_q = is_block_quant(gv->dtype);
-            const bool uv_q = is_block_quant(uv->dtype);
-            const bool dv_q = is_block_quant(dv2->dtype);
-
-            const size_t gate_bytes_per_layer = (size_t)h->weights.w_gate->length() / c.n_layers;
-            const size_t up_bytes_per_layer   = (size_t)h->weights.w_up->length()   / c.n_layers;
-            const size_t down_bytes_per_layer = (size_t)h->weights.w_down->length() / c.n_layers;
+            if (gv->dtype != sk::Dtype::Q4_K || uv->dtype != sk::Dtype::Q4_K) {
+                std::fprintf(stderr, "ds weights: gate/up_exps L%u not Q4_K\n", L);
+                return -35;
+            }
+            if (dv2->dtype != sk::Dtype::Q8_0) {
+                std::fprintf(stderr, "ds weights: down_exps L%u not Q8_0\n", L);
+                return -36;
+            }
             const size_t gate_off = (size_t)L * gate_bytes_per_layer;
-            const size_t up_off   = (size_t)L * up_bytes_per_layer;
             const size_t down_off = (size_t)L * down_bytes_per_layer;
-
-            if (moe_q || gv_q) {
-                if (gv->nbytes != gate_bytes_per_layer) {
-                    std::fprintf(stderr, "ds4 weights: gate_exps size mismatch L%u got %zu expect %zu\n",
-                                 L, gv->nbytes, gate_bytes_per_layer);
-                    return -35;
-                }
-                std::memcpy((char*)h->weights.w_gate->contents() + gate_off, gv->data, gate_bytes_per_layer);
-            } else {
-                if (gv->nbytes != (size_t)E * ni * dm * fp16) return -35;
-                const uint16_t* s = (const uint16_t*)gv->data;
-                uint16_t* d = (uint16_t*)((char*)h->weights.w_gate->contents() + gate_off);
-                std::memcpy(d, s, gv->nbytes);
+            if (gv->nbytes != gate_bytes_per_layer || uv->nbytes != gate_bytes_per_layer) {
+                std::fprintf(stderr, "ds weights: gate/up_exps size L%u got %zu/%zu expect %zu\n",
+                             L, gv->nbytes, uv->nbytes, gate_bytes_per_layer);
+                return -37;
             }
-            if (moe_q || uv_q) {
-                if (uv->nbytes != up_bytes_per_layer) return -36;
-                std::memcpy((char*)h->weights.w_up->contents() + up_off, uv->data, up_bytes_per_layer);
-            } else {
-                if (uv->nbytes != (size_t)E * ni * dm * fp16) return -36;
-                std::memcpy((char*)h->weights.w_up->contents() + up_off, uv->data, uv->nbytes);
+            if (dv2->nbytes != down_bytes_per_layer) {
+                std::fprintf(stderr, "ds weights: down_exps size L%u got %zu expect %zu\n",
+                             L, dv2->nbytes, down_bytes_per_layer);
+                return -38;
             }
-            if (moe_q || dv_q) {
-                if (dv2->nbytes != down_bytes_per_layer) return -37;
-                std::memcpy((char*)h->weights.w_down->contents() + down_off, dv2->data, down_bytes_per_layer);
-            } else {
-                if (dv2->nbytes != (size_t)E * dm * ni * fp16) return -37;
-                std::memcpy((char*)h->weights.w_down->contents() + down_off, dv2->data, dv2->nbytes);
-            }
+            std::memcpy((char*)h->weights.w_gate->contents() + gate_off, gv->data, gate_bytes_per_layer);
+            std::memcpy((char*)h->weights.w_up->contents()   + gate_off, uv->data, gate_bytes_per_layer);
+            std::memcpy((char*)h->weights.w_down->contents() + down_off, dv2->data, down_bytes_per_layer);
         }
     }
 
