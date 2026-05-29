@@ -53,6 +53,9 @@ struct LayerPSOs {
     MTL::ComputePipelineState* split_packed;      // (T, A+B) → (T, A) + (T, B)
     MTL::ComputePipelineState* rope_qk;           // split-half RoPE on Q, K
     MTL::ComputePipelineState* attn;              // mha_causal (d=128, GQA)
+    // Flash-decoding split-K decode attention (long-ctx). Both non-null together.
+    MTL::ComputePipelineState* attn_split   = nullptr;  // mha_decode_split
+    MTL::ComputePipelineState* attn_combine = nullptr;  // mha_decode_combine
     MTL::ComputePipelineState* kv_cache_write;
     MTL::ComputePipelineState* add;
     MTL::ComputePipelineState* add_rmsnorm;
@@ -112,6 +115,11 @@ struct LayerBuffers {
     MTL::Buffer* k_th;
     MTL::Buffer* v_th;
     MTL::Buffer* attn_out_seq;
+
+    // Flash-decoding split-K partials (decode only). Sized batch*n_heads*SPLITS.
+    MTL::Buffer* attn_pm = nullptr;   // float running-max per (head, split)
+    MTL::Buffer* attn_ps = nullptr;   // float running-denom
+    MTL::Buffer* attn_po = nullptr;   // float (·*head_dim) unnormalized acc
 
     // Per-weight dtype (default FP16). Used by the M=1 fast-path to pick
     // between gemv_fp16_m1 and q8_0_matvec.
@@ -408,25 +416,75 @@ inline void dispatch_layer(
                              MTL::Size(32, 4, 1));
     }
 
-    // 7. Attention.
+    // 7. Attention. kv-length-conditional dispatch: at decode (seq==1) with a
+    // long context the flash-decoding split-K kernel reads K/V straight from
+    // device (no per-tile threadgroup staging) and splits the kv range across
+    // many threadgroups; at short kv mha_causal's TG staging amortizes better.
+    // Crossover is Hg-dependent (measured on M4 base): Hg=2 wins unambiguously
+    // from kv≈384, Hg≥4 only from kv≈1024 (4× the per-key simd_sum work delays
+    // the crossover). Gates sit past the break-even so neither config regresses.
     enc_barrier(enc);
-    enc->setComputePipelineState(P.attn);
-    enc->setBuffer(q_in,       0, 0);
-    enc->setBuffer(B.k_cache,  0, 1);
-    enc->setBuffer(B.v_cache,  0, 2);
-    enc->setBuffer(B.attn_out, 0, 3);
     {
         const uint32_t kv_len = p.kv_len;
         const uint32_t cache_stride = p.cache_size;
-        enc->setBytes(&p.seq,         4, 4);
-        enc->setBytes(&p.n_heads,     4, 5);
-        enc->setBytes(&p.n_kv_heads,  4, 6);
-        enc->setBytes(&kv_len,        4, 7);
-        enc->setBytes(&cache_stride,  4, 8);
         const uint32_t Hg_attn = p.n_heads / p.n_kv_heads;
-        enc->dispatchThreadgroups(
-            MTL::Size(p.n_kv_heads, (p.seq + 1) / 2, p.batch),
-            MTL::Size(Hg_attn * 2 * 32, 1, 1));
+        constexpr uint32_t SPLITS = 8u;  // compile-time PM/PS/PO stride
+        constexpr uint32_t NS = 4u;
+        const uint32_t kv_gate = (Hg_attn <= 2u) ? 384u : 1024u;
+        const bool use_split = (p.seq == 1) && (kv_len >= kv_gate)
+                               && (P.attn_split != nullptr)
+                               && (P.attn_combine != nullptr)
+                               && (B.attn_pm != nullptr);
+        if (use_split) {
+            // ~256 keys/split, clamped to [1, SPLITS].
+            uint32_t n_splits = (kv_len + 255u) / 256u;
+            if (n_splits < 1u) n_splits = 1u;
+            if (n_splits > SPLITS) n_splits = SPLITS;
+            enc->setComputePipelineState(P.attn_split);
+            enc->setBuffer(q_in,       0, 0);
+            enc->setBuffer(B.k_cache,  0, 1);
+            enc->setBuffer(B.v_cache,  0, 2);
+            enc->setBuffer(B.attn_pm,  0, 3);
+            enc->setBuffer(B.attn_ps,  0, 4);
+            enc->setBuffer(B.attn_po,  0, 5);
+            enc->setBytes(&p.seq,         4, 6);
+            enc->setBytes(&p.n_heads,     4, 7);
+            enc->setBytes(&p.n_kv_heads,  4, 8);
+            enc->setBytes(&kv_len,        4, 9);
+            enc->setBytes(&cache_stride,  4, 10);
+            enc->setBytes(&n_splits,      4, 11);
+            enc->dispatchThreadgroups(
+                MTL::Size(p.n_kv_heads, n_splits, p.batch),
+                MTL::Size(NS * 32, 1, 1));
+
+            enc_barrier(enc);
+            enc->setComputePipelineState(P.attn_combine);
+            enc->setBuffer(B.attn_pm,  0, 0);
+            enc->setBuffer(B.attn_ps,  0, 1);
+            enc->setBuffer(B.attn_po,  0, 2);
+            enc->setBuffer(B.attn_out, 0, 3);
+            enc->setBytes(&p.seq,         4, 4);
+            enc->setBytes(&p.n_heads,     4, 5);
+            enc->setBytes(&kv_len,        4, 6);
+            enc->setBytes(&n_splits,      4, 7);
+            enc->dispatchThreadgroups(
+                MTL::Size(p.n_heads, 1, p.batch),
+                MTL::Size(32, 1, 1));
+        } else {
+            enc->setComputePipelineState(P.attn);
+            enc->setBuffer(q_in,       0, 0);
+            enc->setBuffer(B.k_cache,  0, 1);
+            enc->setBuffer(B.v_cache,  0, 2);
+            enc->setBuffer(B.attn_out, 0, 3);
+            enc->setBytes(&p.seq,         4, 4);
+            enc->setBytes(&p.n_heads,     4, 5);
+            enc->setBytes(&p.n_kv_heads,  4, 6);
+            enc->setBytes(&kv_len,        4, 7);
+            enc->setBytes(&cache_stride,  4, 8);
+            enc->dispatchThreadgroups(
+                MTL::Size(p.n_kv_heads, (p.seq + 1) / 2, p.batch),
+                MTL::Size(Hg_attn * 2 * 32, 1, 1));
+        }
     }
 
     MTL::Buffer* attn_o_in = B.attn_out;
@@ -695,6 +753,11 @@ struct ModelBuffers {
     MTL::Buffer* v_th;
     MTL::Buffer* attn_out_seq;
 
+    // Flash-decoding split-K partials (decode only). Sized batch*n_heads*SPLITS.
+    MTL::Buffer* attn_pm = nullptr;
+    MTL::Buffer* attn_ps = nullptr;
+    MTL::Buffer* attn_po = nullptr;
+
     // 2-pass argmax scratch (n_blocks partials). Sized at handle-creation
     // time as ceil(vocab_size / 16384). May be nullptr when 2-pass disabled.
     MTL::Buffer* argmax_val_buf = nullptr;
@@ -810,6 +873,9 @@ inline void dispatch_model(
         lb.k_th            = B.k_th;
         lb.v_th            = B.v_th;
         lb.attn_out_seq    = B.attn_out_seq;
+        lb.attn_pm         = B.attn_pm;
+        lb.attn_ps         = B.attn_ps;
+        lb.attn_po         = B.attn_po;
         lb.dt_qkv          = W.dt_qkv;
         lb.dt_o            = W.dt_o;
         lb.dt_gate         = W.dt_gate;

@@ -59,6 +59,14 @@ static bool resolve_psos(ModelPSOs& P) {
     P.layer.split_packed   = sk::bindings_pso("split_packed");
     P.layer.rope_qk        = sk::bindings_pso("qwen_rope_qk");
     P.layer.attn           = sk::bindings_pso("mha_causal");
+    // SK_NO_SPLIT_ATTN=1 forces the mha_causal path everywhere (A/B + bisection).
+    if (getenv("SK_NO_SPLIT_ATTN")) {
+        P.layer.attn_split = nullptr;
+        P.layer.attn_combine = nullptr;
+    } else {
+        P.layer.attn_split   = sk::bindings_pso("mha_decode_split");    // optional; nullptr OK
+        P.layer.attn_combine = sk::bindings_pso("mha_decode_combine");  // optional; nullptr OK
+    }
     P.layer.kv_cache_write = sk::bindings_pso("kv_cache_write");
     P.layer.add            = sk::bindings_pso("add_f16");
     P.layer.add_rmsnorm    = sk::bindings_pso("add_rmsnorm");
@@ -190,6 +198,16 @@ extern "C" sk_qwen_handle* sk_qwen_create(const sk_qwen_config* cfg) {
     h->bufs.k_th       = alloc_zero(dev, (size_t)T_max * cfg->n_kv_heads * hd * 2);
     h->bufs.v_th       = alloc_zero(dev, (size_t)T_max * cfg->n_kv_heads * hd * 2);
     h->bufs.attn_out_seq = alloc_zero(dev, (size_t)T_max * cfg->n_heads  * hd * 2);
+
+    // Flash-decoding split-K partials (decode only). SPLITS must match the
+    // compile-time cap in attn.metal (mha_decode_split<…,SPLITS>).
+    {
+        constexpr uint32_t SPLITS = 8u;
+        const size_t n_part = (size_t)cfg->batch * cfg->n_heads * SPLITS;
+        h->bufs.attn_pm = alloc_zero(dev, n_part * sizeof(float));
+        h->bufs.attn_ps = alloc_zero(dev, n_part * sizeof(float));
+        h->bufs.attn_po = alloc_zero(dev, n_part * hd * sizeof(float));
+    }
 
     // 2-pass argmax scratch (one entry per 16384-elt tile of vocab_size).
     {
@@ -483,6 +501,7 @@ extern "C" void sk_qwen_destroy(sk_qwen_handle* hp) {
     rel(h->bufs.m_in); rel(h->bufs.mlp_out); rel(h->bufs.capture);
     rel(h->bufs.gate_buf); rel(h->bufs.up_buf);
     rel(h->bufs.q_th); rel(h->bufs.k_th); rel(h->bufs.v_th); rel(h->bufs.attn_out_seq);
+    rel(h->bufs.attn_pm); rel(h->bufs.attn_ps); rel(h->bufs.attn_po);
     rel(h->bufs.argmax_val_buf); rel(h->bufs.argmax_idx_buf);
     rel(h->bufs.argmax_args);
     if (h->bufs.argmax_icb) { delete h->bufs.argmax_icb; h->bufs.argmax_icb = nullptr; }
