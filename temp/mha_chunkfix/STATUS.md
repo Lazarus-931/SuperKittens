@@ -62,6 +62,19 @@ Bit-exactness vs pre-fix baseline metallib (test_bitexact.py):
 Robustness sweep (test_mha_chunk-style, 41272 head/case checks):
 current_pos 0..198 × seq {2,3,4,5,7,8,16} × Hg {2,4,5}: 0 failures, worst 2.8e-4.
 
+End-to-end through real qwen3-0.6B-Q8_0 stack (test_e2e_capture.py, sk_qwen
+capture hook): chunk-forward post-layer residual at interior positions vs full
+prefill residual — BIT-IDENTICAL (max_rel 0.0) AFTER fix, and the production
+prefill→greedy-decode stream is deterministic + coherent + in-vocab (regression
+guard). NOTE: the e2e capture reads 0.0 for the PRE-FIX baseline too on these
+token ids — the bug is data-dependent (the dropped diagonal key's softmax weight
+is often small, and the residual stream dilutes the attn_out error), exactly the
+spike's "argmax sometimes survives the bad attention / intermittent" finding. The
+kernel-level synthetic test (which isolates attn_out directly) is therefore the
+authoritative correctness probe; it deterministically triggers the bug (0.3-0.44
+pre-fix) at the exact qwen3-0.6B attention dims (n_heads=16, n_kv=8, hd=128,
+Hg=2). The e2e capture confirms NO regression to the model stack.
+
 ## Risk to production path
 
 None observed. seq=1 decode and current_pos=0 prefill are byte-identical to the
@@ -74,3 +87,4 @@ the decode/prefill numerics are unchanged.
 - temp/mha_chunkfix/test_mha_chunk.py  — synthetic-vs-numpy correctness.
 - temp/mha_chunkfix/test_bitexact.py   — baseline-vs-fixed byte diff.
 - temp/mha_chunkfix/probe.py           — diagnostic (which keys attended).
+- temp/mha_chunkfix/test_e2e_capture.py — e2e chunk-vs-prefill residual (real 0.6B).
