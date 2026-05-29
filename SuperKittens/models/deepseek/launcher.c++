@@ -67,6 +67,29 @@ static MTL::ComputePipelineState* resolve_fa_vec_pso(MTL::Library* lib,
     return pso;
 }
 
+// PSO factory for the q4_K per-expert matvec + shared_swiglu, which read
+// FC slot 600 (NSG, short) and 601 (nxpsg, short).
+static MTL::ComputePipelineState* resolve_mvid_pso(MTL::Library* lib,
+                                                   MTL::Device* dev,
+                                                   const char* name) {
+    auto* fcv = MTL::FunctionConstantValues::alloc()->init();
+    int16_t nsg = 4, nxpsg = 4;
+    fcv->setConstantValue(&nsg,   MTL::DataTypeShort, NS::UInteger(600));
+    fcv->setConstantValue(&nxpsg, MTL::DataTypeShort, NS::UInteger(601));
+    NS::Error* err = nullptr;
+    auto* fn = lib->newFunction(
+        NS::String::string(name, NS::UTF8StringEncoding), fcv, &err);
+    fcv->release();
+    if (!fn) {
+        std::fprintf(stderr, "ds: mvid newFunction failed (%s): %s\n",
+                     name, err ? err->localizedDescription()->utf8String() : "?");
+        return nullptr;
+    }
+    auto* pso = dev->newComputePipelineState(fn, &err);
+    fn->release();
+    return pso;
+}
+
 static bool resolve_psos(ModelPSOs& P, uint32_t dk, uint32_t dv) {
     P.layer.rmsnorm        = sk::bindings_pso("rmsnorm");
     P.layer.rmsnorm_t1     = sk::bindings_pso("rmsnorm_t1");  // optional T=1 fast path
@@ -93,6 +116,15 @@ static bool resolve_psos(ModelPSOs& P, uint32_t dk, uint32_t dv) {
     P.layer.flash_attn_vec = resolve_fa_vec_pso(
         sk::bindings_library(), sk::bindings_device(), dk, dv);
 
+    // V2-Lite MLA + Q4_K MoE path.
+    P.layer.router_v2     = sk::bindings_pso("moe_router");
+    P.layer.mla_decode_v2 = sk::bindings_pso("kernel_mla_decode_v2_f16_dk192_dv128");
+    P.layer.mla_kv_write  = sk::bindings_pso("deepseek_mla_kv_write");
+    P.layer.moe_mv_gate   = resolve_mvid_pso(
+        sk::bindings_library(), sk::bindings_device(), "deepseek_mul_mv_id_q4_K");
+    P.layer.moe_swiglu_f32  = sk::bindings_pso("deepseek_moe_swiglu_f32");
+    P.layer.moe_scatter_add = sk::bindings_pso("deepseek_moe_scatter_add_f32");
+
     P.embedding_lookup = sk::bindings_pso("embedding_lookup");
     P.argmax           = sk::bindings_pso("argmax");
     P.argmax_partial   = sk::bindings_pso("argmax_partial");
@@ -114,11 +146,12 @@ static bool resolve_psos(ModelPSOs& P, uint32_t dk, uint32_t dv) {
     _CK("kv_up_pair",     P.layer.kv_up_pair);
     _CK("split_packed",       P.layer.split_packed);
     _CK("moe_router",            P.layer.moe.router);
-    _CK("moe_swiglu_pair",       P.layer.moe.swiglu_pair);
-    _CK("moe_down_scatter",      P.layer.moe.down_scatter);
-    _CK("moe_swiglu_pair_iq2xxs", P.layer.moe.swiglu_pair_iq2xxs);
-    _CK("moe_down_scatter_q2k",   P.layer.moe.down_scatter_q2k);
-    _CK("flash_attn_vec", P.layer.flash_attn_vec);
+    _CK("moe_router(v2)",        P.layer.router_v2);
+    _CK("mla_decode_v2",         P.layer.mla_decode_v2);
+    _CK("mla_kv_write",          P.layer.mla_kv_write);
+    _CK("moe_mul_mv_id_q4_K",    P.layer.moe_mv_gate);
+    _CK("moe_swiglu_f32",        P.layer.moe_swiglu_f32);
+    _CK("moe_scatter_add_f32",   P.layer.moe_scatter_add);
     _CK("embedding_lookup", P.embedding_lookup);
     _CK("argmax",         P.argmax);
     #undef _CK
@@ -173,13 +206,14 @@ extern "C" sk_deepseek_handle* sk_deepseek_create(const sk_deepseek_config* cfg)
     // Patch G: per-layer e_score_correction_bias (fp32). Allocated unconditionally;
     // loader leaves zeros for V2-Lite, kernel ignores when has_bias=0.
     h->weights.router_bias = alloc_zero(dev, (size_t)cfg->n_layers * cfg->n_expert * 4);
-    // Routed-expert weights. INT2_DS4 layout (ds4 production):
-    //   W_gate/W_up: (E, N_int, D / 256) block_iq2_xxs   →  66 bytes / 256 weights
-    //   W_down     : (E, D, N_int / 256) block_q2_K      →  84 bytes / 256 weights
-    // FP16 layout:  256 weights → 512 bytes (2 bytes each).
+    // Routed-expert weights. Per-256-weight block sizes by quant:
+    //   INT2_DS4: gate/up block_iq2_xxs 66 B, down block_q2_K 84 B (ds4 V4 Flash)
+    //   Q4_K    : 144 B / 256 weights (V2-Lite Q4_K_M; gate/up/down all Q4_K)
+    //   FP16    : 512 B / 256 weights
     const bool   int2     = (cfg->moe_quant == 1);
-    const size_t up_bytes_per_blk    = int2 ? 66 : 512;
-    const size_t down_bytes_per_blk  = int2 ? 84 : 512;
+    const bool   q4k      = (cfg->moe_quant == 2);
+    const size_t up_bytes_per_blk    = int2 ? 66 : (q4k ? 144 : 512);
+    const size_t down_bytes_per_blk  = int2 ? 84 : (q4k ? 144 : 512);
     const size_t n_blocks_gate_per_e = (size_t)cfg->n_int * (cfg->d_model / 256);
     const size_t n_blocks_down_per_e = (size_t)cfg->d_model * (cfg->n_int / 256);
     h->weights.w_gate = alloc_zero(dev, (size_t)cfg->n_layers * cfg->n_expert *
@@ -232,6 +266,12 @@ extern "C" sk_deepseek_handle* sk_deepseek_create(const sk_deepseek_config* cfg)
     h->bufs.moe_top_idx   = alloc_zero(dev, (size_t)T_max * cfg->top_k * sizeof(int32_t));
     h->bufs.moe_top_score = alloc_zero(dev, (size_t)T_max * cfg->top_k * 2);
     h->bufs.moe_hidden    = alloc_zero(dev, (size_t)T_max * cfg->top_k * cfg->n_int * 2);
+    // fp32 scratch for the per-expert mul_mv_id MoE path.
+    h->bufs.moe_x_f32     = alloc_zero(dev, (size_t)T_max * cfg->d_model * 4);
+    h->bufs.moe_gate_f32  = alloc_zero(dev, (size_t)T_max * cfg->top_k * cfg->n_int * 4);
+    h->bufs.moe_up_f32    = alloc_zero(dev, (size_t)T_max * cfg->top_k * cfg->n_int * 4);
+    h->bufs.moe_mid_f32   = alloc_zero(dev, (size_t)T_max * cfg->top_k * cfg->n_int * 4);
+    h->bufs.moe_down_f32  = alloc_zero(dev, (size_t)T_max * cfg->top_k * cfg->d_model * 4);
 
     // 2-pass argmax scratch.
     {
@@ -393,6 +433,8 @@ extern "C" void sk_deepseek_destroy(sk_deepseek_handle* hp) {
     rel(h->bufs.attn_out); rel(h->bufs.o_proj); rel(h->bufs.y_attn);
     rel(h->bufs.m_in); rel(h->bufs.shared_mid); rel(h->bufs.shared_out);
     rel(h->bufs.moe_top_idx); rel(h->bufs.moe_top_score); rel(h->bufs.moe_hidden);
+    rel(h->bufs.moe_x_f32); rel(h->bufs.moe_gate_f32); rel(h->bufs.moe_up_f32);
+    rel(h->bufs.moe_mid_f32); rel(h->bufs.moe_down_f32);
     rel(h->bufs.argmax_val_buf); rel(h->bufs.argmax_idx_buf);
 
     delete h;
