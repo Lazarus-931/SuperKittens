@@ -556,48 +556,54 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
         }
     }
 
-    // ── Per-projection dtype detection (GGUF dtype is uniform across layers,
-    // but mixed *across* projections in Q4_K_M: q/k/o/gate/up=Q4_K, v/down=Q6_K).
-    // Inspect layer 0; the rest are validated per-tensor at load time. ──
-    auto proj_dtype = [&](const char* suffix, sk::Dtype* out) -> bool {
-        char nm[128];
-        std::snprintf(nm, sizeof(nm), "blk.0.%s", suffix);
-        auto* v = store.get(nm);
-        if (!v) { std::fprintf(stderr, "gguf: missing %s\n", nm); return false; }
-        *out = v->dtype;
-        return true;
-    };
+    // ── Per-projection dtype detection. q/k/o/gate/up are uniform across layers
+    // (Q4_K in Q4_K_M); attn_v + ffn_down alternate Q4_K/Q6_K PER LAYER (the
+    // "_M" variant bumps every other layer to Q6_K), so those are read per L. ──
     auto supported_proj_dt = [](sk::Dtype d) {
         return d == sk::Dtype::Q8_0 || d == sk::Dtype::Q4_K || d == sk::Dtype::Q6_K
             || d == sk::Dtype::F16  || d == sk::Dtype::BF16;
     };
-    sk::Dtype dt_q, dt_k, dt_v, dt_o, dt_gate, dt_up, dt_down;
-    if (!proj_dtype("attn_q.weight",      &dt_q)   ||
-        !proj_dtype("attn_k.weight",      &dt_k)   ||
-        !proj_dtype("attn_v.weight",      &dt_v)   ||
-        !proj_dtype("attn_output.weight", &dt_o)   ||
-        !proj_dtype("ffn_gate.weight",    &dt_gate)||
-        !proj_dtype("ffn_up.weight",      &dt_up)  ||
-        !proj_dtype("ffn_down.weight",    &dt_down)) return -20;
-    for (sk::Dtype d : {dt_q, dt_k, dt_v, dt_o, dt_gate, dt_up, dt_down}) {
-        if (!supported_proj_dt(d)) {
-            std::fprintf(stderr, "gguf: unsupported projection dtype %d\n", (int)d);
-            return -21;
+    auto proj_dtype = [&](uint32_t L, const char* suffix, sk::Dtype* out) -> bool {
+        char nm[128];
+        std::snprintf(nm, sizeof(nm), "blk.%u.%s", L, suffix);
+        auto* v = store.get(nm);
+        if (!v) { std::fprintf(stderr, "gguf: missing %s\n", nm); return false; }
+        if (!supported_proj_dt(v->dtype)) {
+            std::fprintf(stderr, "gguf: unsupported dtype %d for %s\n", (int)v->dtype, nm);
+            return false;
         }
-    }
+        *out = v->dtype;
+        return true;
+    };
+    sk::Dtype dt_q, dt_k, dt_o, dt_gate, dt_up;
+    if (!proj_dtype(0, "attn_q.weight",      &dt_q)   ||
+        !proj_dtype(0, "attn_k.weight",      &dt_k)   ||
+        !proj_dtype(0, "attn_output.weight", &dt_o)   ||
+        !proj_dtype(0, "ffn_gate.weight",    &dt_gate)||
+        !proj_dtype(0, "ffn_up.weight",      &dt_up)) return -20;
     if (dt_q != dt_k) {
         std::fprintf(stderr, "gguf: q/k dtype mismatch (%d vs %d) — unsupported\n",
                      (int)dt_q, (int)dt_k);
         return -22;
     }
-    // QKV slab packs Q|K (same dtype). V splits off iff its dtype differs.
-    const bool v_split = (dt_v != dt_q);
     const sk::Dtype dt_qk = dt_q;
+
+    // Per-layer dtype for V and down. v_split = any layer needs V in its own
+    // buffer (always true once a Q6_K V appears; we split unconditionally for
+    // mixed models so the dispatch reads V from w_v uniformly).
+    std::vector<sk::Dtype> dt_v_layer(c.n_layers), dt_down_layer(c.n_layers);
+    bool v_quant_mixed = false;
+    for (uint32_t L = 0; L < c.n_layers; ++L) {
+        if (!proj_dtype(L, "attn_v.weight",  &dt_v_layer[L]))  return -23;
+        if (!proj_dtype(L, "ffn_down.weight",&dt_down_layer[L]))return -24;
+        if (dt_v_layer[L] != dt_qk) v_quant_mixed = true;
+    }
+    // Split V whenever any layer's V differs from Q/K, OR all V are Q6_K.
+    const bool v_split = v_quant_mixed || (dt_v_layer[0] != dt_qk);
 
     const size_t o_layer_bytes    = sk::dtype_bytes(dt_o, Nq * dm);
     const size_t ffn_layer_bytes_gate = sk::dtype_bytes(dt_gate, dm * ni);
     const size_t ffn_layer_bytes_up   = sk::dtype_bytes(dt_up,   dm * ni);
-    const size_t down_layer_bytes = sk::dtype_bytes(dt_down, ni * dm);
 
     // Release the default fan-out buffers allocated in sk_qwen_create — we
     // are about to replace every per-layer entry with its own (mmap-backed
@@ -629,11 +635,11 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
     }
 
     h->weights.dt_qkv  = dt_qk;
-    h->weights.dt_v    = dt_v;
     h->weights.dt_o    = dt_o;
     h->weights.dt_gate = dt_gate;
     h->weights.dt_up   = dt_up;
-    h->weights.dt_down = dt_down;
+    h->weights.dt_down_layer = dt_down_layer;
+    if (v_split) h->weights.dt_v_layer = dt_v_layer;
 
     // Look up a tensor's absolute byte offset in the GGUF file.
     auto find_abs_off = [&](const char* name, uint64_t* out_off, uint64_t* out_nbytes) -> bool {
@@ -700,14 +706,15 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
         std::snprintf(qn, sizeof(qn), "blk.%u.attn_q.weight", L);
         std::snprintf(kn, sizeof(kn), "blk.%u.attn_k.weight", L);
         std::snprintf(vn, sizeof(vn), "blk.%u.attn_v.weight", L);
+        const sk::Dtype dt_vL = dt_v_layer[L];
         const size_t qb = sk::dtype_bytes(dt_qk, Nq  * dm);
         const size_t kb = sk::dtype_bytes(dt_qk, Nkv * dm);
-        const size_t vb = sk::dtype_bytes(dt_v,  Nkv * dm);
+        const size_t vb = sk::dtype_bytes(dt_vL, Nkv * dm);
 
         auto* qv = store.get(qn); auto* kv = store.get(kn); auto* vv = store.get(vn);
         if (!qv || !kv || !vv) { std::fprintf(stderr, "gguf: qkv miss L=%u\n", L); return false; }
         if (qv->nbytes != qb || kv->nbytes != kb || vv->nbytes != vb ||
-            qv->dtype != dt_qk || kv->dtype != dt_qk || vv->dtype != dt_v) {
+            qv->dtype != dt_qk || kv->dtype != dt_qk || vv->dtype != dt_vL) {
             std::fprintf(stderr, "gguf: qkv shape/dtype mismatch L=%u\n", L);
             return false;
         }
@@ -742,8 +749,8 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
                 h->weights.w_qkv[L]     = b;
                 h->weights.w_qkv_off[L] = 0;
             }
-            // V: own buffer (mmap range or memcpy).
-            if (!load_single_tensor(vn, dt_v, vb,
+            // V: own buffer (mmap range or memcpy), per-layer dtype.
+            if (!load_single_tensor(vn, dt_vL, vb,
                                     &h->weights.w_v[L], &h->weights.w_v_off[L])) return false;
             return true;
         }
@@ -805,7 +812,8 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
         if (!load_single_tensor(nbuf, dt_up, ffn_layer_bytes_up,
                                 &h->weights.w_up[L], &h->weights.w_up_off[L])) return -55;
         std::snprintf(nbuf, sizeof(nbuf), "blk.%u.ffn_down.weight", L);
-        if (!load_single_tensor(nbuf, dt_down, down_layer_bytes,
+        const size_t down_bytes_L = sk::dtype_bytes(dt_down_layer[L], ni * dm);
+        if (!load_single_tensor(nbuf, dt_down_layer[L], down_bytes_L,
                                 &h->weights.w_down[L], &h->weights.w_down_off[L])) return -56;
     }
 

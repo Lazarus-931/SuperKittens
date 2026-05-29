@@ -34,6 +34,7 @@ DTYPE_REGISTRY: dict[str, dict] = {
     "BF16":    {"itemsize": 2,  "block_size": 1,   "bytes_per_block": 2},
     "Q8_0":    {"itemsize": None, "block_size": 32,  "bytes_per_block": 34},
     "Q4_K":    {"itemsize": None, "block_size": 256, "bytes_per_block": 144},
+    "Q6_K":    {"itemsize": None, "block_size": 256, "bytes_per_block": 210},
     "Q2_K":    {"itemsize": None, "block_size": 256, "bytes_per_block": 84},
     "IQ2_XXS": {"itemsize": None, "block_size": 256, "bytes_per_block": 66},
 }
@@ -45,6 +46,7 @@ _GGUF_CODE_TO_SK: dict[int, str] = {
     8:  "Q8_0",
     10: "Q2_K",
     12: "Q4_K",
+    14: "Q6_K",
     16: "IQ2_XXS",
     30: "BF16",     # GGMLQuantizationType.BF16 in modern gguf packages
 }

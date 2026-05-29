@@ -180,19 +180,23 @@ inline MTL::ComputePipelineState* quant_matvec_pso(const LayerPSOs& P, sk::Dtype
 
 // Encode a quant matvec (M rows, looping over rows for M>1). Mirrors
 // encode_q8_0_gemm but parameterized on the PSO so Q4_K/Q6_K route here too.
+// ldC = output row stride in elements (defaults to N). For the split-QKV path
+// the QK/V matvecs write into a [M, qkv_N] packed buffer, so ldC = qkv_N while
+// N = qN+kvN (QK) or kvN (V), and off_C selects the column band.
 inline void encode_quant_gemm(
     MTL::ComputeCommandEncoder* enc, MTL::ComputePipelineState* pso,
     MTL::Buffer* A, size_t off_A,
     MTL::Buffer* W, size_t off_W,
     MTL::Buffer* C, size_t off_C,
-    uint32_t M, uint32_t N, uint32_t K)
+    uint32_t M, uint32_t N, uint32_t K, uint32_t ldC = 0)
 {
+    if (ldC == 0) ldC = N;
     for (uint32_t m = 0; m < M; ++m) {
         enc_barrier(enc);
         enc->setComputePipelineState(pso);
         enc->setBuffer(A, off_A + (size_t)m * K * 2, 0);
         enc->setBuffer(W, off_W, 1);
-        enc->setBuffer(C, off_C + (size_t)m * N * 2, 2);
+        enc->setBuffer(C, off_C + (size_t)m * ldC * 2, 2);
         enc->setBytes(&K, 4, 3);
         enc->setBytes(&N, 4, 4);
         const uint32_t rows_per_tg = 2;
@@ -389,17 +393,20 @@ inline void dispatch_layer(
     encode_rmsnorm(enc, P.rmsnorm, B.x, B.w_pre_attn_norm, off_norm,
                    B.x_norm, T, p.d_model, p.eps, P.rmsnorm_t1);
 
-    // 2. QKV-pack GEMM. V splits to its own buffer when its dtype differs from
-    // Q/K (Q4_K_M: Q/K=Q4_K, V=Q6_K). qkv_packed layout stays [Q|K|V].
+    // 2. QKV-pack GEMM. When V is split off (Q4_K_M, where attn_v alternates
+    // Q4_K/Q6_K per layer), w_qkv holds [Q|K] and w_v holds V; two matvecs feed
+    // one packed [Q|K|V] output. Uniform models keep the single-slab path.
     MTL::ComputePipelineState* pso_qkv = quant_matvec_pso(P, B.dt_qkv);
-    if (B.w_v != nullptr && B.dt_v != B.dt_qkv) {
+    if (B.w_v != nullptr) {
         MTL::ComputePipelineState* pso_v = quant_matvec_pso(P, B.dt_v);
         if (pso_qkv && pso_v) {
-            // Q|K slab → qkv_packed[0 : qN+kvN]; V slab → qkv_packed[qN+kvN :].
+            // Output is [T, qkv_N] packed; QK writes band [0:qN+kvN], V writes
+            // band [qN+kvN:qkv_N]. ldC = qkv_N so per-row strides stay correct
+            // during prefill (T>1).
             encode_quant_gemm(enc, pso_qkv, B.x_norm, 0, B.w_qkv, off_w_qkv,
-                              B.qkv_packed, 0, T, qN + kvN, p.d_model);
+                              B.qkv_packed, 0, T, qN + kvN, p.d_model, qkv_N);
             encode_quant_gemm(enc, pso_v, B.x_norm, 0, B.w_v, B.w_v_inner_off,
-                              B.qkv_packed, (size_t)(qN + kvN) * 2, T, kvN, p.d_model);
+                              B.qkv_packed, (size_t)(qN + kvN) * 2, T, kvN, p.d_model, qkv_N);
         } else {
             encode_gemm_fallback(enc, P.gemm, P.gemv_m1, B.x_norm, 0, B.w_qkv, off_w_qkv,
                                  B.qkv_packed, T, qkv_N, p.d_model);
@@ -562,6 +569,10 @@ inline void dispatch_layer(
     // is available (saves 1 dispatch + 1 fence per layer at decode).
     const bool mlp_is_q8 = (B.dt_gate == sk::Dtype::Q8_0 || B.dt_up == sk::Dtype::Q8_0);
     const bool mlp_both_q8 = (B.dt_gate == sk::Dtype::Q8_0 && B.dt_up == sk::Dtype::Q8_0);
+    // gemv_swiglu_m1 reads weights as fp16; only use it when gate AND up are
+    // genuinely fp16/bf16 (Q4_K/Q6_K must route through the quant matvec path).
+    auto is_fp16ish = [](sk::Dtype d) { return d == sk::Dtype::F16 || d == sk::Dtype::BF16; };
+    const bool mlp_both_fp16 = is_fp16ish(B.dt_gate) && is_fp16ish(B.dt_up);
     const bool use_prenorm_fused = (T == 1 && mlp_both_q8 && P.q8_0_swiglu_prenorm_m1 != nullptr);
     if (!use_prenorm_fused) {
         enc_barrier(enc);
@@ -610,7 +621,7 @@ inline void dispatch_layer(
         const uint32_t rows_per_tg = 2;
         enc->dispatchThreadgroups(MTL::Size((N_v + rows_per_tg - 1) / rows_per_tg, 1, 1),
                                   MTL::Size(128, 1, 1));
-    } else if (T == 1 && P.gemv_swiglu_m1 != nullptr && !mlp_is_q8) {
+    } else if (T == 1 && P.gemv_swiglu_m1 != nullptr && mlp_both_fp16) {
         enc_barrier(enc);
         enc->setComputePipelineState(P.gemv_swiglu_m1);
         enc->setBuffer(B.m_in,    0,          0);
@@ -775,14 +786,16 @@ struct ModelWeights {
     const LayerCache* layer_caches;
 
     // Per-projection dtypes (default FP16). Set by loader. dt_qkv is the dtype
-    // of the Q+K slab; dt_v is V's (== dt_qkv unless w_v is split off).
+    // of the Q+K slab. dt_v / dt_down are PER-LAYER: Q4_K_M bumps every other
+    // layer's attn_v + ffn_down to Q6_K, so they vary across the stack. When
+    // w_v is populated, V always lives in its own buffer (dt per dt_v_layer).
     sk::Dtype dt_qkv     = sk::Dtype::F16;
-    sk::Dtype dt_v       = sk::Dtype::F16;
     sk::Dtype dt_o       = sk::Dtype::F16;
     sk::Dtype dt_gate    = sk::Dtype::F16;
     sk::Dtype dt_up      = sk::Dtype::F16;
-    sk::Dtype dt_down    = sk::Dtype::F16;
     sk::Dtype dt_lm_head = sk::Dtype::F16;
+    std::vector<sk::Dtype> dt_v_layer;     // size n_layers when w_v split; else empty
+    std::vector<sk::Dtype> dt_down_layer;  // size n_layers
 };
 
 struct ModelBuffers {
@@ -908,6 +921,8 @@ inline void dispatch_model(
             lb.w_v             = W.w_v[L];
             lb.w_v_inner_off   = W.w_v_off[L];
         }
+        lb.dt_v   = W.dt_v_layer.empty()    ? W.dt_qkv : W.dt_v_layer[L];
+        lb.dt_down= W.dt_down_layer.empty() ? sk::Dtype::F16 : W.dt_down_layer[L];
         lb.w_q_norm          = W.w_q_norm;
         lb.w_k_norm          = W.w_k_norm;
         lb.w_o               = W.w_o[L];
@@ -946,11 +961,9 @@ inline void dispatch_model(
         lb.attn_ps         = B.attn_ps;
         lb.attn_po         = B.attn_po;
         lb.dt_qkv          = W.dt_qkv;
-        lb.dt_v            = W.dt_v;
         lb.dt_o            = W.dt_o;
         lb.dt_gate         = W.dt_gate;
         lb.dt_up           = W.dt_up;
-        lb.dt_down         = W.dt_down;
 
         dispatch_layer(cmd, P.layer, lb, lp);
 
