@@ -384,17 +384,17 @@ class Qwen(Model):
                 memory_aware_cache_max, _unified_memory_bytes)
             weight_bytes = gguf_path.stat().st_size
             mem = _unified_memory_bytes()
-            # Prefill scratch (esp. the seq_max·vocab logits buffer) scales with
-            # seq_max, not cache_max, so an 8192 default would burn ~4 GB that
-            # the KV cache wants. When weights already dominate a tight box,
-            # trim the default seq_max so cache_max keeps real headroom. Only
-            # when seq_max was left at its Config default (caller-pinned seq_max
-            # is respected; CtypesConfig has no "was-set" flag so we compare to
-            # the dataclass default).
+            # Prefill scratch (esp. the seq_max·vocab logits buffer, ~0.5 GB per
+            # 2048 tokens at this vocab) scales with seq_max, not cache_max, so
+            # an 8192 default would burn ~4 GB that the KV cache wants. When
+            # weights already dominate a tight box, trim the default seq_max to
+            # 2048 so cache_max keeps real headroom. Only when seq_max was left
+            # at its Config default (caller-pinned seq_max is respected;
+            # CtypesConfig has no "was-set" flag so we compare to the default).
             seq_default = Config.seq_max  # type: ignore[attr-defined]
             if (mem and seq_default == cfg.seq_max
-                    and weight_bytes > 0.4 * mem and cfg.seq_max > 4096):
-                cfg.seq_max = 4096
+                    and weight_bytes > 0.4 * mem and cfg.seq_max > 2048):
+                cfg.seq_max = 2048
             fitted = memory_aware_cache_max(
                 requested_cache_max=cfg.cache_max,
                 seq_max=cfg.seq_max,

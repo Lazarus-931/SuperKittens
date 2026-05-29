@@ -159,7 +159,7 @@ def memory_aware_cache_max(
     *, requested_cache_max: int, seq_max: int,
     weight_bytes: int, n_layers: int, n_kv_heads: int, head_dim: int,
     d_model: int, n_int: int, n_heads: int, vocab_size: int,
-    headroom_gib: float = 2.5, total_mem_bytes: int | None = None,
+    headroom_gib: float = 4.0, total_mem_bytes: int | None = None,
 ) -> int:
     """Clamp ``requested_cache_max`` so weights + KV + prefill scratch fit memory.
 
@@ -171,7 +171,10 @@ def memory_aware_cache_max(
 
     Returns the largest cache_max ≤ requested that leaves ``headroom_gib`` free,
     floored at 256 and never raised above the request. If memory can't be
-    queried, returns the request unchanged.
+    queried, returns the request unchanged. The 4 GiB default headroom keeps the
+    resident set under physical RAM on a 16 GiB box (OS/desktop ≈ 3-4 GiB);
+    smaller headroom over-commits and the box thrashes the compressor instead
+    of OOM-killing.
     """
     total = total_mem_bytes if total_mem_bytes is not None else _unified_memory_bytes()
     if total <= 0 or weight_bytes <= 0:
