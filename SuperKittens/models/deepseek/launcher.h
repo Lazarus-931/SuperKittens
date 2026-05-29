@@ -57,6 +57,7 @@ typedef struct {
     float    mscale_all_dim;         // YaRN mscale_all_dim
     float    rope_scaling_factor;    // YaRN factor (1.0 = disabled)
     uint32_t first_k_dense_replace;  // V3: 3, V2-Lite: 1
+    uint32_t dense_n_int;            // leading-dense-layer MLP intermediate (V2-Lite 10944)
 } sk_deepseek_config;
 
 // Host weight pointers (NULL allowed; create allocates zero-init buffers).

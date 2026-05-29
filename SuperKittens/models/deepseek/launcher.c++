@@ -122,6 +122,8 @@ static bool resolve_psos(ModelPSOs& P, uint32_t dk, uint32_t dv) {
     P.layer.mla_kv_write  = sk::bindings_pso("deepseek_mla_kv_write");
     P.layer.moe_mv_gate   = resolve_mvid_pso(
         sk::bindings_library(), sk::bindings_device(), "deepseek_mul_mv_id_q4_K");
+    P.layer.moe_mv_down   = resolve_mvid_pso(
+        sk::bindings_library(), sk::bindings_device(), "deepseek_mul_mv_id_q8_0");
     P.layer.moe_swiglu_f32  = sk::bindings_pso("deepseek_moe_swiglu_f32");
     P.layer.moe_scatter_add = sk::bindings_pso("deepseek_moe_scatter_add_f32");
 
@@ -150,6 +152,7 @@ static bool resolve_psos(ModelPSOs& P, uint32_t dk, uint32_t dv) {
     _CK("mla_decode_v2",         P.layer.mla_decode_v2);
     _CK("mla_kv_write",          P.layer.mla_kv_write);
     _CK("moe_mul_mv_id_q4_K",    P.layer.moe_mv_gate);
+    _CK("moe_mul_mv_id_q8_0",    P.layer.moe_mv_down);
     _CK("moe_swiglu_f32",        P.layer.moe_swiglu_f32);
     _CK("moe_scatter_add_f32",   P.layer.moe_scatter_add);
     _CK("embedding_lookup", P.embedding_lookup);
@@ -187,9 +190,14 @@ extern "C" sk_deepseek_handle* sk_deepseek_create(const sk_deepseek_config* cfg)
     // Patch F: separate buffer for lm_head. Loader aliases (sets to w_embed) for tied case.
     h->weights.w_lm_head       = alloc_zero(dev, (size_t)cfg->vocab_size * cfg->d_model * 2);
     h->weights.w_pre_attn_norm = alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * 2);
-    h->weights.w_q_a           = alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * cfg->q_lora_rank * 2);
-    h->weights.w_q_a_norm      = alloc_zero(dev, (size_t)cfg->n_layers * cfg->q_lora_rank * 2);
-    h->weights.w_q_b           = alloc_zero(dev, (size_t)cfg->n_layers * cfg->q_lora_rank * cfg->n_heads * dk * 2);
+    // V2-Lite has no Q-LoRA: q_proj maps d_model -> n_heads*dk directly and the
+    // loader writes it into w_q_b. Size w_q_b for max(q_lora_rank, d_model) as
+    // the input dim so both paths fit. w_q_a / w_q_a_norm get a 1-elem stub.
+    const uint32_t q_in = cfg->q_lora_rank ? cfg->q_lora_rank : cfg->d_model;
+    const uint32_t q_lr1 = cfg->q_lora_rank ? cfg->q_lora_rank : 1u;
+    h->weights.w_q_a           = alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * q_lr1 * 2);
+    h->weights.w_q_a_norm      = alloc_zero(dev, (size_t)cfg->n_layers * q_lr1 * 2);
+    h->weights.w_q_b           = alloc_zero(dev, (size_t)cfg->n_layers * q_in * cfg->n_heads * dk * 2);
     h->weights.w_kv_a          = alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * (cfg->kv_lora_rank + cfg->qk_rope_dim) * 2);
     h->weights.w_kv_a_norm     = alloc_zero(dev, (size_t)cfg->n_layers * cfg->kv_lora_rank * 2);
     h->weights.w_kv_b          = alloc_zero(dev, (size_t)cfg->n_layers * cfg->kv_lora_rank
@@ -202,26 +210,39 @@ extern "C" sk_deepseek_handle* sk_deepseek_create(const sk_deepseek_config* cfg)
     h->weights.w_shared_up   = alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * cfg->shared_n_int * 2);
     h->weights.w_shared_down = alloc_zero(dev, (size_t)cfg->n_layers * cfg->shared_n_int * cfg->d_model * 2);
 
+    // Leading-dense-layer MLP (fp16), sized for the first_k_dense_replace layers.
+    {
+        const uint32_t fkd  = cfg->first_k_dense_replace ? cfg->first_k_dense_replace : 1u;
+        const uint32_t dint = cfg->dense_n_int ? cfg->dense_n_int : cfg->shared_n_int;
+        h->weights.w_dense_gate = alloc_zero(dev, (size_t)fkd * cfg->d_model * dint * 2);
+        h->weights.w_dense_up   = alloc_zero(dev, (size_t)fkd * cfg->d_model * dint * 2);
+        h->weights.w_dense_down = alloc_zero(dev, (size_t)fkd * dint * cfg->d_model * 2);
+    }
+
     h->weights.w_router = alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * cfg->n_expert * 2);
     // Patch G: per-layer e_score_correction_bias (fp32). Allocated unconditionally;
     // loader leaves zeros for V2-Lite, kernel ignores when has_bias=0.
     h->weights.router_bias = alloc_zero(dev, (size_t)cfg->n_layers * cfg->n_expert * 4);
-    // Routed-expert weights. Per-256-weight block sizes by quant:
-    //   INT2_DS4: gate/up block_iq2_xxs 66 B, down block_q2_K 84 B (ds4 V4 Flash)
-    //   Q4_K    : 144 B / 256 weights (V2-Lite Q4_K_M; gate/up/down all Q4_K)
-    //   FP16    : 512 B / 256 weights
+    // Routed-expert weights. V2-Lite Q4_K_M (moe_quant==2): gate/up are Q4_K
+    // (144 B / 256 weights), DOWN is Q8_0 (34 B / 32 weights). INT2_DS4 keeps
+    // the ds4 V4-Flash layout. Layer 0 is dense (leading_dense_block_count=1)
+    // and stores its wide MLP in the shared-expert buffers instead — the routed
+    // buffers reserve a full per-layer slab for every layer for simple indexing.
     const bool   int2     = (cfg->moe_quant == 1);
     const bool   q4k      = (cfg->moe_quant == 2);
-    const size_t up_bytes_per_blk    = int2 ? 66 : (q4k ? 144 : 512);
-    const size_t down_bytes_per_blk  = int2 ? 84 : (q4k ? 144 : 512);
+    const size_t gate_blk = int2 ? 66 : (q4k ? 144 : 512);   // per 256 weights
+    const size_t down_q8_blk = 34;                            // per 32 weights
     const size_t n_blocks_gate_per_e = (size_t)cfg->n_int * (cfg->d_model / 256);
-    const size_t n_blocks_down_per_e = (size_t)cfg->d_model * (cfg->n_int / 256);
+    const size_t n_blocks_down_per_e = q4k
+        ? (size_t)cfg->d_model * (cfg->n_int / 32)            // Q8_0: 32-wide blocks
+        : (size_t)cfg->d_model * (cfg->n_int / 256);
+    const size_t down_blk = q4k ? down_q8_blk : (int2 ? 84 : 512);
     h->weights.w_gate = alloc_zero(dev, (size_t)cfg->n_layers * cfg->n_expert *
-                                        n_blocks_gate_per_e * up_bytes_per_blk);
+                                        n_blocks_gate_per_e * gate_blk);
     h->weights.w_up   = alloc_zero(dev, (size_t)cfg->n_layers * cfg->n_expert *
-                                        n_blocks_gate_per_e * up_bytes_per_blk);
+                                        n_blocks_gate_per_e * gate_blk);
     h->weights.w_down = alloc_zero(dev, (size_t)cfg->n_layers * cfg->n_expert *
-                                        n_blocks_down_per_e * down_bytes_per_blk);
+                                        n_blocks_down_per_e * down_blk);
 
     // Per-layer K, V caches (cache the full decompressed K/V).
     h->layer_caches.resize(cfg->n_layers);
@@ -361,6 +382,7 @@ extern "C" int sk_deepseek_forward(sk_deepseek_handle* hp,
     mp.d_model        = h->cfg.d_model;
     mp.n_int          = h->cfg.n_int;
     mp.shared_n_int   = h->cfg.shared_n_int;
+    mp.dense_n_int    = h->cfg.dense_n_int ? h->cfg.dense_n_int : h->cfg.shared_n_int;
     mp.n_heads        = h->cfg.n_heads;
     mp.qk_nope_dim    = h->cfg.qk_nope_dim;
     mp.qk_rope_dim    = h->cfg.qk_rope_dim;
@@ -420,6 +442,7 @@ extern "C" void sk_deepseek_destroy(sk_deepseek_handle* hp) {
     rel(h->weights.w_kv_a); rel(h->weights.w_kv_a_norm); rel(h->weights.w_kv_b);
     rel(h->weights.w_o); rel(h->weights.w_pre_mlp_norm); rel(h->weights.w_final_norm);
     rel(h->weights.w_shared_gate); rel(h->weights.w_shared_up); rel(h->weights.w_shared_down);
+    rel(h->weights.w_dense_gate); rel(h->weights.w_dense_up); rel(h->weights.w_dense_down);
     rel(h->weights.w_router); rel(h->weights.w_gate); rel(h->weights.w_up); rel(h->weights.w_down);
     for (auto* b : h->k_caches) rel(b);
     for (auto* b : h->v_caches) rel(b);
