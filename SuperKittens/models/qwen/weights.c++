@@ -584,8 +584,8 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
     // (Q4_K in Q4_K_M); attn_v + ffn_down alternate Q4_K/Q6_K PER LAYER (the
     // "_M" variant bumps every other layer to Q6_K), so those are read per L. ──
     auto supported_proj_dt = [](sk::Dtype d) {
-        return d == sk::Dtype::Q8_0 || d == sk::Dtype::Q4_K || d == sk::Dtype::Q6_K
-            || d == sk::Dtype::F16  || d == sk::Dtype::BF16;
+        return d == sk::Dtype::Q8_0 || d == sk::Dtype::Q2_K || d == sk::Dtype::Q4_K
+            || d == sk::Dtype::Q6_K  || d == sk::Dtype::F16  || d == sk::Dtype::BF16;
     };
     auto proj_dtype = [&](uint32_t L, const char* suffix, sk::Dtype* out) -> bool {
         char nm[128];

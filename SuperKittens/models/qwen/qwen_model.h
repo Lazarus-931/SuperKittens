@@ -47,6 +47,7 @@ struct LayerPSOs {
     MTL::ComputePipelineState* gemv_t_m1;         // M=1 matvec w/ transposed weight (LM-head)
     MTL::ComputePipelineState* gemv_t_2dtile_m1 = nullptr;  // 2D-tile variant (preferred when non-null)
     MTL::ComputePipelineState* q8_0_matvec;       // M=1 matvec with Q8_0 weight (decode)
+    MTL::ComputePipelineState* q2k_matvec = nullptr;  // M=1 matvec with Q2_K weight
     MTL::ComputePipelineState* q4k_matvec = nullptr;  // M=1 matvec with Q4_K weight
     MTL::ComputePipelineState* q6k_matvec = nullptr;  // M=1 matvec with Q6_K weight
     MTL::ComputePipelineState* q8_0_swiglu_m1 = nullptr;  // fused Q8_0 gate+up+SiLU·mul (M=1)
@@ -172,6 +173,7 @@ inline void encode_q8_0_matvec(
 inline MTL::ComputePipelineState* quant_matvec_pso(const LayerPSOs& P, sk::Dtype dt) {
     switch (dt) {
         case sk::Dtype::Q8_0: return P.q8_0_matvec;
+        case sk::Dtype::Q2_K: return P.q2k_matvec;
         case sk::Dtype::Q4_K: return P.q4k_matvec;
         case sk::Dtype::Q6_K: return P.q6k_matvec;
         default:              return nullptr;
