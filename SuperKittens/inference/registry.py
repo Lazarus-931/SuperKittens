@@ -170,6 +170,19 @@ SPECS: dict[str, ModelSpec] = {
                   head_dim=128, n_int=9728, vocab_size=151936,
                   eps=1e-6, rope_freq_base=1_000_000.0, tie_word_embeddings=1),
     ),
+    "qwen3-4b-q2k": ModelSpec(
+        family="qwen3",
+        adapter="SuperKittens.models.qwen.qwen:Qwen",
+        # Qwen's official 4B-GGUF repo has no Q2_K build; bartowski's does.
+        hf_repo="bartowski/Qwen_Qwen3-4B-GGUF",
+        weight_dir="Qwen3-4B-GGUF",
+        gguf_name="Qwen_Qwen3-4B-Q2_K.gguf",
+        default_quant="q2_k",
+        tokenizer_family="qwen3",
+        dims=dict(n_layers=36, d_model=2560, n_heads=32, n_kv_heads=8,
+                  head_dim=128, n_int=9728, vocab_size=151936,
+                  eps=1e-6, rope_freq_base=1_000_000.0, tie_word_embeddings=1),
+    ),
     "qwen3-8b": ModelSpec(
         family="qwen3",
         adapter="SuperKittens.models.qwen.qwen:Qwen",
