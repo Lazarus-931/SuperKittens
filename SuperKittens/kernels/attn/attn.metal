@@ -253,31 +253,7 @@ void fa_d128(
 }
 
 
-// Flash-decoding (split-K) direct-K decode attention, d=128, GQA. seq == 1.
-//
-// WHY: mha_causal re-stages every 64-key K/V tile into threadgroup memory with
-// a barrier per tile; at long kv that staging dominates. A single-TG-per-kv-head
-// direct read fixes the staging but launches only n_kv_heads (=8) threadgroups —
-// far too few to fill the GPU or hide K/V load latency at long kv. So we split
-// the kv range across the grid y-axis: SPLITS threadgroups per kv-head each scan
-// one contiguous kv chunk with a flash online-softmax, then a tiny combine pass
-// merges the SPLITS partials per head. K/V are read straight from device (no TG
-// staging); GQA amortization is kept — each TG serves all Hg sibling Q-heads, so
-// every K/V half4 fetched is reused Hg times.
-//
-// Partial layout (device scratch), per (batch, head, split):
-//   PM[idx]            : running max   (float)
-//   PS[idx]            : running denom (float)
-//   PO[idx*D + d]      : unnormalized  Σ exp(s-m)·v   (float, D lanes)
-// where idx = ((batch*nheads + head)*SPLITS + split). PO is float (not half):
-// at short kv each split's chunk is tiny and the half-rounding of partial sums
-// blew the max_rel guardrail past 1e-2; float partials keep it at ~5e-4.
-//
-// MAX_HG / NS / SPLITS are compile-time caps; runtime Hg ≤ MAX_HG is read from
-// args so one instantiation serves every qwen3 variant (Hg ∈ {2,4,5,8}). The
-// runtime n_splits (≤ SPLITS) sets how many kv chunks the host actually
-// launches: short kv → few splits (low launch/combine overhead), long kv → many
-// (parallelism + latency hiding). SPLITS only fixes the PM/PS/PO stride.
+
 template<uint MAX_HG, uint NS, uint SPLITS>
 [[kernel, max_total_threads_per_threadgroup(NS * 32)]]
 void mha_decode_split_t(
