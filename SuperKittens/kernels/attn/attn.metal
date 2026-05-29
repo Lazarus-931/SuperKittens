@@ -174,8 +174,23 @@ void fa_d128(
 
     const uint q_pos = kv_len - seq + q_row;
     const uint total_lim = Causal ? q_pos + 1u : kv_len;
-    const uint full_tiles = total_lim / Bc;
-    const uint partial_lim = total_lim - full_tiles * Bc;
+
+    // WHY: k_smem/v_smem are threadgroup-shared but each simdgroup owns a
+    // different q_row → different total_lim. Gating the cooperative load on the
+    // per-thread total_lim drops keys that a SIBLING row (larger total_lim)
+    // needs, and divergent full_tiles makes per-simdgroup barrier counts differ
+    // (UB). Drive the tile walk by a threadgroup-UNIFORM extent = max total_lim
+    // over the block's rows; re-impose each row's causal cutoff per key column.
+    // Uniform extent is the last row in this Br block (highest q_pos), clamped
+    // to the last valid query (seq-1). For current_pos=0 prefill and seq=1
+    // decode this equals the old per-row total_lim of the driving row, so those
+    // paths are unchanged.
+    uint tg_last_row = gid.y * Br + (Br - 1u);
+    if (tg_last_row >= seq) tg_last_row = seq - 1u;
+    const uint tg_q_pos = kv_len - seq + tg_last_row;
+    const uint tg_lim   = Causal ? tg_q_pos + 1u : kv_len;
+    const uint full_tiles  = tg_lim / Bc;
+    const uint partial_lim = tg_lim - full_tiles * Bc;
 
     for (uint t = 0; t < full_tiles; ++t) {
         const uint c0 = t * Bc;
@@ -187,9 +202,10 @@ void fa_d128(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (uint j = 0; j < Bc; j += 2) {
+            const uint col0 = c0 + j, col1 = c0 + j + 1u;
             half4 k0 = k_smem[j * D4 + lane], k1 = k_smem[(j+1) * D4 + lane];
-            float s0 = simd_sum(dot(q_reg, float4(k0)));
-            float s1 = simd_sum(dot(q_reg, float4(k1)));
+            float s0 = (col0 < total_lim) ? simd_sum(dot(q_reg, float4(k0))) : -INFINITY;
+            float s1 = (col1 < total_lim) ? simd_sum(dot(q_reg, float4(k1))) : -INFINITY;
             float new_m = max(m, max(s0, s1));
             float alpha = metal::fast::exp(m - new_m);
             float b0    = metal::fast::exp(s0 - new_m);
@@ -208,7 +224,7 @@ void fa_d128(
         const uint c0 = full_tiles * Bc;
         for (uint i = lid; i < Bc * D4; i += NT) {
             const uint rr = i / D4, dd = i % D4, col = c0 + rr;
-            if (col < total_lim) {
+            if (col < tg_lim) {
                 k_smem[i] = reinterpret_cast<const device half4*>(K + kv_off + (size_t)col * D)[dd];
                 v_smem[i] = reinterpret_cast<const device half4*>(V + kv_off + (size_t)col * D)[dd];
             } else {
@@ -220,9 +236,10 @@ void fa_d128(
 
         uint j = 0;
         for (; j + 1 < partial_lim; j += 2) {
+            const uint col0 = c0 + j, col1 = c0 + j + 1u;
             half4 k0 = k_smem[j * D4 + lane], k1 = k_smem[(j+1) * D4 + lane];
-            float s0 = simd_sum(dot(q_reg, float4(k0)));
-            float s1 = simd_sum(dot(q_reg, float4(k1)));
+            float s0 = (col0 < total_lim) ? simd_sum(dot(q_reg, float4(k0))) : -INFINITY;
+            float s1 = (col1 < total_lim) ? simd_sum(dot(q_reg, float4(k1))) : -INFINITY;
             float new_m = max(m, max(s0, s1));
             float alpha = metal::fast::exp(m - new_m);
             float b0    = metal::fast::exp(s0 - new_m);
@@ -234,7 +251,9 @@ void fa_d128(
             acc += b1 * float4(v_smem[(j+1) * D4 + lane]);
         }
         if (j < partial_lim) {
-            float score = simd_sum(dot(q_reg, float4(k_smem[j * D4 + lane])));
+            const uint col0 = c0 + j;
+            float score = (col0 < total_lim) ? simd_sum(dot(q_reg, float4(k_smem[j * D4 + lane])))
+                                             : -INFINITY;
             float new_m = max(m, score);
             float alpha = metal::fast::exp(m - new_m);
             float beta  = metal::fast::exp(score - new_m);
