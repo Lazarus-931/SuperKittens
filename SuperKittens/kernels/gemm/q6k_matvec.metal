@@ -3,9 +3,8 @@
 // Unblocks native Q4_K_M: those GGUFs store v_proj / down_proj / token_embd as
 // Q6_K, so without a Q6_K matvec the whole tensor falls back to host-dequant.
 //
-// Block layout (GGML block_q6_K, 210 B / 256 weights), attribution: derived from
-// llama.cpp dequantize_row_q6_K and cross-checked against gguf.quants.Q6_K
-// (ds4 registers q6_K=210B in quants.c but ships no Q6_K kernel/quantizer):
+// Block layout (GGML block_q6_K, 210 B / 256 weights; per llama.cpp
+// dequantize_row_q6_K, validated against gguf.quants.Q6_K):
 //     uint8 ql[128]    // low 4 bits
 //     uint8 qh[64]     // high 2 bits
 //     int8  scales[16] // per-16-element sub-scale

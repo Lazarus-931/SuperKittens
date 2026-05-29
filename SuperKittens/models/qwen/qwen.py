@@ -390,7 +390,7 @@ class Qwen(Model):
             # weights already dominate a tight box, trim the default seq_max to
             # 2048 so cache_max keeps real headroom. Only when seq_max was left
             # at its Config default (caller-pinned seq_max is respected;
-            # CtypesConfig has no "was-set" flag so we compare to the default).
+            # CtypesConfig has no "was-set" flag, so compared against the default).
             seq_default = Config.seq_max  # type: ignore[attr-defined]
             if (mem and seq_default == cfg.seq_max
                     and weight_bytes > 0.4 * mem and cfg.seq_max > 2048):

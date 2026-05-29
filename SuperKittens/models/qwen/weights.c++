@@ -467,7 +467,7 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
     // a 36-layer 4B model and trips the default `ulimit -n 256` on lexie,
     // silently falling back to memcpy and tanking decode tok/s. The mmaps
     // survive `close(fd)` (Darwin/POSIX retains a vnode reference per mapping),
-    // so we close the fd at end of load.
+    // so the fd is closed at end of load.
     int gguf_fd = ::open(path, O_RDONLY);
     if (gguf_fd < 0) {
         std::fprintf(stderr, "sk_qwen_load_gguf: open('%s') failed\n", path);
@@ -494,7 +494,7 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
         if (!read_to_fp16((uint16_t*)h->weights.w_final_norm->contents(), v, dm)) return -13;
     }
     {
-        // For LM head we prefer to keep Q8_0 layout (V × D row-major) to enable
+        // LM head keeps Q8_0 layout (V × D row-major) to enable
         // the q8_0_matvec fast path. Tied models reuse token_embd; untied use
         // output.weight. Either way, allocate a Q8_0-sized w_lm_head buffer.
         const char* tname = c.tie_word_embeddings ? "token_embd.weight" : "output.weight";
@@ -514,7 +514,7 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
             // page-faulting an 8 GB+ region through MTL's resource registry
             // can trigger jetsam SIGKILL during load.
             //
-            // Use the absolute byte offset GGUF records on disk — we can't
+            // Use the absolute byte offset GGUF records on disk — cannot
             // pointer-subtract v->data because WeightStore mmaps the file
             // independently of MmapBuffer.
             size_t tensor_off = (size_t)-1;
@@ -613,7 +613,7 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
     const sk::Dtype dt_qk = dt_q;
 
     // Per-layer dtype for V and down. v_split = any layer needs V in its own
-    // buffer (always true once a Q6_K V appears; we split unconditionally for
+    // buffer (always true once a Q6_K V appears; split unconditionally so
     // mixed models so the dispatch reads V from w_v uniformly).
     std::vector<sk::Dtype> dt_v_layer(c.n_layers), dt_down_layer(c.n_layers);
     bool v_quant_mixed = false;
