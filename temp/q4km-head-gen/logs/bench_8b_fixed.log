@@ -1,0 +1,18 @@
+[bench] spec=qwen3-8b-q4km snap=/Users/amelia/SK_q4km/SuperKittens/model_weights/Qwen3-8B-GGUF
+[qwen] memory-aware cache_max: 32768 -> 12800 (weights=4.7GiB, seq_max=8192)
+[bench] prompt_len=15
+[bench] warmup 0: 16.93 tok/s
+[bench] warmup 1: 20.96 tok/s
+[bench] cooldown 30.0s ...
+[bench] rep 0: 21.07 tok/s
+[bench] rep 1: 21.10 tok/s
+[bench] rep 2: 20.93 tok/s
+[bench] rep 3: 21.09 tok/s
+[bench] rep 4: 21.16 tok/s
+============================================================
+[RESULT] spec=qwen3-8b-q4km median=21.09 tok/s (reps=['21.07', '21.10', '20.93', '21.09', '21.16'])
+[RESULT] nan_or_inf_logits=False frac_printable=1.000
+[RESULT] sample_text<<<
+s
+Okay, the user wants a poem about pizza dough. Let me start by brainstorming some key elements related to pizza dough. First, the texture—fluffy, stretchy, elastic. Then the process of making it: kneading, rising, the smell of yeast. Maybe mention the ingredients like flour,
+>>>

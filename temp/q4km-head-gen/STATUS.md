@@ -71,12 +71,56 @@ coherent. nan_or_inf_logits=False, frac_printable=1.000 both runs.
 memory-aware clamp: fired (32768 -> 31744, weights=2.3GiB). 4B has ample
 headroom; the extra ~640MB Q6_K head (on top of fp16 w_embed) is absorbed.
 
-### 8B-Q4_K_M (qwen3-8b-q4km, untied Q6_K head) — amelia
-Pending (amelia ssh down; monitoring for recovery). Baseline 17.54.
+### 8B-Q4_K_M (qwen3-8b-q4km, untied Q6_K head) — amelia, M4 16GB
+NOTE on the code: my change is a NO-OP for untied 8B. The parent
+dev-q4km-14b-perf already routes untied Q6_K output.weight -> q6k_matvec (the
+M14 fix); my only diff at the head branch is dropping `&& !tie_word_embeddings`,
+which for tie=0 leaves the branch identical. So 8B's win is the M14 fix itself,
+exercised on the shared path. To get a faithful before/after I rebuilt a true
+fp16-head baseline from d10c622 (pre-head-fix: untied Q6_K falls to read_to_fp16
++ fp16 gemv head) and compared it to the current Q6_K-head build.
+
+| build                        | median tok/s | reps |
+|------------------------------|--------------|------|
+| baseline (fp16 head, d10c622)| 18.36        | 18.10 18.45 18.43 18.36 18.27 |
+| fixed (Q6_K head)            | 21.09        | 21.07 21.10 20.93 21.09 21.16 |
+
+**+14.9% end-to-end** (18.36 -> 21.09). Baseline 18.36 ~ documented 17.54.
+Coherence: identical greedy sample text in BOTH builds ("s\nOkay, the user
+wants a poem about pizza dough..."). Numerically exact, no NaN, fully
+printable. Fixed build's smaller resident set eased swap pressure
+(free 603MB vs baseline 374MB).
+
+amelia ssh dropped ~17 min (mini slept/network stalled); recovered after burst
+connects. Hostname-guarded each run to confirm Amelias-Mini (one stray ssh
+fluke resolved to my laptop, immediately re-verified as amelia).
+
+memory-aware clamp: fired hard (32768 -> 12800, weights=4.7GiB). The fp16-head
+baseline THRASHED during load/warmup (system free 4%, swap 3.7/4GB) because the
+clamp's weights estimate (GGUF st_size) undercounts the fp16-head dequant
+expansion (~+0.85GB) — a concrete demonstration of why the head fix matters
+beyond bandwidth. The timed decode reps still came out steady (warm decode loop
+fits). Fixed build (Q6_K head, smaller resident set) recovered free mem to 83%.
+
+## Summary
+| model | baseline | fixed | delta | host  |
+|-------|----------|-------|-------|-------|
+| 4B-Q4 | 33.35    | 38.48 | +15.4%| derek |
+| 8B-Q4 | 18.36    | 21.09 | +14.9%| amelia|
+
+The M14 head-routing win GENERALIZED to both models. 4B required a code change
+(tied-embedding path); 8B was already covered by the unchanged shared fix and
+this is the first faithful before/after for it. Both numerically exact
+(identical greedy output vs fp16-head baseline). Compares well to M14's 14B
++8.5%; the smaller models gain MORE because the LM head is a larger fraction of
+their per-token bandwidth.
 
 ## Progress
-- [x] Local build clean (both artifact sets)
+- [x] Local build clean (fixed, fp16-head baseline, parent baseline)
 - [x] 4B baseline re-bench on derek: 33.35 tok/s
 - [x] 4B fixed re-bench on derek: 38.48 tok/s (+15.4%)
 - [x] 4B coherence: numerically exact (identical greedy output)
-- [ ] 8B re-bench on amelia (waiting for host)
+- [x] 8B baseline (fp16 head) re-bench on amelia: 18.36 tok/s
+- [x] 8B fixed (Q6_K head) re-bench on amelia: 21.09 tok/s (+14.9%)
+- [x] 8B coherence: numerically exact (identical greedy output)
+- [x] memory-aware clamp verified firing on both (4B 31744, 8B 12800)
