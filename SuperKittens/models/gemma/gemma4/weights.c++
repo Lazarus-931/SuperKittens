@@ -603,24 +603,48 @@ extern "C" int sk_gemma4_load_gguf(sk_gemma4_handle* hp, const char* path) {
 
     std::vector<uint16_t> stg, tx;
 
-    // token_embd → w_embed (then *= sqrt(d_model)); tied lm_head packs Q8.
-    // Dequant straight into the device buffer (no vocab*dm bf16 staging vector —
-    // that 2 GB transient OOMs a 16 GB box on top of the ~12.7 GB Q8 body).
+    // token_embd → embed (scaled by sqrt(d_model)); tied lm_head packs Q8.
+    // When w_embed is bf16-resident, dequant straight into it (no vocab*dm bf16
+    // staging — that 2 GB transient OOMs a 16 GB box on top of the ~12.7 GB Q8
+    // body). When SK_GEMMA4_EMBED_Q8 dropped the bf16 embed (w_embed==nullptr),
+    // dequant+scale+Q8-pack in row tiles directly into w_lm_head_q8 (the tied
+    // buffer that then serves BOTH the embedding lookup and the lm_head), so the
+    // bf16 embed never materializes at all. d_model is 256-block-aligned for
+    // Q4_K/Q6_K/Q8_0, so a per-row tile is always block-aligned.
     {
         auto* v = store.get("token_embd.weight");
         if (!v) { std::fprintf(stderr, "gemma4 gguf: missing token_embd.weight\n"); return -10; }
         const size_t n_embed = (size_t)c.vocab_size * dm;
-        auto* dst = (uint16_t*)h->weights.w_embed->contents();
-        switch (v->dtype) {
-            case sk::Dtype::BF16: std::memcpy(dst, v->data, n_embed*2); break;
-            case sk::Dtype::F16:
-            case sk::Dtype::F32:  copy_bf16_from(dst, v->data, v->dtype, n_embed); break;
-            case sk::Dtype::Q8_0: dequant_q8_0_bf16(dst, (const uint8_t*)v->data, n_embed); break;
-            case sk::Dtype::Q4_K: dequant_q4_k_bf16(dst, (const uint8_t*)v->data, n_embed); break;
-            case sk::Dtype::Q6_K: dequant_q6_k_bf16(dst, (const uint8_t*)v->data, n_embed); break;
-            default: std::fprintf(stderr, "gemma4 gguf: unsupported token_embd dtype\n"); return -11;
+        const float  esc = std::sqrt((float)dm);
+        auto deq_range = [&](uint16_t* out, size_t e0, size_t n) -> bool {
+            switch (v->dtype) {
+                case sk::Dtype::BF16: std::memcpy(out, (const uint8_t*)v->data + e0*2, n*2); return true;
+                case sk::Dtype::F16:
+                case sk::Dtype::F32:  copy_bf16_from(out, (const uint8_t*)v->data
+                                          + e0*(v->dtype==sk::Dtype::F32?4:2), v->dtype, n); return true;
+                case sk::Dtype::Q8_0: dequant_q8_0_bf16(out, (const uint8_t*)v->data + (e0/32)*34, n); return true;
+                case sk::Dtype::Q4_K: dequant_q4_k_bf16(out, (const uint8_t*)v->data + (e0/256)*144, n); return true;
+                case sk::Dtype::Q6_K: dequant_q6_k_bf16(out, (const uint8_t*)v->data + (e0/256)*210, n); return true;
+                default: return false;
+            }
+        };
+        if (h->weights.w_embed) {
+            auto* dst = (uint16_t*)h->weights.w_embed->contents();
+            if (!deq_range(dst, 0, n_embed)) { std::fprintf(stderr, "gemma4 gguf: bad token_embd dtype\n"); return -11; }
+            scale_bf16_inplace(dst, n_embed, esc);
+        } else {
+            if (!h->weights.w_lm_head_q8) { std::fprintf(stderr, "gemma4 gguf: EMBED_Q8 but no lm_head_q8\n"); return -11; }
+            auto* q8dst = (uint8_t*)h->weights.w_lm_head_q8->contents();
+            const size_t ROWS = 4096;                 // tile: 4096*3840*2 = ~31 MB bf16
+            std::vector<uint16_t> row(ROWS * dm);
+            for (size_t r0 = 0; r0 < (size_t)c.vocab_size; r0 += ROWS) {
+                const size_t nr = std::min(ROWS, (size_t)c.vocab_size - r0);
+                const size_t e0 = r0 * dm, ne = nr * dm;
+                if (!deq_range(row.data(), e0, ne)) { std::fprintf(stderr, "gemma4 gguf: bad token_embd dtype\n"); return -11; }
+                scale_bf16_inplace(row.data(), ne, esc);
+                sk::quantize_q8_0_bf16(row.data(), ne, q8dst + (e0/32)*34);
+            }
         }
-        scale_bf16_inplace(dst, n_embed, std::sqrt((float)dm));
     }
     {
         auto* v = store.get("output_norm.weight");
@@ -628,7 +652,9 @@ extern "C" int sk_gemma4_load_gguf(sk_gemma4_handle* hp, const char* path) {
         if (!gguf_to_bf16(stg, v, dm)) return -13;
         std::memcpy(h->weights.w_final_norm->contents(), stg.data(), dm*2);
     }
-    if (h->weights.w_lm_head_q8) {
+    // Pack the tied Q8 lm_head from the (scaled) bf16 embed. In EMBED_Q8 mode
+    // w_embed is null and the lm_head Q8 was already packed in tiles above.
+    if (h->weights.w_lm_head_q8 && h->weights.w_embed) {
         const size_t n_elems = (size_t)c.vocab_size * dm;
         sk::quantize_q8_0_bf16((const uint16_t*)h->weights.w_embed->contents(), n_elems,
                                (uint8_t*)h->weights.w_lm_head_q8->contents());

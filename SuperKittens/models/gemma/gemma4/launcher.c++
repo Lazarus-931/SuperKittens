@@ -188,14 +188,28 @@ extern "C" sk_gemma4_handle* sk_gemma4_create(const sk_gemma4_config* cfg) {
 
     // Weight buffers — sized for the slab layout dispatch_layer expects
     // (uniform per-layer stride using head_dim_max / n_kv_max).
-    h->weights.w_embed         = alloc_zero(dev, (size_t)cfg->vocab_size * cfg->d_model * 2);
+    //
+    // SK_GEMMA4_EMBED_Q8=1: drop the bf16 embed entirely and route BOTH the
+    // input embedding lookup AND the tied lm_head through the single Q8 lm-head
+    // buffer (dispatch_model's embed_q8 / use_q8_lm_head paths key off
+    // w_embed==nullptr). Saves the ~2 GB bf16 embed (vocab*d_model*2) — the
+    // difference between OOM and fit for the 12B-unified Q8 body on a 16 GB mini.
+    // Forces the Q8 lm-head on. Default off (E-variant behaviour unchanged).
+    const bool embed_q8 = [&]{
+        const char* e = std::getenv("SK_GEMMA4_EMBED_Q8");
+        return e && e[0] == '1' && (cfg->d_model % 32 == 0) && h->psos.layer.q8_0_matvec_bf16
+            && h->psos.embedding_lookup_q8;
+    }();
+    h->weights.w_embed = embed_q8
+                         ? nullptr
+                         : alloc_zero(dev, (size_t)cfg->vocab_size * cfg->d_model * 2);
     // Optional Q8_0 LM-head buffer. Enabled by default; disable with
     // SK_GEMMA4_LMHEAD_Q8=0 to keep the bf16 fallback (and skip the ~400 MB
     // alloc for E2B). Populated by weights.c++ when the bf16 lm_head is
-    // available (tied with embed_tokens for gemma4).
+    // available (tied with embed_tokens for gemma4). Forced on when EMBED_Q8.
     {
         const char* env = std::getenv("SK_GEMMA4_LMHEAD_Q8");
-        const bool want_q8 = !env || (env[0] != '0');
+        const bool want_q8 = embed_q8 || !env || (env[0] != '0');
         if (want_q8 && (cfg->d_model % 32 == 0) && h->psos.layer.q8_0_matvec_bf16) {
             const size_t n_elems  = (size_t)cfg->vocab_size * cfg->d_model;
             const size_t n_blocks = n_elems / 32;
