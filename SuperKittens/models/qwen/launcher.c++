@@ -60,6 +60,10 @@ static bool resolve_psos(ModelPSOs& P) {
     P.layer.q8_0_matvec_addres = sk::bindings_pso("q8_0_matvec_addres");  // optional
     P.layer.split_packed   = sk::bindings_pso("split_packed");
     P.layer.rope_qk        = sk::bindings_pso("qwen_rope_qk");
+    // SK_NO_QKV_FUSION=1 forces the 6-dispatch split→norm→rope path (A/B bench).
+    P.layer.qkv_norm_rope_t1 = getenv("SK_NO_QKV_FUSION")
+        ? nullptr
+        : sk::bindings_pso("qwen_qkv_norm_rope_t1");  // optional; nullptr OK
     P.layer.attn           = sk::bindings_pso("mha_causal");
     // SK_NO_SPLIT_ATTN=1 forces the mha_causal path everywhere (A/B + bisection).
     if (getenv("SK_NO_SPLIT_ATTN")) {
