@@ -113,8 +113,11 @@ static bool resolve_psos(ModelPSOs& P) {
 }}  // namespace meow::gemma4
 
 extern "C" sk_gemma4_handle* sk_gemma4_create(const sk_gemma4_config* cfg) {
+    const bool _dbg = std::getenv("SK_GEMMA4_DEBUG") != nullptr;
+    if (_dbg) std::fprintf(stderr, "[g4] create enter cfg=%p\n", (void*)cfg);
     if (!cfg) return nullptr;
     auto* dev = sk::bindings_device();
+    if (_dbg) std::fprintf(stderr, "[g4] device=%p\n", (void*)dev);
     if (!dev) return nullptr;
 
     auto* h = new meow::gemma4::Handle();
@@ -122,9 +125,11 @@ extern "C" sk_gemma4_handle* sk_gemma4_create(const sk_gemma4_config* cfg) {
     h->current_pos = 0;
 
     if (!meow::gemma4::resolve_psos(h->psos)) {
+        if (_dbg) std::fprintf(stderr, "[g4] resolve_psos FAILED\n");
         delete h;
         return nullptr;
     }
+    if (_dbg) std::fprintf(stderr, "[g4] resolve_psos ok; allocating\n");
 
     using namespace meow::gemma4;
 
@@ -394,6 +399,7 @@ extern "C" sk_gemma4_handle* sk_gemma4_create(const sk_gemma4_config* cfg) {
         h->bufs.argmax_idx_buf = alloc_zero(dev, (size_t)n_blocks * sizeof(int32_t));
     }
 
+    if (_dbg) std::fprintf(stderr, "[g4] create returning h=%p\n", (void*)h);
     return reinterpret_cast<sk_gemma4_handle*>(h);
 }
 
