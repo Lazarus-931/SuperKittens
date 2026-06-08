@@ -38,6 +38,11 @@ struct Handle {
     std::vector<size_t>   up_q8_off;
     std::vector<size_t>   down_q8_off;
 
+    // Q4_K body (layout must match launcher.c++'s Handle exactly).
+    bool                  body_q4k = false;
+    std::vector<BodyEnc>  enc_q_pl, enc_k_pl, enc_v_pl, enc_out_pl,
+                          enc_gate_pl, enc_up_pl, enc_down_pl;
+
     bool dump_enabled = false;
 };
 }}
@@ -661,13 +666,84 @@ extern "C" int sk_gemma4_load_gguf(sk_gemma4_handle* hp, const char* path) {
     }
 
     auto* qkv_base = h->weights.w_qkv ? (char*)h->weights.w_qkv->contents() : nullptr;
-    const bool body_q8 = (h->weights.w_q_q8 != nullptr);
 
     char nm[160];
     auto get_layer = [&](uint32_t L, const char* suf) -> const sk::TensorView* {
         std::snprintf(nm, sizeof(nm), "blk.%u.%s", L, suf);
         return store.get(nm);
     };
+
+    // ── Q4_K body sizing + allocation (deferred from create: the per-tensor
+    // GGUF block dtypes are only known here). Each projection is stored VERBATIM
+    // as its GGUF K-quant blocks (Q4_K 144B/256, Q6_K 210B/256 on the v/down
+    // rows a Q4_K_M keeps in Q6_K). One contiguous slab per projection; per-layer
+    // byte offsets in the *_q8_off tables; per-layer encoding in enc_*_pl.
+    auto dtype_to_enc = [](sk::Dtype d) -> meow::gemma4::BodyEnc {
+        return d == sk::Dtype::Q6_K ? meow::gemma4::BodyEnc::Q6K : meow::gemma4::BodyEnc::Q4K;
+    };
+    if (h->body_q4k) {
+        MTL::Device* dev = h->weights.w_lm_head_q8 ? h->weights.w_lm_head_q8->device()
+                         : (h->weights.w_embed ? h->weights.w_embed->device() : nullptr);
+        if (!dev) { std::fprintf(stderr, "gemma4 gguf: Q4_K body but no device handle\n"); return -40; }
+
+        const size_t L_n = c.n_layers;
+        h->q_q8_off.resize(L_n);    h->k_q8_off.resize(L_n);    h->v_q8_off.resize(L_n);
+        h->out_q8_off.resize(L_n);  h->gate_q8_off.resize(L_n); h->up_q8_off.resize(L_n);
+        h->down_q8_off.resize(L_n);
+        h->enc_q_pl.resize(L_n);    h->enc_k_pl.resize(L_n);    h->enc_v_pl.resize(L_n);
+        h->enc_out_pl.resize(L_n);  h->enc_gate_pl.resize(L_n); h->enc_up_pl.resize(L_n);
+        h->enc_down_pl.resize(L_n);
+
+        size_t cq=0, ck=0, cv=0, co=0, cg=0, cu=0, cd=0;
+        auto size_proj = [&](uint32_t L, const char* suf, size_t n_elems, size_t& cur,
+                             size_t& off_out, meow::gemma4::BodyEnc& enc_out) -> bool {
+            auto* v = get_layer(L, suf);
+            if (!v) { std::fprintf(stderr, "gemma4 gguf(q4k size): missing blk.%u.%s\n", L, suf); return false; }
+            enc_out = dtype_to_enc(v->dtype);
+            off_out = cur;
+            cur += sk::dtype_bytes(v->dtype, n_elems);
+            return true;
+        };
+        for (uint32_t L = 0; L < L_n; ++L) {
+            const bool   is_g = ((L % c.local_period) == (c.local_period - 1));
+            const size_t n_kv = is_g ? c.n_kv_heads_global : c.n_kv_heads_local;
+            const size_t hd   = is_g ? c.head_dim_global   : c.head_dim_local;
+            const size_t Nq = nh * hd, Nkv = n_kv * hd, ni = (size_t)h->n_int_per_layer[L];
+            const char* v_suf = get_layer(L, "attn_v.weight") ? "attn_v.weight" : "attn_k.weight";
+            if (!size_proj(L, "attn_q.weight",      Nq*dm,  cq, h->q_q8_off[L],    h->enc_q_pl[L]))    return -41;
+            if (!size_proj(L, "attn_k.weight",      Nkv*dm, ck, h->k_q8_off[L],    h->enc_k_pl[L]))    return -41;
+            if (!size_proj(L, v_suf,                Nkv*dm, cv, h->v_q8_off[L],    h->enc_v_pl[L]))    return -41;
+            if (!size_proj(L, "attn_output.weight", Nq*dm,  co, h->out_q8_off[L],  h->enc_out_pl[L]))  return -41;
+            if (!size_proj(L, "ffn_gate.weight",    dm*ni,  cg, h->gate_q8_off[L], h->enc_gate_pl[L])) return -41;
+            if (!size_proj(L, "ffn_up.weight",      dm*ni,  cu, h->up_q8_off[L],   h->enc_up_pl[L]))   return -41;
+            if (!size_proj(L, "ffn_down.weight",    ni*dm,  cd, h->down_q8_off[L], h->enc_down_pl[L])) return -41;
+        }
+        auto alloc = [&](size_t bytes) -> MTL::Buffer* {
+            auto* b = dev->newBuffer(bytes, MTL::ResourceStorageModeShared);
+            if (b) std::memset(b->contents(), 0, bytes);
+            return b;
+        };
+        h->weights.w_q_q8    = alloc(cq); h->weights.w_k_q8  = alloc(ck);
+        h->weights.w_v_q8    = alloc(cv); h->weights.w_out_q8 = alloc(co);
+        h->weights.w_gate_q8 = alloc(cg); h->weights.w_up_q8 = alloc(cu);
+        h->weights.w_down_q8 = alloc(cd);
+        h->weights.q_q8_off  = h->q_q8_off.data();   h->weights.k_q8_off  = h->k_q8_off.data();
+        h->weights.v_q8_off  = h->v_q8_off.data();   h->weights.out_q8_off = h->out_q8_off.data();
+        h->weights.gate_q8_off = h->gate_q8_off.data(); h->weights.up_q8_off = h->up_q8_off.data();
+        h->weights.down_q8_off = h->down_q8_off.data();
+        h->weights.enc_q_per_layer    = h->enc_q_pl.data();
+        h->weights.enc_k_per_layer    = h->enc_k_pl.data();
+        h->weights.enc_v_per_layer    = h->enc_v_pl.data();
+        h->weights.enc_out_per_layer  = h->enc_out_pl.data();
+        h->weights.enc_gate_per_layer = h->enc_gate_pl.data();
+        h->weights.enc_up_per_layer   = h->enc_up_pl.data();
+        h->weights.enc_down_per_layer = h->enc_down_pl.data();
+        std::fprintf(stderr, "gemma4 gguf: Q4_K body slabs q=%.2f k=%.2f v=%.2f o=%.2f "
+            "gate=%.2f up=%.2f down=%.2f GB (total %.2f GB)\n",
+            cq/1e9, ck/1e9, cv/1e9, co/1e9, cg/1e9, cu/1e9, cd/1e9,
+            (cq+ck+cv+co+cg+cu+cd)/1e9);
+    }
+    const bool body_q8 = (h->weights.w_q_q8 != nullptr) && !h->body_q4k;
 
     for (uint32_t L = 0; L < c.n_layers; ++L) {
         const bool   is_global = ((L % c.local_period) == (c.local_period - 1));
@@ -739,7 +815,29 @@ extern "C" int sk_gemma4_load_gguf(sk_gemma4_handle* hp, const char* path) {
         // layers have a real attn_v.
         const char* v_src = get_layer(L, "attn_v.weight") ? "attn_v.weight" : "attn_k.weight";
 
-        if (body_q8) {
+        // Q4_K body: copy the GGUF K-quant blocks verbatim (no dequant/re-quant).
+        // GGUF [out,in] == HF [N,K] row-major == exactly what q4k/q6k_matvec_bf16
+        // read. Block dtype per tensor was captured in enc_*_pl during sizing.
+        auto load_proj_raw = [&](const char* suf, MTL::Buffer* dst, size_t byte_off, size_t n_elems) -> bool {
+            auto* v = get_layer(L, suf);
+            if (!v) { std::fprintf(stderr, "gemma4 gguf: missing blk.%u.%s\n", L, suf); return false; }
+            const size_t want = sk::dtype_bytes(v->dtype, n_elems);
+            if (v->nbytes < want) {
+                std::fprintf(stderr, "gemma4 gguf(q4k): %s short %zu < %zu\n", suf, v->nbytes, want); return false;
+            }
+            std::memcpy((char*)dst->contents() + byte_off, v->data, want);
+            return true;
+        };
+
+        if (h->body_q4k) {
+            if (!load_proj_raw("attn_q.weight",      h->weights.w_q_q8,    h->q_q8_off[L],    Nq  * dm)) return -30;
+            if (!load_proj_raw("attn_k.weight",      h->weights.w_k_q8,    h->k_q8_off[L],    Nkv * dm)) return -32;
+            if (!load_proj_raw(v_src,                h->weights.w_v_q8,    h->v_q8_off[L],    Nkv * dm)) return -33;
+            if (!load_proj_raw("attn_output.weight", h->weights.w_out_q8,  h->out_q8_off[L],  Nq  * dm)) return -26;
+            if (!load_proj_raw("ffn_gate.weight",    h->weights.w_gate_q8, h->gate_q8_off[L], dm  * ni)) return -27;
+            if (!load_proj_raw("ffn_up.weight",      h->weights.w_up_q8,   h->up_q8_off[L],   dm  * ni)) return -28;
+            if (!load_proj_raw("ffn_down.weight",    h->weights.w_down_q8, h->down_q8_off[L], ni  * dm)) return -29;
+        } else if (body_q8) {
             if (!load_proj_q8("attn_output.weight", h->weights.w_out_q8, h->out_q8_off[L], Nq * dm)) return -26;
             if (!load_proj_q8("ffn_gate.weight",    h->weights.w_gate_q8, h->gate_q8_off[L], dm * ni)) return -27;
             if (!load_proj_q8("ffn_up.weight",      h->weights.w_up_q8,   h->up_q8_off[L],   dm * ni)) return -28;

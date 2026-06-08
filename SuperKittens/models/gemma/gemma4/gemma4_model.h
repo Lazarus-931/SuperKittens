@@ -63,6 +63,30 @@ inline void enc_q8_matvec(
     }
 }
 
+// Encode one K-quant (Q4_K=144B/256 or Q6_K=210B/256) matvec/GEMM with the
+// SAME binding+dispatch shape as enc_q8_matvec: A (bf16 [M,K]) × W (kquant
+// [N,K] row-major) → C (bf16 [M,N], row stride ldC). pso is q4k_matvec_bf16 or
+// q6k_matvec_bf16. Dispatch: grid ceil(N/2), threadgroup 128 (4 SGs × 32 lanes).
+inline void enc_kquant_matvec(
+    MTL::ComputeCommandEncoder* enc, MTL::ComputePipelineState* pso,
+    MTL::Buffer* A, size_t off_A_bytes,
+    MTL::Buffer* W, size_t off_W_bytes,
+    MTL::Buffer* C, size_t off_C_bytes,
+    uint32_t M, uint32_t N, uint32_t K, uint32_t ldC)
+{
+    enc->setComputePipelineState(pso);
+    const uint32_t NR0 = 2;
+    for (uint32_t m = 0; m < M; ++m) {
+        enc->setBuffer(A, off_A_bytes + (size_t)m * K * 2, 0);
+        enc->setBuffer(W, off_W_bytes,                     1);
+        enc->setBuffer(C, off_C_bytes + (size_t)m * ldC * 2, 2);
+        enc->setBytes(&K, 4, 3);
+        enc->setBytes(&N, 4, 4);
+        enc->dispatchThreadgroups(MTL::Size((N + NR0 - 1) / NR0, 1, 1),
+                                  MTL::Size(128, 1, 1));
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 //  Layer-level
 // ──────────────────────────────────────────────────────────────────────
@@ -99,6 +123,17 @@ struct LayerParams {
 
     // KV-sharing
     bool     is_kv_shared   = false;   // if true, skip kv_cache_write and reuse source's cache
+
+    // Q4_K body: per-projection block encoding for THIS layer (Q4_K_M mixes
+    // Q4_K/Q6_K on v/down). Ignored unless the *_q8 buffers carry K-quant blocks
+    // (body_q4k path). q/k/o/gate/up are Q4_K; v/down may be Q4_K or Q6_K.
+    BodyEnc  enc_q     = BodyEnc::Q8;
+    BodyEnc  enc_k     = BodyEnc::Q8;
+    BodyEnc  enc_v     = BodyEnc::Q8;
+    BodyEnc  enc_out   = BodyEnc::Q8;
+    BodyEnc  enc_gate  = BodyEnc::Q8;
+    BodyEnc  enc_up    = BodyEnc::Q8;
+    BodyEnc  enc_down  = BodyEnc::Q8;
 };
 
 struct LayerPSOs {
@@ -127,8 +162,16 @@ struct LayerPSOs {
     MTL::ComputePipelineState* gemv_bf16_m1       = nullptr; // M=1 bf16 GEMV (down projection etc.)
     MTL::ComputePipelineState* qkv_norm_rope_partial_t1 = nullptr; // fused qkv-split + per-head rmsnorm + partial RoPE (global layers)
     MTL::ComputePipelineState* q8_0_matvec_bf16   = nullptr; // M=1 Q8_0 × bf16 matvec → bf16 (LM head + Q8 body projections)
+    MTL::ComputePipelineState* q4k_matvec_bf16    = nullptr; // M=1 Q4_K × bf16 matvec → bf16 (Q4_K body, fit-16GB)
+    MTL::ComputePipelineState* q6k_matvec_bf16    = nullptr; // M=1 Q6_K × bf16 matvec → bf16 (Q4_K_M v/down Q6_K rows)
     MTL::ComputePipelineState* geglu_mul          = nullptr; // gelu(gate)*up elementwise (Q8 MLP)
 };
+
+// Per-projection body weight encoding: when the Q4_K body is active each layer's
+// projection carries the GGUF's native K-quant block bytes verbatim (no dequant
+// re-quant). attn_q/k/o/gate/up are uniformly Q4_K; attn_v/ffn_down are mixed
+// Q4_K/Q6_K per layer in a Q4_K_M GGUF. BodyEnc tags which matvec PSO to pick.
+enum class BodyEnc : uint8_t { Q8 = 0, Q4K = 1, Q6K = 2 };
 
 struct LayerBuffers {
     // Dump stash (optional; only used for L0 intermediates when dump_enabled).
@@ -167,6 +210,12 @@ struct LayerBuffers {
     // Optional Q8_0 body projections (HF-native [N, K] row-major). When the
     // *_q8 buffers are non-null, dispatch_layer routes the projections through
     // q8_0_matvec_bf16 (the *_q8_off fields are this layer's byte offset).
+    // Q4_K body (fit-16GB): when body_kquant is true the *_q8 buffers instead
+    // carry the GGUF's native K-quant blocks (Q4_K 144B/256, or Q6_K 210B/256 on
+    // v/down) and the per-layer BodyEnc tags in LayerParams select
+    // q4k/q6k_matvec_bf16. The Q8 path stays default (body_kquant=false) so
+    // E2B/E4B are untouched.
+    bool         body_kquant = false;
     MTL::Buffer* w_q_q8    = nullptr;
     MTL::Buffer* w_k_q8    = nullptr;
     MTL::Buffer* w_v_q8    = nullptr;
@@ -236,6 +285,21 @@ inline void dispatch_layer(
     const uint32_t qkv_out = (p.n_heads + 2u * p.n_kv_heads_max) * p.head_dim_max;
     const uint32_t qhd_max = p.n_heads * p.head_dim_max;
 
+    // Q4_K body: dispatch one body projection through the matvec PSO that matches
+    // its per-layer BodyEnc tag. Q8 path unchanged (body_kquant=false).
+    auto enc_body = [&](MTL::ComputeCommandEncoder* enc, BodyEnc e,
+                        MTL::Buffer* A, size_t offA, MTL::Buffer* W, size_t offW,
+                        MTL::Buffer* C, size_t offC,
+                        uint32_t M, uint32_t N, uint32_t Kd, uint32_t ldC) {
+        if (B.body_kquant) {
+            MTL::ComputePipelineState* pso =
+                (e == BodyEnc::Q6K) ? P.q6k_matvec_bf16 : P.q4k_matvec_bf16;
+            enc_kquant_matvec(enc, pso, A, offA, W, offW, C, offC, M, N, Kd, ldC);
+        } else {
+            enc_q8_matvec(enc, P.q8_0_matvec_bf16, A, offA, W, offW, C, offC, M, N, Kd, ldC);
+        }
+    };
+
     // Per-layer byte offsets.
     const size_t off_norm        = (size_t)L * p.d_model * 2;
     const size_t off_qkv         = (size_t)L * p.d_model * qkv_out * 2;
@@ -272,20 +336,22 @@ inline void dispatch_layer(
         const uint32_t N_v = (p.n_heads + 2 * p.n_kv_heads) * p.head_dim;
         const uint32_t Nq  = p.n_heads * p.head_dim;
         const uint32_t Nkv = p.n_kv_heads * p.head_dim;
-        // Q8_0 path: separate Q/K/V matvecs packing into the qkv_packed bands.
+        // Q8_0 / Q4_K body path: separate Q/K/V matvecs packing into qkv_packed.
         const bool use_q8 = (B.w_q_q8 != nullptr) && (B.w_k_q8 != nullptr)
-                         && (B.w_v_q8 != nullptr) && (P.q8_0_matvec_bf16 != nullptr);
+                         && (B.w_v_q8 != nullptr)
+                         && (B.body_kquant ? (P.q4k_matvec_bf16 != nullptr && P.q6k_matvec_bf16 != nullptr)
+                                           : (P.q8_0_matvec_bf16 != nullptr));
         // T=1 decode fast path: bf16 M=1 GEMV. Threshold guard N<=32768 — at
         // larger N the in-tree tile-MMA wins (per lab REPORT.md).
         static bool _disable_m1 = (std::getenv("SK_DISABLE_GEMV_M1") != nullptr);
         if (use_q8) {
             auto* enc = E.get();
-            enc_q8_matvec(enc, P.q8_0_matvec_bf16, B.x_norm, 0, B.w_q_q8, B.q_q8_off,
-                          B.qkv_packed, 0,                  M, Nq,  K_v, N_v);
-            enc_q8_matvec(enc, P.q8_0_matvec_bf16, B.x_norm, 0, B.w_k_q8, B.k_q8_off,
-                          B.qkv_packed, (size_t)Nq * 2,     M, Nkv, K_v, N_v);
-            enc_q8_matvec(enc, P.q8_0_matvec_bf16, B.x_norm, 0, B.w_v_q8, B.v_q8_off,
-                          B.qkv_packed, (size_t)(Nq + Nkv) * 2, M, Nkv, K_v, N_v);
+            enc_body(enc, p.enc_q, B.x_norm, 0, B.w_q_q8, B.q_q8_off,
+                     B.qkv_packed, 0,                  M, Nq,  K_v, N_v);
+            enc_body(enc, p.enc_k, B.x_norm, 0, B.w_k_q8, B.k_q8_off,
+                     B.qkv_packed, (size_t)Nq * 2,     M, Nkv, K_v, N_v);
+            enc_body(enc, p.enc_v, B.x_norm, 0, B.w_v_q8, B.v_q8_off,
+                     B.qkv_packed, (size_t)(Nq + Nkv) * 2, M, Nkv, K_v, N_v);
         } else if (!_disable_m1 && M == 1 && N_v <= 32768u && P.gemv_bf16_m1 != nullptr) {
             auto* enc = E.get();
             enc->setComputePipelineState(P.gemv_bf16_m1);
@@ -563,12 +629,14 @@ inline void dispatch_layer(
         const uint32_t M = p.batch * p.seq;
         const uint32_t K_v = p.n_heads * p.head_dim;
         const uint32_t N_v = p.d_model;
-        const bool use_q8_o = (B.w_out_q8 != nullptr) && (P.q8_0_matvec_bf16 != nullptr);
+        const bool use_q8_o = (B.w_out_q8 != nullptr)
+                         && (B.body_kquant ? (P.q4k_matvec_bf16 != nullptr && P.q6k_matvec_bf16 != nullptr)
+                                           : (P.q8_0_matvec_bf16 != nullptr));
         static bool _disable_m1_o = (std::getenv("SK_DISABLE_GEMV_M1") != nullptr);
         if (use_q8_o) {
             auto* enc = E.get();
-            enc_q8_matvec(enc, P.q8_0_matvec_bf16, B.attn_out, 0, B.w_out_q8, B.out_q8_off,
-                          B.o_proj, 0, M, N_v, K_v, N_v);
+            enc_body(enc, p.enc_out, B.attn_out, 0, B.w_out_q8, B.out_q8_off,
+                     B.o_proj, 0, M, N_v, K_v, N_v);
         } else if (!_disable_m1_o && M == 1 && N_v <= 32768u && P.gemv_bf16_m1 != nullptr) {
             auto* enc = E.get();
             enc->setComputePipelineState(P.gemv_bf16_m1);
@@ -650,7 +718,9 @@ inline void dispatch_layer(
         static bool _disable_mlp_fast = (std::getenv("SK_DISABLE_MLP_FAST_T1") != nullptr);
         const bool use_q8_mlp =
             (B.w_gate_q8 != nullptr) && (B.w_up_q8 != nullptr) && (B.w_down_q8 != nullptr)
-            && (P.q8_0_matvec_bf16 != nullptr) && (P.geglu_mul != nullptr)
+            && (B.body_kquant ? (P.q4k_matvec_bf16 != nullptr && P.q6k_matvec_bf16 != nullptr)
+                              : (P.q8_0_matvec_bf16 != nullptr))
+            && (P.geglu_mul != nullptr)
             && (B.m_int_scratch != nullptr) && (B.m_up_scratch != nullptr);
         const bool use_fast =
             !_disable_mlp_fast &&
@@ -666,10 +736,10 @@ inline void dispatch_layer(
             // gate -> m_int_scratch, up -> m_up_scratch (both [M, Ni], K=Dm).
             {
                 auto* enc = E.get();
-                enc_q8_matvec(enc, P.q8_0_matvec_bf16, B.m_in, 0, B.w_gate_q8, B.gate_q8_off,
-                              B.m_int_scratch, 0, M, Ni, Dm, Ni);
-                enc_q8_matvec(enc, P.q8_0_matvec_bf16, B.m_in, 0, B.w_up_q8, B.up_q8_off,
-                              B.m_up_scratch, 0, M, Ni, Dm, Ni);
+                enc_body(enc, p.enc_gate, B.m_in, 0, B.w_gate_q8, B.gate_q8_off,
+                         B.m_int_scratch, 0, M, Ni, Dm, Ni);
+                enc_body(enc, p.enc_up, B.m_in, 0, B.w_up_q8, B.up_q8_off,
+                         B.m_up_scratch, 0, M, Ni, Dm, Ni);
             }
             // gelu(gate)*up -> m_int_scratch.
             {
@@ -686,8 +756,8 @@ inline void dispatch_layer(
             // down: m_out = m_int @ W_down (K=Ni, N=Dm).
             {
                 auto* enc = E.get();
-                enc_q8_matvec(enc, P.q8_0_matvec_bf16, B.m_int_scratch, 0, B.w_down_q8, B.down_q8_off,
-                              B.m_out, 0, M, Dm, Ni, Dm);
+                enc_body(enc, p.enc_down, B.m_int_scratch, 0, B.w_down_q8, B.down_q8_off,
+                         B.m_out, 0, M, Dm, Ni, Dm);
             }
         } else if (use_fast) {
             // 10a: fused gate+up+gelu+mul -> m_int_scratch (1, n_int).
@@ -1064,6 +1134,18 @@ struct ModelWeights {
     const size_t* up_q8_off   = nullptr;
     const size_t* down_q8_off = nullptr;
 
+    // Q4_K body (fit-16GB): when true the *_q8 buffers carry the GGUF's native
+    // K-quant blocks (not Q8_0) and the per-layer BodyEnc tables select the
+    // q4k/q6k matvec PSO. Tables are length n_layers (nullptr → all Q8).
+    bool          body_kquant = false;
+    const BodyEnc* enc_q_per_layer    = nullptr;
+    const BodyEnc* enc_k_per_layer    = nullptr;
+    const BodyEnc* enc_v_per_layer    = nullptr;
+    const BodyEnc* enc_out_per_layer  = nullptr;
+    const BodyEnc* enc_gate_per_layer = nullptr;
+    const BodyEnc* enc_up_per_layer   = nullptr;
+    const BodyEnc* enc_down_per_layer = nullptr;
+
     MTL::Buffer* cos_local;
     MTL::Buffer* sin_local;
     MTL::Buffer* cos_global;
@@ -1327,6 +1409,15 @@ inline void dispatch_model(
         lp.off_w_down_e   = M.mlp_down_off_e ? M.mlp_down_off_e[L] : (size_t)L * M.n_int * M.d_model;
         const int32_t kv_src = M.kv_source_layer ? M.kv_source_layer[L] : -1;
         lp.is_kv_shared   = (kv_src >= 0);
+        // Q4_K body: per-layer projection encodings (Q4_K_M mixes Q4_K/Q6_K on
+        // v/down). Tables are nullptr for the Q8 body (all stay BodyEnc::Q8).
+        lp.enc_q    = M.enc_q_per_layer    ? M.enc_q_per_layer[L]    : BodyEnc::Q8;
+        lp.enc_k    = M.enc_k_per_layer    ? M.enc_k_per_layer[L]    : BodyEnc::Q8;
+        lp.enc_v    = M.enc_v_per_layer    ? M.enc_v_per_layer[L]    : BodyEnc::Q8;
+        lp.enc_out  = M.enc_out_per_layer  ? M.enc_out_per_layer[L]  : BodyEnc::Q8;
+        lp.enc_gate = M.enc_gate_per_layer ? M.enc_gate_per_layer[L] : BodyEnc::Q8;
+        lp.enc_up   = M.enc_up_per_layer   ? M.enc_up_per_layer[L]   : BodyEnc::Q8;
+        lp.enc_down = M.enc_down_per_layer ? M.enc_down_per_layer[L] : BodyEnc::Q8;
 
         LayerBuffers lb;
         // L0 extra-dump wiring: enabled only for L0 when dump is on. The
@@ -1394,7 +1485,8 @@ inline void dispatch_model(
         lb.w_gate           = W.w_gate;
         lb.w_up             = W.w_up;
         lb.w_down           = W.w_down;
-        // Q8_0 body projections (per-layer byte offsets from the offset tables).
+        // Q8_0 / Q4_K body projections (per-layer byte offsets from the tables).
+        lb.body_kquant = W.body_kquant;
         lb.w_q_q8    = W.w_q_q8;    lb.q_q8_off    = W.q_q8_off    ? W.q_q8_off[L]    : 0;
         lb.w_k_q8    = W.w_k_q8;    lb.k_q8_off    = W.k_q8_off    ? W.k_q8_off[L]    : 0;
         lb.w_v_q8    = W.w_v_q8;    lb.v_q8_off    = W.v_q8_off    ? W.v_q8_off[L]    : 0;

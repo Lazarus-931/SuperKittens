@@ -28,7 +28,7 @@ struct Handle {
     std::vector<int32_t>  kv_source_layer;
     std::vector<float>    layer_scalar_host;   // gemma4_unified per-layer output scale
 
-    // Per-layer byte offsets into the Q8_0 body buffers (empty if Q8 body off).
+    // Per-layer byte offsets into the Q8_0/Q4_K body buffers (empty if off).
     std::vector<size_t>   q_q8_off;
     std::vector<size_t>   k_q8_off;
     std::vector<size_t>   v_q8_off;
@@ -36,6 +36,13 @@ struct Handle {
     std::vector<size_t>   gate_q8_off;
     std::vector<size_t>   up_q8_off;
     std::vector<size_t>   down_q8_off;
+
+    // Q4_K body: per-layer projection encoding tables (sized in the GGUF loader,
+    // which is the first point the actual GGUF block dtypes are known). When
+    // body_q4k is set the launcher defers body-buffer allocation to the loader.
+    bool                  body_q4k = false;
+    std::vector<BodyEnc>  enc_q_pl, enc_k_pl, enc_v_pl, enc_out_pl,
+                          enc_gate_pl, enc_up_pl, enc_down_pl;
 
     bool dump_enabled = false;
 };
@@ -71,6 +78,8 @@ static bool resolve_psos(ModelPSOs& P) {
     P.layer.gemv_bf16_m1       = sk::bindings_pso("gemv_bf16_m1");
     P.layer.qkv_norm_rope_partial_t1 = sk::bindings_pso("gemma4_qkv_norm_rope_partial_t1");
     P.layer.q8_0_matvec_bf16   = sk::bindings_pso("q8_0_matvec_bf16");
+    P.layer.q4k_matvec_bf16    = sk::bindings_pso("q4k_matvec_bf16");   // optional (Q4_K body)
+    P.layer.q6k_matvec_bf16    = sk::bindings_pso("q6k_matvec_bf16");   // optional (Q4_K body v/down Q6_K)
     P.layer.geglu_mul          = sk::bindings_pso("gemma4_geglu_mul");
     P.embedding_lookup     = sk::bindings_pso("embedding_lookup_bf16");
     P.embedding_lookup_q8  = sk::bindings_pso("embedding_lookup_q8_bf16");  // optional
@@ -276,15 +285,35 @@ extern "C" sk_gemma4_handle* sk_gemma4_create(const sk_gemma4_config* cfg) {
     // [N, K] row-major (q8_0_matvec_bf16 reads that layout directly, no
     // transpose). One contiguous slab per projection across layers; the
     // *_q8_off tables hold per-layer byte offsets (q8 block = 34 bytes / 32).
-    bool body_q8 = false;
+    // Q4_K body (fit-16GB; SK_GEMMA4_BODY_Q4K=1): the GGUF's native K-quant
+    // blocks (Q4_K 144B/256, plus Q6_K 210B/256 on the v/down rows a Q4_K_M
+    // GGUF keeps in Q6_K) are loaded VERBATIM — no dequant→Q8 re-quant. The 12B
+    // Q8 body (~11.7 GB) blows the M4 GPU-wired ceiling; the Q4_K body is
+    // ~6.5 GB resident, fitting comfortably. Buffer allocation is deferred to
+    // sk_gemma4_load_gguf, the first point the per-tensor GGUF dtypes are known.
+    // Wins over body_q8; both 256-block aligned (d_model 3840, n_int 15360).
     {
+        const char* env = std::getenv("SK_GEMMA4_BODY_Q4K");
+        const bool want = env && (env[0] == '1');
+        h->body_q4k = want && (cfg->d_model % 256 == 0)
+                   && h->psos.layer.q4k_matvec_bf16 && h->psos.layer.q6k_matvec_bf16
+                   && h->psos.layer.geglu_mul;
+    }
+    bool body_q8 = false;
+    if (!h->body_q4k) {
         const char* env = std::getenv("SK_GEMMA4_BODY_Q8");
         const bool want = !env || (env[0] != '0');
         body_q8 = want && (cfg->d_model % 32 == 0) && h->psos.layer.q8_0_matvec_bf16
                && h->psos.layer.geglu_mul;
     }
     auto q8_bytes = [](size_t n_elems) -> size_t { return (n_elems / 32) * 34; };
-    if (body_q8) {
+    if (h->body_q4k) {
+        // Defer body-buffer allocation to the loader; mark the K-quant path so
+        // dispatch routes through q4k/q6k_matvec_bf16. bf16 body slabs stay null.
+        h->weights.body_kquant = true;
+        h->weights.w_qkv = nullptr; h->weights.w_out = nullptr;
+        h->weights.w_gate = nullptr; h->weights.w_up = nullptr; h->weights.w_down = nullptr;
+    } else if (body_q8) {
         h->q_q8_off.resize(cfg->n_layers);    h->k_q8_off.resize(cfg->n_layers);
         h->v_q8_off.resize(cfg->n_layers);    h->out_q8_off.resize(cfg->n_layers);
         h->gate_q8_off.resize(cfg->n_layers); h->up_q8_off.resize(cfg->n_layers);
