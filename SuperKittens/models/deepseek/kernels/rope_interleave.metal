@@ -61,9 +61,14 @@ kernel void rope_interleave_f32(
 
     const float p = (float)pos[i3 * args.ne01 + i1];
     const int   n = args.n_dims;
-    const size_t row = ((size_t)i3 * args.ne02 + i2) * args.ne01 + i1;
-    device const float* s = src + row * args.ne00;
-    device float*       d = dst + row * args.ne00;
+    // Byte-stride addressing: nb01 = seq(row) stride, nb02 = head stride,
+    // nb03 = batch stride. q_packed is token-major [batch, seq, head, dk] so the
+    // launcher passes nb02 = dk*4 and nb01 = n_heads*dk*4 (NOT the old head-major
+    // assumption). WHY: head-major-only indexing scrambled prefill (T>1) Q.
+    const size_t boff = (size_t)i3 * args.nb03 + (size_t)i1 * args.nb01
+                      + (size_t)i2 * args.nb02;
+    device const float* s = (device const float*)((device const char*)src + boff);
+    device float*       d = (device float*)((device char*)dst + boff);
 
     // DeepSeek-V2 partial RoPE: q is [nope(ne00-n_dims) ++ pe(n_dims)] per head,
     // RoPE acts only on the pe tail (apply_rotary_emb operates on q_pe after the
