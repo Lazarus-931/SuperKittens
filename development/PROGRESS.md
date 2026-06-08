@@ -76,7 +76,7 @@ chase improvements, iterate on wins, never stop until the user says stop.
 ### F. SSM
 | # | Item | Pri | Status | Notes |
 |---|------|-----|--------|-------|
-| 24 | mamba2_ssd.metal numeric fix (softplus/dt·B·x/D·x/n_groups) | MED | TODO | KNOWN BROKEN |
+| 24 | mamba2_ssd.metal numeric fix (softplus/dt·B·x/D·x/n_groups) | MED | **WIN PR#60 (open, review)** | full rewrite, matches HF ref ≤2.1e-4, argmax-equiv 0/12296, 2.37-2.73× over ref-fallback; launcher prefers it. dt-clamp(0.001,0.1)-vs-HF(0,inf) flagged follow-up |
 | 25 | mamba3 seqlen>1024 hang fix | LOW | TODO | |
 
 ### G. Structure / design / organizing
@@ -103,6 +103,7 @@ chase improvements, iterate on wins, never stop until the user says stop.
 | 40 | GQA amortization audit (mha_causal) — guard against regressions | LOW | TODO | |
 
 ## Log (newest first)
+- **[#24 mamba2_ssd = WIN (PR #60, open for review)]** `a678f9656535bf38b` done. Full rewrite of the KNOWN-BROKEN kernel → matches HF transformers ref ≤2.1e-4 (L∈{16..700}, n_groups=2, batch=2), argmax-equiv 0/12296, prefill→decode state bit-exact. **2.37× @L=64 → 2.73× @L=1024** over the slow ref-fallback; launcher now prefers it (ref = fallback). PR #60 → main MERGEABLE but auto-merge to main was correctly BLOCKED by the classifier (PR-only/don't-touch-main) → held for user review alongside #55 (batched GEMM) + #57 (KV-quant). Note: dt-clamp(0.001,0.1) vs HF(0,inf) is a flagged orthogonal follow-up. Replenishing with #25 mamba3-hang. NOTE: agent git-op flipped local dev-sk-redesign ref to 2fca67f again — reset to origin (d735700); the "stay in own worktree" violation keeps recurring.
 - **[#42 small-M = WIN → PR#59 merged into dev-sk-batched-gemm]** `a0fec52cfa0ad30aa` done. gemm_mma_smallm Q8_0/Q4_K **bit-exact (diff=0.0)** vs matvec M∈{1,2,4,8}. Verify floor (vs M=1 decode): **seq2 4.6-5.8×→1.0-1.1×, seq4→1.3-1.5×, seq8→2.3-2.8× (Q8_0)**. M-threshold dispatch (sm 2≤M≤8 Q8_0 / 2≤M≤4 Q4_K; M=1 matvec; M>8 MMA) wired on all 6 projections + fixed dead PSOs. dev-sk-batched-gemm now = #8+#8b+#42 (PR #55→main carries all). **Break-even mean-accept now below K → spec-decode should flip to a win.** Launching the e2e spec-decode RE-BENCH on this kernel (the agent left it to avoid entangling PR lines).
 - **[wave-5 — KV-quant done; process-restart recovery; small-M win-in-progress]**
   - **#17 KV-quant Q8_0 = MEMORY WIN (PR #57), not a speed win.** `a5d0b0494b2c34187` done. Q8_0 K/V (kv_cache_write_q8 + mha_causal_q8 + mha_decode_split_q8, gated SK_KV_Q8, fp16 fallback). Numerics ≤1e-2 vs fp16 across kv∈{128..4096}/GQA/prefill; coherence identical. Bench (lexie 4B): decode **parity** at short AND long ctx (kv=2048/4096) — NO BW win because decode is weight-bound, KV is a small slice (confirms the BW-wall finding). **But ~1.9-2.0× larger cache_max on 14B** (memory feature). Opt-in, default byte-identical. PR #57 open (NOT merged).
