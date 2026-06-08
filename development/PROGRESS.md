@@ -87,8 +87,8 @@ chase improvements, iterate on wins, never stop until the user says stop.
 |---|------|-----|--------|-------|
 | 26 | Unify per-family launcher pattern (shared encode_* lib) | MED | TODO | qwen/gemma/deepseek |
 | 27 | Centralize encode_quant_gemm PSO-dispatch across families | MED | TODO | |
-| 28 | docs/kernels.md architecture index refresh | LOW | TODO | |
-| 29 | best.md scoreboard refresh | LOW | TODO | |
+| 28 | docs/kernels.md architecture index refresh | LOW | **WIN PR#65** | + CLAUDE.md open-state; corrected stale gemm/conv1d/delta_net/mamba2 claims |
+| 29 | best.md scoreboard refresh | LOW | **WIN PR#65** | folded into #28 |
 | 30 | registry.py dtype-aware variant auto-derivation | LOW | TODO | |
 | 31 | Unify mixed-quant detection across families (loader) | MED | TODO | |
 | 32 | Generalize ICB recorder across families | MED | TODO | depends #3 |
@@ -106,6 +106,7 @@ chase improvements, iterate on wins, never stop until the user says stop.
 | 40 | GQA amortization audit (mha_causal) — guard against regressions | LOW | TODO | |
 
 ## Log (newest first)
+- **[#28/#29 docs refresh = WIN (PR #65)]** `a4a2f68ab45299f9f`. docs/kernels.md + best.md + CLAUDE.md open-state refreshed (all new kernels tagged [PR #N]/not-on-main; settled findings: decode BW-wall, Q4_K_M sweet spot, spec-decode dead, KV-quant=memory). Corrected stale claims: gemm/ dir listing (ships q8/q4k/q6k/q2k/iq2/swiglu, not just fp16/fp8), conv1d_silu is in fusion/ not conv/, undocumented delta_net/ scaffold, stale mamba2-broken note. Docs-only, PR #65→main. Replenishing with gemma4-e2e (verify repo exists first).
 - **[spec-decode 8B = NEG (0.860×) — definitively CLOSED]** `a6b5c3015973b7e53`. 8B target refuted the ~1.1-1.3× projection: best 0.860× (low-entropy K=8), lossless. Draft tax DID halve (15% of 8B decode) but break-even accept(K=6)=3.44 not 2.84 because the verify forward stays **2.5-3.5× a decode** (multi-row verify dequant/compute-bound, doesn't collapse to ~1×) + all-rows-head + Python-loop overhead. Spec-decode loses at BOTH 4B (0.88×) and 8B (0.86×) → SETTLED-NEG on M4, bigger targets are NOT the lever. Branch dev-sk-spec-decode-8b pushed, no PR. (Infra win: downloaded 8B GGUF directly on lexie via curl 80MB/s vs 40MB/min inter-host — use this pattern.) Replenishing with #11 chunked-prefill.
 - **[#41 logits-fix = WIN (PR #64) — fixed 2 LIVE bugs on main]** `ae159d96bed2a8db5`. Bug1: qwen prefill projected all T rows, argmax wrote output_id[0..T-1] into a batch=1 buffer → OOB write + greedy read row0 = argmax of FIRST prompt token not last (empirically 1479 vs correct 264); the #56 last-row fix was only on the gemm branch, never on main. Bug2 (#41): get_last_logits read absolute current_pos-1 vs the head's step-local row → stale after T=1 decode / 2nd prefill chunk. Fix: prefill projects only row T-1; get_last_logits reads logits[last_seq-1]. Validated on 0.6b: prefill-T>1 first token 264==264, get_last_logits correct after prefill+chunked, greedy C decode byte-identical. PR #64→main. **NOTE: T>1 prefill generation on main returns the WRONG first token — real correctness bug, fixed here.** Replenishing with #28/#29 docs refresh (local).
 - **[#20/#21 q3k/q5k canonical = WIN (PR #63, housekeeping)]** `a5caf67c702ab063d`. One canonical q3k_matvec + q5k_matvec in kernels/gemm/ (lane=pos, matches q6k sibling) + byte-assembly scale-unpack (UB fix: scales @offset96/110B-stride only 2-byte-aligned) + full Dtype::Q3_K/Q5_K plumbing (weight_store/gguf codes 11,13/qwen_model/launcher/weight_loader.py) — none was on main. De-duped 3 divergent q3k ports. Numerics median_rel 1.7e-4, cosine 1.0 (incl 14B dims). PR #63→main (open, review). Replenishing with #41 logits-OOB audit (local).
