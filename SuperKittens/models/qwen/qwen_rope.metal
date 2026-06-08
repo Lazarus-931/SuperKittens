@@ -50,7 +50,7 @@ void qwen_rope_qk(
 // permuted by the HF->GGUF converter so this NORM convention reproduces HF
 // rotate_half; the split-half kernel above (rope type 2 / NEOX, Qwen3) would
 // scramble positions. cos/sin tables are the same (freq-indexed). Grid/TG identical
-// to qwen_rope_qk; each lane handles 4 contiguous dims = 2 pairs (freq d4*2, d4*2+1).
+// to qwen_rope_qk.
 [[host_name("qwen_rope_qk_interleaved")]]
 [[kernel, max_total_threads_per_threadgroup(1024)]]
 void qwen_rope_qk_interleaved(
