@@ -191,12 +191,19 @@ class DeepSeek(Model):
                      **kw_weights: np.ndarray) -> None:
         if weights is None: weights = {}
         weights = {**weights, **kw_weights}
+        # w_lm_head (null → tied to embed) and router_bias (null → V2-Lite) are
+        # optional in the C ABI; the rest are required.
+        optional_w = {"w_lm_head", "router_bias"}
         keep: list[np.ndarray] = []
         w = _Weights()
         for name in _WEIGHT_FIELDS:
             a = weights.get(name)
             if a is None:
-                raise ValueError(f"missing weight: {name}. Required: {_WEIGHT_FIELDS}")
+                if name in optional_w:
+                    setattr(w, name, None)
+                    continue
+                raise ValueError(f"missing weight: {name}. Required: "
+                                 f"{tuple(n for n in _WEIGHT_FIELDS if n not in optional_w)}")
             a = np.ascontiguousarray(a, dtype=np.float16)
             keep.append(a)
             setattr(w, name, a.ctypes.data)

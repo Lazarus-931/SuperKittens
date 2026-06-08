@@ -8,6 +8,7 @@
 #include <cmath>
 
 #include "../../kernels/moe/moe_ffn.h"
+#include "../../inference/weight_store.h"
 
 namespace meow { namespace deepseek {
 inline float metal_sqrt_safe(float x) { return std::sqrt(x); }
@@ -95,6 +96,15 @@ struct LayerPSOs {
     MTL::ComputePipelineState* gated_mlp;
     MTL::ComputePipelineState* silu_mul;        // fp16 elementwise silu(gate)*up
 
+    // Native K-quant matvec (decode M=1) so dense/attn/shared/LM-head weights
+    // stay quantized at their GGUF dtype instead of host-dequant→fp16 (which
+    // both inflates resident ~1.7 GB and spikes 838 MB fp32 temps at load,
+    // OOM-killing the 16 GB box). All three share the qwen ABI:
+    //   B(act fp16 [K])=0, A(weight [N,K] row-major)=1, C(out fp16 [N])=2, K=3, N=4.
+    MTL::ComputePipelineState* q4k_matvec = nullptr;
+    MTL::ComputePipelineState* q6k_matvec = nullptr;
+    MTL::ComputePipelineState* q8_0_matvec = nullptr;
+
     MoeFfnPSOs moe;
 };
 
@@ -123,6 +133,15 @@ struct LayerBuffers {
     MTL::Buffer* w_gate;
     MTL::Buffer* w_up;
     MTL::Buffer* w_down;
+
+    // Per-projection weight dtype. F16 → fp16 GEMM; Q4_K/Q6_K/Q8_0 → quant matvec
+    // (decode). attn_kv_b stays fp16 always (de-interleaved per head at load).
+    sk::Dtype dt_q     = sk::Dtype::F16;   // q_proj (w_q_b on V2-Lite)
+    sk::Dtype dt_kv_a  = sk::Dtype::F16;
+    sk::Dtype dt_o     = sk::Dtype::F16;
+    sk::Dtype dt_sh_gate = sk::Dtype::F16;
+    sk::Dtype dt_sh_up   = sk::Dtype::F16;
+    sk::Dtype dt_sh_down = sk::Dtype::F16;
 
     MTL::Buffer* rope_pos;
 
@@ -186,6 +205,61 @@ inline void encode_gemm(
     enc->endEncoding();
 }
 
+// Decode-time K-quant matvec. Weight A is GGUF-native [N, K] row-major (no
+// transpose); activation B is fp16 [M, K]; output C is fp16 [M, N]. One M=1
+// dispatch per row (M>1 prefill loops). qwen ABI: B=0, A=1, C=2, K=3, N=4.
+inline MTL::ComputePipelineState* ds_quant_matvec_pso(
+    const LayerPSOs& P, sk::Dtype dt)
+{
+    switch (dt) {
+        case sk::Dtype::Q4_K: return P.q4k_matvec;
+        case sk::Dtype::Q6_K: return P.q6k_matvec;
+        case sk::Dtype::Q8_0: return P.q8_0_matvec;
+        default:              return nullptr;
+    }
+}
+
+inline void encode_quant_matvec(
+    MTL::CommandBuffer* cmd, MTL::ComputePipelineState* pso,
+    MTL::Buffer* A, size_t off_A,        // weight [N, K] quantized
+    MTL::Buffer* B, size_t off_B,        // activation fp16 [M, K]
+    MTL::Buffer* C, size_t off_C,        // output fp16 [M, N]
+    uint32_t M, uint32_t N, uint32_t K)
+{
+    auto* enc = cmd->computeCommandEncoder();
+    enc->setComputePipelineState(pso);
+    for (uint32_t m = 0; m < M; ++m) {
+        enc->setBuffer(B, off_B + (size_t)m * K * 2, 0);
+        enc->setBuffer(A, off_A,                     1);
+        enc->setBuffer(C, off_C + (size_t)m * N * 2, 2);
+        enc->setBytes(&K, 4, 3);
+        enc->setBytes(&N, 4, 4);
+        const uint32_t rows_per_tg = 2;
+        enc->dispatchThreadgroups(MTL::Size((N + rows_per_tg - 1) / rows_per_tg, 1, 1),
+                                  MTL::Size(128, 1, 1));
+    }
+    enc->endEncoding();
+}
+
+// Dispatch a projection: quant matvec when dt is a K-quant, else fp16 GEMM.
+// w_off is the byte offset into the (single, multi-layer) weight buffer; for
+// quant weights this is computed from the quant block size, for fp16 from 2 B.
+inline void encode_proj(
+    MTL::CommandBuffer* cmd, const LayerPSOs& P, sk::Dtype dt,
+    MTL::Buffer* W, size_t off_W,
+    MTL::Buffer* X, size_t off_X,
+    MTL::Buffer* Y, size_t off_Y,
+    uint32_t M, uint32_t N, uint32_t K)
+{
+    MTL::ComputePipelineState* qpso = ds_quant_matvec_pso(P, dt);
+    if (qpso) {
+        encode_quant_matvec(cmd, qpso, W, off_W, X, off_X, Y, off_Y, M, N, K);
+    } else {
+        // fp16 GEMM expects A=activation [M,K], B=weight [K,N]; off_Y must be 0.
+        encode_gemm(cmd, P.gemm, X, off_X, W, off_W, Y, M, N, K);
+    }
+}
+
 inline void encode_cast(
     MTL::CommandBuffer* cmd, MTL::ComputePipelineState* pso,
     MTL::Buffer* src, MTL::Buffer* dst, uint32_t n)
@@ -245,34 +319,41 @@ inline void dispatch_attn(
     const float rope_fscale   = (rope_factor > 1.f) ? (1.f / rope_factor) : 1.f;
     const float rope_csmscale = 1.f;   // attention_factor == 1.0 for V2-Lite
 
+    // Per-layer byte stride for a weight of `elems` per layer at dtype dt.
+    auto layer_off = [](sk::Dtype dt, uint32_t L, size_t elems) -> size_t {
+        return (size_t)L * sk::dtype_bytes(dt, elems);
+    };
+
     const size_t off_norm        = (size_t)L * p.d_model * 2;
     const size_t off_w_q_a       = (size_t)L * p.d_model * p.q_lora_rank * 2;
     const size_t off_w_q_a_norm  = (size_t)L * p.q_lora_rank * 2;
-    const size_t off_w_q_b       = (size_t)L * p.q_lora_rank * p.n_heads * dk * 2;
-    const size_t off_w_kv_a      = (size_t)L * p.d_model * (p.kv_lora_rank + p.qk_rope_dim) * 2;
     const size_t off_w_kv_a_norm = (size_t)L * p.kv_lora_rank * 2;
-    const size_t off_w_o         = (size_t)L * p.n_heads * p.v_head_dim * p.d_model * 2;
+    const uint32_t kva_N         = p.kv_lora_rank + p.qk_rope_dim;
+    const uint32_t qbN           = p.n_heads * dk;
 
     encode_rmsnorm(cmd, P.rmsnorm, B.x, B.w_pre_attn_norm, off_norm,
                    B.x_norm, T, p.d_model, p.eps, P.rmsnorm_t1);
 
     if (p.has_q_lora) {
+        const size_t off_w_q_b = layer_off(B.dt_q, L, (size_t)qbN * p.q_lora_rank);
         encode_gemm(cmd, P.gemm, B.x_norm, 0, B.w_q_a, off_w_q_a, B.q_a,
                     T, p.q_lora_rank, p.d_model);
         encode_rmsnorm(cmd, P.rmsnorm, B.q_a, B.w_q_a_norm, off_w_q_a_norm,
                        B.q_a, T, p.q_lora_rank, p.eps, P.rmsnorm_t1);
-        encode_gemm(cmd, P.gemm, B.q_a, 0, B.w_q_b, off_w_q_b, B.q_packed,
-                    T, p.n_heads * dk, p.q_lora_rank);
+        encode_proj(cmd, P, B.dt_q, B.w_q_b, off_w_q_b, B.q_a, 0, B.q_packed, 0,
+                    T, qbN, p.q_lora_rank);
     } else {
-        // Patch H: V2-Lite has no q_lora; q_proj is a single dense (d_model -> n_heads*dk).
-        // Loader writes the q_proj weight directly into w_q_b (configuration_deepseek_v2:q_lora_rank=None).
-        const size_t off_w_q_proj = (size_t)L * p.d_model * p.n_heads * dk * 2;
-        encode_gemm(cmd, P.gemm, B.x_norm, 0, B.w_q_b, off_w_q_proj, B.q_packed,
-                    T, p.n_heads * dk, p.d_model);
+        // V2-Lite has no q_lora; q_proj is a single dense (d_model -> n_heads*dk).
+        const size_t off_w_q_proj = layer_off(B.dt_q, L, (size_t)qbN * p.d_model);
+        encode_proj(cmd, P, B.dt_q, B.w_q_b, off_w_q_proj, B.x_norm, 0, B.q_packed, 0,
+                    T, qbN, p.d_model);
     }
 
-    encode_gemm(cmd, P.gemm, B.x_norm, 0, B.w_kv_a, off_w_kv_a, B.kv_a_packed,
-                T, p.kv_lora_rank + p.qk_rope_dim, p.d_model);
+    {
+        const size_t off_w_kv_a = layer_off(B.dt_kv_a, L, (size_t)kva_N * p.d_model);
+        encode_proj(cmd, P, B.dt_kv_a, B.w_kv_a, off_w_kv_a, B.x_norm, 0,
+                    B.kv_a_packed, 0, T, kva_N, p.d_model);
+    }
 
     {
         auto* enc = cmd->computeCommandEncoder();
@@ -567,8 +648,12 @@ inline void dispatch_attn(
                     T * p.n_heads * p.v_head_dim);
     }
 
-    encode_gemm(cmd, P.gemm, B.attn_out, 0, B.w_o, off_w_o, B.o_proj,
-                T, p.d_model, p.n_heads * p.v_head_dim);
+    {
+        const uint32_t o_K = p.n_heads * p.v_head_dim;
+        const size_t off_w_o = layer_off(B.dt_o, L, (size_t)p.d_model * o_K);
+        encode_proj(cmd, P, B.dt_o, B.w_o, off_w_o, B.attn_out, 0, B.o_proj, 0,
+                    T, p.d_model, o_K);
+    }
 }
 
 // Unfused gated MLP: gate=x@Wg, up=x@Wu, mid=silu(gate)*up, out=mid@Wd.
@@ -580,16 +665,16 @@ inline void dispatch_gated_mlp_unfused(
     const LayerPSOs&     P,
     const LayerBuffers&  B,
     const LayerParams&   p,
-    MTL::Buffer* w_gate, size_t off_gate,
-    MTL::Buffer* w_up,   size_t /*off_up == off_gate*/,
-    MTL::Buffer* w_down, size_t off_down,
+    MTL::Buffer* w_gate, size_t off_gate, sk::Dtype dt_gate,
+    MTL::Buffer* w_up,   size_t off_up,   sk::Dtype dt_up,
+    MTL::Buffer* w_down, size_t off_down, sk::Dtype dt_down,
     uint32_t n_int,
     MTL::Buffer* out)
 {
     const uint32_t T = p.batch * p.seq;
-    encode_gemm(cmd, P.gemm, B.m_in, 0, w_gate, off_gate, B.mlp_gate,
+    encode_proj(cmd, P, dt_gate, w_gate, off_gate, B.m_in, 0, B.mlp_gate, 0,
                 T, n_int, p.d_model);
-    encode_gemm(cmd, P.gemm, B.m_in, 0, w_up,   off_gate, B.mlp_up,
+    encode_proj(cmd, P, dt_up,   w_up,   off_up,   B.m_in, 0, B.mlp_up,   0,
                 T, n_int, p.d_model);
     {
         const uint32_t n = T * n_int;
@@ -603,7 +688,7 @@ inline void dispatch_gated_mlp_unfused(
                                   MTL::Size(256, 1, 1));
         enc->endEncoding();
     }
-    encode_gemm(cmd, P.gemm, B.mlp_gate, 0, w_down, off_down, out,
+    encode_proj(cmd, P, dt_down, w_down, off_down, B.mlp_gate, 0, out, 0,
                 T, p.d_model, n_int);
 }
 
@@ -614,12 +699,13 @@ inline void dispatch_shared_expert(
     const LayerParams&   p)
 {
     const uint32_t L = p.layer_idx;
-    const size_t off_w_gate = (size_t)L * p.d_model * p.shared_n_int * 2;
-    const size_t off_w_down = (size_t)L * p.shared_n_int * p.d_model * 2;
+    const size_t off_w_gate = (size_t)L * sk::dtype_bytes(B.dt_sh_gate, (size_t)p.shared_n_int * p.d_model);
+    const size_t off_w_up   = (size_t)L * sk::dtype_bytes(B.dt_sh_up,   (size_t)p.shared_n_int * p.d_model);
+    const size_t off_w_down = (size_t)L * sk::dtype_bytes(B.dt_sh_down, (size_t)p.d_model * p.shared_n_int);
     dispatch_gated_mlp_unfused(cmd, P, B, p,
-                               B.w_shared_gate, off_w_gate,
-                               B.w_shared_up,   off_w_gate,
-                               B.w_shared_down, off_w_down,
+                               B.w_shared_gate, off_w_gate, B.dt_sh_gate,
+                               B.w_shared_up,   off_w_up,   B.dt_sh_up,
+                               B.w_shared_down, off_w_down, B.dt_sh_down,
                                p.shared_n_int, B.shared_out);
 }
 
@@ -654,12 +740,14 @@ inline void dispatch_layer(
     // Leading dense layers (L < first_k_dense_replace): a single wide gated MLP
     // (no shared/routed experts). y_out = y_attn + dense_mlp(m_in).
     if (!p.is_moe_layer) {
+        // Leading dense layer kept fp16 (single layer, ~0.13 GB — negligible to
+        // the 16 GB fit; avoids a Q8_0-down + Q4_K-gate mixed matvec path here).
         const size_t off_g = (size_t)L * p.d_model * p.dense_n_int * 2;
         const size_t off_d = (size_t)L * p.dense_n_int * p.d_model * 2;
         dispatch_gated_mlp_unfused(cmd, P, B, p,
-                                   B.w_dense_gate, off_g,
-                                   B.w_dense_up,   off_g,
-                                   B.w_dense_down, off_d,
+                                   B.w_dense_gate, off_g, sk::Dtype::F16,
+                                   B.w_dense_up,   off_g, sk::Dtype::F16,
+                                   B.w_dense_down, off_d, sk::Dtype::F16,
                                    p.dense_n_int, B.shared_out);
         auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(P.add);
@@ -886,6 +974,17 @@ struct ModelWeights {
     MTL::Buffer* w_up;
     MTL::Buffer* w_down;
     const LayerCache* layer_caches;
+
+    // Per-projection weight dtype (uniform across layers in Q4_K_M except shared
+    // down, which alternates Q4_K/Q6_K — tracked per layer in dt_sh_down_per_L).
+    // F16 → fp16 GEMM; Q4_K/Q6_K/Q8_0 → native matvec (keeps weights quantized).
+    sk::Dtype dt_q       = sk::Dtype::F16;
+    sk::Dtype dt_kv_a    = sk::Dtype::F16;
+    sk::Dtype dt_o       = sk::Dtype::F16;
+    sk::Dtype dt_sh_gate = sk::Dtype::F16;
+    sk::Dtype dt_sh_up   = sk::Dtype::F16;
+    sk::Dtype dt_lm_head = sk::Dtype::F16;
+    const sk::Dtype* dt_sh_down_per_L = nullptr;   // [n_layers]; F16 for dense layers
 };
 
 struct ModelBuffers {
@@ -1028,6 +1127,12 @@ inline void dispatch_model(
         lb.w_gate          = W.w_gate;
         lb.w_up            = W.w_up;
         lb.w_down          = W.w_down;
+        lb.dt_q            = W.dt_q;
+        lb.dt_kv_a         = W.dt_kv_a;
+        lb.dt_o            = W.dt_o;
+        lb.dt_sh_gate      = W.dt_sh_gate;
+        lb.dt_sh_up        = W.dt_sh_up;
+        lb.dt_sh_down      = W.dt_sh_down_per_L ? W.dt_sh_down_per_L[L] : sk::Dtype::F16;
         lb.rope_pos        = B.rope_pos;
         lb.c_kv_cache      = W.layer_caches[L].c_kv;
         lb.k_pe_cache      = W.layer_caches[L].k_pe;
@@ -1071,26 +1176,35 @@ inline void dispatch_model(
                    nxt, T, M.d_model, M.eps, P.layer.rmsnorm_t1);
 
     {
-        auto* enc = cmd->computeCommandEncoder();
-        enc->setComputePipelineState(P.layer.gemm);
         const uint32_t M_v = T;
         const uint32_t K_v = M.d_model;
         const uint32_t N_v = M.vocab_size;
-        uint32_t ldA = K_v, ldB = K_v, ldC = N_v;
-        int transA = 0, transB = 1, has_bias = 0;
-        enc->setBuffer(nxt,        0, 0);
-        // Patch F: untied LM head; loader aliases w_lm_head -> w_embed for V2-tied case.
-        enc->setBuffer(W.w_lm_head ? W.w_lm_head : W.w_embed, 0, 1);
-        enc->setBuffer(B.logits,   0, 2);
-        enc->setBytes(&M_v,      4, 3); enc->setBytes(&N_v,      4, 4);
-        enc->setBytes(&K_v,      4, 5); enc->setBytes(&ldA,      4, 6);
-        enc->setBytes(&ldB,      4, 7); enc->setBytes(&ldC,      4, 8);
-        enc->setBytes(&transA,   4, 9); enc->setBytes(&transB,   4, 10);
-        enc->setBytes(&has_bias, 4, 11);
-        enc->setBuffer(B.logits, 0, 12);
-        enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M_v + 63) / 64, 1),
-                                  MTL::Size(64, 1, 1));
-        enc->endEncoding();
+        MTL::Buffer* lm = W.w_lm_head ? W.w_lm_head : W.w_embed;
+        MTL::ComputePipelineState* lm_q = ds_quant_matvec_pso(P.layer, W.dt_lm_head);
+        if (lm_q) {
+            // q{4,6,8}_matvec reads the LM head as [vocab, d_model] row-major —
+            // the same orientation the fp16 transB=1 GEMM used — so the quant
+            // head is numerically identical to the fp16-dequant head, just
+            // dequantized in-kernel (qwen Q6_K-LM-head pattern).
+            encode_quant_matvec(cmd, lm_q, lm, 0, nxt, 0, B.logits, 0, M_v, N_v, K_v);
+        } else {
+            auto* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(P.layer.gemm);
+            uint32_t ldA = K_v, ldB = K_v, ldC = N_v;
+            int transA = 0, transB = 1, has_bias = 0;
+            enc->setBuffer(nxt,        0, 0);
+            enc->setBuffer(lm,         0, 1);
+            enc->setBuffer(B.logits,   0, 2);
+            enc->setBytes(&M_v,      4, 3); enc->setBytes(&N_v,      4, 4);
+            enc->setBytes(&K_v,      4, 5); enc->setBytes(&ldA,      4, 6);
+            enc->setBytes(&ldB,      4, 7); enc->setBytes(&ldC,      4, 8);
+            enc->setBytes(&transA,   4, 9); enc->setBytes(&transB,   4, 10);
+            enc->setBytes(&has_bias, 4, 11);
+            enc->setBuffer(B.logits, 0, 12);
+            enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M_v + 63) / 64, 1),
+                                      MTL::Size(64, 1, 1));
+            enc->endEncoding();
+        }
     }
 
     {

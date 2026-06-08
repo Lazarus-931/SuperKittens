@@ -1,6 +1,7 @@
 #include "weights.h"
 #include "deepseek_model.h"
 #include "../../inference/weight_store.h"
+#include "../../kernels/runtime_bindings.h"
 #include "../load/gguf/gguf.h"
 
 #include <cstdio>
@@ -249,6 +250,104 @@ bool is_block_quant(sk::Dtype t) {
     return t == sk::Dtype::Q2_K || t == sk::Dtype::Q4_K || t == sk::Dtype::IQ2_XXS;
 }
 
+// Dtypes the deepseek decode matvec (q4k/q6k/q8_0) can consume directly.
+bool is_quant_matvec(sk::Dtype t) {
+    return t == sk::Dtype::Q4_K || t == sk::Dtype::Q6_K || t == sk::Dtype::Q8_0;
+}
+
+// Stream a quantized [V, D] embedding table to fp16 row-by-row so the transient
+// fp32 temp is one row (D floats), not the whole tensor (V*D = 838 MB at V2-Lite).
+// The full-tensor copy_into spike on top of ~12 GB resident is what OOM-kills the
+// 16 GB box at layer 26/27.
+bool stream_embed_to_fp16(MTL::Buffer* dst, sk::WeightStore* store,
+                          const std::string& name, size_t V, size_t D) {
+    auto* v = store->get(name);
+    if (!v) { std::fprintf(stderr, "ds weights: missing tensor '%s'\n", name.c_str()); return false; }
+    uint16_t* d = (uint16_t*)dst->contents();
+    std::vector<float> row(D);
+    const uint8_t* src = (const uint8_t*)v->data;
+    size_t src_row_bytes = 0;
+    switch (v->dtype) {
+        case sk::Dtype::F16:
+            std::memcpy(d, v->data, V * D * 2); return true;
+        case sk::Dtype::F32: {
+            const float* s = (const float*)v->data;
+            for (size_t i = 0; i < V * D; ++i) d[i] = f32_to_fp16_bits(s[i]);
+            return true;
+        }
+        case sk::Dtype::Q8_0: src_row_bytes = (D / 32) * 34;  break;
+        case sk::Dtype::Q5_0: src_row_bytes = (D / 32) * 22;  break;
+        case sk::Dtype::Q4_K: src_row_bytes = (D / 256) * 144; break;
+        case sk::Dtype::Q6_K: src_row_bytes = (D / 256) * 210; break;
+        default:
+            std::fprintf(stderr, "ds weights: embed unsupported dtype\n"); return false;
+    }
+    for (size_t r = 0; r < V; ++r) {
+        const uint8_t* sr = src + r * src_row_bytes;
+        switch (v->dtype) {
+            case sk::Dtype::Q8_0: dequant_q8_0_to_f32(row.data(), sr, D); break;
+            case sk::Dtype::Q5_0: dequant_q5_0_to_f32(row.data(), sr, D); break;
+            case sk::Dtype::Q4_K: dequant_q4_k_to_f32(row.data(), sr, D); break;
+            case sk::Dtype::Q6_K: dequant_q6_k_to_f32(row.data(), sr, D); break;
+            default: return false;
+        }
+        for (size_t j = 0; j < D; ++j) d[r * D + j] = f32_to_fp16_bits(row[j]);
+    }
+    return true;
+}
+
+// Keep a quant tensor at its GGUF dtype: release the fp16-sized buffer the
+// launcher pre-allocated and reallocate a quant-sized one, then raw-memcpy the
+// block bytes. Block-quant GGUF tensors are stored row-major [out, in] — exactly
+// the layout q{4,6,8}_matvec want — so NO transpose/dequant (kills the fp32 spike
+// AND the fp16 bloat). `expect_elems` = out*in (n_layers * per_layer for the
+// multi-layer slab buffers).
+bool keep_quant(MTL::Buffer** dst, MTL::Device* dev, sk::WeightStore* store,
+                const std::string& name, sk::Dtype expect_dt, size_t expect_elems) {
+    auto* v = store->get(name);
+    if (!v) { std::fprintf(stderr, "ds weights: missing tensor '%s'\n", name.c_str()); return false; }
+    if (v->dtype != expect_dt) {
+        std::fprintf(stderr, "ds weights: '%s' dtype %d != expected %d\n",
+                     name.c_str(), (int)v->dtype, (int)expect_dt);
+        return false;
+    }
+    const size_t want = sk::dtype_bytes(expect_dt, expect_elems);
+    if (v->nbytes != want) {
+        std::fprintf(stderr, "ds weights: '%s' size %zu != expect %zu\n",
+                     name.c_str(), v->nbytes, want);
+        return false;
+    }
+    if (*dst && (*dst)->length() != want) { (*dst)->release(); *dst = nullptr; }
+    if (!*dst) {
+        *dst = dev->newBuffer(want, MTL::ResourceStorageModeShared);
+        if (!*dst) { std::fprintf(stderr, "ds weights: alloc '%s' failed\n", name.c_str()); return false; }
+    }
+    std::memcpy((*dst)->contents(), v->data, want);
+    return true;
+}
+
+// Copy one layer's quant block bytes into a multi-layer quant slab at byte
+// offset L*per_layer_bytes (buffer pre-sized for all layers at quant dtype).
+bool copy_quant_layer(MTL::Buffer* dst, size_t dst_off, sk::WeightStore* store,
+                      const std::string& name, sk::Dtype expect_dt,
+                      size_t per_layer_elems) {
+    auto* v = store->get(name);
+    if (!v) { std::fprintf(stderr, "ds weights: missing tensor '%s'\n", name.c_str()); return false; }
+    if (v->dtype != expect_dt) {
+        std::fprintf(stderr, "ds weights: '%s' dtype %d != expected %d\n",
+                     name.c_str(), (int)v->dtype, (int)expect_dt);
+        return false;
+    }
+    const size_t want = sk::dtype_bytes(expect_dt, per_layer_elems);
+    if (v->nbytes != want) {
+        std::fprintf(stderr, "ds weights: '%s' size %zu != expect %zu\n",
+                     name.c_str(), v->nbytes, want);
+        return false;
+    }
+    std::memcpy((char*)dst->contents() + dst_off, v->data, want);
+    return true;
+}
+
 }  // namespace
 
 extern "C" int sk_deepseek_load_from_store(sk_deepseek_handle* hp, sk::WeightStore* store) {
@@ -272,19 +371,84 @@ extern "C" int sk_deepseek_load_from_store(sk_deepseek_handle* hp, sk::WeightSto
     const size_t E    = c.n_expert;
     const bool   has_qlora  = (c.has_q_lora != 0);
 
-    if (!copy_into(h->weights.w_embed, 0, store,
-                   "token_embd.weight", (size_t)c.vocab_size * dm * fp16)) return -10;
+    auto* dev = sk::bindings_device();
+    if (!dev) return -2;
+
+    // Embed: stream-dequant to fp16 (cheap per-token gather; row-by-row temp
+    // avoids the whole-tensor 838 MB fp32 spike).
+    if (!stream_embed_to_fp16(h->weights.w_embed, store,
+                              "token_embd.weight", c.vocab_size, dm)) return -10;
     if (!copy_into(h->weights.w_final_norm, 0, store,
                    "output_norm.weight", dm * fp16)) return -11;
-    // Untied LM head (output.weight); dequant to fp16 [vocab, d_model].
-    if (store->get("output.weight")) {
-        if (!copy_into(h->weights.w_lm_head, 0, store,
-                       "output.weight", (size_t)c.vocab_size * dm * fp16)) return -12;
-    }
 
     // q_in for the q_proj: q_lora_rank if present, else d_model (V2-Lite direct).
     const size_t q_in = has_qlora ? qra : dm;
     const size_t dint = c.dense_n_int ? c.dense_n_int : sni;
+
+    // ── Keep dense/attn/shared/LM-head QUANTIZED at GGUF dtype + native matvec ──
+    // (the host-dequant-to-fp16 trap: inflates resident ~1.7 GB and spikes fp32
+    // temps that OOM-kill the 16 GB box). Detect each projection's dtype from the
+    // first layer that has it; block-quant GGUF tensors are [out,in] row-major =
+    // exactly the q{4,6,8}_matvec layout, so raw-memcpy (no transpose/dequant).
+    auto dt_of = [&](const std::string& nm) -> sk::Dtype {
+        auto* v = store->get(nm);
+        return v ? v->dtype : sk::Dtype::F16;
+    };
+    const uint32_t first_moe = c.first_k_dense_replace;
+    const std::string q_name = has_qlora ? "attn_q_b.weight" : "attn_q.weight";
+    h->weights.dt_q     = dt_of(blk_key(0, q_name.c_str()));
+    h->weights.dt_kv_a  = dt_of(blk_key(0, store->get(blk_key(0,"attn_kv_a_mqa.weight"))
+                                          ? "attn_kv_a_mqa.weight" : "attn_kv.weight"));
+    h->weights.dt_o     = dt_of(blk_key(0, "attn_output.weight"));
+    h->weights.dt_sh_gate = dt_of(blk_key(first_moe, "ffn_gate_shexp.weight"));
+    h->weights.dt_sh_up   = dt_of(blk_key(first_moe, "ffn_up_shexp.weight"));
+
+    // SK_DS_FORCE_FP16=1 forces the legacy host-dequant→fp16 path (A/B baseline).
+    const bool force_fp16 = std::getenv("SK_DS_FORCE_FP16") != nullptr;
+    if (force_fp16) {
+        h->weights.dt_q = h->weights.dt_kv_a = h->weights.dt_o = sk::Dtype::F16;
+        h->weights.dt_sh_gate = h->weights.dt_sh_up = sk::Dtype::F16;
+    }
+    const bool quant_q  = is_quant_matvec(h->weights.dt_q);
+    const bool quant_kv = is_quant_matvec(h->weights.dt_kv_a);
+    const bool quant_o  = is_quant_matvec(h->weights.dt_o);
+    const bool quant_sg = is_quant_matvec(h->weights.dt_sh_gate);
+    const bool quant_su = is_quant_matvec(h->weights.dt_sh_up);
+
+    // Reallocate the multi-layer slab buffers to quant size when kept quantized.
+    auto realloc_slab = [&](MTL::Buffer** b, bool quant, sk::Dtype dt, size_t per_layer_elems) {
+        if (!quant) return true;
+        const size_t want = (size_t)c.n_layers * sk::dtype_bytes(dt, per_layer_elems);
+        if (*b) { (*b)->release(); }
+        *b = dev->newBuffer(want, MTL::ResourceStorageModeShared);
+        return *b != nullptr;
+    };
+    if (!realloc_slab(&h->weights.w_q_b,         quant_q,  h->weights.dt_q,     (size_t)qbN * q_in)) return -3;
+    if (!realloc_slab(&h->weights.w_kv_a,        quant_kv, h->weights.dt_kv_a,  (size_t)kva_cols * dm)) return -3;
+    if (!realloc_slab(&h->weights.w_o,           quant_o,  h->weights.dt_o,     (size_t)dm * nh * dv)) return -3;
+    if (!realloc_slab(&h->weights.w_shared_gate, quant_sg, h->weights.dt_sh_gate, (size_t)sni * dm)) return -3;
+    if (!realloc_slab(&h->weights.w_shared_up,   quant_su, h->weights.dt_sh_up,   (size_t)sni * dm)) return -3;
+
+    // Per-layer shared-down dtype (Q4_K_M alternates Q4_K/Q6_K). Kept fp16 here
+    // (mixed-dtype slab adds risk for ~0.2 GB; gate/up + attn carry the win).
+    static std::vector<sk::Dtype> sh_down_dt;
+    sh_down_dt.assign(c.n_layers, sk::Dtype::F16);
+    h->weights.dt_sh_down_per_L = sh_down_dt.data();
+
+    // LM head: keep Q6_K (largest per-token read) + q6k_matvec. Numerically
+    // identical to the fp16 transB=1 head, just dequantized in-kernel.
+    {
+        auto* v = store->get("output.weight");
+        if (v && is_quant_matvec(v->dtype) && !force_fp16) {
+            if (!keep_quant(&h->weights.w_lm_head, dev, store, "output.weight",
+                            v->dtype, (size_t)c.vocab_size * dm)) return -12;
+            h->weights.dt_lm_head = v->dtype;
+        } else if (v) {
+            if (!copy_into(h->weights.w_lm_head, 0, store,
+                           "output.weight", (size_t)c.vocab_size * dm * fp16)) return -12;
+            h->weights.dt_lm_head = sk::Dtype::F16;
+        }
+    }
 
     // Per-layer routed-expert slab byte sizes (gate/up Q4_K, down Q8_0).
     const size_t gate_bytes_per_layer = (size_t)E * ni * (dm / 256) * 144;
@@ -311,6 +475,8 @@ extern "C" int sk_deepseek_load_from_store(sk_deepseek_handle* hp, sk::WeightSto
                        blk_key(L, "attn_kv_a_norm.weight"), kvr * fp16)) return -23;
 
         // Q projection. V2-Lite: direct q_proj (attn_q). V3: q_a/q_a_norm/q_b.
+        // q_b/attn_q: GGUF stores [out=qbN, in=q_in] row-major = matvec layout.
+        const size_t q_b_qoff = (size_t)L * sk::dtype_bytes(h->weights.dt_q, (size_t)qbN * q_in);
         if (has_qlora) {
             const size_t qan_off = (size_t)L * qra * fp16;
             const size_t q_a_off = (size_t)L * dm * qra * fp16;
@@ -318,20 +484,29 @@ extern "C" int sk_deepseek_load_from_store(sk_deepseek_handle* hp, sk::WeightSto
                            blk_key(L, "attn_q_a_norm.weight"), qra * fp16)) return -22;
             if (!copy_transpose_fp16(h->weights.w_q_a, q_a_off, store,
                            blk_key(L, "attn_q_a.weight"), qra, dm)) return -24;
-            if (!copy_transpose_fp16(h->weights.w_q_b, q_b_off, store,
+            if (quant_q) {
+                if (!copy_quant_layer(h->weights.w_q_b, q_b_qoff, store,
+                               blk_key(L, "attn_q_b.weight"), h->weights.dt_q, (size_t)qbN * qra)) return -25;
+            } else if (!copy_transpose_fp16(h->weights.w_q_b, q_b_off, store,
                            blk_key(L, "attn_q_b.weight"), qbN, qra)) return -25;
         } else {
-            // attn_q: GGUF [in=dm, out=qbN] → dense GEMM wants [in=dm, out=qbN].
-            if (!copy_transpose_fp16(h->weights.w_q_b, q_b_off, store,
+            if (quant_q) {
+                if (!copy_quant_layer(h->weights.w_q_b, q_b_qoff, store,
+                               blk_key(L, "attn_q.weight"), h->weights.dt_q, (size_t)qbN * dm)) return -25;
+            } else if (!copy_transpose_fp16(h->weights.w_q_b, q_b_off, store,
                            blk_key(L, "attn_q.weight"), dm, qbN)) return -25;
         }
 
         {
-            // kv_a: GEMM wants [K=d_model, N=kva_cols]; GGUF logical [kva_cols, d_model].
+            // kv_a: GGUF stores [out=kva_cols, in=d_model] row-major = matvec layout.
             const std::string nm = blk_key(L, "attn_kv_a_mqa.weight");
             auto* v = store->get(nm);
             const std::string nm2 = v ? nm : blk_key(L, "attn_kv.weight");
-            if (!copy_transpose_fp16(h->weights.w_kv_a, kv_a_off, store,
+            if (quant_kv) {
+                const size_t kv_a_qoff = (size_t)L * sk::dtype_bytes(h->weights.dt_kv_a, (size_t)kva_cols * dm);
+                if (!copy_quant_layer(h->weights.w_kv_a, kv_a_qoff, store,
+                               nm2, h->weights.dt_kv_a, (size_t)kva_cols * dm)) return -26;
+            } else if (!copy_transpose_fp16(h->weights.w_kv_a, kv_a_off, store,
                            nm2, dm, kva_cols)) return -26;
         }
 
@@ -362,9 +537,12 @@ extern "C" int sk_deepseek_load_from_store(sk_deepseek_handle* hp, sk::WeightSto
                 }
             }
         }
-        // o_proj: dense GEMM wants [K=nh*dv, N=d_model]; GGUF logical is
-        // [out=d_model, in=nh*dv] → transpose to [nh*dv, d_model].
-        if (!copy_transpose_fp16(h->weights.w_o, o_off, store,
+        // o_proj: GGUF stores [out=d_model, in=nh*dv] row-major = matvec layout.
+        if (quant_o) {
+            const size_t o_qoff = (size_t)L * sk::dtype_bytes(h->weights.dt_o, (size_t)dm * nh * dv);
+            if (!copy_quant_layer(h->weights.w_o, o_qoff, store,
+                           blk_key(L, "attn_output.weight"), h->weights.dt_o, (size_t)dm * nh * dv)) return -28;
+        } else if (!copy_transpose_fp16(h->weights.w_o, o_off, store,
                        blk_key(L, "attn_output.weight"), nh * dv, dm)) return -28;
 
         if (dense) {
@@ -380,12 +558,20 @@ extern "C" int sk_deepseek_load_from_store(sk_deepseek_handle* hp, sk::WeightSto
             continue;
         }
 
-        // Shared experts (dequant to fp16) + router. gated_mlp wants
-        // w_gate/up [K=d_model, N_int=sni] and w_down [N_int=sni, N=d_model];
-        // GGUF gate/up logical [sni, dm], down logical [dm, sni] → transpose.
-        if (!copy_transpose_fp16(h->weights.w_shared_gate, sh_gate_off, store,
+        // Shared gate/up: GGUF stores [out=sni, in=dm] row-major = matvec layout.
+        // Kept quantized (Q4_K) + native matvec. Shared down stays fp16 (its
+        // GGUF dtype alternates Q4_K/Q6_K per layer; mixed slab deferred).
+        if (quant_sg) {
+            const size_t sg_qoff = (size_t)L * sk::dtype_bytes(h->weights.dt_sh_gate, (size_t)sni * dm);
+            if (!copy_quant_layer(h->weights.w_shared_gate, sg_qoff, store,
+                           blk_key(L, "ffn_gate_shexp.weight"), h->weights.dt_sh_gate, (size_t)sni * dm)) return -30;
+        } else if (!copy_transpose_fp16(h->weights.w_shared_gate, sh_gate_off, store,
                        blk_key(L, "ffn_gate_shexp.weight"), dm, sni)) return -30;
-        if (!copy_transpose_fp16(h->weights.w_shared_up, sh_gate_off, store,
+        if (quant_su) {
+            const size_t su_qoff = (size_t)L * sk::dtype_bytes(h->weights.dt_sh_up, (size_t)sni * dm);
+            if (!copy_quant_layer(h->weights.w_shared_up, su_qoff, store,
+                           blk_key(L, "ffn_up_shexp.weight"), h->weights.dt_sh_up, (size_t)sni * dm)) return -31;
+        } else if (!copy_transpose_fp16(h->weights.w_shared_up, sh_gate_off, store,
                        blk_key(L, "ffn_up_shexp.weight"), dm, sni)) return -31;
         if (!copy_transpose_fp16(h->weights.w_shared_down, sh_down_off, store,
                        blk_key(L, "ffn_down_shexp.weight"), sni, dm)) return -32;
