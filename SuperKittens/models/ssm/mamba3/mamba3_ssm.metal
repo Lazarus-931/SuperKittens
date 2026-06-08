@@ -83,11 +83,17 @@ void mamba3_ssm(
 
     for (uint ci = 0; ci < nC; ci++) {
         uint s = ci * CS, cl = min(CS, L - s);
+        // Tail chunks may have cl not a multiple of 8; the simdgroup score MMA
+        // tiles in 8x8, so pad Qc/Kc rows up to clp with zeros (zero scores)
+        // and guard the scatter to rows < cl so the tail rows aren't dropped.
+        uint clp = (cl + 7u) & ~7u;
 
         // load Q, K (full DQ), V tile (BV columns), A, B, angle
-        for (uint i = lid; i < cl * DQ; i += T) {
-            Qc[i] = Q[sQ + s*DQ + i];
-            Kc[i] = K[sQ + s*DQ + i];
+        for (uint i = lid; i < clp * DQ; i += T) {
+            uint t = i / DQ;
+            half qv = (t < cl) ? Q[sQ + s*DQ + i] : 0.0h;
+            half kv = (t < cl) ? K[sQ + s*DQ + i] : 0.0h;
+            Qc[i] = qv; Kc[i] = kv;
         }
         for (uint i = lid; i < cl * BV; i += T) {
             uint t = i / BV, vi = i % BV;
@@ -137,40 +143,43 @@ void mamba3_ssm(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // ── scores Q @ K^T via simdgroup mma (same as v1) ──
-        const uint MR = cl / 8, MC = cl / 8;
-        for (uint i = lid; i < cl * cl; i += T) sc[i] = 0.0h;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint k = 0; k < DQ / 8; k++) {
-            if (simd < MR * MC) {
-                uint r = simd / MC, c = simd % MC;
+        // ── scores Q @ K^T via simdgroup mma ──
+        // The accumulator must stay in registers across the full DQ/8 k-loop;
+        // reading a partial sum back out of threadgroup `sc` is invalid because
+        // thread_elements()[] does not map to logical (row,col) — only the
+        // lane-scatter below does. The store happens once after the k-loop.
+        // clp (cl padded to 8) needs (clp/8)^2 = up to 16 output tiles, but a
+        // 128-thread TG has only NSG=4 simdgroups, so each simdgroup strides
+        // over the tiles it owns rather than assuming one tile per simdgroup.
+        // sc uses stride clp so padded rows/cols (zero scores) don't alias real
+        // entries; the causal mask + cc<=pos read exclude the padded region.
+        const uint MR = clp / 8, MC = clp / 8;
+        const uint NSG = T / 32;
+        for (uint tile = simd; tile < MR * MC; tile += NSG) {
+            uint r = tile / MC, c = tile % MC;
+            simdgroup_float8x8 acc = simdgroup_float8x8(0.0f);
+            for (uint k = 0; k < DQ / 8; k++) {
                 simdgroup_half8x8 a, b;
                 simdgroup_load(a, Qc + (r*8)*DQ + k*8, DQ);
                 simdgroup_load(b, Kc + (c*8)*DQ + k*8, DQ, ulong2(0,0), true);
-
-                simdgroup_float8x8 acc;
-                for (uint ii = 0; ii < 8; ii++)
-                    for (uint jj = 0; jj < 8; jj++)
-                        acc.thread_elements()[ii*8+jj] = float(sc[(r*8+ii)*cl + c*8+jj]);
                 simdgroup_multiply_accumulate(acc, a, b, acc);
-                float2 v = reinterpret_cast<thread float2&>(acc.thread_elements());
-                uint qid = lane / 4;
-                uint lr = (qid & 4) + ((lane / 2) % 4);
-                uint lc = (qid & 2) * 2 + (lane % 2) * 2;
-                sc[(r*8+lr)*cl + c*8+lc]     = half(v.x);
-                sc[(r*8+lr)*cl + c*8+lc + 1] = half(v.y);
             }
+            float2 v = reinterpret_cast<thread float2&>(acc.thread_elements());
+            uint qid = lane / 4;
+            uint lr = (qid & 4) + ((lane / 2) % 4);
+            uint lc = (qid & 2) * 2 + (lane % 2) * 2;
+            sc[(r*8+lr)*clp + c*8+lc]     = half(v.x);
+            sc[(r*8+lr)*clp + c*8+lc + 1] = half(v.y);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // decay + causal mask
+        // decay + causal mask (only the real cl x cl region matters)
         for (uint i = lid; i < cl * cl; i += T) {
             uint row = i / cl, col = i % cl;
-            float val = float(sc[i]);
+            float val = float(sc[row*clp + col]);
             if (col <= row) val *= metal::fast::exp(a_cs[row] - a_cs[col]);
             else val = 0.0f;
-            sc[i] = half(val);
+            sc[row*clp + col] = half(val);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -181,7 +190,7 @@ void mamba3_ssm(
             float qd = metal::fast::exp(a_cs[pos]) * b_s[pos];
             float intra = 0.0f;
             for (uint cc = 0; cc <= pos; cc++) {
-                intra += float(sc[pos*cl + cc]) * float(Vc[cc*BV + j]);
+                intra += float(sc[pos*clp + cc]) * float(Vc[cc*BV + j]);
             }
             float inter = 0.0f;
             for (uint di = 0; di < DQ; di++) {
