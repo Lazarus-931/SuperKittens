@@ -72,13 +72,16 @@ static MTL::ComputePipelineState* resolve_fa_vec_pso(MTL::Library* lib,
 static MTL::ComputePipelineState* resolve_mvid_pso(MTL::Library* lib,
                                                    MTL::Device* dev,
                                                    const char* name) {
+    (void)lib;
     auto* fcv = MTL::FunctionConstantValues::alloc()->init();
     int16_t nsg = 4, nxpsg = 4;
     fcv->setConstantValue(&nsg,   MTL::DataTypeShort, NS::UInteger(600));
     fcv->setConstantValue(&nxpsg, MTL::DataTypeShort, NS::UInteger(601));
     NS::Error* err = nullptr;
-    auto* fn = lib->newFunction(
-        NS::String::string(name, NS::UTF8StringEncoding), fcv, &err);
+    // Resolve across the prebuilt metallib AND the SK_METAL_SRC_FALLBACK source
+    // library, so a kernel present only in the runtime-compiled .metal (e.g. a
+    // freshly-added q5_0 variant) still binds on a CLT-only bench host.
+    auto* fn = sk::bindings_function(name, fcv, &err);
     fcv->release();
     if (!fn) {
         std::fprintf(stderr, "ds: mvid newFunction failed (%s): %s\n",
@@ -124,7 +127,7 @@ static bool resolve_psos(ModelPSOs& P, uint32_t dk, uint32_t dv) {
     P.layer.moe_mv_gate   = resolve_mvid_pso(
         sk::bindings_library(), sk::bindings_device(), "deepseek_mul_mv_id_q4_K");
     P.layer.moe_mv_down   = resolve_mvid_pso(
-        sk::bindings_library(), sk::bindings_device(), "deepseek_mul_mv_id_q8_0");
+        sk::bindings_library(), sk::bindings_device(), "deepseek_mul_mv_id_q5_0");
     P.layer.moe_swiglu_f32  = sk::bindings_pso("deepseek_moe_swiglu_f32");
     P.layer.moe_scatter_add = sk::bindings_pso("deepseek_moe_scatter_add_f32");
 
@@ -159,7 +162,7 @@ static bool resolve_psos(ModelPSOs& P, uint32_t dk, uint32_t dv) {
     _CK("mla_decode_v2",         P.layer.mla_decode_v2);
     _CK("mla_kv_write",          P.layer.mla_kv_write);
     _CK("moe_mul_mv_id_q4_K",    P.layer.moe_mv_gate);
-    _CK("moe_mul_mv_id_q8_0",    P.layer.moe_mv_down);
+    _CK("moe_mul_mv_id_q5_0",    P.layer.moe_mv_down);
     _CK("moe_swiglu_f32",        P.layer.moe_swiglu_f32);
     _CK("moe_scatter_add_f32",   P.layer.moe_scatter_add);
     _CK("q4k_matvec",            P.layer.q4k_matvec);
@@ -234,19 +237,20 @@ extern "C" sk_deepseek_handle* sk_deepseek_create(const sk_deepseek_config* cfg)
     // loader leaves zeros for V2-Lite, kernel ignores when has_bias=0.
     h->weights.router_bias = alloc_zero(dev, (size_t)cfg->n_layers * cfg->n_expert * 4);
     // Routed-expert weights. V2-Lite Q4_K_M (moe_quant==2): gate/up are Q4_K
-    // (144 B / 256 weights), DOWN is Q8_0 (34 B / 32 weights). INT2_DS4 keeps
-    // the ds4 V4-Flash layout. Layer 0 is dense (leading_dense_block_count=1)
-    // and stores its wide MLP in the shared-expert buffers instead — the routed
-    // buffers reserve a full per-layer slab for every layer for simple indexing.
+    // (144 B / 256 weights), DOWN is requantized to Q5_0 (22 B / 32 weights) to
+    // drop resident below the 16 GB swap line. INT2_DS4 keeps the ds4 V4-Flash
+    // layout. Layer 0 is dense (leading_dense_block_count=1) and stores its wide
+    // MLP in the shared-expert buffers instead — the routed buffers reserve a
+    // full per-layer slab for every layer for simple indexing.
     const bool   int2     = (cfg->moe_quant == 1);
     const bool   q4k      = (cfg->moe_quant == 2);
     const size_t gate_blk = int2 ? 66 : (q4k ? 144 : 512);   // per 256 weights
-    const size_t down_q8_blk = 34;                            // per 32 weights
+    const size_t down_q5_blk = 22;                            // Q5_0 per 32 weights
     const size_t n_blocks_gate_per_e = (size_t)cfg->n_int * (cfg->d_model / 256);
     const size_t n_blocks_down_per_e = q4k
-        ? (size_t)cfg->d_model * (cfg->n_int / 32)            // Q8_0: 32-wide blocks
+        ? (size_t)cfg->d_model * (cfg->n_int / 32)            // Q5_0: 32-wide blocks
         : (size_t)cfg->d_model * (cfg->n_int / 256);
-    const size_t down_blk = q4k ? down_q8_blk : (int2 ? 84 : 512);
+    const size_t down_blk = q4k ? down_q5_blk : (int2 ? 84 : 512);
     h->weights.w_gate = alloc_zero(dev, (size_t)cfg->n_layers * cfg->n_expert *
                                         n_blocks_gate_per_e * gate_blk);
     h->weights.w_up   = alloc_zero(dev, (size_t)cfg->n_layers * cfg->n_expert *
