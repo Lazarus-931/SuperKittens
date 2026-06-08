@@ -139,9 +139,36 @@ inline MTL::ComputePipelineState* bindings_pso_icb(const char* name) {
     return pso;
 }
 
-inline MTL::Device*       bindings_device()  { bindings_init(); return _bs().dev; }
-inline MTL::CommandQueue* bindings_queue()   { bindings_init(); return _bs().q;   }
-inline MTL::Library*      bindings_library() { bindings_init(); return _bs().lib; }
+inline MTL::Device*       bindings_device()      { bindings_init(); return _bs().dev; }
+inline MTL::CommandQueue* bindings_queue()       { bindings_init(); return _bs().q;   }
+inline MTL::Library*      bindings_library()     { bindings_init(); return _bs().lib; }
+inline MTL::Library*      bindings_library_src() { bindings_init(); return _bs().lib_src; }
+
+// Resolve a function by name across the prebuilt metallib AND the optional
+// SK_METAL_SRC_FALLBACK source library (the only PSO route on a CLT-only host).
+// Callers that build PSOs with function-constant specialization use this so a
+// kernel that lives only in the source-fallback lib still resolves.
+inline MTL::Function* bindings_function(const char* name,
+                                        MTL::FunctionConstantValues* fcv = nullptr,
+                                        NS::Error** out_err = nullptr) {
+    bindings_init();
+    auto& bs = _bs();
+    auto* nm = NS::String::string(name, NS::UTF8StringEncoding);
+    NS::Error* err = nullptr;
+    if (bs.lib) {
+        auto* fn = fcv ? bs.lib->newFunction(nm, fcv, &err) : bs.lib->newFunction(nm);
+        if (fn) return fn;
+    }
+    if (bs.lib_src) {
+        NS::Error* serr = nullptr;
+        auto* fn = fcv ? bs.lib_src->newFunction(nm, fcv, &serr) : bs.lib_src->newFunction(nm);
+        if (fn) return fn;
+        if (out_err) *out_err = serr;
+        return nullptr;
+    }
+    if (out_err) *out_err = err;
+    return nullptr;
+}
 
 } // namespace sk
 #endif

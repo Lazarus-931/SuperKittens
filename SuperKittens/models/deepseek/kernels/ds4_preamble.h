@@ -13,8 +13,10 @@ using namespace metal;
 #define SWAP(x, y)  { auto tmp = (x); (x) = (y); (y) = tmp; }
 
 #define QK8_0           32
+#define QK5_0           32
 #define N_SIMDWIDTH     32
 #define N_R0_Q8_0        2
+#define N_R0_Q5_0        2
 #define N_SG_Q8_0        4
 #define FC_MUL_MV      600
 #define FC_MUL_MM      700
@@ -33,6 +35,16 @@ enum ds4_sort_order {
 struct block_q8_0 {
     half d;
     int8_t qs[QK8_0];
+};
+
+// GGML Q5_0 block: 22 bytes / 32 weights (5.5 bit). qh is the packed 5th-bit
+// plane (bit i = high bit of weight i); qs packs two 4-bit lows per byte.
+// q[i]      = ((qs[i] & 0x0F) | ((qh >> i)        & 1) << 4) - 16   (i in 0..15)
+// q[i+16]   = ((qs[i] >>   4) | ((qh >> (i+16))   & 1) << 4) - 16   (i in 0..15)
+struct block_q5_0 {
+    half    d;
+    uint8_t qh[4];
+    uint8_t qs[QK5_0 / 2];
 };
 
 struct ds4_metal_args_mul_mv {
