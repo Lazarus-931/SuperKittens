@@ -160,7 +160,7 @@ def memory_aware_cache_max(
     weight_bytes: int, n_layers: int, n_kv_heads: int, head_dim: int,
     d_model: int, n_int: int, n_heads: int, vocab_size: int,
     headroom_gib: float = 6.0, total_mem_bytes: int | None = None,
-    kv_q8: bool = False,
+    kv_q8: bool = False, kv_q4: bool = False, kv_q4k: bool = False,
 ) -> int:
     """Clamp ``requested_cache_max`` so weights + KV + prefill scratch fit memory.
 
@@ -188,8 +188,19 @@ def memory_aware_cache_max(
         return requested_cache_max
 
     # fp16: head_dim*2 bytes per K (or V). Q8_0: head_dim int8 + (head_dim/32)
-    # fp16 block scales. ×2 for K and V.
-    per_kv = (head_dim + (head_dim // 32) * 2) if kv_q8 else (head_dim * 2)
+    # fp16 block scales. Q4: head_dim/2 nibbles + (head_dim/32) fp16 scales.
+    # ×2 for K and V.
+    sc = (head_dim // 32) * 2
+    if kv_q4k:
+        # K = D/2 nibbles + scales; V = D int8 + scales. (asymmetric: ×1 each)
+        per_kv_total = ((head_dim // 2) + sc) + (head_dim + sc)
+    elif kv_q4:
+        per_kv_total = 2 * ((head_dim // 2) + sc)
+    elif kv_q8:
+        per_kv_total = 2 * (head_dim + sc)
+    else:
+        per_kv_total = 2 * (head_dim * 2)
+    per_kv = per_kv_total // 2  # kv_per_tok below multiplies by ×2 for K+V
     kv_per_tok = n_layers * n_kv_heads * per_kv * 2
     cos_sin_per_slot = (head_dim // 2) * 2 * 2
 

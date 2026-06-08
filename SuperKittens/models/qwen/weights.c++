@@ -25,6 +25,8 @@ struct Handle {
     std::vector<MTL::Buffer*> v_caches;
     // Mirror launcher.c++ Handle exactly (ODR: both TUs define meow::qwen::Handle).
     bool kv_q8 = false;
+    bool kv_q4 = false;
+    bool kv_q4k = false;
     std::vector<MTL::Buffer*> kq_caches, vq_caches, ks_caches, vs_caches;
     uint32_t       layers_run;
     int32_t        capture_layer;

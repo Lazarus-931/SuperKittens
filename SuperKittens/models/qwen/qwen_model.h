@@ -61,6 +61,16 @@ struct LayerPSOs {
     MTL::ComputePipelineState* kv_cache_write_q8 = nullptr;
     MTL::ComputePipelineState* attn_q8           = nullptr;  // mha_causal_q8
     MTL::ComputePipelineState* attn_split_q8     = nullptr;  // mha_decode_split_q8
+    // Q4-KV path (gated by SK_KV_Q4). Reuses the *_q/_s cache buffers; ~0.28x
+    // the fp16 cache bytes (D/2 nibbles + D/32 fp16 scales, ×2 for K+V).
+    MTL::ComputePipelineState* kv_cache_write_q4 = nullptr;
+    MTL::ComputePipelineState* attn_q4           = nullptr;  // mha_causal_q4
+    MTL::ComputePipelineState* attn_split_q4     = nullptr;  // mha_decode_split_q4
+    // Mixed K-Q4/V-Q8 path (gated by SK_KV_Q4K). Near-Q8 coherence at long ctx
+    // (attention error is V-dominated) for ~0.41x the fp16 cache bytes.
+    MTL::ComputePipelineState* kv_cache_write_q4k = nullptr;
+    MTL::ComputePipelineState* attn_q4k           = nullptr;  // mha_causal_q4k_q8v
+    MTL::ComputePipelineState* attn_split_q4k     = nullptr;  // mha_decode_split_q4k_q8v
     MTL::ComputePipelineState* add;
     MTL::ComputePipelineState* add_rmsnorm;
     MTL::ComputePipelineState* gated_mlp;
@@ -102,6 +112,8 @@ struct LayerBuffers {
     MTL::Buffer* k_cache_s = nullptr;
     MTL::Buffer* v_cache_s = nullptr;
     bool         kv_q8     = false;
+    bool         kv_q4     = false;
+    bool         kv_q4k    = false;
 
     // Scratch (reused across layers)
     MTL::Buffer* x_norm;
@@ -410,8 +422,10 @@ inline void dispatch_layer(
 
     // 6. KV cache write.
     enc_barrier(enc);
-    if (B.kv_q8) {
-        enc->setComputePipelineState(P.kv_cache_write_q8);
+    if (B.kv_q8 || B.kv_q4 || B.kv_q4k) {
+        enc->setComputePipelineState(
+            B.kv_q4k ? P.kv_cache_write_q4k
+                     : (B.kv_q4 ? P.kv_cache_write_q4 : P.kv_cache_write_q8));
         enc->setBuffer(k_in,        0, 0);
         enc->setBuffer(v_in,        0, 1);
         enc->setBuffer(B.k_cache_q, 0, 2);
@@ -460,9 +474,13 @@ inline void dispatch_layer(
         constexpr uint32_t SPLITS = 8u;  // compile-time PM/PS/PO stride
         constexpr uint32_t NS = 4u;
         const uint32_t kv_gate = (Hg_attn <= 2u) ? 384u : 1024u;
+        const bool quant_kv = B.kv_q8 || B.kv_q4 || B.kv_q4k;
+        MTL::ComputePipelineState* split_pso =
+            B.kv_q4k ? P.attn_split_q4k
+                     : (B.kv_q4 ? P.attn_split_q4
+                                : (B.kv_q8 ? P.attn_split_q8 : P.attn_split));
         const bool use_split = (p.seq == 1) && (kv_len >= kv_gate)
-                               && (B.kv_q8 ? (P.attn_split_q8 != nullptr)
-                                           : (P.attn_split != nullptr))
+                               && (split_pso != nullptr)
                                && (P.attn_combine != nullptr)
                                && (B.attn_pm != nullptr);
         if (use_split) {
@@ -470,8 +488,8 @@ inline void dispatch_layer(
             uint32_t n_splits = (kv_len + 255u) / 256u;
             if (n_splits < 1u) n_splits = 1u;
             if (n_splits > SPLITS) n_splits = SPLITS;
-            if (B.kv_q8) {
-                enc->setComputePipelineState(P.attn_split_q8);
+            if (quant_kv) {
+                enc->setComputePipelineState(split_pso);
                 enc->setBuffer(q_in,        0, 0);
                 enc->setBuffer(B.k_cache_q, 0, 1);
                 enc->setBuffer(B.v_cache_q, 0, 2);
@@ -518,8 +536,9 @@ inline void dispatch_layer(
             enc->dispatchThreadgroups(
                 MTL::Size(p.n_heads, 1, p.batch),
                 MTL::Size(32, 1, 1));
-        } else if (B.kv_q8) {
-            enc->setComputePipelineState(P.attn_q8);
+        } else if (quant_kv) {
+            enc->setComputePipelineState(
+                B.kv_q4k ? P.attn_q4k : (B.kv_q4 ? P.attn_q4 : P.attn_q8));
             enc->setBuffer(q_in,        0, 0);
             enc->setBuffer(B.k_cache_q, 0, 1);
             enc->setBuffer(B.v_cache_q, 0, 2);
@@ -729,6 +748,8 @@ struct ModelParams {
     int32_t  capture_layer  = -1;  // if >=0, copy post-layer residual to capture_buf
 
     bool     kv_q8          = false;  // Q8_0 KV cache write + attention
+    bool     kv_q4          = false;  // Q4 KV cache write + attention
+    bool     kv_q4k         = false;  // mixed K-Q4/V-Q8 KV cache write + attention
 };
 
 struct ModelPSOs {
@@ -931,6 +952,8 @@ inline void dispatch_model(
         lb.k_cache_s       = W.layer_caches[L].ks;
         lb.v_cache_s       = W.layer_caches[L].vs;
         lb.kv_q8           = M.kv_q8;
+        lb.kv_q4           = M.kv_q4;
+        lb.kv_q4k          = M.kv_q4k;
         lb.x_norm          = B.x_norm;
         lb.qkv_packed      = B.qkv_packed;
         lb.q               = B.q;

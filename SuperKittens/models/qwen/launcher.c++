@@ -21,8 +21,12 @@ struct Handle {
     std::vector<LayerCache> layer_caches;
     std::vector<MTL::Buffer*> k_caches;
     std::vector<MTL::Buffer*> v_caches;
-    // Q8_0-KV cache buffers (parallel to k_caches/v_caches when kv_q8 active).
+    // Quantized-KV cache buffers (parallel to k_caches/v_caches when kv_q8 OR
+    // kv_q4 active; the two are mutually exclusive). Q4 packs nibbles so kq/vq
+    // are sized D/2 not D; the *_q4 kernels read them as packed uchar.
     bool kv_q8 = false;
+    bool kv_q4 = false;
+    bool kv_q4k = false;
     std::vector<MTL::Buffer*> kq_caches, vq_caches, ks_caches, vs_caches;
 
     uint32_t layers_run     = 0;
@@ -77,6 +81,14 @@ static bool resolve_psos(ModelPSOs& P) {
     P.layer.attn_q8           = sk::bindings_pso("mha_causal_q8");
     if (!getenv("SK_NO_SPLIT_ATTN"))
         P.layer.attn_split_q8 = sk::bindings_pso("mha_decode_split_q8");
+    P.layer.kv_cache_write_q4 = sk::bindings_pso("kv_cache_write_q4");
+    P.layer.attn_q4           = sk::bindings_pso("mha_causal_q4");
+    if (!getenv("SK_NO_SPLIT_ATTN"))
+        P.layer.attn_split_q4 = sk::bindings_pso("mha_decode_split_q4");
+    P.layer.kv_cache_write_q4k = sk::bindings_pso("kv_cache_write_q4k_q8v");
+    P.layer.attn_q4k           = sk::bindings_pso("mha_causal_q4k_q8v");
+    if (!getenv("SK_NO_SPLIT_ATTN"))
+        P.layer.attn_split_q4k = sk::bindings_pso("mha_decode_split_q4k_q8v");
     P.layer.add            = sk::bindings_pso("add_f16");
     P.layer.add_rmsnorm    = sk::bindings_pso("add_rmsnorm");
     P.layer.gated_mlp      = sk::bindings_pso("gated_mlp");
@@ -174,21 +186,31 @@ extern "C" sk_qwen_handle* sk_qwen_create(const sk_qwen_config* cfg) {
     h->kv_q8 = getenv("SK_KV_Q8") != nullptr
                && h->psos.layer.kv_cache_write_q8 != nullptr
                && h->psos.layer.attn_q8 != nullptr;
+    // SK_KV_Q4 stores K/V as 4-bit (D/2 nibbles + per-32-block fp16 scale):
+    // ~0.28x the fp16 cache bytes. Q8 takes precedence if both are set.
+    h->kv_q4k = !h->kv_q8 && getenv("SK_KV_Q4K") != nullptr
+                && h->psos.layer.kv_cache_write_q4k != nullptr
+                && h->psos.layer.attn_q4k != nullptr;
+    h->kv_q4 = !h->kv_q8 && !h->kv_q4k && getenv("SK_KV_Q4") != nullptr
+               && h->psos.layer.kv_cache_write_q4 != nullptr
+               && h->psos.layer.attn_q4 != nullptr;
     h->layer_caches.resize(cfg->n_layers);
     h->k_caches.resize(cfg->n_layers);
     h->v_caches.resize(cfg->n_layers);
-    if (h->kv_q8) {
+    if (h->kv_q8 || h->kv_q4 || h->kv_q4k) {
         const uint32_t nblk = hd / 32u;
         const size_t n_tok = (size_t)cfg->batch * cfg->n_kv_heads * cfg->cache_max;
-        const size_t q_bytes = n_tok * hd;            // int8
+        // K is Q4 (D/2 nibbles) in both q4 and q4k; V is Q4 only in pure q4.
+        const size_t kq_bytes = n_tok * ((h->kv_q4 || h->kv_q4k) ? (hd / 2) : hd);
+        const size_t vq_bytes = n_tok * (h->kv_q4 ? (hd / 2) : hd);
         const size_t s_bytes = n_tok * nblk * 2;      // fp16 scales
         h->kq_caches.resize(cfg->n_layers);
         h->vq_caches.resize(cfg->n_layers);
         h->ks_caches.resize(cfg->n_layers);
         h->vs_caches.resize(cfg->n_layers);
         for (uint32_t L = 0; L < cfg->n_layers; ++L) {
-            h->kq_caches[L] = alloc_zero(dev, q_bytes);
-            h->vq_caches[L] = alloc_zero(dev, q_bytes);
+            h->kq_caches[L] = alloc_zero(dev, kq_bytes);
+            h->vq_caches[L] = alloc_zero(dev, vq_bytes);
             h->ks_caches[L] = alloc_zero(dev, s_bytes);
             h->vs_caches[L] = alloc_zero(dev, s_bytes);
             h->layer_caches[L].kq = h->kq_caches[L];
@@ -380,6 +402,8 @@ static int run_step(Handle* h, MTL::CommandQueue* q, uint32_t seq) {
     mp.layers_run      = h->layers_run;
     mp.capture_layer   = h->capture_layer;
     mp.kv_q8           = h->kv_q8;
+    mp.kv_q4           = h->kv_q4;
+    mp.kv_q4k          = h->kv_q4k;
     h->last_seq        = seq;
 
     auto* cmd = q->commandBuffer();

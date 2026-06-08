@@ -93,4 +93,120 @@ void kv_cache_write_q8(
     }
 }
 
+// Q4 KV write. Same per-32-block fp16-scale layout as Q8, but values are 4-bit:
+// scale = max|x|/7, q = round(x/scale) clamped to [-8,7], stored as a nibble
+// biased by +8 into [0,15] so two nibbles pack into one uint8 (low nibble =
+// even lane, high nibble = odd lane). Halves the qs bytes vs Q8 (D/2 vs D).
+// Layout: qs in (B,H_kv,cache_size,D/2) uint8, sc in (B,H_kv,cache_size,D/32)
+// fp16. One simdgroup of 32 lanes owns one (bh, t_in, block); D mult of 32.
+[[host_name("kv_cache_write_q4")]]
+[[kernel]]
+void kv_cache_write_q4(
+    device const half*  new_k      [[buffer(0)]],
+    device const half*  new_v      [[buffer(1)]],
+    device       uchar* k_cache_q  [[buffer(2)]],   // (B,H_kv,cache_size,D/2) packed nibbles
+    device       uchar* v_cache_q  [[buffer(3)]],
+    device       half*  k_cache_s  [[buffer(4)]],   // (B,H_kv,cache_size,D/32) fp16
+    device       half*  v_cache_s  [[buffer(5)]],
+    constant uint& B               [[buffer(6)]],
+    constant uint& H_kv            [[buffer(7)]],
+    constant uint& D_head          [[buffer(8)]],
+    constant uint& seq_in          [[buffer(9)]],
+    constant uint& pos             [[buffer(10)]],
+    constant uint& cache_size      [[buffer(11)]],
+    uint3 gid  [[thread_position_in_grid]],
+    uint  lane [[thread_index_in_simdgroup]])
+{
+    const uint nblk = D_head / 32u;
+    const uint blk  = gid.x >> 5;
+    const uint t_in = gid.y;
+    const uint bh   = gid.z;
+    if (blk >= nblk || t_in >= seq_in || bh >= B * H_kv) return;
+
+    const uint buf_t = (pos + t_in) % cache_size;
+    const size_t in_row  = ((size_t)bh * seq_in     + t_in)  * D_head      + blk * 32u;
+    const size_t out_row = ((size_t)bh * cache_size + buf_t) * (D_head / 2) + blk * 16u;
+    const size_t sc_row  = ((size_t)bh * cache_size + buf_t) * nblk         + blk;
+
+    const float kf = float(new_k[in_row + lane]);
+    const float vf = float(new_v[in_row + lane]);
+    const float kd = simd_max(fabs(kf)) / 7.0f;
+    const float vd = simd_max(fabs(vf)) / 7.0f;
+    const float kinv = kd > 0.0f ? 1.0f / kd : 0.0f;
+    const float vinv = vd > 0.0f ? 1.0f / vd : 0.0f;
+
+    // Bias signed [-8,7] by +8 -> [0,15]; clamp guards round-half overshoot at
+    // the absmax element (x*inv = +-7 exactly).
+    const int kq = clamp(int(round(kf * kinv)) + 8, 0, 15);
+    const int vq = clamp(int(round(vf * vinv)) + 8, 0, 15);
+
+    // Even lane owns byte (lane/2): low nibble = even lane, high nibble = odd.
+    const uint kq_hi = simd_shuffle_down((uint)kq, 1u);
+    const uint vq_hi = simd_shuffle_down((uint)vq, 1u);
+    if ((lane & 1u) == 0u) {
+        const uint byte_idx = lane >> 1;
+        k_cache_q[out_row + byte_idx] = uchar((uint)kq | (kq_hi << 4));
+        v_cache_q[out_row + byte_idx] = uchar((uint)vq | (vq_hi << 4));
+    }
+    if (lane == 0) {
+        k_cache_s[sc_row] = half(kd);
+        v_cache_s[sc_row] = half(vd);
+    }
+}
+
+// Mixed-precision KV write: K as Q4 (D/2 nibbles), V as Q8 (D int8); both with
+// per-32-block fp16 scales. Attention error is V-dominated (softmax averages V
+// directly; K only perturbs scores, which the softmax normalizes away), so
+// K-Q4 V-Q8 keeps near-Q8 coherence at ~0.41x the fp16 cache bytes vs Q8's
+// 0.53x. K nibbles biased +8 like kv_cache_write_q4; V int8 like q8.
+[[host_name("kv_cache_write_q4k_q8v")]]
+[[kernel]]
+void kv_cache_write_q4k_q8v(
+    device const half*  new_k      [[buffer(0)]],
+    device const half*  new_v      [[buffer(1)]],
+    device       uchar* k_cache_q  [[buffer(2)]],   // (B,H_kv,cache_size,D/2) packed nibbles
+    device       char*  v_cache_q  [[buffer(3)]],   // (B,H_kv,cache_size,D) int8
+    device       half*  k_cache_s  [[buffer(4)]],
+    device       half*  v_cache_s  [[buffer(5)]],
+    constant uint& B               [[buffer(6)]],
+    constant uint& H_kv            [[buffer(7)]],
+    constant uint& D_head          [[buffer(8)]],
+    constant uint& seq_in          [[buffer(9)]],
+    constant uint& pos             [[buffer(10)]],
+    constant uint& cache_size      [[buffer(11)]],
+    uint3 gid  [[thread_position_in_grid]],
+    uint  lane [[thread_index_in_simdgroup]])
+{
+    const uint nblk = D_head / 32u;
+    const uint blk  = gid.x >> 5;
+    const uint t_in = gid.y;
+    const uint bh   = gid.z;
+    if (blk >= nblk || t_in >= seq_in || bh >= B * H_kv) return;
+
+    const uint buf_t = (pos + t_in) % cache_size;
+    const size_t in_row    = ((size_t)bh * seq_in     + t_in)  * D_head      + blk * 32u;
+    const size_t kout_row  = ((size_t)bh * cache_size + buf_t) * (D_head / 2) + blk * 16u;
+    const size_t vout_row  = ((size_t)bh * cache_size + buf_t) * D_head       + blk * 32u;
+    const size_t sc_row    = ((size_t)bh * cache_size + buf_t) * nblk         + blk;
+
+    const float kf = float(new_k[in_row + lane]);
+    const float vf = float(new_v[in_row + lane]);
+    const float kd = simd_max(fabs(kf)) / 7.0f;
+    const float vd = simd_max(fabs(vf)) / 127.0f;
+    const float kinv = kd > 0.0f ? 1.0f / kd : 0.0f;
+    const float vinv = vd > 0.0f ? 1.0f / vd : 0.0f;
+
+    const int kq = clamp(int(round(kf * kinv)) + 8, 0, 15);
+    const uint kq_hi = simd_shuffle_down((uint)kq, 1u);
+    if ((lane & 1u) == 0u)
+        k_cache_q[kout_row + (lane >> 1)] = uchar((uint)kq | (kq_hi << 4));
+
+    v_cache_q[vout_row + lane] = (char)round(vf * vinv);
+
+    if (lane == 0) {
+        k_cache_s[sc_row] = half(kd);
+        v_cache_s[sc_row] = half(vd);
+    }
+}
+
 } // namespace meow::ops::kv_cache
