@@ -25,6 +25,7 @@ struct ArgsPool {
 struct IcbPSOs {
     MTL::ComputePipelineState* embedding_lookup;
     MTL::ComputePipelineState* rmsnorm;
+    MTL::ComputePipelineState* rmsnorm_t1;   // T=1 full-d_model norm (matches dispatch_model)
     MTL::ComputePipelineState* split_packed;
     MTL::ComputePipelineState* rope_qk;
     MTL::ComputePipelineState* kv_cache_write;
@@ -74,6 +75,11 @@ QwenDecodeIcb* qwen_icb_build(MTL::Device* dev,
     IcbPSOs P{};
     P.embedding_lookup = req(P, "embedding_lookup");
     P.rmsnorm          = req(P, "rmsnorm");
+    // dispatch_model picks rmsnorm_t1 for the rows==1 (T=1) full-d_model norms
+    // (pre-attn, final); the SIMD-tree reduction order differs from rmsnorm, so
+    // matching it is required for byte-identical logits. Optional: if absent,
+    // fall back to rmsnorm everywhere (parity may then break — guarded below).
+    P.rmsnorm_t1       = sk::bindings_pso_icb("rmsnorm_t1");
     P.split_packed     = req(P, "split_packed");
     P.rope_qk          = req(P, "qwen_rope_qk");
     P.kv_cache_write   = req(P, "kv_cache_write");
@@ -88,6 +94,20 @@ QwenDecodeIcb* qwen_icb_build(MTL::Device* dev,
     P.argmax_partial = req(P, "argmax_partial");
     P.argmax_reduce  = req(P, "argmax_reduce");
     if (!P.ok) return nullptr;
+
+    // Parity guard: dispatch_model uses rmsnorm_t1 for the T=1 full-d_model
+    // norms iff P0.layer.rmsnorm_t1 is registered. The ICB must use the same
+    // kernel or logits diverge in the last fp16 bit. If dispatch_model would
+    // use t1 but the ICB-variant PSO is unavailable, bail to per-dispatch.
+    const bool model_uses_t1 = (P0.layer.rmsnorm_t1 != nullptr);
+    if (model_uses_t1 && !P.rmsnorm_t1) {
+        std::fprintf(stderr, "qwen_icb: rmsnorm_t1 ICB PSO unavailable; "
+                             "using per-dispatch decode for parity\n");
+        return nullptr;
+    }
+    // PSO for the T=1 full-d_model norm: t1 when the model uses it, else plain.
+    MTL::ComputePipelineState* norm_full_pso = model_uses_t1 ? P.rmsnorm_t1 : P.rmsnorm;
+    const bool norm_full_is_t1 = model_uses_t1;
 
     const uint32_t T   = 1;
     const uint32_t hd  = M.head_dim;
@@ -203,14 +223,15 @@ QwenDecodeIcb* qwen_icb_build(MTL::Device* dev,
         const sk::Dtype dt_v   = W.dt_v_layer.empty()    ? W.dt_qkv : W.dt_v_layer[L];
         const sk::Dtype dt_down= W.dt_down_layer.empty() ? sk::Dtype::F16 : W.dt_down_layer[L];
 
-        // 1. pre-attn rmsnorm: (x, gamma, y, rows, d, eps)
+        // 1. pre-attn rmsnorm: (x, gamma, y, rows, d, eps). rows==T==1 → t1.
         {
-            Rec r; r.slot = slot++; r.pso = P.rmsnorm; r.barrier = true;
+            Rec r; r.slot = slot++; r.pso = norm_full_pso; r.barrier = true;
             r.bufs = { cur, W.w_pre_attn_norm, B.x_norm, nullptr, nullptr, nullptr };
             NS::UInteger oR = pool.put_u(T), oD = pool.put_u(M.d_model), oE = pool.put_f(M.eps);
             r.offs = { 0, off_norm, 0, oR, oD, oE };
             r.args_idx = { 3, 4, 5 };
-            r.grid = MTL::Size(1, (T + 3) / 4, 1); r.tg = MTL::Size(128, 1, 1);
+            if (norm_full_is_t1) { r.grid = MTL::Size(1, T, 1); r.tg = MTL::Size(256, 1, 1); }
+            else                 { r.grid = MTL::Size(1, (T + 3) / 4, 1); r.tg = MTL::Size(128, 1, 1); }
             recs.push_back(std::move(r));
             mark(cur); mark(W.w_pre_attn_norm); mark(B.x_norm);
         }
@@ -387,14 +408,15 @@ QwenDecodeIcb* qwen_icb_build(MTL::Device* dev,
         MTL::Buffer* tmp = cur; cur = nxt; nxt = tmp;
     }
 
-    // C. final rmsnorm: cur → nxt
+    // C. final rmsnorm: cur → nxt. rows==T==1 → t1 (matches dispatch_model).
     {
-        Rec r; r.slot = slot++; r.pso = P.rmsnorm; r.barrier = true;
+        Rec r; r.slot = slot++; r.pso = norm_full_pso; r.barrier = true;
         r.bufs = { cur, W.w_final_norm, nxt, nullptr, nullptr, nullptr };
         NS::UInteger oR = pool.put_u(T), oD = pool.put_u(M.d_model), oE = pool.put_f(M.eps);
         r.offs = { 0, 0, 0, oR, oD, oE };
         r.args_idx = { 3, 4, 5 };
-        r.grid = MTL::Size(1, (T + 3) / 4, 1); r.tg = MTL::Size(128, 1, 1);
+        if (norm_full_is_t1) { r.grid = MTL::Size(1, T, 1); r.tg = MTL::Size(256, 1, 1); }
+        else                 { r.grid = MTL::Size(1, (T + 3) / 4, 1); r.tg = MTL::Size(128, 1, 1); }
         recs.push_back(std::move(r));
         mark(cur); mark(W.w_final_norm); mark(nxt);
     }

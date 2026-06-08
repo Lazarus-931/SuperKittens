@@ -75,6 +75,7 @@ QWEN_ABI = {
     "load_gguf":              optional([ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int),
     "set_rope_tables":  optional([ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p], ctypes.c_int),
     "get_last_logits":  optional([ctypes.c_void_p, ctypes.c_void_p], ctypes.c_int),
+    "get_timing":       optional([ctypes.c_void_p, ctypes.c_void_p], ctypes.c_int),
 }
 
 
@@ -298,6 +299,26 @@ class Qwen(Model):
         rc = _load().sk_qwen_get_last_logits(self._h, out.ctypes.data)
         if rc: raise RuntimeError(f"sk_qwen_get_last_logits failed: {rc}")
         return out
+
+    def decode_timing(self) -> dict:
+        """Read + reset accumulated T=1 decode-step timing (CPU-encode vs GPU
+        wait). Returns per-step means in microseconds. Requires a build with
+        sk_qwen_get_timing (returns empty dict otherwise)."""
+        lib = _load()
+        if not hasattr(lib, "sk_qwen_get_timing"):
+            return {}
+        buf = np.zeros((3,), dtype=np.uint64)
+        rc = lib.sk_qwen_get_timing(self._h, buf.ctypes.data)
+        if rc:
+            return {}
+        cpu_ns, gpu_ns, steps = int(buf[0]), int(buf[1]), int(buf[2])
+        if steps == 0:
+            return {"steps": 0}
+        return {
+            "steps": steps,
+            "cpu_encode_us": cpu_ns / steps / 1e3,
+            "gpu_wait_us":   gpu_ns / steps / 1e3,
+        }
 
     def set_rope_tables(self, cos: np.ndarray, sin: np.ndarray) -> None:
         c = np.ascontiguousarray(cos, dtype=np.float16)

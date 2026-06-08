@@ -9,6 +9,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <vector>
+#include <chrono>
 
 namespace meow { namespace qwen {
 
@@ -43,6 +44,14 @@ struct Handle {
     QwenDecodeIcb* decode_icb     = nullptr;
     bool           icb_enabled    = false;
     bool           icb_build_tried = false;
+
+    // Decode-step timing (T=1 only). cpu_encode_ns sums the host-side cost of
+    // turning a token into a committed command buffer (per-dispatch: the full
+    // dispatch_model re-encode; ICB: prepare + executeCommandsInBuffer). Lets
+    // the bench isolate the per-token CPU-encode gap from GPU wall time.
+    uint64_t cpu_encode_ns = 0;
+    uint64_t gpu_wait_ns   = 0;
+    uint64_t step_count    = 0;
 };
 
 static MTL::Buffer* alloc_zero(MTL::Device* dev, size_t bytes) {
@@ -369,21 +378,51 @@ static int run_step(Handle* h, MTL::CommandQueue* q, uint32_t seq) {
     if (want_icb && h->decode_icb) {
         const uint32_t total_after = mp.current_pos + 1;
         const uint32_t kv_len = (total_after < mp.cache_max) ? total_after : mp.cache_max;
-        qwen_icb_prepare(h->decode_icb, mp.current_pos, kv_len, mp.head_dim);
-        auto* cmd = q->commandBuffer();
-        qwen_icb_replay(h->decode_icb, cmd);
-        cmd->commit();
-        cmd->waitUntilCompleted();
-        cmd->release();
-        h->current_pos += seq;
-        return 0;
+        // The ICB records only mha_causal. dispatch_model switches to the
+        // split-K decode kernel once kv_len crosses kv_gate (Hg-dependent), so
+        // replay only while still on the mha_causal path — else fall through to
+        // dispatch_model to preserve byte-identical logits.
+        const uint32_t Hg_attn = mp.n_heads / mp.n_kv_heads;
+        const uint32_t kv_gate = (Hg_attn <= 2u) ? 384u : 1024u;
+        const bool split_active = (h->psos.layer.attn_split != nullptr)
+                                  && (h->psos.layer.attn_combine != nullptr)
+                                  && (h->bufs.attn_pm != nullptr)
+                                  && (kv_len >= kv_gate);
+        if (!split_active) {
+            using clk = std::chrono::steady_clock;
+            auto t0 = clk::now();
+            qwen_icb_prepare(h->decode_icb, mp.current_pos, kv_len, mp.head_dim);
+            auto* cmd = q->commandBuffer();
+            qwen_icb_replay(h->decode_icb, cmd);
+            cmd->commit();
+            auto t1 = clk::now();
+            cmd->waitUntilCompleted();
+            auto t2 = clk::now();
+            cmd->release();
+            if (seq == 1) {
+                h->cpu_encode_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+                h->gpu_wait_ns   += std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
+                h->step_count    += 1;
+            }
+            h->current_pos += seq;
+            return 0;
+        }
     }
 
+    using clk = std::chrono::steady_clock;
+    auto t0 = clk::now();
     auto* cmd = q->commandBuffer();
     dispatch_model(cmd, h->psos, h->weights, h->bufs, mp);
     cmd->commit();
+    auto t1 = clk::now();
     cmd->waitUntilCompleted();
+    auto t2 = clk::now();
     cmd->release();
+    if (seq == 1) {
+        h->cpu_encode_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+        h->gpu_wait_ns   += std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
+        h->step_count    += 1;
+    }
     h->current_pos += seq;
     return 0;
 }
@@ -478,6 +517,21 @@ extern "C" int sk_qwen_get_last_logits(sk_qwen_handle* hp, void* out_fp16) {
     const size_t last_row = (size_t)(h->current_pos - 1);
     const char* src = (const char*)h->bufs.logits->contents() + last_row * row_bytes;
     std::memcpy(out_fp16, src, row_bytes);
+    return 0;
+}
+
+// Decode-step timing accessor. Returns accumulated CPU-encode / GPU-wait time
+// (ns) over all T=1 steps and the step count, then zeroes the accumulators so
+// the next region (warmup vs measured) starts clean. out is 3 uint64:
+//   [0] cpu_encode_ns total, [1] gpu_wait_ns total, [2] step_count.
+extern "C" int sk_qwen_get_timing(sk_qwen_handle* hp, void* out_u64x3) {
+    if (!hp || !out_u64x3) return -1;
+    auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
+    uint64_t* o = (uint64_t*)out_u64x3;
+    o[0] = h->cpu_encode_ns;
+    o[1] = h->gpu_wait_ns;
+    o[2] = h->step_count;
+    h->cpu_encode_ns = 0; h->gpu_wait_ns = 0; h->step_count = 0;
     return 0;
 }
 
