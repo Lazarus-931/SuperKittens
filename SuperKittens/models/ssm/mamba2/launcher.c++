@@ -36,9 +36,9 @@ static bool resolve_psos(ModelPSOs& P) {
     P.layer.gemm         = sk::bindings_pso("gemm_fp16");
     P.layer.split_packed = sk::bindings_pso("split_packed");
     P.layer.conv1d_silu  = sk::bindings_pso("conv1d_silu");
-    // Prefer the reference (HF-signature-correct) kernels; fall back to legacy.
-    P.layer.mamba2_ssd   = sk::bindings_pso("mamba2_ssd_ref");
-    if (!P.layer.mamba2_ssd) P.layer.mamba2_ssd = sk::bindings_pso("mamba2_ssd");
+    // Production SSD; ref kernel (same signature) is the numerical fallback.
+    P.layer.mamba2_ssd   = sk::bindings_pso("mamba2_ssd");
+    if (!P.layer.mamba2_ssd) P.layer.mamba2_ssd = sk::bindings_pso("mamba2_ssd_ref");
     P.layer.mamba2_step  = sk::bindings_pso("mamba2_step_ref");
     if (!P.layer.mamba2_step) P.layer.mamba2_step = sk::bindings_pso("mamba2_step");
     P.layer.gate_norm    = sk::bindings_pso("gate_norm");

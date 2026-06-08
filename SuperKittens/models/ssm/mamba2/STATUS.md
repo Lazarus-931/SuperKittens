@@ -1,15 +1,42 @@
 # Mamba 2 SK port — STATUS
 
-## KNOWN BROKEN
+## SSD kernel — FIXED (dev-sk-mamba2-ssd-fix)
 
-`mamba2_ssd.metal` is numerically incorrect and is **not** used by the launcher.
-Missing: softplus(dt + dt_bias), `dt * B * x` input gating, `D * x` skip,
-n_groups sharing for B/C. Signature takes `(Q, K, V, A_log[B,H,L])` — does not
-match HF Mamba2 SSD.
+`mamba2_ssd.metal` was rewritten to the HF-correct signature
+(`x, dt_raw, A_log, B, C, D, dt_bias → y, ssm_state`) — same buffer layout as
+`mamba2_ssd_ref` so the launcher binds it unchanged. It now does
+softplus(dt + dt_bias) clamp, `dt * B * x` input gating, `D * x` skip, and
+n_groups B/C sharing.
 
-The launcher routes around it to `mamba2_ssd_ref.metal` / `mamba2_step_ref.metal`
-(per-token recurrence, signature-correct). The chunked `mamba2_ssd.metal` needs
-a full rewrite before it can replace the ref path.
+Design: grid `(B*H, P)`, one simdgroup (32 lanes) per (h,p) row, N/32 state
+elements per lane held in registers, per-token `C·s` reduction via a single
+`simd_sum` (no threadgroup barriers, no shared state). Algebraically the same
+selective-state recurrence as the ref and as HF `torch_forward`.
+
+The launcher now prefers `mamba2_ssd` (ref kernel is the numerical fallback).
+The legacy Q/K/V `sk_mamba2_ssd*` / `sk_mamba2_step` C stubs in `mamba2.{c++,h}`
+were removed (they would misbind the new signature; nothing referenced them).
+
+**Validation (local, this Mac, vs numpy oracle + HF + ref kernel):**
+- numpy oracle cross-checked against real HF `Mamba2Mixer.torch_forward`: rel_y
+  ~4e-8 (so the oracle is faithful).
+- new kernel vs oracle: **rel_y ≤ 2.1e-4** (fp16 output noise), fp32 state
+  rel ≤ 7e-7, across L ∈ {16,128,200,255,256,257,300,512,600,700} — incl.
+  L = chunk_size and L > chunk_size. Also n_groups=2 and batch=2 pass.
+- new vs ref kernel: rel_y ~4e-6; state-carry (prefill → decode steps) is
+  **bit-exact** vs one-shot.
+- argmax equivalence through an out_proj→lm_head-shaped fp16 projection:
+  **0 / 12296 token-position mismatches** vs the ref kernel ⇒ swapping kernels
+  cannot change a generated token, so the ref path's known HF-argmax-match /
+  coherent decode (see below) carries over unchanged.
+
+**Perf (single-layer SSD op, GPU-timed, min-of-reps, this Mac):**
+- new vs ref: **2.37x @ L=64, 2.65x @ L=256, 2.73x @ L=1024** (eliminates the
+  ref's per-token tree-reduction + scalar-broadcast threadgroup barriers).
+
+Lab: `temp/mamba2_ssd_fix/` (gitignored) — `ssd_ref_np.py` (oracle),
+`check_vs_hf.py`, `validate.py` / `validate_full.py`, `argmax_equiv.py`,
+`bench_ssd.py`, `metal_runner.py` (runtime-compile harness).
 
 ---
 
@@ -106,8 +133,8 @@ Need (mirroring qwen/qwen_model.h, qwen/launcher.{h,c++}, qwen/weights.{h,c++}):
 SuperKittens/models/ssm/mamba2/
 ├── conv1d_silu.metal      # usable
 ├── gate_norm.metal        # usable
-├── mamba2_ssd.metal       # signature wrong (needs rewrite per HF L398-586)
-├── mamba2_step.metal      # signature wrong (needs rewrite for decode)
+├── mamba2_ssd.metal       # FIXED: HF-correct sig, simd_sum scan (= ref, ~2.7x faster)
+├── mamba2_step.metal      # legacy Q/K/V sig (unused; decode uses mamba2_step_ref)
 ├── mamba2_block.h         # partial scaffold, not used yet
 ├── mamba2.{c++,h,py}      # legacy stubs, replace with launcher.{c++,h} + mamba2.py
 └── STATUS.md              # this file
