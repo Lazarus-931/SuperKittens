@@ -59,11 +59,14 @@ static bool resolve_psos(ModelPSOs& P) {
     // the per-row matvec loop in encode_quant_gemm. SK_NO_GEMM_MMA=1 forces the
     // matvec-loop prefill (A/B bench of the batched path against the per-row one).
     if (getenv("SK_NO_GEMM_MMA")) {
-        P.layer.gemm_mma_f16 = P.layer.gemm_mma_q8_0 = P.layer.gemm_mma_q4k = nullptr;
+        P.layer.gemm_mma_f16 = P.layer.gemm_mma_bf16 = P.layer.gemm_mma_q8_0 =
+            P.layer.gemm_mma_q4k = P.layer.gemm_mma_q6k = nullptr;
     } else {
         P.layer.gemm_mma_f16   = sk::bindings_pso("gemm_mma_f16");
+        P.layer.gemm_mma_bf16  = sk::bindings_pso("gemm_mma_bf16");
         P.layer.gemm_mma_q8_0  = sk::bindings_pso("gemm_mma_q8_0");
         P.layer.gemm_mma_q4k   = sk::bindings_pso("gemm_mma_q4k");
+        P.layer.gemm_mma_q6k   = sk::bindings_pso("gemm_mma_q6k");
     }
     P.layer.q8_0_swiglu_m1 = sk::bindings_pso("q8_0_swiglu_m1");  // optional; nullptr OK
     P.layer.q8_0_swiglu_prenorm_m1 = sk::bindings_pso("q8_0_swiglu_prenorm_m1");  // optional

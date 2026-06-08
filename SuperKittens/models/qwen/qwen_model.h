@@ -53,8 +53,10 @@ struct LayerPSOs {
     // prefill of T tokens costs ≪ T× the M=1 matvec. Nullable; prefill falls
     // back to the per-row matvec loop when absent.
     MTL::ComputePipelineState* gemm_mma_f16  = nullptr;
+    MTL::ComputePipelineState* gemm_mma_bf16 = nullptr;
     MTL::ComputePipelineState* gemm_mma_q8_0 = nullptr;
     MTL::ComputePipelineState* gemm_mma_q4k  = nullptr;
+    MTL::ComputePipelineState* gemm_mma_q6k  = nullptr;
     MTL::ComputePipelineState* q8_0_swiglu_m1 = nullptr;  // fused Q8_0 gate+up+SiLU·mul (M=1)
     MTL::ComputePipelineState* q8_0_swiglu_prenorm_m1 = nullptr;  // fused residual+rmsnorm+swiglu (M=1)
     MTL::ComputePipelineState* q8_0_matvec_addres = nullptr;  // matvec + residual add (M=1)
@@ -184,15 +186,15 @@ inline MTL::ComputePipelineState* quant_matvec_pso(const LayerPSOs& P, sk::Dtype
     }
 }
 
-// Batched MMA GEMM PSO for a weight dtype. Q6_K has no MMA tile-loader yet, so
-// Q6_K projections (Q4_K_M's alternating V/down) stay on the per-row matvec at
-// prefill. Returns nullptr when no MMA path exists for the dtype.
+// Batched MMA GEMM PSO for a weight dtype. Returns nullptr when no MMA path
+// exists for the dtype (caller then falls back to the per-row matvec loop).
 inline MTL::ComputePipelineState* gemm_mma_pso(const LayerPSOs& P, sk::Dtype dt) {
     switch (dt) {
         case sk::Dtype::Q8_0: return P.gemm_mma_q8_0;
         case sk::Dtype::Q4_K: return P.gemm_mma_q4k;
+        case sk::Dtype::Q6_K: return P.gemm_mma_q6k;
         case sk::Dtype::F16:  return P.gemm_mma_f16;
-        case sk::Dtype::BF16: return nullptr;  // MMA tile-loader is fp16-only
+        case sk::Dtype::BF16: return P.gemm_mma_bf16;
         default:              return nullptr;
     }
 }
@@ -1045,51 +1047,56 @@ inline void dispatch_model(
     }
 
     // D. LM-head GEMM (tied → reuse embedding; untied → use w_lm_head). Both (V,D) row-major → transB=1.
+    //
+    // Generation reads ONLY the last position's logits (get_last_logits reads
+    // row current_pos-1; generate_n consumes output_id[0]), so at prefill (T>1)
+    // the head projects just row T-1 — the other T-1 rows are vocab×d_model of
+    // dead work. The last row is written to logits row (T-1) so get_last_logits'
+    // current_pos-1 offset is unchanged; argmax (below) reads that same row.
     {
-        const uint32_t M_v = T, K_v = M.d_model, N_v = M.vocab_size;
+        const uint32_t last = T - 1u;
+        const uint32_t M_v = 1u, K_v = M.d_model, N_v = M.vocab_size;
+        const size_t   off_A = (size_t)last * K_v * 2;
+        const size_t   off_C = (size_t)last * N_v * 2;
         MTL::Buffer* w_head = W.w_lm_head ? W.w_lm_head : W.w_embed;
 
         if (W.dt_lm_head == sk::Dtype::Q8_0 && W.w_lm_head &&
             P.layer.q8_0_matvec != nullptr) {
-            for (uint32_t m = 0; m < M_v; ++m) {
-                auto* enc = cmd->computeCommandEncoder();
-                enc->setComputePipelineState(P.layer.q8_0_matvec);
-                enc->setBuffer(nxt,           (size_t)m * K_v * 2,  0);
-                enc->setBuffer(W.w_lm_head,   W.off_w_lm_head,      1);
-                enc->setBuffer(B.logits,      (size_t)m * N_v * 2,  2);
-                enc->setBytes(&K_v, 4, 3);
-                enc->setBytes(&N_v, 4, 4);
-                enc->dispatchThreadgroups(MTL::Size((N_v + 1) / 2, 1, 1), MTL::Size(128, 1, 1));
-                enc->endEncoding();
-            }
+            auto* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(P.layer.q8_0_matvec);
+            enc->setBuffer(nxt,           off_A,           0);
+            enc->setBuffer(W.w_lm_head,   W.off_w_lm_head, 1);
+            enc->setBuffer(B.logits,      off_C,           2);
+            enc->setBytes(&K_v, 4, 3);
+            enc->setBytes(&N_v, 4, 4);
+            enc->dispatchThreadgroups(MTL::Size((N_v + 1) / 2, 1, 1), MTL::Size(128, 1, 1));
+            enc->endEncoding();
         } else
         if (W.dt_lm_head == sk::Dtype::Q6_K && W.w_lm_head &&
             P.layer.q6k_matvec != nullptr) {
             // Q4_K_M's output.weight is Q6_K; matvec straight from the quant
             // bytes (vocab·d_model) instead of a host-dequanted fp16 head.
-            for (uint32_t m = 0; m < M_v; ++m) {
-                auto* enc = cmd->computeCommandEncoder();
-                enc->setComputePipelineState(P.layer.q6k_matvec);
-                enc->setBuffer(nxt,           (size_t)m * K_v * 2,  0);
-                enc->setBuffer(W.w_lm_head,   W.off_w_lm_head,      1);
-                enc->setBuffer(B.logits,      (size_t)m * N_v * 2,  2);
-                enc->setBytes(&K_v, 4, 3);
-                enc->setBytes(&N_v, 4, 4);
-                enc->dispatchThreadgroups(MTL::Size((N_v + 1) / 2, 1, 1), MTL::Size(128, 1, 1));
-                enc->endEncoding();
-            }
+            auto* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(P.layer.q6k_matvec);
+            enc->setBuffer(nxt,           off_A,           0);
+            enc->setBuffer(W.w_lm_head,   W.off_w_lm_head, 1);
+            enc->setBuffer(B.logits,      off_C,           2);
+            enc->setBytes(&K_v, 4, 3);
+            enc->setBytes(&N_v, 4, 4);
+            enc->dispatchThreadgroups(MTL::Size((N_v + 1) / 2, 1, 1), MTL::Size(128, 1, 1));
+            enc->endEncoding();
         } else
-        if (M_v == 1 && P.layer.gemv_t_m1 != nullptr) {
-            // Decode fast path: M=1 transposed-weight matvec. Prefer 2D-tile
-            // variant when registered; same buffer signature, different grid/TG.
+        if (P.layer.gemv_t_m1 != nullptr) {
+            // M=1 transposed-weight matvec (head input is the single last row).
+            // Prefer 2D-tile variant when registered; same buffer signature.
             const size_t off_head = (w_head == W.w_lm_head) ? W.off_w_lm_head : 0;
             auto* enc = cmd->computeCommandEncoder();
             const bool use_2d = (P.layer.gemv_t_2dtile_m1 != nullptr);
             enc->setComputePipelineState(use_2d ? P.layer.gemv_t_2dtile_m1
                                                 : P.layer.gemv_t_m1);
-            enc->setBuffer(nxt,      0,        0);
+            enc->setBuffer(nxt,      off_A,    0);
             enc->setBuffer(w_head,   off_head, 1);
-            enc->setBuffer(B.logits, 0,        2);
+            enc->setBuffer(B.logits, off_C,    2);
             enc->setBytes(&N_v, 4, 3);
             enc->setBytes(&K_v, 4, 4);
             if (use_2d) {
@@ -1110,16 +1117,16 @@ inline void dispatch_model(
             enc->setComputePipelineState(P.layer.gemm);
             uint32_t ldA = K_v, ldB = K_v, ldC = N_v;
             int transA = 0, transB = 1, has_bias = 0;
-            enc->setBuffer(nxt,        0,        0);
+            enc->setBuffer(nxt,        off_A,    0);
             enc->setBuffer(w_head,     off_head, 1);
-            enc->setBuffer(B.logits,   0,        2);
+            enc->setBuffer(B.logits,   off_C,    2);
             enc->setBytes(&M_v,      4, 3); enc->setBytes(&N_v,      4, 4);
             enc->setBytes(&K_v,      4, 5); enc->setBytes(&ldA,      4, 6);
             enc->setBytes(&ldB,      4, 7); enc->setBytes(&ldC,      4, 8);
             enc->setBytes(&transA,   4, 9); enc->setBytes(&transB,   4, 10);
             enc->setBytes(&has_bias, 4, 11);
-            enc->setBuffer(B.logits, 0, 12);
-            enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M_v + 63) / 64, 1),
+            enc->setBuffer(B.logits, off_C, 12);
+            enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, 1, 1),
                                       MTL::Size(64, 1, 1));
             enc->endEncoding();
         }
@@ -1175,12 +1182,16 @@ inline void dispatch_model(
             enc->endEncoding();
         }
     } else {
+        // Only the last row's logits exist (D wrote row T-1); argmax that one
+        // row → output_id[0]. The logits base is offset to row T-1 so the
+        // kernel's row=0 lands on it (output_id is sized for batch=1, so a
+        // T-wide dispatch would also write out[1..T-1] out of bounds).
         auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(P.argmax);
-        enc->setBuffer(B.logits,    0, 0);
+        enc->setBuffer(B.logits,    (size_t)(T - 1u) * M.vocab_size * 2, 0);
         enc->setBuffer(B.output_id, 0, 1);
         enc->setBytes(&M.vocab_size, 4, 2);
-        enc->dispatchThreadgroups(MTL::Size(T, 1, 1), MTL::Size(1024, 1, 1));
+        enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(1024, 1, 1));
         enc->endEncoding();
     }
 }

@@ -15,7 +15,7 @@ Canonical perf numbers: `best.md` (repo root).
 | `paged_attn` | Paged KV-cache attention |
 | `conv` | conv1d, conv1d_silu, conv2d, conv3d |
 | `fusion` | rms_rope, rms_residual, add_rmsnorm, gemm_bias_act, gemm_res_norm, gated_mlp (+ bf16/geglu variants), gemv_bf16_m1, gemv_swiglu_m1, kv_up_pair, silu_mul |
-| `gemm` | fp16 (`fp16/gemm.metal`), fp8 (`fp8/gemm.metal`, M5+), M=1 quant matvecs (q8_0/q4k/q6k/q2k/iq2xxs), batched seq>1 MMA GEMM (`gemm_mma.metal`: f16/q8_0/q4k) |
+| `gemm` | fp16 (`fp16/gemm.metal`), fp8 (`fp8/gemm.metal`, M5+), M=1 quant matvecs (q8_0/q4k/q6k/q2k/iq2xxs), batched seq>1 MMA GEMM (`gemm_mma.metal`: f16/bf16/q8_0/q4k/q6k) |
 | `moe` | router, router_v3, down_scatter, swiglu_pair (+ Q2K / IQ2XXS quantized) |
 | `ops` | add, cast, causal_mask, kv_cache, sample, split, transpose |
 | `rotary` | RoPE on Q/K (standalone path; usually fused via `fusion/rms_rope`) |
