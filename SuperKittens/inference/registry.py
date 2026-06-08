@@ -66,20 +66,23 @@ SPECS: dict[str, ModelSpec] = {
         config_path="text_config",
         dims=dict(variant="e4b"),
     ),
-    # NOTE: gemma-4-12B-it is model_type "gemma4_unified" (arch
-    # Gemma4UnifiedForConditionalGeneration), NOT the same arch as E2B/E4B/31B
-    # (model_type "gemma4"). The unified variant differs structurally and is not
-    # yet supported by this adapter — listed so the repo is discoverable, but
-    # loading it will need a unified codepath. (`gemma-4-26B-it` does not exist.)
-    "gemma4-12b": ModelSpec(
-        family="gemma4",
-        adapter="SuperKittens.models.gemma.gemma4.gemma4:Gemma4",
+    # gemma-4-12B-it is model_type "gemma4_unified" (arch
+    # Gemma4UnifiedForConditionalGeneration) — structurally distinct from the
+    # E2B/E4B/31B "gemma4" arch (NO PLE, NO KV-sharing, full RoPE on global
+    # layers, a standalone per-layer output scale, 8-local/1-global KV heads).
+    # It gets its OWN adapter (Gemma4Unified) reusing the shared gemma4 launcher +
+    # kernels; the E-variant Gemma4 adapter is untouched. Fit-16GB artifact is a
+    # Q4_K_M GGUF (HF bf16 safetensors are 23.9 GB). See temp/gemma4-unified/STATUS.md.
+    "gemma4-12b-unified": ModelSpec(
+        family="gemma4_unified",
+        adapter="SuperKittens.models.gemma.gemma4_unified.gemma4_unified:Gemma4Unified",
         hf_repo="google/gemma-4-12B-it",
-        weight_dir="gemma-4-12B-it",
-        default_quant=None,
+        weight_dir="gemma-4-12B-it-GGUF",
+        gguf_name="gemma-4-12B-it-Q4_K_M.gguf",
+        default_quant="q4_k_m",
         tokenizer_family="gemma4",
         config_path="text_config",
-        dims=dict(variant="12b"),
+        dims=dict(variant="12b-unified"),
     ),
     "gemma4-31b": ModelSpec(
         family="gemma4",

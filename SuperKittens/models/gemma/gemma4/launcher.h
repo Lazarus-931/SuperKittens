@@ -39,6 +39,14 @@ typedef struct {
     float    final_logit_softcap;
     uint32_t use_double_wide_mlp;
     uint32_t num_kv_shared_layers;
+    // gemma4_unified deltas (0 = E-variant gemma4 behaviour):
+    //   full_rope_global   — rotate the FULL global head_dim instead of partial 0.25.
+    //   apply_layer_scalar — multiply each layer's residual by a per-layer learned
+    //                        scalar (GGUF blk.N.layer_output_scale). E-variant only
+    //                        applies layer_scalar inside the PLE inject; unified has
+    //                        no PLE but still carries this per-layer output scale.
+    uint32_t full_rope_global;
+    uint32_t apply_layer_scalar;
 } sk_gemma4_config;
 
 typedef struct {
@@ -70,6 +78,11 @@ typedef struct {
 
 sk_gemma4_handle* sk_gemma4_create(const sk_gemma4_config* cfg);
 int sk_gemma4_load_weights(sk_gemma4_handle* h, const sk_gemma4_weights* w);
+
+// Load weights from a GGUF (blk.N.* names, K-quant blocks dequantized to bf16
+// on host). Used by the gemma4_unified path: its fit-16GB artifact is a Q4_K_M
+// GGUF and the HF bf16 safetensors (23.9 GB) do not fit. Returns 0 on success.
+int sk_gemma4_load_gguf(sk_gemma4_handle* h, const char* path);
 
 // Run a forward pass. Maintains an internal current_pos cursor:
 //   - Call sk_gemma4_reset before a new sequence (sets current_pos = 0).
