@@ -341,9 +341,11 @@ inline void dispatch_attn(
         if (p.rope_interleave) {
             ArgsRopeInterleave iq{};
             iq.ne00 = dk; iq.ne01 = p.seq; iq.ne02 = p.n_heads; iq.ne03 = p.batch;
-            iq.nb01 = sizeof(float) * dk;
-            iq.nb02 = iq.nb01 * p.seq;
-            iq.nb03 = iq.nb02 * p.n_heads;
+            // q_packed is token-major [batch, seq, head, dk]: seq(row) stride spans
+            // a full token (n_heads*dk), head stride is one head (dk).
+            iq.nb02 = sizeof(float) * dk;
+            iq.nb01 = iq.nb02 * p.n_heads;
+            iq.nb03 = (uint64_t)sizeof(float) * dk * p.n_heads * p.seq;
             iq.n_dims     = (int32_t)p.qk_rope_dim;
             iq.n_ctx_orig = p.rope_n_ctx_orig;
             iq.freq_base  = p.rope_freq_base;
@@ -514,9 +516,13 @@ inline void dispatch_attn(
 
         ArgsMLA a{};
         a.ne01 = (int32_t)p.seq;     a.ne02 = (int32_t)p.n_heads; a.ne03 = (int32_t)p.batch;
-        a.nb01 = (uint64_t)dk * sizeof(float);   // Q fp32 row stride
-        a.nb02 = a.nb01 * p.seq;
-        a.nb03 = a.nb02 * p.n_heads;
+        // Q (q_packed_f32) is token-major [batch, seq, head, dk]: the seq(row)
+        // stride spans a whole token (n_heads*dk) and the head stride is one head
+        // (dk). Coincides with the old head-major strides only at seq==1, so the
+        // head-major form broke prefill (T>1) head selection.
+        a.nb02 = (uint64_t)dk * sizeof(float);                 // Q head stride
+        a.nb01 = a.nb02 * p.n_heads;                           // Q seq(row) stride
+        a.nb03 = a.nb01 * p.seq;                               // Q batch stride
         a.ne11 = (int32_t)p.kv_len;  a.ne_12_2 = (int32_t)p.n_heads; a.ne_12_3 = (int32_t)p.batch;
         // K cache: [head, cache_max, dk]. Row stride dk*2; head stride cache_max*dk*2.
         a.nb11 = (uint64_t)dk * sizeof(uint16_t);
@@ -533,10 +539,11 @@ inline void dispatch_attn(
         a.nb32 = a.nb31 * p.seq;
         a.nb33 = a.nb32;
         a.ne1 = (int32_t)p.n_heads; a.ne2 = (int32_t)p.seq; a.ne3 = (int32_t)p.batch;
-        // HF DeepseekV2Attention.scaling = qk_head_dim^-0.5. YaRN mscale is folded
-        // into the RoPE cos/sin attention_factor (== 1.0 here since mscale ==
-        // mscale_all_dim), NOT into the softmax scale.
-        a.scale = 1.f / metal_sqrt_safe((float)dk);
+        // HF DeepseekV2Attention.scaling = qk_head_dim^-0.5 * mscale^2 when YaRN
+        // mscale_all_dim is set (modeling_deepseek_v3.py:373-375). For V2-Lite
+        // mscale==mscale_all_dim so the cos/sin attention_factor is 1.0, but the
+        // softmax scale STILL carries mscale^2 = ds_compute_yarn_mscale()^2.
+        a.scale = (1.f / metal_sqrt_safe((float)dk)) * p.yarn_mscale * p.yarn_mscale;
         a.max_bias = 0.f; a.m0 = 1.f; a.m1 = 1.f;
         a.n_head_log2 = 0; a.logit_softcap = 0.f;
 
