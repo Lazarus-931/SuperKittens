@@ -55,6 +55,10 @@ void mamba2_ssd_ref(
     constant uint& Nstate         [[buffer(14)]],
     constant float& dt_min        [[buffer(15)]],
     constant float& dt_max        [[buffer(16)]],
+    // Per-token stride (elements) of the x/B/C buffers. They alias one
+    // interleaved [x(E)|B(G*N)|C(G*N)] tensor with stride C_in, not the
+    // packed H*P / G*N strides their separate-tensor shapes would imply.
+    constant uint&  XBC_stride     [[buffer(17)]],
     uint  lid  [[thread_index_in_threadgroup]],
     uint3 gid  [[threadgroup_position_in_grid]])
 {
@@ -74,42 +78,38 @@ void mamba2_ssd_ref(
         + (size_t)p * (size_t)Nstate + (size_t)n;
     float s = ssm_state[st_idx];
 
-    // Cached head-broadcast scalars (computed per token):
-    threadgroup float dt_t;
-    threadgroup float dA_t;
-    threadgroup float x_t;     // x[b,t,h,p]
-    threadgroup float B_tn[256];  // we hold B for this group across N
-    threadgroup float C_tn[256];
+    threadgroup float partial[256];  // tg-scope: declaring inside the t-loop is UB
 
     const float A = -exp((float)A_log[h]);
     const float Db = (float)D_in[h];
 
     for (uint t = 0; t < L; ++t) {
-        // One thread loads scalars.
-        if (n == 0) {
-            float dtr = (float)dt_raw[((size_t)b * L + t) * H + h]
-                       + (float)dt_bias[h];
-            // softplus
-            float dt;
-            if (dtr > 20.0f) dt = dtr;
-            else dt = log(1.0f + exp(dtr));
-            dt = clamp(dt, dt_min, dt_max);
-            dt_t = dt;
-            dA_t = exp(dt * A);
-            x_t  = (float)x[(((size_t)b * L + t) * H + h) * P + p];
-        }
-        // All threads load B,C for their n.
-        const size_t bcn_base = (((size_t)b * L + t) * G + g) * Nstate;
-        B_tn[n] = (float)B_in[bcn_base + n];
-        C_tn[n] = (float)C_in[bcn_base + n];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // dt/dA/x_t are head-/position-scalars (depend on h,p only), identical
+        // for every thread in this threadgroup — recompute per-thread rather
+        // than broadcast via threadgroup memory (the broadcast needed a leading
+        // barrier the loop lacked, corrupting t>=1).
+        float dtr = (float)dt_raw[((size_t)b * L + t) * H + h]
+                   + (float)dt_bias[h];
+        float dt;
+        if (dtr > 20.0f) dt = dtr;
+        else dt = log(1.0f + exp(dtr));
+        // HF time_step_limit clamp. dt_max is +inf by default (no upper bound);
+        // fast-math drops infs, so gate on a magnitude sentinel.
+        dt = max(dt, dt_min);
+        if (dt_max < 1e30f) dt = min(dt, dt_max);
+        const float dA  = exp(dt * A);
+        const size_t tok = ((size_t)b * L + t) * (size_t)XBC_stride;
+        const float x_t = (float)x[tok + (size_t)h * P + p];
+
+        const size_t bcn_base = tok + (size_t)g * Nstate;
+        const float Bv = (float)B_in[bcn_base + n];
+        const float Cv = (float)C_in[bcn_base + n];
 
         // state update: s = dA*s + dt*B*x
-        s = dA_t * s + dt_t * B_tn[n] * x_t;
+        s = dA * s + dt * Bv * x_t;
 
         // Per-thread partial y contribution = C[n] * s[n]; then tg reduce.
-        threadgroup float partial[256];
-        partial[n] = C_tn[n] * s;
+        partial[n] = Cv * s;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // Tree reduction over N (assumes Nstate is a power of 2, e.g. 128).

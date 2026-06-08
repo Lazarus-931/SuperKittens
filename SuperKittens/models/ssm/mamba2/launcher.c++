@@ -122,7 +122,9 @@ extern "C" sk_mamba2_handle* sk_mamba2_create(const sk_mamba2_config* cfg) {
     h->bufs.ssd_out       = alloc_zero(dev, T_max * E * fp16);
     h->bufs.gated         = alloc_zero(dev, T_max * E * fp16);
     h->bufs.out_proj_out  = alloc_zero(dev, T_max * D * fp16);
-    h->bufs.logits        = alloc_zero(dev, (size_t)cfg->vocab_size * fp16);
+    // LM head GEMM writes all T rows; the (T-1) row read by argmax/get_last_logits
+    // is OOB if this is sized for one row only.
+    h->bufs.logits        = alloc_zero(dev, T_max * (size_t)cfg->vocab_size * fp16);
 
     // 2-pass argmax scratch.
     {
@@ -173,8 +175,8 @@ extern "C" int sk_mamba2_forward(sk_mamba2_handle* hp,
     mp.chunk_size   = h->cfg.chunk_size;
     mp.vocab_size   = h->cfg.vocab_size;
     mp.eps          = h->cfg.rms_eps;
-    mp.dt_min       = h->cfg.time_step_min;
-    mp.dt_max       = h->cfg.time_step_max;
+    mp.dt_min       = h->cfg.dt_limit_min;
+    mp.dt_max       = h->cfg.dt_limit_max;
 
     // Use a single shared device buffer for output_id (1 int32).
     static MTL::Buffer* s_out_id = nullptr;

@@ -25,6 +25,7 @@
 
 #include <Metal/Metal.hpp>
 #include <cstdint>
+#include <cmath>
 
 namespace meow {
 namespace mamba2 {
@@ -41,8 +42,9 @@ struct LayerParams {
     uint32_t conv_kernel  = 4;
     uint32_t chunk_size   = 256;
     float    eps          = 1e-5f;
-    float    dt_min       = 0.001f;
-    float    dt_max       = 0.1f;
+    // HF time_step_limit (default (0, inf)); time_step_{min,max} only bound dt_bias init.
+    float    dt_min       = 0.0f;
+    float    dt_max       = INFINITY;
 
     uint32_t layer_idx    = 0;
     uint32_t is_decode    = 0;      // 0 = prefill (chunked SSD), 1 = decode (single-step)
@@ -338,6 +340,7 @@ inline void dispatch_layer(
         enc->setBytes(&Nv,       4, 14);
         enc->setBytes(&p.dt_min, 4, 15);
         enc->setBytes(&p.dt_max, 4, 16);
+        enc->setBytes(&C_in,     4, 17);   // x/B/C share the interleaved C_in token stride
         enc->dispatchThreadgroups(MTL::Size(p.batch * H, Pd, 1),
                                   MTL::Size(Nv, 1, 1));
         enc->endEncoding();
@@ -371,8 +374,8 @@ struct ModelParams {
     uint32_t chunk_size   = 256;
     uint32_t vocab_size   = 50288;
     float    eps          = 1e-5f;
-    float    dt_min       = 0.001f;
-    float    dt_max       = 0.1f;
+    float    dt_min       = 0.0f;
+    float    dt_max       = INFINITY;
 };
 
 inline void dispatch_model(

@@ -1,5 +1,46 @@
 # Mamba 2 SK port — STATUS
 
+## END-TO-END COHERENT (dev-sk-mamba2-e2e)
+
+mamba2-130m (`AntonV/mamba2-130m-hf`) generates **token-for-token identical**
+output to HF `torch_forward` greedy. Verified on 4 prompts (33/33, 35/35, 34/34,
+37/37 token match). Prompt "Hi" →
+`"Hi, I'm a newbie here. I'm a student at the University of California, Berkeley..."`.
+Prompt logits rel_L2 = 0.0008 vs HF (was 0.147 before the dt-clamp fix). Argmax 13.
+Decode probe ~50 tok/s on this laptop (HF fp32 baseline 14.48).
+
+Three bugs fixed to close the loop (all in the prefill SSD + LM-head path):
+
+1. **dt clamp** — launcher clamped dt to `time_step_{min,max}` = (0.001, 0.1).
+   Those only bound `dt_bias` init in HF; the *runtime* clamp is
+   `time_step_limit` = (0, inf). Now plumbed through as `dt_limit_{min,max}`
+   (config → C ABI → kernels). The kernels gate the +inf upper bound on a 1e30
+   sentinel (Metal compiles `-no-infs-fp-math`, so `clamp(x, 0, inf)` is unsafe).
+
+2. **interleaved x/B/C token stride** — both `mamba2_ssd.metal` and
+   `mamba2_ssd_ref.metal` indexed x with token-stride `H*P` and B/C with `G*N`,
+   but the launcher hands them ONE interleaved `[x(E)|B(G*N)|C(G*N)]` buffer
+   whose per-token stride is `C_in = E + 2*G*N`. Correct only for t=0; every
+   later token read the wrong region. Added an `XBC_stride` (=C_in) param.
+
+3. **logits buffer under-allocated** — `bufs.logits` was sized for ONE row but
+   the LM-head GEMM writes all T rows; the (T-1) row read by argmax /
+   get_last_logits was OOB → garbage/zero. Now `T_max * vocab_size`.
+
+`Mamba2Model.generate` re-prefills the growing sequence each step (HF
+`torch_forward` semantics).
+
+### Remaining (decode fast-path — separate from this loop)
+`conv1d_silu` carries no decode state: a single-token forward zero-pads the
+previous K-1 conv inputs instead of reading `LayerState.conv_state`. The
+persistent single-step decode path (`forward([last])` reusing ssm_state) is
+therefore incoherent (`"Hi, and the same time, and the same as a few years…"`).
+`generate` works around it by re-prefilling (O(T^2)). To get an O(1)/token
+decode: thread `conv_state` through `conv1d_silu` (shift in the new token, read
+the prior K-1) and route L=1 through `mamba2_step_ref` (already
+signature-correct). `dump_layer` only exposes last-forward scratch, so per-layer
+parity is checked via the n_layers=k truncation trick (see temp/mamba2_validate).
+
 ## SSD kernel — FIXED (dev-sk-mamba2-ssd-fix)
 
 `mamba2_ssd.metal` was rewritten to the HF-correct signature

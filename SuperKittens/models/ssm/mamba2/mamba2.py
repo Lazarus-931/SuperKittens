@@ -33,13 +33,16 @@ class Mamba2Config(CtypesConfig):
     chunk_size: int = 256
     vocab_size: int = 50288
     rms_eps: float = 1e-5
-    time_step_min: float = 0.001
-    time_step_max: float = 0.1
+    # Runtime dt clamp = HF time_step_limit (NOT time_step_{min,max}, which only
+    # bound dt_bias init). HF default (0.0, inf): lower no-op, no upper clamp.
+    dt_limit_min: float = 0.0
+    dt_limit_max: float = float("inf")
     tie_word_embeddings: int = 1
 
     @classmethod
     def from_hf_json(cls, path: str | os.PathLike) -> "Mamba2Config":
         j = json.loads(Path(path).read_text())
+        lim = j.get("time_step_limit", [0.0, float("inf")])
         return cls(
             n_layers=j["num_hidden_layers"],
             d_model=j["hidden_size"],
@@ -52,8 +55,8 @@ class Mamba2Config(CtypesConfig):
             chunk_size=j.get("chunk_size", 256),
             vocab_size=j["vocab_size"],
             rms_eps=j.get("layer_norm_epsilon", j.get("rms_norm_eps", 1e-5)),
-            time_step_min=j.get("time_step_min", 0.001),
-            time_step_max=j.get("time_step_max", 0.1),
+            dt_limit_min=float(lim[0]),
+            dt_limit_max=float(lim[1]),
             tie_word_embeddings=int(j.get("tie_word_embeddings", True)),
         )
 
@@ -73,8 +76,8 @@ class _CConfig(ctypes.Structure):
         ("chunk_size",    ctypes.c_uint32),
         ("vocab_size",    ctypes.c_uint32),
         ("rms_eps",       ctypes.c_float),
-        ("time_step_min", ctypes.c_float),
-        ("time_step_max", ctypes.c_float),
+        ("dt_limit_min",  ctypes.c_float),
+        ("dt_limit_max",  ctypes.c_float),
         ("tie_word_embeddings", ctypes.c_uint32),
     ]
 
@@ -117,6 +120,47 @@ class Mamba2Model(Model):
         if rc != 0:
             raise RuntimeError(f"sk_mamba2_forward rc={rc}")
         return out.value
+
+    def _forward(self, input_ids):
+        import numpy as np
+        return np.array([self.forward(list(int(i) for i in np.asarray(input_ids).reshape(-1)))],
+                        dtype=np.int32)
+
+    def _last_logits(self):
+        return self.get_last_logits()
+
+    def generate(self, input_ids, *, max_new_tokens: int = 64, **kw):
+        """Greedy/sampled generation via full re-prefill of the growing sequence.
+
+        conv1d_silu carries no decode-time state (it zero-pads the previous
+        K-1 positions), so the persistent single-step path is incoherent.
+        Re-prefilling the whole sequence each step matches HF torch_forward
+        exactly. O(T^2) but fine for the 130m at short lengths.
+        """
+        import numpy as np
+        ids = [int(i) for i in np.asarray(input_ids, dtype=np.int32).reshape(-1)]
+        rng = np.random.default_rng(kw.get("seed", 0))
+        temperature = kw.get("temperature", 0.0)
+        top_p = kw.get("top_p", 1.0)
+        top_k = kw.get("top_k", None)
+        greedy = temperature <= 0.0 and (top_p >= 1.0 or top_p <= 0.0) and not top_k
+        stops: set = set()
+        if kw.get("eos_ids"):
+            stops |= {int(x) for x in kw["eos_ids"]}
+        if kw.get("eos_id") is not None:
+            stops.add(int(kw["eos_id"]))
+        seq = list(ids)
+        out: list[int] = []
+        for _ in range(max_new_tokens):
+            self.reset()
+            arg = self.forward(seq)
+            nxt = int(arg) if greedy else self._sample(
+                self.get_last_logits(), temperature, top_p, top_k, rng)
+            seq.append(nxt)
+            out.append(nxt)
+            if nxt in stops:
+                break
+        return out
 
     def dump(self, tag: str):
         """Return numpy fp16/fp32 array (best-effort sized to known buffer)."""

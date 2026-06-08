@@ -61,6 +61,10 @@ void mamba2_ssd(
     constant uint& Nstate         [[buffer(14)]],
     constant float& dt_min        [[buffer(15)]],
     constant float& dt_max        [[buffer(16)]],
+    // Per-token stride (elements) of the x/B/C buffers: they alias one
+    // interleaved [x(E)|B(G*N)|C(G*N)] tensor (stride C_in), not the packed
+    // H*P / G*N strides their separate-tensor shapes imply.
+    constant uint&  XBC_stride     [[buffer(17)]],
     uint  lid  [[thread_index_in_threadgroup]],
     uint3 gid  [[threadgroup_position_in_grid]])
 {
@@ -91,13 +95,17 @@ void mamba2_ssd(
     for (uint t = 0; t < L; ++t) {
         const float dtr = (float)dt_raw[((size_t)b * L + t) * H + h]
                         + (float)dt_bias[h];
-        const float dt  = clamp((dtr > 20.0f) ? dtr : log(1.0f + exp(dtr)),
-                                dt_min, dt_max);
+        float dt = (dtr > 20.0f) ? dtr : log(1.0f + exp(dtr));
+        // HF time_step_limit clamp. dt_max is +inf by default (no upper bound);
+        // fast-math drops infs, so gate the upper bound on a magnitude sentinel.
+        dt = max(dt, dt_min);
+        if (dt_max < 1e30f) dt = min(dt, dt_max);
         const float dA  = exp(dt * A);
-        const float xv  = (float)x[(((size_t)b * L + t) * H + h) * P + p];
+        const size_t tok = ((size_t)b * L + t) * (size_t)XBC_stride;
+        const float xv  = (float)x[tok + (size_t)h * P + p];
         const float dtx = dt * xv;
 
-        const size_t bc_base = (((size_t)b * L + t) * G + g) * Nstate;
+        const size_t bc_base = tok + (size_t)g * Nstate;
 
         float yacc = 0.0f;
         for (uint j = 0; j < npl; ++j) {
