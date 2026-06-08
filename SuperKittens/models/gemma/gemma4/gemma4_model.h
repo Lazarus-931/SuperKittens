@@ -91,6 +91,12 @@ inline void enc_kquant_matvec(
 //  Layer-level
 // ──────────────────────────────────────────────────────────────────────
 
+// Per-projection body weight encoding: when the Q4_K body is active each layer's
+// projection carries the GGUF's native K-quant block bytes verbatim (no dequant
+// re-quant). attn_q/k/o/gate/up are uniformly Q4_K; attn_v/ffn_down are mixed
+// Q4_K/Q6_K per layer in a Q4_K_M GGUF. BodyEnc tags which matvec PSO to pick.
+enum class BodyEnc : uint8_t { Q8 = 0, Q4K = 1, Q6K = 2 };
+
 struct LayerParams {
     // Shape
     uint32_t batch          = 1;
@@ -166,12 +172,6 @@ struct LayerPSOs {
     MTL::ComputePipelineState* q6k_matvec_bf16    = nullptr; // M=1 Q6_K × bf16 matvec → bf16 (Q4_K_M v/down Q6_K rows)
     MTL::ComputePipelineState* geglu_mul          = nullptr; // gelu(gate)*up elementwise (Q8 MLP)
 };
-
-// Per-projection body weight encoding: when the Q4_K body is active each layer's
-// projection carries the GGUF's native K-quant block bytes verbatim (no dequant
-// re-quant). attn_q/k/o/gate/up are uniformly Q4_K; attn_v/ffn_down are mixed
-// Q4_K/Q6_K per layer in a Q4_K_M GGUF. BodyEnc tags which matvec PSO to pick.
-enum class BodyEnc : uint8_t { Q8 = 0, Q4K = 1, Q6K = 2 };
 
 struct LayerBuffers {
     // Dump stash (optional; only used for L0 intermediates when dump_enabled).
@@ -1411,13 +1411,13 @@ inline void dispatch_model(
         lp.is_kv_shared   = (kv_src >= 0);
         // Q4_K body: per-layer projection encodings (Q4_K_M mixes Q4_K/Q6_K on
         // v/down). Tables are nullptr for the Q8 body (all stay BodyEnc::Q8).
-        lp.enc_q    = M.enc_q_per_layer    ? M.enc_q_per_layer[L]    : BodyEnc::Q8;
-        lp.enc_k    = M.enc_k_per_layer    ? M.enc_k_per_layer[L]    : BodyEnc::Q8;
-        lp.enc_v    = M.enc_v_per_layer    ? M.enc_v_per_layer[L]    : BodyEnc::Q8;
-        lp.enc_out  = M.enc_out_per_layer  ? M.enc_out_per_layer[L]  : BodyEnc::Q8;
-        lp.enc_gate = M.enc_gate_per_layer ? M.enc_gate_per_layer[L] : BodyEnc::Q8;
-        lp.enc_up   = M.enc_up_per_layer   ? M.enc_up_per_layer[L]   : BodyEnc::Q8;
-        lp.enc_down = M.enc_down_per_layer ? M.enc_down_per_layer[L] : BodyEnc::Q8;
+        lp.enc_q    = W.enc_q_per_layer    ? W.enc_q_per_layer[L]    : BodyEnc::Q8;
+        lp.enc_k    = W.enc_k_per_layer    ? W.enc_k_per_layer[L]    : BodyEnc::Q8;
+        lp.enc_v    = W.enc_v_per_layer    ? W.enc_v_per_layer[L]    : BodyEnc::Q8;
+        lp.enc_out  = W.enc_out_per_layer  ? W.enc_out_per_layer[L]  : BodyEnc::Q8;
+        lp.enc_gate = W.enc_gate_per_layer ? W.enc_gate_per_layer[L] : BodyEnc::Q8;
+        lp.enc_up   = W.enc_up_per_layer   ? W.enc_up_per_layer[L]   : BodyEnc::Q8;
+        lp.enc_down = W.enc_down_per_layer ? W.enc_down_per_layer[L] : BodyEnc::Q8;
 
         LayerBuffers lb;
         // L0 extra-dump wiring: enabled only for L0 when dump is on. The
