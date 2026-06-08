@@ -21,6 +21,9 @@ struct Handle {
     std::vector<LayerCache> layer_caches;
     std::vector<MTL::Buffer*> k_caches;
     std::vector<MTL::Buffer*> v_caches;
+    // Q8_0-KV cache buffers (parallel to k_caches/v_caches when kv_q8 active).
+    bool kv_q8 = false;
+    std::vector<MTL::Buffer*> kq_caches, vq_caches, ks_caches, vs_caches;
 
     uint32_t layers_run     = 0;
     int32_t  capture_layer  = -1;
@@ -70,6 +73,12 @@ static bool resolve_psos(ModelPSOs& P) {
         P.layer.attn_combine = sk::bindings_pso("mha_decode_combine");  // optional; nullptr OK
     }
     P.layer.kv_cache_write = sk::bindings_pso("kv_cache_write");
+    // Q8_0-KV path (optional; nullptr OK). dispatch_layer only takes it when the
+    // handle allocated Q8 caches (SK_KV_Q8) AND all three resolve.
+    P.layer.kv_cache_write_q8 = sk::bindings_pso("kv_cache_write_q8");
+    P.layer.attn_q8           = sk::bindings_pso("mha_causal_q8");
+    if (!getenv("SK_NO_SPLIT_ATTN"))
+        P.layer.attn_split_q8 = sk::bindings_pso("mha_decode_split_q8");
     P.layer.add            = sk::bindings_pso("add_f16");
     P.layer.add_rmsnorm    = sk::bindings_pso("add_rmsnorm");
     P.layer.gated_mlp      = sk::bindings_pso("gated_mlp");
@@ -159,16 +168,46 @@ extern "C" sk_qwen_handle* sk_qwen_create(const sk_qwen_config* cfg) {
     h->weights.w_lm_head       = cfg->tie_word_embeddings ? nullptr
                                   : alloc_zero(dev, (size_t)cfg->vocab_size * cfg->d_model * 2);
 
-    // Per-layer K, V caches (full cache; GQA → n_kv_heads not n_heads)
+    // Per-layer K, V caches (full cache; GQA → n_kv_heads not n_heads).
+    // SK_KV_Q8=1 stores K/V as Q8_0 (int8 + per-32-block fp16 scale) instead of
+    // fp16: ~0.53× the cache bytes (128B int8 + 4×2B scale vs 256B fp16 per
+    // 128-d token) and ~half the attention KV read traffic at long context.
+    // Requires the three Q8 PSOs; if any is missing we silently keep fp16.
+    h->kv_q8 = getenv("SK_KV_Q8") != nullptr
+               && h->psos.layer.kv_cache_write_q8 != nullptr
+               && h->psos.layer.attn_q8 != nullptr;
     h->layer_caches.resize(cfg->n_layers);
     h->k_caches.resize(cfg->n_layers);
     h->v_caches.resize(cfg->n_layers);
-    for (uint32_t L = 0; L < cfg->n_layers; ++L) {
-        const size_t kv_bytes = (size_t)cfg->batch * cfg->n_kv_heads * cfg->cache_max * hd * 2;
-        h->k_caches[L] = alloc_zero(dev, kv_bytes);
-        h->v_caches[L] = alloc_zero(dev, kv_bytes);
-        h->layer_caches[L].k = h->k_caches[L];
-        h->layer_caches[L].v = h->v_caches[L];
+    if (h->kv_q8) {
+        const uint32_t nblk = hd / 32u;
+        const size_t n_tok = (size_t)cfg->batch * cfg->n_kv_heads * cfg->cache_max;
+        const size_t q_bytes = n_tok * hd;            // int8
+        const size_t s_bytes = n_tok * nblk * 2;      // fp16 scales
+        h->kq_caches.resize(cfg->n_layers);
+        h->vq_caches.resize(cfg->n_layers);
+        h->ks_caches.resize(cfg->n_layers);
+        h->vs_caches.resize(cfg->n_layers);
+        for (uint32_t L = 0; L < cfg->n_layers; ++L) {
+            h->kq_caches[L] = alloc_zero(dev, q_bytes);
+            h->vq_caches[L] = alloc_zero(dev, q_bytes);
+            h->ks_caches[L] = alloc_zero(dev, s_bytes);
+            h->vs_caches[L] = alloc_zero(dev, s_bytes);
+            h->layer_caches[L].kq = h->kq_caches[L];
+            h->layer_caches[L].vq = h->vq_caches[L];
+            h->layer_caches[L].ks = h->ks_caches[L];
+            h->layer_caches[L].vs = h->vs_caches[L];
+            h->k_caches[L] = nullptr;
+            h->v_caches[L] = nullptr;
+        }
+    } else {
+        for (uint32_t L = 0; L < cfg->n_layers; ++L) {
+            const size_t kv_bytes = (size_t)cfg->batch * cfg->n_kv_heads * cfg->cache_max * hd * 2;
+            h->k_caches[L] = alloc_zero(dev, kv_bytes);
+            h->v_caches[L] = alloc_zero(dev, kv_bytes);
+            h->layer_caches[L].k = h->k_caches[L];
+            h->layer_caches[L].v = h->v_caches[L];
+        }
     }
     h->weights.layer_caches = h->layer_caches.data();
 
@@ -342,6 +381,7 @@ static int run_step(Handle* h, MTL::CommandQueue* q, uint32_t seq) {
     mp.rope_beta_slow  = h->cfg.rope_beta_slow;
     mp.layers_run      = h->layers_run;
     mp.capture_layer   = h->capture_layer;
+    mp.kv_q8           = h->kv_q8;
     h->last_seq        = seq;
 
     auto* cmd = q->commandBuffer();
@@ -494,6 +534,10 @@ extern "C" void sk_qwen_destroy(sk_qwen_handle* hp) {
     if (h->gguf_mmap) { delete h->gguf_mmap; h->gguf_mmap = nullptr; }
     for (auto* b : h->k_caches) rel(b);
     for (auto* b : h->v_caches) rel(b);
+    for (auto* b : h->kq_caches) rel(b);
+    for (auto* b : h->vq_caches) rel(b);
+    for (auto* b : h->ks_caches) rel(b);
+    for (auto* b : h->vs_caches) rel(b);
     rel(h->bufs.input_ids); rel(h->bufs.output_id);
     rel(h->bufs.x_a); rel(h->bufs.x_b); rel(h->bufs.logits); rel(h->bufs.rope_pos);
     rel(h->bufs.cos_tbl); rel(h->bufs.sin_tbl);

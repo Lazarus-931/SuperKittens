@@ -403,6 +403,7 @@ class Qwen(Model):
                 head_dim=cfg.head_dim, d_model=cfg.d_model, n_int=cfg.n_int,
                 n_heads=cfg.n_heads, vocab_size=cfg.vocab_size,
                 total_mem_bytes=mem if mem else None,
+                kv_q8=bool(os.environ.get("SK_KV_Q8")),
             )
             if fitted < cfg.cache_max:
                 print(f"[qwen] memory-aware cache_max: {cfg.cache_max} -> {fitted} "
