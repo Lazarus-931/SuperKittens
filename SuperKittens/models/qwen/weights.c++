@@ -585,6 +585,7 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
     // "_M" variant bumps every other layer to Q6_K), so those are read per L. ──
     auto supported_proj_dt = [](sk::Dtype d) {
         return d == sk::Dtype::Q8_0 || d == sk::Dtype::Q4_K || d == sk::Dtype::Q6_K
+            || d == sk::Dtype::Q3_K || d == sk::Dtype::Q5_K
             || d == sk::Dtype::F16  || d == sk::Dtype::BF16;
     };
     auto proj_dtype = [&](uint32_t L, const char* suffix, sk::Dtype* out) -> bool {

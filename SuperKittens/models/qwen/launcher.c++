@@ -55,6 +55,8 @@ static bool resolve_psos(ModelPSOs& P) {
     P.layer.q8_0_matvec    = sk::bindings_pso("q8_0_matvec");  // optional; nullptr OK
     P.layer.q4k_matvec     = sk::bindings_pso("q4k_matvec");   // optional; nullptr OK
     P.layer.q6k_matvec     = sk::bindings_pso("q6k_matvec");   // optional; nullptr OK
+    P.layer.q3k_matvec     = sk::bindings_pso("q3k_matvec");   // optional; nullptr OK
+    P.layer.q5k_matvec     = sk::bindings_pso("q5k_matvec");   // optional; nullptr OK
     // Batched (seq>1) MMA GEMM for prefill. All optional; absence falls back to
     // the per-row matvec loop in encode_quant_gemm. SK_NO_GEMM_MMA=1 forces the
     // matvec-loop prefill (A/B bench of the batched path against the per-row one).
