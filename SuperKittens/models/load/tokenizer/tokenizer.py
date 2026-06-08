@@ -39,6 +39,9 @@ class Tokenizer:
         "gemma4":  {"bos": ("<bos>",),                   "eos": ("<eos>", "<turn|>"),             "pad": ("<pad>",)},
         "gemma":   {"bos": ("<bos>",),                   "eos": ("<end_of_turn>", "<eos>"),       "pad": ("<pad>",)},
         "llama":   {"bos": ("<s>", "<|begin_of_text|>"), "eos": ("</s>", "<|end_of_text|>", "<|eot_id|>"), "pad": ("<pad>",)},
+        # Llama-3.1-Nemotron-Nano: chat turns end on <|eot_id|>; <|end_of_text|> is
+        # the base-completion stop. Both resolve in the Llama-3 vocab.
+        "nemotron": {"bos": ("<|begin_of_text|>",), "eos": ("<|eot_id|>", "<|end_of_text|>"), "pad": ("<|end_of_text|>",)},
         "mistral": {"bos": ("<s>",),                     "eos": ("</s>",),                        "pad": ("<pad>",)},
         # DeepSeek V2/V3 use full-width tokens for BOS/EOS in the trained vocab.
         "deepseek": {"bos": ("<｜begin▁of▁sentence｜>",),

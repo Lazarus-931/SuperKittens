@@ -821,12 +821,16 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
         std::snprintf(nbuf, sizeof(nbuf), "blk.%u.ffn_norm.weight", L);
         if (!read_to_fp16((uint16_t*)((char*)h->weights.w_pre_mlp_norm->contents() + pre_off),
                           store.get(nbuf), dm)) return -41;
-        std::snprintf(nbuf, sizeof(nbuf), "blk.%u.attn_q_norm.weight", L);
-        if (!read_to_fp16((uint16_t*)((char*)h->weights.w_q_norm->contents() + qnorm_off),
-                          store.get(nbuf), hd)) return -42;
-        std::snprintf(nbuf, sizeof(nbuf), "blk.%u.attn_k_norm.weight", L);
-        if (!read_to_fp16((uint16_t*)((char*)h->weights.w_k_norm->contents() + qnorm_off),
-                          store.get(nbuf), hd)) return -43;
+        // Qwen3 has per-head Q/K RMSNorm γ; Llama-arch (Nemotron-Nano,
+        // use_qk_norm=0) does not ship these tensors — skip the read.
+        if (c.use_qk_norm) {
+            std::snprintf(nbuf, sizeof(nbuf), "blk.%u.attn_q_norm.weight", L);
+            if (!read_to_fp16((uint16_t*)((char*)h->weights.w_q_norm->contents() + qnorm_off),
+                              store.get(nbuf), hd)) return -42;
+            std::snprintf(nbuf, sizeof(nbuf), "blk.%u.attn_k_norm.weight", L);
+            if (!read_to_fp16((uint16_t*)((char*)h->weights.w_k_norm->contents() + qnorm_off),
+                              store.get(nbuf), hd)) return -43;
+        }
 
         if (!load_qkv_layer(L)) return -50;
 

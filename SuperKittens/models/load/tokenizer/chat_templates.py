@@ -18,6 +18,21 @@ def deepseek_template(messages: Sequence[dict], add_generation_prompt: bool = Tr
     return "".join(parts)
 
 
+def llama_template(messages: Sequence[dict], add_generation_prompt: bool = True) -> str:
+    """Llama-3 header format (also used by Llama-3.1-Nemotron-Nano).
+    <|begin_of_text|> is NOT prepended here -- callers opt in via chat(bos=True).
+    Nemotron-Nano's non-reasoning default is a "detailed thinking off" system
+    message; pass it explicitly in `messages` when that mode is wanted.
+    """
+    parts = []
+    for m in messages:
+        role = m.get("role", "user").lower()
+        parts.append(f"<|start_header_id|>{role}<|end_header_id|>\n\n{m.get('content','')}<|eot_id|>")
+    if add_generation_prompt:
+        parts.append("<|start_header_id|>assistant<|end_header_id|>\n\n")
+    return "".join(parts)
+
+
 def qwen_template(messages: Sequence[dict], add_generation_prompt: bool = True) -> str:
     parts = []
     for m in messages:
@@ -66,4 +81,6 @@ CHAT_TEMPLATES = {
     "chatml": qwen_template,
     "gemma": gemma_template,
     "gemma4": gemma4_template,
+    "llama": llama_template,
+    "nemotron": llama_template,
 }

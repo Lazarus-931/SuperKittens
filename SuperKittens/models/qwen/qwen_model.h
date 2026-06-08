@@ -21,6 +21,7 @@ struct LayerParams {
     uint32_t head_dim     = 128;
     uint32_t n_int        = 27392;
     float    eps          = 1e-6f;
+    uint32_t use_qk_norm  = 1;  // 0 for Llama-arch (Nemotron-Nano): skip per-head Q/K RMSNorm
 
     uint32_t layer_idx    = 0;
     uint32_t kv_buf_start = 0;
@@ -566,15 +567,18 @@ inline void dispatch_layer(
     encode_split(enc, P.split_packed, B.kv_pack, B.k_tmp, B.v_tmp,
                  T, kvN, kvN);
 
-    // 4. Per-head Q/K-norm. K-norm writes a distinct buffer from Q-norm
-    // (B.k_tmp vs B.q); its dep on split-2 is honored transitively by the
-    // barrier before Q-norm (Metal buffer-scope barriers are full fences),
-    // so skip the redundant barrier here.
-    encode_rmsnorm(enc, P.rmsnorm, B.q, B.w_q_norm, off_w_q_norm,
-                   B.q, T * p.n_heads, hd, p.eps);
-    encode_rmsnorm(enc, P.rmsnorm, B.k_tmp, B.w_k_norm, off_w_k_norm,
-                   B.k_tmp, T * p.n_kv_heads, hd, p.eps,
-                   /*pso_t1=*/nullptr, /*barrier_before=*/false);
+    // 4. Per-head Q/K-norm (Qwen3 only). K-norm writes a distinct buffer from
+    // Q-norm (B.k_tmp vs B.q); its dep on split-2 is honored transitively by the
+    // barrier before Q-norm (Metal buffer-scope barriers are full fences), so
+    // skip the redundant barrier here. Llama-arch (Nemotron-Nano, use_qk_norm=0)
+    // has no per-head Q/K RMSNorm — skip both so Q/K feed RoPE unmodified.
+    if (p.use_qk_norm) {
+        encode_rmsnorm(enc, P.rmsnorm, B.q, B.w_q_norm, off_w_q_norm,
+                       B.q, T * p.n_heads, hd, p.eps);
+        encode_rmsnorm(enc, P.rmsnorm, B.k_tmp, B.w_k_norm, off_w_k_norm,
+                       B.k_tmp, T * p.n_kv_heads, hd, p.eps,
+                       /*pso_t1=*/nullptr, /*barrier_before=*/false);
+    }
 
     // 5. RoPE on Q and K. RoPE-K writes a distinct buffer from RoPE-Q;
     // dep on K-norm is honored by the barrier before RoPE-Q.
@@ -920,6 +924,7 @@ struct ModelParams {
     uint32_t cache_max    = 32768;
     uint32_t vocab_size   = 151936;
     float    eps          = 1e-6f;
+    uint32_t use_qk_norm  = 1;  // 0 for Llama-arch (Nemotron-Nano): skip per-head Q/K RMSNorm
     uint32_t current_pos  = 0;
 
     // RoPE
@@ -1108,6 +1113,7 @@ inline void dispatch_model(
         lp.head_dim     = M.head_dim;
         lp.n_int        = M.n_int;
         lp.eps          = M.eps;
+        lp.use_qk_norm  = M.use_qk_norm;
         lp.layer_idx    = L;
         lp.kv_buf_start = kv_buf_start;
         lp.kv_len       = kv_len;

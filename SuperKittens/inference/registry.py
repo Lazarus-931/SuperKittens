@@ -139,6 +139,27 @@ SPECS: dict[str, ModelSpec] = {
             first_k_dense_replace=1,
         ),
     ),
+    # Llama-3.1-Nemotron-Nano-8B-v1: model_type "llama" (LlamaForCausalLM) — the
+    # Qwen3 dense decoder minus per-head Q/K-norm, with Llama-3.1 RoPE (theta
+    # 500000 + "llama3" frequency scaling). Reuses the qwen launcher/kernels; the
+    # Nemotron adapter sets use_qk_norm=0 and re-bakes RoPE with llama3 scaling.
+    # Q4_K_M (4.92 GB) fits a 16 GB mini. Untied LM head (output.weight).
+    "nemotron-nano-8b": ModelSpec(
+        family="nemotron",
+        adapter="SuperKittens.models.nemotron.nemotron:Nemotron",
+        hf_repo="nvidia/Llama-3.1-Nemotron-Nano-8B-v1",
+        weight_dir="Llama-3.1-Nemotron-Nano-8B-v1-GGUF",
+        gguf_name="nvidia_Llama-3.1-Nemotron-Nano-8B-v1-Q4_K_M.gguf",
+        default_quant="q4_k_m",
+        tokenizer_family="nemotron",
+        dims=dict(n_layers=32, d_model=4096, n_heads=32, n_kv_heads=8,
+                  head_dim=128, n_int=14336, vocab_size=128256,
+                  eps=1e-5, rope_freq_base=500000.0, tie_word_embeddings=0,
+                  use_qk_norm=0,
+                  rope_scaling=dict(rope_type="llama3", factor=8.0,
+                                    low_freq_factor=1.0, high_freq_factor=4.0,
+                                    original_max_position_embeddings=8192)),
+    ),
     "qwen3-1.7b": ModelSpec(
         family="qwen3",
         adapter="SuperKittens.models.qwen.qwen:Qwen",
