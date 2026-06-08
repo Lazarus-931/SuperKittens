@@ -49,6 +49,12 @@ struct LayerPSOs {
     MTL::ComputePipelineState* q8_0_matvec;       // M=1 matvec with Q8_0 weight (decode)
     MTL::ComputePipelineState* q4k_matvec = nullptr;  // M=1 matvec with Q4_K weight
     MTL::ComputePipelineState* q6k_matvec = nullptr;  // M=1 matvec with Q6_K weight
+    // Batched (seq>1) MMA GEMM: amortizes one weight read across M rows so a
+    // prefill of T tokens costs ≪ T× the M=1 matvec. Nullable; prefill falls
+    // back to the per-row matvec loop when absent.
+    MTL::ComputePipelineState* gemm_mma_f16  = nullptr;
+    MTL::ComputePipelineState* gemm_mma_q8_0 = nullptr;
+    MTL::ComputePipelineState* gemm_mma_q4k  = nullptr;
     MTL::ComputePipelineState* q8_0_swiglu_m1 = nullptr;  // fused Q8_0 gate+up+SiLU·mul (M=1)
     MTL::ComputePipelineState* q8_0_swiglu_prenorm_m1 = nullptr;  // fused residual+rmsnorm+swiglu (M=1)
     MTL::ComputePipelineState* q8_0_matvec_addres = nullptr;  // matvec + residual add (M=1)
@@ -178,6 +184,43 @@ inline MTL::ComputePipelineState* quant_matvec_pso(const LayerPSOs& P, sk::Dtype
     }
 }
 
+// Batched MMA GEMM PSO for a weight dtype. Q6_K has no MMA tile-loader yet, so
+// Q6_K projections (Q4_K_M's alternating V/down) stay on the per-row matvec at
+// prefill. Returns nullptr when no MMA path exists for the dtype.
+inline MTL::ComputePipelineState* gemm_mma_pso(const LayerPSOs& P, sk::Dtype dt) {
+    switch (dt) {
+        case sk::Dtype::Q8_0: return P.gemm_mma_q8_0;
+        case sk::Dtype::Q4_K: return P.gemm_mma_q4k;
+        case sk::Dtype::F16:  return P.gemm_mma_f16;
+        case sk::Dtype::BF16: return nullptr;  // MMA tile-loader is fp16-only
+        default:              return nullptr;
+    }
+}
+
+// Encode one batched MMA GEMM: A (fp16 [M,K]) × W ([N,K] quant/fp16) → C
+// (fp16 [M,N], row stride ldC). BM=8 rows × BN=32 cols per threadgroup.
+inline void encode_gemm_mma(
+    MTL::ComputeCommandEncoder* enc, MTL::ComputePipelineState* pso,
+    MTL::Buffer* A, size_t off_A,
+    MTL::Buffer* W, size_t off_W,
+    MTL::Buffer* C, size_t off_C,
+    uint32_t M, uint32_t N, uint32_t K, uint32_t ldC)
+{
+    enc_barrier(enc);
+    enc->setComputePipelineState(pso);
+    enc->setBuffer(A, off_A, 0);
+    enc->setBuffer(W, off_W, 1);
+    enc->setBuffer(C, off_C, 2);
+    enc->setBytes(&M, 4, 3);
+    enc->setBytes(&N, 4, 4);
+    enc->setBytes(&K, 4, 5);
+    enc->setBytes(&ldC, 4, 6);
+    constexpr uint32_t BM = 8, BN = 32;
+    enc->dispatchThreadgroups(
+        MTL::Size((N + BN - 1) / BN, (M + BM - 1) / BM, 1),
+        MTL::Size(64, 1, 1));
+}
+
 // Encode a quant matvec (M rows, looping over rows for M>1). Mirrors
 // encode_q8_0_gemm but parameterized on the PSO so Q4_K/Q6_K route here too.
 // ldC = output row stride in elements (defaults to N). For the split-QKV path
@@ -188,9 +231,17 @@ inline void encode_quant_gemm(
     MTL::Buffer* A, size_t off_A,
     MTL::Buffer* W, size_t off_W,
     MTL::Buffer* C, size_t off_C,
-    uint32_t M, uint32_t N, uint32_t K, uint32_t ldC = 0)
+    uint32_t M, uint32_t N, uint32_t K, uint32_t ldC = 0,
+    MTL::ComputePipelineState* pso_mma = nullptr)
 {
     if (ldC == 0) ldC = N;
+    // Prefill (M>1): one MMA GEMM amortizes the weight read across all M rows,
+    // so a T-token forward costs ≪ T× the per-row matvec. Decode (M==1) keeps
+    // the matvec — its NR0=2 geometry beats the BM=8 MMA tile at one row.
+    if (M > 1 && pso_mma != nullptr) {
+        encode_gemm_mma(enc, pso_mma, A, off_A, W, off_W, C, off_C, M, N, K, ldC);
+        return;
+    }
     for (uint32_t m = 0; m < M; ++m) {
         enc_barrier(enc);
         enc->setComputePipelineState(pso);
@@ -404,16 +455,19 @@ inline void dispatch_layer(
             // band [qN+kvN:qkv_N]. ldC = qkv_N so per-row strides stay correct
             // during prefill (T>1).
             encode_quant_gemm(enc, pso_qkv, B.x_norm, 0, B.w_qkv, off_w_qkv,
-                              B.qkv_packed, 0, T, qN + kvN, p.d_model, qkv_N);
+                              B.qkv_packed, 0, T, qN + kvN, p.d_model, qkv_N,
+                              gemm_mma_pso(P, B.dt_qkv));
             encode_quant_gemm(enc, pso_v, B.x_norm, 0, B.w_v, B.w_v_inner_off,
-                              B.qkv_packed, (size_t)(qN + kvN) * 2, T, kvN, p.d_model, qkv_N);
+                              B.qkv_packed, (size_t)(qN + kvN) * 2, T, kvN, p.d_model, qkv_N,
+                              gemm_mma_pso(P, B.dt_v));
         } else {
             encode_gemm_fallback(enc, P.gemm, P.gemv_m1, B.x_norm, 0, B.w_qkv, off_w_qkv,
                                  B.qkv_packed, T, qkv_N, p.d_model);
         }
     } else if (pso_qkv != nullptr) {
         encode_quant_gemm(enc, pso_qkv, B.x_norm, 0, B.w_qkv, off_w_qkv,
-                          B.qkv_packed, 0, T, qkv_N, p.d_model);
+                          B.qkv_packed, 0, T, qkv_N, p.d_model, /*ldC=*/0,
+                          gemm_mma_pso(P, B.dt_qkv));
     } else {
         encode_gemm_fallback(enc, P.gemm, P.gemv_m1, B.x_norm, 0, B.w_qkv, off_w_qkv,
                              B.qkv_packed, T, qkv_N, p.d_model);
@@ -559,7 +613,8 @@ inline void dispatch_layer(
     MTL::ComputePipelineState* pso_o = quant_matvec_pso(P, B.dt_o);
     if (pso_o != nullptr) {
         encode_quant_gemm(enc, pso_o, attn_o_in, 0, B.w_o, off_w_o,
-                          B.o_proj, 0, T, p.d_model, p.n_heads * hd);
+                          B.o_proj, 0, T, p.d_model, p.n_heads * hd, /*ldC=*/0,
+                          gemm_mma_pso(P, B.dt_o));
     } else {
         encode_gemm_fallback(enc, P.gemm, P.gemv_m1, attn_o_in, 0, B.w_o, off_w_o,
                              B.o_proj, T, p.d_model, p.n_heads * hd);
@@ -639,14 +694,16 @@ inline void dispatch_layer(
         MTL::ComputePipelineState* pso_up   = quant_matvec_pso(P, B.dt_up);
         if (pso_gate != nullptr) {
             encode_quant_gemm(enc, pso_gate, B.m_in, 0, B.w_gate, off_w_gate,
-                              B.gate_buf, 0, T, p.n_int, p.d_model);
+                              B.gate_buf, 0, T, p.n_int, p.d_model, /*ldC=*/0,
+                              gemm_mma_pso(P, B.dt_gate));
         } else {
             encode_gemm_fallback(enc, P.gemm, P.gemv_m1, B.m_in, 0, B.w_gate, off_w_gate,
                                  B.gate_buf, T, p.n_int, p.d_model);
         }
         if (pso_up != nullptr) {
             encode_quant_gemm(enc, pso_up, B.m_in, 0, B.w_up, off_w_up,
-                              B.up_buf, 0, T, p.n_int, p.d_model);
+                              B.up_buf, 0, T, p.n_int, p.d_model, /*ldC=*/0,
+                              gemm_mma_pso(P, B.dt_up));
         } else {
             encode_gemm_fallback(enc, P.gemm, P.gemv_m1, B.m_in, 0, B.w_up, off_w_up,
                                  B.up_buf, T, p.n_int, p.d_model);
@@ -684,7 +741,8 @@ inline void dispatch_layer(
         MTL::ComputePipelineState* pso_down = quant_matvec_pso(P, B.dt_down);
         if (pso_down != nullptr) {
             encode_quant_gemm(enc, pso_down, B.up_buf, 0, B.w_down, off_w_down,
-                              B.mlp_out, 0, T, p.d_model, p.n_int);
+                              B.mlp_out, 0, T, p.d_model, p.n_int, /*ldC=*/0,
+                              gemm_mma_pso(P, B.dt_down));
         } else {
             encode_gemm_fallback(enc, P.gemm, P.gemv_m1, B.up_buf, 0, B.w_down, off_w_down,
                                  B.mlp_out, T, p.d_model, p.n_int);
