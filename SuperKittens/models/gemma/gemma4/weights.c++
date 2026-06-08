@@ -75,10 +75,10 @@ inline uint32_t fp16_to_fp32_bits(uint16_t h16) {
         // subnormals (~1e-5); flushing them to zero zeroes whole dequant blocks.
         // Renormalize: value = (-1)^s * 2^-14 * (m/1024).
         if (m == 0) return (s << 31);
-        e = 1u;
-        while ((m & 0x400u) == 0u) { m <<= 1; --e; }
+        int32_t ee = 1;
+        while ((m & 0x400u) == 0u) { m <<= 1; --ee; }
         m &= 0x3FFu;
-        return (s << 31) | ((e + 112u) << 23) | (m << 13);
+        return (s << 31) | ((uint32_t)(ee + 112) << 23) | (m << 13);
     }
     if (e == 31)      return (s << 31) | (0xFFu << 23) | (m << 13);
     return (s << 31) | ((e + 112u) << 23) | (m << 13);
