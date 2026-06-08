@@ -445,6 +445,7 @@ static int run_step(Handle* h, MTL::CommandQueue* q, uint32_t seq) {
     mp.cache_max      = h->cfg.cache_max;
     mp.vocab_size     = h->cfg.vocab_size;
     mp.eps            = h->cfg.eps;
+    mp.use_qk_norm    = h->cfg.use_qk_norm;
     mp.current_pos    = h->current_pos;
     mp.rope_n_ctx_orig = h->cfg.rope_n_ctx_orig;
     mp.rope_freq_base  = h->cfg.rope_freq_base;

@@ -37,6 +37,7 @@ class _Config(ctypes.Structure):
         ("rope_beta_slow",     ctypes.c_float),
         ("eps",                ctypes.c_float),
         ("tie_word_embeddings", ctypes.c_uint32),
+        ("use_qk_norm",        ctypes.c_uint32),
     ]
 
 
@@ -113,6 +114,7 @@ class Config(CtypesConfig):
     seq_max: int = 8192
     cache_max: int = 32768
     tie_word_embeddings: int = 1  # Qwen3-0.6B and 32B share tied embeddings; set 0 for untied variants
+    use_qk_norm: int = 1  # Qwen3 per-head Q/K RMSNorm; 0 for Llama-arch (Nemotron-Nano-8B)
 
     @classmethod
     def preset(cls, name: str) -> "Config":

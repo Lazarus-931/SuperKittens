@@ -34,6 +34,7 @@ typedef struct {
 
     float    eps;
     uint32_t tie_word_embeddings;  // 1 = tie LM head to embedding (Qwen3-0.6B), 0 = separate lm_head (Qwen3-8B)
+    uint32_t use_qk_norm;          // 1 = Qwen3 per-head Q/K RMSNorm; 0 = Llama-arch (Nemotron-Nano-8B) no qk-norm
 } sk_qwen_config;
 
 typedef struct {
