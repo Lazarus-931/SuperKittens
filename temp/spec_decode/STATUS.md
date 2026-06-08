@@ -55,36 +55,57 @@ real claim — 4B-Q4_K_M (d_model=2560,n_int=9728, ~4x dims) verify approaching
 seq=1 cost — needs the 4B target, which is NOT on this Mac. Commit 53da587
 measured 4B-class Q8_0 prefill 2.3-2.6x and seq=128 only 8-13x a seq=1 (sub-linear).
 
-## BENCH STATE — READY-TO-BENCH (no host slot at attempt time)
-- Required GGUFs present on **lexie**: 0.6B-Q8 (model_weights/Qwen3-0.6B/),
-  4B-Q4_K_M (~/qwen-gguf/Qwen3-4B-Q4_K_M.gguf). amelia/derek lacked the 4B-Q4_K_M.
-- All three minis 16GB and CONTENDED at attempt (load 1.2-1.8; free mem
-  amelia 1.2G / derek 131M / lexie 1.35G). draft(0.6B ~0.6G)+target(4B-q4km ~2.5G)
-  both resident needs headroom these didn't have. Prior identical agent was KILLED
-  by the 600s watchdog on a synchronous contended-derek bench — did NOT repeat.
-- lexie SK checkout is on dev-perf-iter w/ a stale (May 26) build.
+## BENCH DONE — lexie M4, qwen3-4b-q4km target + qwen3-0.6b draft (2026-06-08)
+Build: locally-built dylib+metallib from a21fd25, rsync'd to lexie:~/sk_specdecode/
+(self-contained, SK_DYLIB/SK_METALLIB pinned; did NOT touch lexie's own checkout).
+GGUFs symlinked into the synced model_weights. n=64, reps=5 median, cache_max=1024.
+macOS has no flock/setsid: used an mkdir-mutex /tmp/sk_bench.lock + an orphaning
+subshell `( cmd >log 2>&1 </dev/null & )` (nohup fails "can't detach from console"
+under non-tty ssh). Poll loop bounded <300s/ssh.
 
-### To run the bench (lexie, the only host with both GGUFs; least loaded):
-1. Get this branch's build onto lexie. Either:
-   (a) rsync the locally-built `build/libsk.dylib` + `build/libsk.metallib` to
-       lexie (self-contained; avoids concurrent xcrun crashes), OR
-   (b) on lexie: `git fetch && git checkout dev-sk-spec-decode && ./build.sh`.
-2. Link 4B-Q4_K_M into model_weights so sk.load finds it:
-   `mkdir -p ~/SuperKittens/SuperKittens/model_weights/Qwen3-4B-GGUF && \
-    ln -sf ~/qwen-gguf/Qwen3-4B-Q4_K_M.gguf .../Qwen3-4B-GGUF/Qwen3-4B-Q4_K_M.gguf`
-   (tokenizer.json already in that dir for chat prompts).
-3. Hold the lock around the bench only:
-   `( flock -n 9 || exit 1; cd ~/SuperKittens; \
-      SK_DYLIB=build/libsk.dylib SK_METALLIB=build/libsk.metallib \
-      PYTHONPATH=. nohup python -u temp/spec_decode/specbench.py \
-        --target qwen3-4b-q4km --draft qwen3-0.6b --n 64 --K 2 4 6 \
-        --cache-max 1024 --reps 5 > ~/spec_bench.log 2>&1 & ) 9>/tmp/sk_bench.lock`
-4. POLL every 60-90s with SHORT ssh: `ssh lexie 'tail -3 ~/spec_bench.log'`.
-   NEVER block one ssh >300s.
+    prompt       K  baseline  spec    ratio   accept/K  tok/fwd  lossless
+    creative     2  39.31     14.29   0.364   0.88      1.88     True
+    creative     4  39.46     18.68   0.473   2.05      3.05     True
+    creative     6  39.47     19.39   0.491   2.76      3.76     True
+    low-entropy  2  39.40     15.20   0.386   0.97      2.00     True
+    low-entropy  4  39.34     24.49   0.623   2.94      4.00     True
+    low-entropy  6  39.40     25.36   0.644   3.85      4.92     True
 
-## VERDICT (pending the host bench)
-Local correctness is GREEN (lossless + verify logits fixed). The structural
-prerequisite (gemm_mma amortization) is confirmed on 0.6B but only wins at the
-target's larger matrix scale. Expected outcome on 4B: spec/baseline > 1.0 if the
-4B seq=(K+1) verify approaches seq=1 cost AND mean-accept stays ~1.6-1.9; ceiling
-~mean-accept x. Old spike was 0.54x. Bench fills in the actual ratio.
+LOSSLESS = True on all 6 (spec greedy ids == target greedy ids exactly). Accept
+rates are HEALTHY (up to 4.92 tok/fwd at K=6). Best ratio 0.644x — better than the
+0.54x May spike but STILL < 1.0. NOT A WIN.
+
+## WHY it loses — the gemm_mma seq>1 verify does NOT amortize on M4
+time_target.py (per-seq forward timing, 4b-q4km on lexie):
+    target seq=1 decode : 25.44 ms  (= 39.3 t/s, == baseline)
+    draft  seq=1        :  6.96 ms
+    K=2 verify seq=3 : 116.34 ms  (4.6x a seq=1, vs ideal ~=1x)  break-even accept 4.12
+    K=4 verify seq=5 : 132.65 ms  (5.2x)                          break-even accept 5.31
+    K=6 verify seq=7 : 147.86 ms  (5.8x)                          break-even accept 6.45
+Spec step cost = K*draft_seq1 + target_verify. To beat baseline you need
+mean-accept >= break-even, but the break-even accept EXCEEDS K at every K
+(4.12>2, 5.31>4, 6.45>6) — so a win is mathematically UNREACHABLE here regardless
+of acceptance. Root cause: the gemm_mma seq>1 path has a large fixed-cost floor on
+M4 — a seq=3 forward costs ~4.6x a seq=1 decode instead of ~1x. The #55 prefill
+win (2.3-2.6x) was at seq=128 and on Q8_0; at the tiny seq=K+1 verify lengths
+spec-decode uses, the matvec decode path is far cheaper per token. Same floor seen
+on 0.6B locally (seq2 = 112 ms vs seq1 = 12 ms).
+
+## 8B follow-up — NOT RUN (no host slot)
+amelia has 8B-Q4_K_M but NO 0.6B draft GGUF and ~58 MB free (load 2.1, rising).
+derek has the 0.6B but only 8B-Q8 (8.7G, won't fit w/ draft in 16G), load 8.18,
+~69 MB free. Neither can host 8B+draft now. Prediction: an 8B target raises seq=1
+cost (~2x) which shrinks the floor's relative weight, but the verify forward
+inherits the SAME non-amortizing gemm_mma floor, so a win is unlikely to flip
+without fixing that kernel's small-seq cost.
+
+## VERDICT — LOSSLESS GREEN, PERF NOT A WIN (0.36-0.64x)
+Speculative decoding is now provably LOSSLESS and the orchestration/ABI are
+correct end-to-end on a real 4B target. But it does NOT beat baseline decode on
+M4: 0.644x best, and break-even accept > K means no K tuning recovers it. The
+blocker is no longer "no batched GEMM" (that exists) — it is that the gemm_mma
+seq>1 verify forward does not amortize at the small seq lengths (K+1 <= 7) that
+spec-decode generates on M4; it costs ~5x a seq=1 decode. NO PR for a perf win.
+The real unblocking lever is a verify-forward kernel whose seq=2..8 cost
+approaches seq=1 (a low-fixed-cost batched matvec / a wider-decode kernel), not
+more spec-decode tuning. Until then spec-decode is a regression on M4.
