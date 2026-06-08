@@ -70,8 +70,8 @@ chase improvements, iterate on wins, never stop until the user says stop.
 ### E. Quant kernels / fit
 | # | Item | Pri | Status | Notes |
 |---|------|-----|--------|-------|
-| 20 | Consolidate 3 q3k_matvec ports → 1 canonical (fit enabler) | MED | TODO | 4B/8B/14B agents each wrote one |
-| 21 | Canonicalize q5k_matvec (fit enabler) | MED | TODO | |
+| 20 | Consolidate 3 q3k_matvec ports → 1 canonical (fit enabler) | MED | **WIN PR#63 (open, review)** | + q5k; lane=pos, byte-assembly UB fix, full Q3_K/Q5_K plumbing; median_rel 1.7e-4 |
+| 21 | Canonicalize q5k_matvec (fit enabler) | MED | **WIN PR#63** | folded into #20 |
 | 22 | Q3_K SoA-repack (4-aligned, vectorized) — parity experiment | LOW | TODO | best-case ~parity |
 | 23 | IQ2_XXS matvec for extreme fit | LOW | TODO | |
 
@@ -106,6 +106,7 @@ chase improvements, iterate on wins, never stop until the user says stop.
 | 40 | GQA amortization audit (mha_causal) — guard against regressions | LOW | TODO | |
 
 ## Log (newest first)
+- **[#20/#21 q3k/q5k canonical = WIN (PR #63, housekeeping)]** `a5caf67c702ab063d`. One canonical q3k_matvec + q5k_matvec in kernels/gemm/ (lane=pos, matches q6k sibling) + byte-assembly scale-unpack (UB fix: scales @offset96/110B-stride only 2-byte-aligned) + full Dtype::Q3_K/Q5_K plumbing (weight_store/gguf codes 11,13/qwen_model/launcher/weight_loader.py) — none was on main. De-duped 3 divergent q3k ports. Numerics median_rel 1.7e-4, cosine 1.0 (incl 14B dims). PR #63→main (open, review). Replenishing with #41 logits-OOB audit (local).
 - **[spec-decode formal NEG confirmed; 8B win-test launched]** `a4da0c` completed: 4B+0.6B = 0.56-0.88× (best 0.882× low-entropy K=6), lossless. Added `lm_head_all_rows` ABI (PR#56 last-row broke spec-verify per-position logits). **Lead: 8B target projected ~1.1-1.3× at low entropy** (break-even accept 2.84 < measured 3.85) — launched spec-8B test `a6b5c3015973b7e53` (dev-sk-spec-decode-8b, download models directly on target mini). ROOT CAUSE of branch-flips CONFIRMED: this agent's `git reset` hit the shared checkout → "stay in own worktree" is THE fix (in all prompts now).
 - **[mamba2-130m e2e = WIN (PR #62); spec-decode re-bench = NEG]**
   - **mamba2-130m COHERENT** `a09a38f1439ff6bbb`. dt-clamp was the dominant bug (config time_step_{min,max} bound dt_bias INIT only; HF runtime clamp = time_step_limit (0,inf)) → re-plumbed dt_limit_{min,max}, +inf via 1e30 sentinel (Metal -no-infs-fp-math). **Logits rel_L2 0.147→0.0008 vs HF.** +2 more bugs: interleaved x/B/C token-stride (wrong region for t>0; added XBC_stride) and logits-buffer OOB (sized 1 row, GEMM writes T → T_max*vocab). Generation token-identical to HF (33/33,35/35,34/34,37/37), ~50 tok/s. PR #62 (→main, stacks on #60). Follow-up: conv1d_silu has no decode-state carry → single-step decode O(T²) re-prefill workaround; O(1) fix = thread conv_state + route L=1 to mamba2_step_ref.
