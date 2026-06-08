@@ -39,6 +39,30 @@ struct EncCtx {
     ~EncCtx() { flush(); }
 };
 
+// Encode one Q8_0 matvec/GEMM: A (bf16 [M,K]) × W (q8_0 [N,K] row-major) → C
+// (bf16 [M,N], row stride ldC). M>1 loops per row (prefill is short; decode
+// M=1 is a single dispatch). off_C selects a column band in a wider output
+// row (used to pack Q|K|V into the qkv_packed buffer).
+inline void enc_q8_matvec(
+    MTL::ComputeCommandEncoder* enc, MTL::ComputePipelineState* pso,
+    MTL::Buffer* A, size_t off_A_bytes,
+    MTL::Buffer* W, size_t off_W_bytes,
+    MTL::Buffer* C, size_t off_C_bytes,
+    uint32_t M, uint32_t N, uint32_t K, uint32_t ldC)
+{
+    enc->setComputePipelineState(pso);
+    const uint32_t NR0 = 2;
+    for (uint32_t m = 0; m < M; ++m) {
+        enc->setBuffer(A, off_A_bytes + (size_t)m * K * 2, 0);
+        enc->setBuffer(W, off_W_bytes,                     1);
+        enc->setBuffer(C, off_C_bytes + (size_t)m * ldC * 2, 2);
+        enc->setBytes(&K, 4, 3);
+        enc->setBytes(&N, 4, 4);
+        enc->dispatchThreadgroups(MTL::Size((N + NR0 - 1) / NR0, 1, 1),
+                                  MTL::Size(128, 1, 1));
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 //  Layer-level
 // ──────────────────────────────────────────────────────────────────────
@@ -101,7 +125,8 @@ struct LayerPSOs {
     MTL::ComputePipelineState* gemv_geglu_bf16_m1 = nullptr; // fused gate+up+gelu+mul -> m_int
     MTL::ComputePipelineState* gemv_bf16_m1       = nullptr; // M=1 bf16 GEMV (down projection etc.)
     MTL::ComputePipelineState* qkv_norm_rope_partial_t1 = nullptr; // fused qkv-split + per-head rmsnorm + partial RoPE (global layers)
-    MTL::ComputePipelineState* q8_0_matvec_bf16   = nullptr; // M=1 Q8_0 × bf16 matvec → bf16 (LM head fast path)
+    MTL::ComputePipelineState* q8_0_matvec_bf16   = nullptr; // M=1 Q8_0 × bf16 matvec → bf16 (LM head + Q8 body projections)
+    MTL::ComputePipelineState* geglu_mul          = nullptr; // gelu(gate)*up elementwise (Q8 MLP)
 };
 
 struct LayerBuffers {
@@ -138,6 +163,24 @@ struct LayerBuffers {
     MTL::Buffer* w_up;               // (n_layers, d_model, n_int)
     MTL::Buffer* w_down;             // (n_layers, n_int, d_model)
 
+    // Optional Q8_0 body projections (HF-native [N, K] row-major). When the
+    // *_q8 buffers are non-null, dispatch_layer routes the projections through
+    // q8_0_matvec_bf16 (the *_q8_off fields are this layer's byte offset).
+    MTL::Buffer* w_q_q8    = nullptr;
+    MTL::Buffer* w_k_q8    = nullptr;
+    MTL::Buffer* w_v_q8    = nullptr;
+    MTL::Buffer* w_out_q8  = nullptr;
+    MTL::Buffer* w_gate_q8 = nullptr;
+    MTL::Buffer* w_up_q8   = nullptr;
+    MTL::Buffer* w_down_q8 = nullptr;
+    size_t       q_q8_off    = 0;
+    size_t       k_q8_off    = 0;
+    size_t       v_q8_off    = 0;
+    size_t       out_q8_off  = 0;
+    size_t       gate_q8_off = 0;
+    size_t       up_q8_off   = 0;
+    size_t       down_q8_off = 0;
+
     // PLE pipeline (E-models)
     MTL::Buffer* w_per_layer_input_gate;        // (n_layers, PLE_dim, d_model)
     MTL::Buffer* w_per_layer_projection;        // (n_layers, d_model, PLE_dim)
@@ -166,6 +209,7 @@ struct LayerBuffers {
     MTL::Buffer* m_out;
     MTL::Buffer* y_out;
     MTL::Buffer* m_int_scratch = nullptr; // (T, N_int) bf16 — used by gemv_geglu_bf16_m1 fast path
+    MTL::Buffer* m_up_scratch  = nullptr; // (T, N_int) bf16 — Q8 MLP up-projection band
 
     // PLE scratch
     MTL::Buffer* ple_gate_out;       // (T, PLE_dim)
@@ -225,10 +269,23 @@ inline void dispatch_layer(
         const uint32_t M = p.batch * p.seq;
         const uint32_t K_v = p.d_model;
         const uint32_t N_v = (p.n_heads + 2 * p.n_kv_heads) * p.head_dim;
+        const uint32_t Nq  = p.n_heads * p.head_dim;
+        const uint32_t Nkv = p.n_kv_heads * p.head_dim;
+        // Q8_0 path: separate Q/K/V matvecs packing into the qkv_packed bands.
+        const bool use_q8 = (B.w_q_q8 != nullptr) && (B.w_k_q8 != nullptr)
+                         && (B.w_v_q8 != nullptr) && (P.q8_0_matvec_bf16 != nullptr);
         // T=1 decode fast path: bf16 M=1 GEMV. Threshold guard N<=32768 — at
         // larger N the in-tree tile-MMA wins (per lab REPORT.md).
         static bool _disable_m1 = (std::getenv("SK_DISABLE_GEMV_M1") != nullptr);
-        if (!_disable_m1 && M == 1 && N_v <= 32768u && P.gemv_bf16_m1 != nullptr) {
+        if (use_q8) {
+            auto* enc = E.get();
+            enc_q8_matvec(enc, P.q8_0_matvec_bf16, B.x_norm, 0, B.w_q_q8, B.q_q8_off,
+                          B.qkv_packed, 0,                  M, Nq,  K_v, N_v);
+            enc_q8_matvec(enc, P.q8_0_matvec_bf16, B.x_norm, 0, B.w_k_q8, B.k_q8_off,
+                          B.qkv_packed, (size_t)Nq * 2,     M, Nkv, K_v, N_v);
+            enc_q8_matvec(enc, P.q8_0_matvec_bf16, B.x_norm, 0, B.w_v_q8, B.v_q8_off,
+                          B.qkv_packed, (size_t)(Nq + Nkv) * 2, M, Nkv, K_v, N_v);
+        } else if (!_disable_m1 && M == 1 && N_v <= 32768u && P.gemv_bf16_m1 != nullptr) {
             auto* enc = E.get();
             enc->setComputePipelineState(P.gemv_bf16_m1);
             enc->setBuffer(B.x_norm,     0,       0);
@@ -504,8 +561,13 @@ inline void dispatch_layer(
         const uint32_t M = p.batch * p.seq;
         const uint32_t K_v = p.n_heads * p.head_dim;
         const uint32_t N_v = p.d_model;
+        const bool use_q8_o = (B.w_out_q8 != nullptr) && (P.q8_0_matvec_bf16 != nullptr);
         static bool _disable_m1_o = (std::getenv("SK_DISABLE_GEMV_M1") != nullptr);
-        if (!_disable_m1_o && M == 1 && N_v <= 32768u && P.gemv_bf16_m1 != nullptr) {
+        if (use_q8_o) {
+            auto* enc = E.get();
+            enc_q8_matvec(enc, P.q8_0_matvec_bf16, B.attn_out, 0, B.w_out_q8, B.out_q8_off,
+                          B.o_proj, 0, M, N_v, K_v, N_v);
+        } else if (!_disable_m1_o && M == 1 && N_v <= 32768u && P.gemv_bf16_m1 != nullptr) {
             auto* enc = E.get();
             enc->setComputePipelineState(P.gemv_bf16_m1);
             enc->setBuffer(B.attn_out, 0,         0);
@@ -584,6 +646,10 @@ inline void dispatch_layer(
     {
         const uint32_t T_mlp = p.batch * p.seq;
         static bool _disable_mlp_fast = (std::getenv("SK_DISABLE_MLP_FAST_T1") != nullptr);
+        const bool use_q8_mlp =
+            (B.w_gate_q8 != nullptr) && (B.w_up_q8 != nullptr) && (B.w_down_q8 != nullptr)
+            && (P.q8_0_matvec_bf16 != nullptr) && (P.geglu_mul != nullptr)
+            && (B.m_int_scratch != nullptr) && (B.m_up_scratch != nullptr);
         const bool use_fast =
             !_disable_mlp_fast &&
             (T_mlp == 1) &&
@@ -591,7 +657,37 @@ inline void dispatch_layer(
             (P.gemv_bf16_m1       != nullptr) &&
             (B.m_int_scratch      != nullptr);
 
-        if (use_fast) {
+        if (use_q8_mlp) {
+            const uint32_t M  = T_mlp;
+            const uint32_t Ni = p.n_int;
+            const uint32_t Dm = p.d_model;
+            // gate -> m_int_scratch, up -> m_up_scratch (both [M, Ni], K=Dm).
+            {
+                auto* enc = E.get();
+                enc_q8_matvec(enc, P.q8_0_matvec_bf16, B.m_in, 0, B.w_gate_q8, B.gate_q8_off,
+                              B.m_int_scratch, 0, M, Ni, Dm, Ni);
+                enc_q8_matvec(enc, P.q8_0_matvec_bf16, B.m_in, 0, B.w_up_q8, B.up_q8_off,
+                              B.m_up_scratch, 0, M, Ni, Dm, Ni);
+            }
+            // gelu(gate)*up -> m_int_scratch.
+            {
+                auto* enc = E.get();
+                enc->setComputePipelineState(P.geglu_mul);
+                enc->setBuffer(B.m_int_scratch, 0, 0);
+                enc->setBuffer(B.m_up_scratch,  0, 1);
+                enc->setBuffer(B.m_int_scratch, 0, 2);
+                uint32_t n = M * Ni;
+                enc->setBytes(&n, 4, 3);
+                enc->dispatchThreadgroups(MTL::Size((n / 4u + 127u) / 128u, 1, 1),
+                                          MTL::Size(128, 1, 1));
+            }
+            // down: m_out = m_int @ W_down (K=Ni, N=Dm).
+            {
+                auto* enc = E.get();
+                enc_q8_matvec(enc, P.q8_0_matvec_bf16, B.m_int_scratch, 0, B.w_down_q8, B.down_q8_off,
+                              B.m_out, 0, M, Dm, Ni, Dm);
+            }
+        } else if (use_fast) {
             // 10a: fused gate+up+gelu+mul -> m_int_scratch (1, n_int).
             {
                 auto* enc = E.get();
@@ -931,6 +1027,29 @@ struct ModelWeights {
     MTL::Buffer* w_gate;
     MTL::Buffer* w_up;
     MTL::Buffer* w_down;
+
+    // Optional Q8_0-packed body projections (decode + prefill). When non-null
+    // dispatch_layer routes the projection matvecs through q8_0_matvec_bf16
+    // instead of the bf16 GEMM/GEMV, and the bf16 body buffers above are left
+    // unallocated (the whole point: free the ~8 GB of bf16 body weights so E2B
+    // fits 16 GB without memory compression). Layout is HF-native [N, K]
+    // row-major q8_0 (34 bytes / 32 weights). Per-layer byte offsets in the
+    // *_q8_off tables (length n_layers).
+    MTL::Buffer* w_q_q8    = nullptr;
+    MTL::Buffer* w_k_q8    = nullptr;
+    MTL::Buffer* w_v_q8    = nullptr;
+    MTL::Buffer* w_out_q8  = nullptr;
+    MTL::Buffer* w_gate_q8 = nullptr;
+    MTL::Buffer* w_up_q8   = nullptr;
+    MTL::Buffer* w_down_q8 = nullptr;
+    const size_t* q_q8_off    = nullptr;
+    const size_t* k_q8_off    = nullptr;
+    const size_t* v_q8_off    = nullptr;
+    const size_t* out_q8_off  = nullptr;
+    const size_t* gate_q8_off = nullptr;
+    const size_t* up_q8_off   = nullptr;
+    const size_t* down_q8_off = nullptr;
+
     MTL::Buffer* cos_local;
     MTL::Buffer* sin_local;
     MTL::Buffer* cos_global;
@@ -961,6 +1080,7 @@ struct ModelBuffers {
     MTL::Buffer* m_out;
     MTL::Buffer* y_out;
     MTL::Buffer* m_int_scratch = nullptr; // (T, max_N_int) bf16 — gemv_geglu_bf16_m1 T=1 fast path
+    MTL::Buffer* m_up_scratch  = nullptr; // (T, max_N_int) bf16 — Q8 MLP up-projection band
 
     // PLE scratch
     MTL::Buffer* per_layer_inputs;   // (T, n_layers, PLE_dim)
@@ -1227,6 +1347,14 @@ inline void dispatch_model(
         lb.w_gate           = W.w_gate;
         lb.w_up             = W.w_up;
         lb.w_down           = W.w_down;
+        // Q8_0 body projections (per-layer byte offsets from the offset tables).
+        lb.w_q_q8    = W.w_q_q8;    lb.q_q8_off    = W.q_q8_off    ? W.q_q8_off[L]    : 0;
+        lb.w_k_q8    = W.w_k_q8;    lb.k_q8_off    = W.k_q8_off    ? W.k_q8_off[L]    : 0;
+        lb.w_v_q8    = W.w_v_q8;    lb.v_q8_off    = W.v_q8_off    ? W.v_q8_off[L]    : 0;
+        lb.w_out_q8  = W.w_out_q8;  lb.out_q8_off  = W.out_q8_off  ? W.out_q8_off[L]  : 0;
+        lb.w_gate_q8 = W.w_gate_q8; lb.gate_q8_off = W.gate_q8_off ? W.gate_q8_off[L] : 0;
+        lb.w_up_q8   = W.w_up_q8;   lb.up_q8_off   = W.up_q8_off   ? W.up_q8_off[L]   : 0;
+        lb.w_down_q8 = W.w_down_q8; lb.down_q8_off = W.down_q8_off ? W.down_q8_off[L] : 0;
         {
             const uint32_t kv_L = (kv_src >= 0) ? (uint32_t)kv_src : L;
             lb.k_cache      = W.layer_caches[kv_L].k;
@@ -1243,6 +1371,7 @@ inline void dispatch_model(
         lb.m_in       = B.m_in;
         lb.m_out      = B.m_out;
         lb.m_int_scratch = B.m_int_scratch;
+        lb.m_up_scratch  = B.m_up_scratch;
         lb.y_out      = nxt;
 
         dispatch_layer(cmd, P.layer, lb, lp);

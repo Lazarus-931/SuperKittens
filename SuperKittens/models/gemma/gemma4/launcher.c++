@@ -27,6 +27,15 @@ struct Handle {
     std::vector<size_t>   mlp_down_off_e;
     std::vector<int32_t>  kv_source_layer;
 
+    // Per-layer byte offsets into the Q8_0 body buffers (empty if Q8 body off).
+    std::vector<size_t>   q_q8_off;
+    std::vector<size_t>   k_q8_off;
+    std::vector<size_t>   v_q8_off;
+    std::vector<size_t>   out_q8_off;
+    std::vector<size_t>   gate_q8_off;
+    std::vector<size_t>   up_q8_off;
+    std::vector<size_t>   down_q8_off;
+
     bool dump_enabled = false;
 };
 
@@ -61,6 +70,7 @@ static bool resolve_psos(ModelPSOs& P) {
     P.layer.gemv_bf16_m1       = sk::bindings_pso("gemv_bf16_m1");
     P.layer.qkv_norm_rope_partial_t1 = sk::bindings_pso("gemma4_qkv_norm_rope_partial_t1");
     P.layer.q8_0_matvec_bf16   = sk::bindings_pso("q8_0_matvec_bf16");
+    P.layer.geglu_mul          = sk::bindings_pso("gemma4_geglu_mul");
     P.embedding_lookup     = sk::bindings_pso("embedding_lookup_bf16");
     P.ple_lookup           = sk::bindings_pso("gemma4_ple_lookup");
     P.ple_context_mix      = sk::bindings_pso("gemma4_ple_context_mix");
@@ -220,12 +230,66 @@ extern "C" sk_gemma4_handle* sk_gemma4_create(const sk_gemma4_config* cfg) {
     h->weights.w_pre_feedforward_layernorm  = alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * 2);
     h->weights.w_post_feedforward_layernorm = alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * 2);
     h->weights.w_final_norm    = alloc_zero(dev, (size_t)cfg->d_model * 2);
-    h->weights.w_qkv           = alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model
-                                                  * qkv_slots_max * hd_max * 2);
-    h->weights.w_out           = alloc_zero(dev, (size_t)cfg->n_layers * cfg->n_heads * hd_max * cfg->d_model * 2);
     h->weights.gamma_q         = alloc_zero(dev, (size_t)cfg->n_layers * hd_max * 2);
     h->weights.gamma_k         = alloc_zero(dev, (size_t)cfg->n_layers * hd_max * 2);
+
+    // Q8_0 body projections: when enabled (default; SK_GEMMA4_BODY_Q8=0 to
+    // disable), the per-layer q/k/v/o/gate/up/down weights are packed Q8_0 and
+    // the bf16 body slabs are NOT allocated — this is what lets E2B fit 16 GB
+    // without bf16 memory compression. Each projection tensor is HF-native
+    // [N, K] row-major (q8_0_matvec_bf16 reads that layout directly, no
+    // transpose). One contiguous slab per projection across layers; the
+    // *_q8_off tables hold per-layer byte offsets (q8 block = 34 bytes / 32).
+    bool body_q8 = false;
     {
+        const char* env = std::getenv("SK_GEMMA4_BODY_Q8");
+        const bool want = !env || (env[0] != '0');
+        body_q8 = want && (cfg->d_model % 32 == 0) && h->psos.layer.q8_0_matvec_bf16
+               && h->psos.layer.geglu_mul;
+    }
+    auto q8_bytes = [](size_t n_elems) -> size_t { return (n_elems / 32) * 34; };
+    if (body_q8) {
+        h->q_q8_off.resize(cfg->n_layers);    h->k_q8_off.resize(cfg->n_layers);
+        h->v_q8_off.resize(cfg->n_layers);    h->out_q8_off.resize(cfg->n_layers);
+        h->gate_q8_off.resize(cfg->n_layers); h->up_q8_off.resize(cfg->n_layers);
+        h->down_q8_off.resize(cfg->n_layers);
+        size_t cq = 0, ck = 0, cv = 0, co = 0, cg = 0, cu = 0, cd = 0;
+        for (uint32_t L = 0; L < cfg->n_layers; ++L) {
+            const bool   is_global = ((L % cfg->local_period) == (cfg->local_period - 1));
+            const size_t n_kv = is_global ? cfg->n_kv_heads_global : cfg->n_kv_heads_local;
+            const size_t hd   = is_global ? cfg->head_dim_global   : cfg->head_dim_local;
+            const size_t Nq   = (size_t)cfg->n_heads * hd;
+            const size_t Nkv  = n_kv * hd;
+            const size_t ni   = h->n_int_per_layer[L];
+            h->q_q8_off[L]    = cq; cq += q8_bytes(Nq  * cfg->d_model);
+            h->k_q8_off[L]    = ck; ck += q8_bytes(Nkv * cfg->d_model);
+            h->v_q8_off[L]    = cv; cv += q8_bytes(Nkv * cfg->d_model);
+            h->out_q8_off[L]  = co; co += q8_bytes(Nq  * cfg->d_model);
+            h->gate_q8_off[L] = cg; cg += q8_bytes((size_t)cfg->d_model * ni);
+            h->up_q8_off[L]   = cu; cu += q8_bytes((size_t)cfg->d_model * ni);
+            h->down_q8_off[L] = cd; cd += q8_bytes((size_t)ni * cfg->d_model);
+        }
+        h->weights.w_q_q8    = alloc_zero(dev, cq);
+        h->weights.w_k_q8    = alloc_zero(dev, ck);
+        h->weights.w_v_q8    = alloc_zero(dev, cv);
+        h->weights.w_out_q8  = alloc_zero(dev, co);
+        h->weights.w_gate_q8 = alloc_zero(dev, cg);
+        h->weights.w_up_q8   = alloc_zero(dev, cu);
+        h->weights.w_down_q8 = alloc_zero(dev, cd);
+        h->weights.q_q8_off    = h->q_q8_off.data();
+        h->weights.k_q8_off    = h->k_q8_off.data();
+        h->weights.v_q8_off    = h->v_q8_off.data();
+        h->weights.out_q8_off  = h->out_q8_off.data();
+        h->weights.gate_q8_off = h->gate_q8_off.data();
+        h->weights.up_q8_off   = h->up_q8_off.data();
+        h->weights.down_q8_off = h->down_q8_off.data();
+        // bf16 body slabs stay null; weights.c++ skips their copies when Q8 on.
+        h->weights.w_qkv = nullptr; h->weights.w_out = nullptr;
+        h->weights.w_gate = nullptr; h->weights.w_up = nullptr; h->weights.w_down = nullptr;
+    } else {
+        h->weights.w_qkv = alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model
+                                           * qkv_slots_max * hd_max * 2);
+        h->weights.w_out = alloc_zero(dev, (size_t)cfg->n_layers * cfg->n_heads * hd_max * cfg->d_model * 2);
         size_t total_gate_e = h->mlp_gate_off_e.back() + (size_t)cfg->d_model * h->n_int_per_layer.back();
         size_t total_down_e = h->mlp_down_off_e.back() + (size_t)h->n_int_per_layer.back() * cfg->d_model;
         h->weights.w_gate = alloc_zero(dev, total_gate_e * 2);
@@ -280,6 +344,8 @@ extern "C" sk_gemma4_handle* sk_gemma4_create(const sk_gemma4_config* cfg) {
             if (h->n_int_per_layer[L] > max_n_int) max_n_int = h->n_int_per_layer[L];
         }
         h->bufs.m_int_scratch = alloc_zero(dev, (size_t)T_max * max_n_int * 2);
+        // m_up_scratch: Q8 GeGLU up-projection band (gate→m_int, up→m_up).
+        h->bufs.m_up_scratch  = alloc_zero(dev, (size_t)T_max * max_n_int * 2);
     }
     h->bufs.y_out      = alloc_zero(dev, x_bytes);
 
@@ -591,6 +657,9 @@ extern "C" void sk_gemma4_destroy(sk_gemma4_handle* hp) {
     rel(h->weights.w_qkv); rel(h->weights.w_out);
     rel(h->weights.gamma_q); rel(h->weights.gamma_k);
     rel(h->weights.w_gate); rel(h->weights.w_up); rel(h->weights.w_down);
+    rel(h->weights.w_q_q8); rel(h->weights.w_k_q8); rel(h->weights.w_v_q8);
+    rel(h->weights.w_out_q8); rel(h->weights.w_gate_q8);
+    rel(h->weights.w_up_q8); rel(h->weights.w_down_q8);
     rel(h->weights.cos_local); rel(h->weights.sin_local);
     rel(h->weights.cos_global); rel(h->weights.sin_global);
 
@@ -606,6 +675,7 @@ extern "C" void sk_gemma4_destroy(sk_gemma4_handle* hp) {
     rel(h->bufs.q_norm); rel(h->bufs.k_tmp); rel(h->bufs.v_tmp);
     rel(h->bufs.attn_out); rel(h->bufs.o_proj); rel(h->bufs.y_attn);
     rel(h->bufs.m_in); rel(h->bufs.m_out); rel(h->bufs.y_out);
+    rel(h->bufs.m_int_scratch); rel(h->bufs.m_up_scratch);
     rel(h->bufs.per_layer_inputs); rel(h->bufs.ple_ctx_proj); rel(h->bufs.ple_gate_out);
     rel(h->bufs.ple_gated); rel(h->bufs.ple_proj_back);
     rel(h->bufs.dump_stash);
