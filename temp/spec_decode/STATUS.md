@@ -63,6 +63,33 @@ STILL A LOSS (0.56-0.88x), though improved from the old 0.36-0.64x. Lossless hol
 - break-even mean-accept: K=2 -> 2.32 (impossible), K=4 -> 3.61, K=6 -> 4.42. Actual
   accept tops out at 3.85 (low-entropy K=6) < break-even. Draft tax (K*6.92 ms) dominates.
 
+## K sweep (lexie, same build/host) — peak is still < 1.0x
+| prompt      | K | ratio | accept/K |
+|-------------|---|-------|----------|
+| creative    | 3 | 0.507 | 1.13     |
+| creative    | 5 | 0.688 | 2.50     |
+| creative    | 8 | 0.423 | 2.56     |
+| low-entropy | 5 | 0.784 | 2.94     |
+| low-entropy | 8 | 0.640 | 4.25     |
+Best across all K = 0.88x (low-entropy K=6). K=8 regresses (draft tax + verify floor
+grow faster than accept; Q4_K verify M>4 routes to MMA, no small-M help).
+
+## 8B-target projection (qwen3-8b-q4km + 0.6b) — likely the only path to >1.0x, BLOCKED
+From measured 4B scaling: an 8B-Q4KM decode ~= 2x a 4B decode (~50 ms; ~2x weight
+bytes, bandwidth-bound) while the 0.6B draft tax stays 7 ms/token, so the relative
+draft tax HALVES. Verify(8B, seq7) ~= 2x verify(4B) ~= 150 ms. Break-even accept(K=6)
+~= (6*7 + 150)/50 - 1 ~= 2.84, vs measured low-entropy accept 3.85 -> 8B should WIN
+(~1.1-1.3x) at low-entropy. NOT confirmed: no 8B-Q4KM on lexie; amelia has it but is
+memory-tight (0.4 GB free) + no 0.6B draft + no spec ABI/Xcode; inter-host 5GB copy
+to lexie ran at ~40 MB/min (impractical). Infra-blocked, not code-blocked. To run:
+put Qwen3-8B-Q4_K_M.gguf in a snapshot dir on an idle 16GB mini and
+`specbench.py --target qwen3-8b-q4km --draft qwen3-0.6b --K 4 6 --cache-max 512`.
+
+## CONCLUSION
+Orchestration correct + LOSSLESS; small-M rebase improved spec-decode from 0.36-0.64x
+to 0.56-0.88x, but it is STILL a net LOSS on M4 for the 4B target. No PR-for-win (it's
+not a win). 8B target is the projected win but is infra-blocked on the current hosts.
+
 ## Local-only artifacts (NOT committed)
 - `_snap_06b/` symlink snapshot, `local_lossless.py`, `repro.py`, `fit_check.py`,
-  `time_dbg.py` (kept, harmless local harnesses).
+  `time_dbg.py`, `draft_dbg.py` (kept, harmless local harnesses).
