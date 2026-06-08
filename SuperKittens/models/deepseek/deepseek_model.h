@@ -55,6 +55,7 @@ struct LayerParams {
     float    yarn_mscale       = 1.0f;     // pre-squared; attn scale *= mscale^2 (modeling:412-414)
     uint32_t n_group           = 8;        // 0 disables grouping (V2-Lite)
     uint32_t topk_group        = 4;
+    float    rope_scaling_factor = 1.0f;   // YaRN factor (1.0 = disabled)
     float    routed_scaling    = 2.5f;     // V2-Lite: 1.0
     bool     norm_topk_prob    = true;     // V2-Lite: false
     bool     router_has_bias   = true;     // V2-Lite: false (no e_score_correction_bias)
@@ -92,6 +93,7 @@ struct LayerPSOs {
     MTL::ComputePipelineState* add;
     MTL::ComputePipelineState* add_rmsnorm;
     MTL::ComputePipelineState* gated_mlp;
+    MTL::ComputePipelineState* silu_mul;        // fp16 elementwise silu(gate)*up
 
     MoeFfnPSOs moe;
 };
@@ -146,6 +148,8 @@ struct LayerBuffers {
     MTL::Buffer* m_in;
     MTL::Buffer* shared_mid;
     MTL::Buffer* shared_out;
+    MTL::Buffer* mlp_gate;        // dense/shared MLP gate scratch [T, max_n_int] fp16
+    MTL::Buffer* mlp_up;          // dense/shared MLP up scratch
     MTL::Buffer* moe_top_idx;
     MTL::Buffer* moe_top_score;
     MTL::Buffer* moe_hidden;
@@ -230,6 +234,16 @@ inline void dispatch_attn(
     const uint32_t T   = p.batch * p.seq;
     const uint32_t L   = p.layer_idx;
     const uint32_t dk  = p.qk_nope_dim + p.qk_rope_dim;
+
+    // YaRN RoPE: HF computes a per-dim blended inv_freq (interpolation /factor on
+    // low-freq dims, extrapolation on high-freq). The rope_interleave kernel
+    // reproduces this when ext_factor=1, freq_scale=1/factor. cos/sin
+    // attention_factor is get_mscale(f,mscale)/get_mscale(f,mscale_all_dim) — 1.0
+    // for V2-Lite (mscale==mscale_all_dim). With factor<=1 YaRN is a no-op.
+    const float rope_factor   = (p.rope_scaling_factor > 1.f) ? p.rope_scaling_factor : 1.f;
+    const float rope_yarn_ext = (rope_factor > 1.f) ? 1.f : 0.f;
+    const float rope_fscale   = (rope_factor > 1.f) ? (1.f / rope_factor) : 1.f;
+    const float rope_csmscale = 1.f;   // attention_factor == 1.0 for V2-Lite
 
     const size_t off_norm        = (size_t)L * p.d_model * 2;
     const size_t off_w_q_a       = (size_t)L * p.d_model * p.q_lora_rank * 2;
@@ -333,12 +347,12 @@ inline void dispatch_attn(
             iq.n_dims     = (int32_t)p.qk_rope_dim;
             iq.n_ctx_orig = p.rope_n_ctx_orig;
             iq.freq_base  = p.rope_freq_base;
-            iq.freq_scale = p.rope_freq_scale;
-            iq.ext_factor = p.rope_ext_factor;
+            iq.freq_scale = rope_fscale;
+            iq.ext_factor = rope_yarn_ext;
             iq.attn_factor = p.rope_attn_factor;
             iq.beta_fast  = p.rope_beta_fast;
             iq.beta_slow  = p.rope_beta_slow;
-            iq.mscale     = 1.0f;
+            iq.mscale     = rope_csmscale;
             enc->setComputePipelineState(P.rope_interleave);
             enc->setBytes(&iq, sizeof(iq), 0);
             enc->setBuffer(B.q_packed_f32, 0, 1);
@@ -383,12 +397,12 @@ inline void dispatch_attn(
             ik.n_dims     = (int32_t)p.qk_rope_dim;
             ik.n_ctx_orig = p.rope_n_ctx_orig;
             ik.freq_base  = p.rope_freq_base;
-            ik.freq_scale = p.rope_freq_scale;
-            ik.ext_factor = p.rope_ext_factor;
+            ik.freq_scale = rope_fscale;
+            ik.ext_factor = rope_yarn_ext;
             ik.attn_factor = p.rope_attn_factor;
             ik.beta_fast  = p.rope_beta_fast;
             ik.beta_slow  = p.rope_beta_slow;
-            ik.mscale     = 1.0f;
+            ik.mscale     = rope_csmscale;
             enc2->setComputePipelineState(P.rope_interleave);
             enc2->setBytes(&ik, sizeof(ik), 0);
             enc2->setBuffer(B.k_pe_f32, 0, 1);
@@ -519,7 +533,10 @@ inline void dispatch_attn(
         a.nb32 = a.nb31 * p.seq;
         a.nb33 = a.nb32;
         a.ne1 = (int32_t)p.n_heads; a.ne2 = (int32_t)p.seq; a.ne3 = (int32_t)p.batch;
-        a.scale = (1.f / metal_sqrt_safe((float)dk)) * p.yarn_mscale * p.yarn_mscale;
+        // HF DeepseekV2Attention.scaling = qk_head_dim^-0.5. YaRN mscale is folded
+        // into the RoPE cos/sin attention_factor (== 1.0 here since mscale ==
+        // mscale_all_dim), NOT into the softmax scale.
+        a.scale = 1.f / metal_sqrt_safe((float)dk);
         a.max_bias = 0.f; a.m0 = 1.f; a.m1 = 1.f;
         a.n_head_log2 = 0; a.logit_softcap = 0.f;
 
@@ -547,35 +564,56 @@ inline void dispatch_attn(
                 T, p.d_model, p.n_heads * p.v_head_dim);
 }
 
+// Unfused gated MLP: gate=x@Wg, up=x@Wu, mid=silu(gate)*up, out=mid@Wd.
+// The fused gated_mlp kernel only holds a BM×BN=64×64 intermediate tile, so it
+// is wrong (and overflows threadgroup scratch) for n_int > 64. DeepSeek shared
+// experts (2816) and the leading dense MLP (10944) both need this unfused path.
+inline void dispatch_gated_mlp_unfused(
+    MTL::CommandBuffer*  cmd,
+    const LayerPSOs&     P,
+    const LayerBuffers&  B,
+    const LayerParams&   p,
+    MTL::Buffer* w_gate, size_t off_gate,
+    MTL::Buffer* w_up,   size_t /*off_up == off_gate*/,
+    MTL::Buffer* w_down, size_t off_down,
+    uint32_t n_int,
+    MTL::Buffer* out)
+{
+    const uint32_t T = p.batch * p.seq;
+    encode_gemm(cmd, P.gemm, B.m_in, 0, w_gate, off_gate, B.mlp_gate,
+                T, n_int, p.d_model);
+    encode_gemm(cmd, P.gemm, B.m_in, 0, w_up,   off_gate, B.mlp_up,
+                T, n_int, p.d_model);
+    {
+        const uint32_t n = T * n_int;
+        auto* enc = cmd->computeCommandEncoder();
+        enc->setComputePipelineState(P.silu_mul);
+        enc->setBuffer(B.mlp_gate, 0, 0);
+        enc->setBuffer(B.mlp_up,   0, 1);
+        enc->setBuffer(B.mlp_gate, 0, 2);   // in-place into mlp_gate
+        enc->setBytes(&n, 4, 3);
+        enc->dispatchThreadgroups(MTL::Size((n + 255) / 256, 1, 1),
+                                  MTL::Size(256, 1, 1));
+        enc->endEncoding();
+    }
+    encode_gemm(cmd, P.gemm, B.mlp_gate, 0, w_down, off_down, out,
+                T, p.d_model, n_int);
+}
+
 inline void dispatch_shared_expert(
     MTL::CommandBuffer*  cmd,
     const LayerPSOs&     P,
     const LayerBuffers&  B,
     const LayerParams&   p)
 {
-    const uint32_t T = p.batch * p.seq;
     const uint32_t L = p.layer_idx;
-
     const size_t off_w_gate = (size_t)L * p.d_model * p.shared_n_int * 2;
     const size_t off_w_down = (size_t)L * p.shared_n_int * p.d_model * 2;
-
-    auto* enc = cmd->computeCommandEncoder();
-    enc->setComputePipelineState(P.gated_mlp);
-    enc->setBuffer(B.m_in,          0,          0);
-    enc->setBuffer(B.w_shared_gate, off_w_gate, 1);
-    enc->setBuffer(B.w_shared_up,   off_w_gate, 2);
-    enc->setBuffer(B.w_shared_down, off_w_down, 3);
-    enc->setBuffer(B.shared_out,    0,          4);
-    uint32_t M = T;
-    uint32_t N_v = p.d_model;
-    uint32_t K_v = p.d_model;
-    enc->setBytes(&M,             4, 5);
-    enc->setBytes(&N_v,           4, 6);
-    enc->setBytes(&K_v,           4, 7);
-    enc->setBytes(&p.shared_n_int, 4, 8);
-    enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M + 63) / 64, 1),
-                              MTL::Size(128, 1, 1));
-    enc->endEncoding();
+    dispatch_gated_mlp_unfused(cmd, P, B, p,
+                               B.w_shared_gate, off_w_gate,
+                               B.w_shared_up,   off_w_gate,
+                               B.w_shared_down, off_w_down,
+                               p.shared_n_int, B.shared_out);
 }
 
 inline void dispatch_layer(
@@ -611,23 +649,11 @@ inline void dispatch_layer(
     if (!p.is_moe_layer) {
         const size_t off_g = (size_t)L * p.d_model * p.dense_n_int * 2;
         const size_t off_d = (size_t)L * p.dense_n_int * p.d_model * 2;
-        {
-            auto* enc = cmd->computeCommandEncoder();
-            enc->setComputePipelineState(P.gated_mlp);
-            enc->setBuffer(B.m_in,        0,     0);
-            enc->setBuffer(B.w_dense_gate, off_g, 1);
-            enc->setBuffer(B.w_dense_up,   off_g, 2);
-            enc->setBuffer(B.w_dense_down, off_d, 3);
-            enc->setBuffer(B.shared_out,  0,     4);
-            uint32_t M = T, N_v = p.d_model, K_v = p.d_model;
-            enc->setBytes(&M,             4, 5);
-            enc->setBytes(&N_v,           4, 6);
-            enc->setBytes(&K_v,           4, 7);
-            enc->setBytes(&p.dense_n_int, 4, 8);
-            enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M + 63) / 64, 1),
-                                      MTL::Size(128, 1, 1));
-            enc->endEncoding();
-        }
+        dispatch_gated_mlp_unfused(cmd, P, B, p,
+                                   B.w_dense_gate, off_g,
+                                   B.w_dense_up,   off_g,
+                                   B.w_dense_down, off_d,
+                                   p.dense_n_int, B.shared_out);
         auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(P.add);
         enc->setBuffer(B.y_attn,     0, 0);
@@ -881,6 +907,8 @@ struct ModelBuffers {
     MTL::Buffer* m_in;
     MTL::Buffer* shared_mid;
     MTL::Buffer* shared_out;
+    MTL::Buffer* mlp_gate;
+    MTL::Buffer* mlp_up;
     MTL::Buffer* moe_top_idx;
     MTL::Buffer* moe_top_score;
     MTL::Buffer* moe_hidden;
@@ -963,6 +991,7 @@ inline void dispatch_model(
         lp.is_moe_layer    = (L >= M.first_k_dense_replace);
         lp.rope_interleave = M.rope_interleave;
         lp.yarn_mscale     = ds_compute_yarn_mscale(M.rope_scaling_factor, M.mscale_all_dim);
+        lp.rope_scaling_factor = M.rope_scaling_factor;
         lp.n_group         = M.n_group;
         lp.topk_group      = M.topk_group;
         lp.routed_scaling  = M.routed_scaling;
@@ -1014,6 +1043,8 @@ inline void dispatch_model(
         lb.m_in          = B.m_in;
         lb.shared_mid    = B.shared_mid;
         lb.shared_out    = B.shared_out;
+        lb.mlp_gate      = B.mlp_gate;
+        lb.mlp_up        = B.mlp_up;
         lb.moe_top_idx   = B.moe_top_idx;
         lb.moe_top_score = B.moe_top_score;
         lb.moe_hidden    = B.moe_hidden;

@@ -104,6 +104,7 @@ static bool resolve_psos(ModelPSOs& P, uint32_t dk, uint32_t dv) {
     P.layer.cast_f2h       = sk::bindings_pso("cast_f32_to_f16");
     P.layer.causal_mask_fill = sk::bindings_pso("causal_mask_fill");
     P.layer.gated_mlp      = sk::bindings_pso("gated_mlp");
+    P.layer.silu_mul       = sk::bindings_pso("silu_mul_f16");
     P.layer.kv_up_pair     = sk::bindings_pso("kv_up_pair");
     P.layer.split_packed       = sk::bindings_pso("split_packed");
 
@@ -145,6 +146,7 @@ static bool resolve_psos(ModelPSOs& P, uint32_t dk, uint32_t dv) {
     _CK("cast_f32_to_f16", P.layer.cast_f2h);
     _CK("causal_mask_fill", P.layer.causal_mask_fill);
     _CK("gated_mlp",      P.layer.gated_mlp);
+    _CK("silu_mul_f16",   P.layer.silu_mul);
     _CK("kv_up_pair",     P.layer.kv_up_pair);
     _CK("split_packed",       P.layer.split_packed);
     _CK("moe_router",            P.layer.moe.router);
@@ -284,6 +286,13 @@ extern "C" sk_deepseek_handle* sk_deepseek_create(const sk_deepseek_config* cfg)
     h->bufs.m_in        = alloc_zero(dev, x_bytes);
     h->bufs.shared_mid  = alloc_zero(dev, (size_t)T_max * cfg->shared_n_int * 2);
     h->bufs.shared_out  = alloc_zero(dev, x_bytes);
+    // Dense/shared MLP scratch sized for the widest n_int (dense MLP, e.g. 10944).
+    {
+        const uint32_t dni = cfg->dense_n_int ? cfg->dense_n_int : cfg->shared_n_int;
+        const uint32_t max_n_int = (dni > cfg->shared_n_int) ? dni : cfg->shared_n_int;
+        h->bufs.mlp_gate = alloc_zero(dev, (size_t)T_max * max_n_int * 2);
+        h->bufs.mlp_up   = alloc_zero(dev, (size_t)T_max * max_n_int * 2);
+    }
     h->bufs.moe_top_idx   = alloc_zero(dev, (size_t)T_max * cfg->top_k * sizeof(int32_t));
     h->bufs.moe_top_score = alloc_zero(dev, (size_t)T_max * cfg->top_k * 2);
     h->bufs.moe_hidden    = alloc_zero(dev, (size_t)T_max * cfg->top_k * cfg->n_int * 2);
@@ -455,6 +464,7 @@ extern "C" void sk_deepseek_destroy(sk_deepseek_handle* hp) {
     rel(h->bufs.kv_a_packed); rel(h->bufs.k_no_pe); rel(h->bufs.v);
     rel(h->bufs.attn_out); rel(h->bufs.o_proj); rel(h->bufs.y_attn);
     rel(h->bufs.m_in); rel(h->bufs.shared_mid); rel(h->bufs.shared_out);
+    rel(h->bufs.mlp_gate); rel(h->bufs.mlp_up);
     rel(h->bufs.moe_top_idx); rel(h->bufs.moe_top_score); rel(h->bufs.moe_hidden);
     rel(h->bufs.moe_x_f32); rel(h->bufs.moe_gate_f32); rel(h->bufs.moe_up_f32);
     rel(h->bufs.moe_mid_f32); rel(h->bufs.moe_down_f32);
