@@ -279,13 +279,18 @@ extern "C" sk_deepseek_handle* sk_deepseek_create(const sk_deepseek_config* cfg)
     h->bufs.rope_pos    = alloc_zero(dev, (size_t)T_max * sizeof(int32_t));
 
     h->bufs.x_norm      = alloc_zero(dev, x_bytes);
-    h->bufs.q_a         = alloc_zero(dev, (size_t)T_max * cfg->q_lora_rank * 2);
+    h->bufs.q_a         = alloc_zero(dev, (size_t)T_max * (cfg->q_lora_rank ? cfg->q_lora_rank : 1u) * 2);
     h->bufs.q_packed    = alloc_zero(dev, (size_t)T_max * cfg->n_heads * dk * 2);
     h->bufs.q_packed_f32 = alloc_zero(dev, (size_t)T_max * cfg->n_heads * dk * 4);
     h->bufs.k_pe_f32     = alloc_zero(dev, (size_t)T_max * cfg->qk_rope_dim * 4);
     h->bufs.attn_out_f32 = alloc_zero(dev, (size_t)T_max * cfg->n_heads * cfg->v_head_dim * 4);
     h->bufs.causal_mask  = alloc_zero(dev, (size_t)cfg->seq_max * cfg->cache_max * 2);
     h->bufs.kv_a_packed = alloc_zero(dev, (size_t)T_max * (cfg->kv_lora_rank + cfg->qk_rope_dim) * 2);
+    // split_packed writes the compressed-KV latent (c_kv) and the RoPE part
+    // (k_pe) out of kv_a_packed; both are read downstream (kv_a_norm, RoPE,
+    // kv_up). They were never allocated → NULL bindings (undefined GPU reads).
+    h->bufs.c_kv        = alloc_zero(dev, (size_t)T_max * cfg->kv_lora_rank * 2);
+    h->bufs.k_pe        = alloc_zero(dev, (size_t)T_max * cfg->qk_rope_dim * 2);
     h->bufs.k_no_pe     = alloc_zero(dev, (size_t)T_max * cfg->n_heads * cfg->qk_nope_dim * 2);
     h->bufs.v           = alloc_zero(dev, (size_t)T_max * cfg->n_heads * cfg->v_head_dim * 2);
     h->bufs.attn_out    = alloc_zero(dev, (size_t)T_max * cfg->n_heads * cfg->v_head_dim * 2);
@@ -490,6 +495,7 @@ extern "C" void sk_deepseek_destroy(sk_deepseek_handle* hp) {
     rel(h->bufs.q_packed_f32); rel(h->bufs.k_pe_f32); rel(h->bufs.attn_out_f32);
     rel(h->bufs.causal_mask);
     rel(h->bufs.kv_a_packed); rel(h->bufs.k_no_pe); rel(h->bufs.v);
+    rel(h->bufs.c_kv); rel(h->bufs.k_pe);
     rel(h->bufs.attn_out); rel(h->bufs.o_proj); rel(h->bufs.y_attn);
     rel(h->bufs.m_in); rel(h->bufs.shared_mid); rel(h->bufs.shared_out);
     rel(h->bufs.mlp_gate); rel(h->bufs.mlp_up);
