@@ -47,6 +47,7 @@ class _Config(ctypes.Structure):
         ("eps",                ctypes.c_float),
         ("tie_word_embeddings", ctypes.c_uint32),
         ("use_qk_norm",        ctypes.c_uint32),
+        ("rope_interleaved",   ctypes.c_uint32),
     ]
 
 
@@ -127,6 +128,8 @@ class Config(CtypesConfig):
     cache_max: int = 32768
     tie_word_embeddings: int = 1  # 1 = tied LM head; 0 for untied variants
     use_qk_norm: int = 1          # 1 = per-head Q/K RMSNorm (Qwen3); 0 for Llama-arch
+    rope_interleaved: int = 0     # 0 = split-half/NeoX RoPE (Qwen3, GGML type 2);
+                                  # 1 = interleaved/NORM (Llama GGUF, GGML type 0)
 
 
 class DenseDecoder(Model):
