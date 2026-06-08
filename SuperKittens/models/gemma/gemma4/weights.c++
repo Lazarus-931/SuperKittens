@@ -245,7 +245,15 @@ void dequant_q4_k_bf16(uint16_t* dst, const uint8_t* src, size_t n) {
 
 void dequant_q6_k_bf16(uint16_t* dst, const uint8_t* src, size_t n) {
     const size_t nb = n / 256;
-    if (n > 1000000000ull) std::fprintf(stderr, "Q6KDEQ: n=%zu nb=%zu src=%p dst=%p\n", n, nb, (void*)src, (void*)dst);
+    if (n > 1000000000ull) {
+        std::fprintf(stderr, "Q6KDEQ: n=%zu nb=%zu src=%p dst=%p\n", n, nb, (void*)src, (void*)dst);
+        for (size_t bb = 1604; bb <= 1607; ++bb) {
+            const uint8_t* pp = src + bb*210;
+            uint16_t dd; std::memcpy(&dd, pp+208, 2);
+            std::fprintf(stderr, "  rawd blk %zu: d_bits=%04x ql0=%02x qh0=%02x sc0=%d\n",
+                bb, dd, pp[0], pp[128], (int)(int8_t)pp[192]);
+        }
+    }
     for (size_t b = 0; b < nb; ++b) {
         const uint8_t* p = src + b * 210;
         const uint8_t* ql = p;
