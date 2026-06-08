@@ -27,6 +27,15 @@ struct Handle {
     std::vector<size_t>   mlp_down_off_e;
     std::vector<int32_t>  kv_source_layer;
 
+    // Per-layer byte offsets into the Q8_0 body buffers (empty if Q8 body off).
+    std::vector<size_t>   q_q8_off;
+    std::vector<size_t>   k_q8_off;
+    std::vector<size_t>   v_q8_off;
+    std::vector<size_t>   out_q8_off;
+    std::vector<size_t>   gate_q8_off;
+    std::vector<size_t>   up_q8_off;
+    std::vector<size_t>   down_q8_off;
+
     bool dump_enabled = false;
 };
 
@@ -61,6 +70,7 @@ static bool resolve_psos(ModelPSOs& P) {
     P.layer.gemv_bf16_m1       = sk::bindings_pso("gemv_bf16_m1");
     P.layer.qkv_norm_rope_partial_t1 = sk::bindings_pso("gemma4_qkv_norm_rope_partial_t1");
     P.layer.q8_0_matvec_bf16   = sk::bindings_pso("q8_0_matvec_bf16");
+    P.layer.geglu_mul          = sk::bindings_pso("gemma4_geglu_mul");
     P.embedding_lookup     = sk::bindings_pso("embedding_lookup_bf16");
     P.ple_lookup           = sk::bindings_pso("gemma4_ple_lookup");
     P.ple_context_mix      = sk::bindings_pso("gemma4_ple_context_mix");

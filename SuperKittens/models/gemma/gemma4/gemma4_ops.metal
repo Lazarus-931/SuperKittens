@@ -200,4 +200,39 @@ void gemma4_logit_descale(
     }
 }
 
+// gemma4_geglu_mul: elementwise out[i] = gelu_tanh(gate[i]) * up[i].
+// Completes the Q8_0 GeGLU MLP after the gate/up q8 matvecs write their bands;
+// the down q8 matvec then consumes `out`. gelu_tanh matches gemv_geglu_bf16_m1.
+[[host_name("gemma4_geglu_mul")]]
+[[kernel]]
+void gemma4_geglu_mul(
+    device const bfloat* gate  [[buffer(0)]],
+    device const bfloat* up    [[buffer(1)]],
+    device       bfloat* out   [[buffer(2)]],
+    constant uint& n         [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    const float K0 = 0.7978845608028654f;  // sqrt(2/pi)
+    const float K1 = 0.044715f;
+    const uint i = gid * 4;
+    if (i + 4 <= n) {
+        float4 g = float4(*reinterpret_cast<const device bfloat4*>(gate + i));
+        float4 u = float4(*reinterpret_cast<const device bfloat4*>(up + i));
+        float4 t;
+        #pragma unroll
+        for (uint j = 0; j < 4; ++j) {
+            float x = g[j];
+            float gv = 0.5f * x * (1.0f + precise::tanh(K0 * (x + K1 * x * x * x)));
+            t[j] = gv * u[j];
+        }
+        *reinterpret_cast<device bfloat4*>(out + i) = bfloat4(t);
+    } else {
+        for (uint j = i; j < n; ++j) {
+            float x = (float)gate[j];
+            float gv = 0.5f * x * (1.0f + precise::tanh(K0 * (x + K1 * x * x * x)));
+            out[j] = bfloat(gv * (float)up[j]);
+        }
+    }
+}
+
 } // namespace meow::gemma4::ops
