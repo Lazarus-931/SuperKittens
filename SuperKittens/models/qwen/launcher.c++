@@ -337,8 +337,34 @@ extern "C" void sk_qwen_reset(sk_qwen_handle* hp) {
 }
 
 namespace meow { namespace qwen {
+static int run_step(Handle* h, MTL::CommandQueue* q, uint32_t seq);
+
 // WHY: one-step driver shared between sk_qwen_forward and the in-C decode
 // loop. Caller has already memcpy'd input_ids + rope_pos for `seq` tokens.
+// WHY: prefill a prompt in chunks of <= chunk_step tokens, carrying KV + pos
+// across chunks. Each chunk is one run_step; the seq_max-sized scratch only has
+// to cover chunk_step rows, so a prompt longer than seq_max prefills with
+// bounded memory. The chunk boundary is numerically transparent (PR #54 fixed
+// the mha_causal current_pos>0 interior logits), so the final-position result
+// matches a single seq=prompt_seq forward. Caller has the queue + input/rope
+// buffers; this fills them per chunk. Returns 0 on success.
+static int run_prefill_chunked(Handle* h, MTL::CommandQueue* q,
+                               const int* prompt_ids, uint32_t prompt_seq,
+                               uint32_t chunk_step) {
+    int32_t* in_ids = (int32_t*)h->bufs.input_ids->contents();
+    int32_t* pos    = (int32_t*)h->bufs.rope_pos->contents();
+    for (uint32_t s = 0; s < prompt_seq; s += chunk_step) {
+        const uint32_t this_seq = (prompt_seq - s < chunk_step)
+                                  ? (prompt_seq - s) : chunk_step;
+        if (h->current_pos + this_seq > h->cfg.cache_max) return -4;
+        std::memcpy(in_ids, prompt_ids + s, (size_t)this_seq * sizeof(int32_t));
+        for (uint32_t i = 0; i < this_seq; ++i)
+            pos[i] = (int32_t)(h->current_pos + i);
+        if (int rc = run_step(h, q, this_seq)) return rc;
+    }
+    return 0;
+}
+
 static int run_step(Handle* h, MTL::CommandQueue* q, uint32_t seq) {
     ModelParams mp;
     mp.batch          = h->cfg.batch;
@@ -399,13 +425,35 @@ extern "C" int sk_qwen_forward(sk_qwen_handle* hp,
     return 0;
 }
 
+extern "C" int sk_qwen_prefill_chunked(sk_qwen_handle* hp,
+                                       const int* prompt_ids, uint32_t prompt_seq,
+                                       uint32_t chunk_size, int* output_id) {
+    if (!hp || !prompt_ids || !output_id) return -1;
+    auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
+    if (prompt_seq == 0) return -2;
+    if (h->cfg.batch != 1) return -5;  // chunked prefill is batch=1
+    uint32_t step = (chunk_size == 0) ? h->cfg.seq_max : chunk_size;
+    if (step > h->cfg.seq_max) step = h->cfg.seq_max;
+    if (step == 0) return -2;
+    if (h->current_pos + prompt_seq > h->cfg.cache_max) return -4;
+
+    auto* q = sk::bindings_queue();
+    if (!q) return -3;
+
+    if (int rc = meow::qwen::run_prefill_chunked(h, q, prompt_ids, prompt_seq, step))
+        return rc;
+
+    std::memcpy(output_id, h->bufs.output_id->contents(), sizeof(int32_t));
+    return 0;
+}
+
 extern "C" int sk_qwen_generate_n(sk_qwen_handle* hp,
                                   const int* prompt_ids, uint32_t prompt_seq,
                                   int* out_tokens, uint32_t n_tokens,
                                   int32_t eos_id) {
     if (!hp || !prompt_ids || !out_tokens) return -1;
     auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
-    if (prompt_seq == 0 || prompt_seq > h->cfg.seq_max) return -2;
+    if (prompt_seq == 0) return -2;
     if (n_tokens == 0) return 0;
     if (h->current_pos + prompt_seq > h->cfg.cache_max) return -4;
     if (h->cfg.batch != 1) return -5;  // greedy multi-token loop is batch=1
@@ -413,15 +461,13 @@ extern "C" int sk_qwen_generate_n(sk_qwen_handle* hp,
     auto* q = sk::bindings_queue();
     if (!q) return -3;
 
-    // Prefill on the prompt: produces argmax for next token in output_id.
-    std::memcpy(h->bufs.input_ids->contents(), prompt_ids,
-                (size_t)prompt_seq * sizeof(int32_t));
-    {
-        int32_t* pos = (int32_t*)h->bufs.rope_pos->contents();
-        for (uint32_t i = 0; i < prompt_seq; ++i)
-            pos[i] = (int32_t)(h->current_pos + i);
-    }
-    if (int rc = meow::qwen::run_step(h, q, prompt_seq)) return rc;
+    // Prefill on the prompt (chunked at seq_max so a prompt longer than the
+    // scratch buffers still prefills): leaves the next-token argmax in
+    // output_id. The chunk boundary is transparent, so the result is identical
+    // to a single seq=prompt_seq forward.
+    if (int rc = meow::qwen::run_prefill_chunked(h, q, prompt_ids, prompt_seq,
+                                                 h->cfg.seq_max))
+        return rc;
 
     int32_t* in_ids  = (int32_t*)h->bufs.input_ids->contents();
     int32_t* rope    = (int32_t*)h->bufs.rope_pos->contents();
@@ -459,8 +505,11 @@ extern "C" int sk_qwen_get_last_logits(sk_qwen_handle* hp, void* out_fp16) {
     auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
     const size_t V = h->cfg.vocab_size;
     const size_t row_bytes = V * sizeof(uint16_t);
-    if (h->current_pos == 0) return -2;
-    const size_t last_row = (size_t)(h->current_pos - 1);
+    // The LM head writes only the last row (last_seq-1) of the seq_max-sized
+    // logits buffer. Reading current_pos-1 reads out of bounds once a chunked
+    // prefill (or decode step) has advanced current_pos past seq_max.
+    if (h->last_seq == 0) return -2;
+    const size_t last_row = (size_t)(h->last_seq - 1);
     const char* src = (const char*)h->bufs.logits->contents() + last_row * row_bytes;
     std::memcpy(out_fp16, src, row_bytes);
     return 0;
