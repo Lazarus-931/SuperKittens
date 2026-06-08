@@ -245,6 +245,7 @@ void dequant_q4_k_bf16(uint16_t* dst, const uint8_t* src, size_t n) {
 
 void dequant_q6_k_bf16(uint16_t* dst, const uint8_t* src, size_t n) {
     const size_t nb = n / 256;
+    if (n > 1000000000ull) std::fprintf(stderr, "Q6KDEQ: n=%zu nb=%zu src=%p dst=%p\n", n, nb, (void*)src, (void*)dst);
     for (size_t b = 0; b < nb; ++b) {
         const uint8_t* p = src + b * 210;
         const uint8_t* ql = p;
@@ -267,6 +268,11 @@ void dequant_q6_k_bf16(uint16_t* dst, const uint8_t* src, size_t n) {
                 put(nn+l+96, d * (float)sc[is+6] * (float)q4);
             }
             ql += 64; qh += 32; sc += 8;
+        }
+        if (n > 1000000000ull && (b == 1605 || b == 1606)) {
+            size_t nz=0; for(int i=0;i<256;++i) if(out[i]&0x7fff) nz++;
+            std::fprintf(stderr, "Q6KDEQ blk %zu: d=%g nz=%zu out[0..2]=%04x %04x %04x\n",
+                b, (double)d, nz, out[0], out[1], out[2]);
         }
     }
 }
