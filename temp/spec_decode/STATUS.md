@@ -74,21 +74,62 @@ STILL A LOSS (0.56-0.88x), though improved from the old 0.36-0.64x. Lossless hol
 Best across all K = 0.88x (low-entropy K=6). K=8 regresses (draft tax + verify floor
 grow faster than accept; Q4_K verify M>4 routes to MMA, no small-M help).
 
-## 8B-target projection (qwen3-8b-q4km + 0.6b) — likely the only path to >1.0x, BLOCKED
-From measured 4B scaling: an 8B-Q4KM decode ~= 2x a 4B decode (~50 ms; ~2x weight
-bytes, bandwidth-bound) while the 0.6B draft tax stays 7 ms/token, so the relative
-draft tax HALVES. Verify(8B, seq7) ~= 2x verify(4B) ~= 150 ms. Break-even accept(K=6)
-~= (6*7 + 150)/50 - 1 ~= 2.84, vs measured low-entropy accept 3.85 -> 8B should WIN
-(~1.1-1.3x) at low-entropy. NOT confirmed: no 8B-Q4KM on lexie; amelia has it but is
-memory-tight (0.4 GB free) + no 0.6B draft + no spec ABI/Xcode; inter-host 5GB copy
-to lexie ran at ~40 MB/min (impractical). Infra-blocked, not code-blocked. To run:
-put Qwen3-8B-Q4_K_M.gguf in a snapshot dir on an idle 16GB mini and
-`specbench.py --target qwen3-8b-q4km --draft qwen3-0.6b --K 4 6 --cache-max 512`.
+## 8B-target projection (qwen3-8b-q4km + 0.6b) — was BLOCKED, now MEASURED (still a loss)
+PROJECTION (refuted below): from 4B scaling, an 8B-Q4KM decode ~= 2x a 4B decode
+(~50 ms) while the 0.6B draft tax stays ~7 ms, so the relative draft tax halves;
+verify(8B,seq7) ~= 2x verify(4B) ~= 150 ms -> break-even accept(K=6) ~= 2.84 < measured
+low-entropy accept 3.85, predicting ~1.1-1.3x at low entropy.
 
-## CONCLUSION
-Orchestration correct + LOSSLESS; small-M rebase improved spec-decode from 0.36-0.64x
-to 0.56-0.88x, but it is STILL a net LOSS on M4 for the 4B target. No PR-for-win (it's
-not a win). 8B target is the projected win but is infra-blocked on the current hosts.
+INFRA (resolved): downloaded Qwen3-8B-Q4_K_M.gguf (4.68 GiB) DIRECTLY on lexie from
+Qwen/Qwen3-8B-GGUF via curl (~80 MB/s, 60 s — NOT the 40 MB/min inter-host copy).
+0.6B draft already resident. dylib/metallib built locally on the M2 Air (only Mac w/
+Metal toolchain; minis are CLT-only) + rsync'd. cache_max=512 -> both models fit 16GB.
+
+## BENCH RESULT (lexie, M4 16GB, qwen3-8b-q4km target + qwen3-0.6b draft, N=64, reps=5)
+Baseline plain 8B-Q4KM decode = 21.3 t/s (46.8 ms/token, ~2x a 4B as projected).
+LOSSLESS=True everywhere (greedy spec ids == target greedy ids exactly).
+| prompt      | K | spec t/s | ratio | accept/K | tok/fwd |
+|-------------|---|----------|-------|----------|---------|
+| creative    | 4 | 10.97    | 0.514 | 1.78     | 2.78    |
+| creative    | 6 | 13.95    | 0.654 | 2.71     | 3.76    |
+| creative    | 8 | 10.55    | 0.495 | 3.00     | 4.00    |
+| low-entropy | 4 | 12.27    | 0.576 | 2.05     | 3.05    |
+| low-entropy | 6 | 17.32    | 0.813 | 3.92     | 4.92    |
+| low-entropy | 8 | 18.27    | 0.860 | 6.11     | 7.11    |
+Best ratio = 0.860x (low-entropy K=8). STILL A LOSS. Does NOT cross 1.0x.
+NOT the first spec-decode win. The ~1.1-1.3x projection is REFUTED.
+
+## WHY the 8B projection was wrong (time_target.py on the 8B, cache_max=512)
+target seq=1 = 46.77 ms; draft seq=1 = 7.01 ms (the relative draft tax DID halve:
+15% of an 8B decode vs 27% of a 4B decode). But the verify forward is the problem:
+| K | verify seq=K+1 | (=K+1 x seq1) | step_cost (K*draft+verify) | break-even accept |
+|---|----------------|---------------|----------------------------|-------------------|
+| 2 | 119.3 ms       | 140.3 (3x)    | 133.3 ms                   | 1.85              |
+| 4 | 154.6 ms       | 233.9 (5x)    | 182.7 ms                   | 2.91              |
+| 6 | 165.5 ms       | 327.4 (7x)    | 207.5 ms                   | 3.44              |
+Two projection errors:
+1. break-even accept(K=6) is 3.44, NOT 2.84 — verify(8B,seq7)=165 ms is 3.54x a seq-1
+   decode, not the assumed ~2x of verify(4B). The 8B decode is more bandwidth-bound,
+   but the multi-row verify is dequant/compute-bound and scales WORSE relative to its
+   own seq-1 than the 4B did, so the verify floor stays high.
+2. The analytic step_cost ignores per-step ORCHESTRATION overhead that dominates the
+   wall clock: the all-rows LM head does K+1 full-vocab (151936) Q6_K projections per
+   verify, and the Python loop does K+1 argmax-over-151936 + get_pos/set_pos per step.
+   Even when measured accept (low-entropy K=6 = 3.92) clears the 3.44 analytic
+   break-even, the bench still lands at 0.813x because that overhead isn't in step_cost.
+The relative-draft-tax-halving was real; it just wasn't enough to overcome a verify
+forward that costs 2.5-3.5x a decode plus the all-rows head + Python per-step cost.
+
+## CONCLUSION (definitive — settles whether spec-decode can win on M4)
+Spec-decode is LOSSLESS and orchestrated correctly, but it is a NET LOSS on M4 at BOTH
+target sizes: 4B peaks 0.88x, 8B peaks 0.860x. Doubling the target halved the relative
+draft tax (as projected) but did NOT cross 1.0x, because the seq=(K+1) verify forward
+does not collapse to ~1x a decode — it stays 2.5-3.5x — and the all-rows LM head +
+Python per-step overhead eat the remaining margin. Bigger targets are NOT the lever.
+The real levers would be: (a) a verify forward that is genuinely sub-linear at small M
+(the small-M GEMM helps only seq<=4 for Q4_K; seq 5-8 route to the MMA floor), and
+(b) moving the per-step argmax/accept loop + all-rows head off the Python critical path.
+NOT a win -> NO win-PR. This branch is the record of the measured 8B result.
 
 ## Local-only artifacts (NOT committed)
 - `_snap_06b/` symlink snapshot, `local_lossless.py`, `repro.py`, `fit_check.py`,
