@@ -419,20 +419,29 @@ extern "C" int sk_deepseek_load_from_store(sk_deepseek_handle* hp, sk::WeightSto
 
             // down_exps dtype varies per layer (Q8_0 / Q5_0 in Q4_K_M). Requantize
             // to a uniform Q8_0 so the q8_0 per-expert matvec sees one layout.
+            // Process row-by-row off the mmap'd source so the fp32 temp stays
+            // tiny — a whole-layer f32 buffer is ~0.7 GB and OOMs the 16 GB box.
             {
-                const size_t n_down = (size_t)E * dm * ni;
-                std::vector<float> f32(n_down);
-                bool ok = true;
-                if (dv2->dtype == sk::Dtype::Q8_0)      dequant_q8_0_to_f32(f32.data(), (const uint8_t*)dv2->data, n_down);
-                else if (dv2->dtype == sk::Dtype::Q5_0) dequant_q5_0_to_f32(f32.data(), (const uint8_t*)dv2->data, n_down);
-                else ok = dequant_to_f32(f32, dv2, n_down);
-                if (!ok) { std::fprintf(stderr, "ds weights: down_exps L%u dequant failed\n", L); return -36; }
+                const size_t rows = (size_t)E * dm;        // each row length ni
+                const size_t row_bytes = (ni / 32) * 34;   // Q8_0 bytes/row
                 uint8_t* d = (uint8_t*)h->weights.w_down->contents() + down_off;
-                // Each of E*dm rows (length ni) -> 34*(ni/32) bytes Q8_0.
-                const size_t rows = (size_t)E * dm;
-                const size_t row_bytes = (ni / 32) * 34;
-                for (size_t r = 0; r < rows; ++r)
-                    quantize_row_q8_0(d + r * row_bytes, f32.data() + r * ni, ni);
+                const uint8_t* src = (const uint8_t*)dv2->data;
+                // Source bytes-per-row depends on the source quant.
+                size_t src_row_bytes = 0;
+                if (dv2->dtype == sk::Dtype::Q8_0)      src_row_bytes = (ni / 32) * 34;
+                else if (dv2->dtype == sk::Dtype::Q5_0) src_row_bytes = (ni / 32) * 22;
+                else if (dv2->dtype == sk::Dtype::Q6_K) src_row_bytes = (ni / 256) * 210;
+                else if (dv2->dtype == sk::Dtype::Q4_K) src_row_bytes = (ni / 256) * 144;
+                std::vector<float> row(ni);
+                for (size_t r = 0; r < rows; ++r) {
+                    const uint8_t* srow = src + r * src_row_bytes;
+                    if (dv2->dtype == sk::Dtype::Q8_0)      dequant_q8_0_to_f32(row.data(), srow, ni);
+                    else if (dv2->dtype == sk::Dtype::Q5_0) dequant_q5_0_to_f32(row.data(), srow, ni);
+                    else if (dv2->dtype == sk::Dtype::Q6_K) dequant_q6_k_to_f32(row.data(), srow, ni);
+                    else if (dv2->dtype == sk::Dtype::Q4_K) dequant_q4_k_to_f32(row.data(), srow, ni);
+                    else { std::fprintf(stderr, "ds weights: down_exps L%u unsupported dtype\n", L); return -36; }
+                    quantize_row_q8_0(d + r * row_bytes, row.data(), ni);
+                }
             }
         }
     }

@@ -29,10 +29,14 @@ static inline void rope_freq(int i, int n_dims, float base, float ext_factor,
     float theta_interp = freq_scale * theta;
     float theta_v = theta_interp;
     if (ext_factor != 0.0f) {
-        float lo = (float)n_dims * log((float)n_ctx_orig / (beta_fast * 6.2831853f)) /
-                   (2.0f * log(base));
-        float hi = (float)n_dims * log((float)n_ctx_orig / (beta_slow * 6.2831853f)) /
-                   (2.0f * log(base));
+        // HF find_correction_range(truncate=True): floor(low), ceil(high),
+        // clamped to [0, n_dims/2 - 1]; ramp indexed by the pair index i/2.
+        float lo = floor((float)n_dims * log((float)n_ctx_orig / (beta_fast * 6.2831853f)) /
+                         (2.0f * log(base)));
+        float hi = ceil((float)n_dims * log((float)n_ctx_orig / (beta_slow * 6.2831853f)) /
+                        (2.0f * log(base)));
+        lo = max(lo, 0.0f);
+        hi = min(hi, (float)(n_dims / 2 - 1));
         float ramp_mix = yarn_ramp(lo, hi, i / 2) * ext_factor;
         theta_v = theta_interp * (1.0f - ramp_mix) + theta * ramp_mix;
     }
@@ -61,20 +65,28 @@ kernel void rope_interleave_f32(
     device const float* s = src + row * args.ne00;
     device float*       d = dst + row * args.ne00;
 
-    // Interleaved (GPT-J style): pairs are (s[2k], s[2k+1]).
+    // DeepSeek-V2 partial RoPE: q is [nope(ne00-n_dims) ++ pe(n_dims)] per head,
+    // RoPE acts only on the pe tail (apply_rotary_emb operates on q_pe after the
+    // [qk_nope, qk_rope] split). Frequencies index the pe sub-block (0-based),
+    // not the absolute 192-position.
+    const int n_nope = args.ne00 - n;
+
+    // Copy the un-rotated nope prefix.
+    for (int i0 = (int)tpitg; i0 < n_nope; i0 += 256) {
+        d[i0] = s[i0];
+    }
+
+    // Interleaved (view_as_complex) pairs within the pe tail: (s[n_nope+2k], s[n_nope+2k+1]).
     // y0 = x0*c - x1*s ; y1 = x0*s + x1*c
-    for (int i0 = (int)tpitg * 2; i0 < n; i0 += 256 * 2) {
+    for (int r = (int)tpitg * 2; r < n; r += 256 * 2) {
         float c, sn;
-        rope_freq(i0, n, args.freq_base, args.ext_factor, args.attn_factor,
+        rope_freq(r, n, args.freq_base, args.ext_factor, args.attn_factor,
                   args.beta_fast, args.beta_slow, args.n_ctx_orig,
                   args.freq_scale, c, sn, p, args.mscale);
+        const int i0 = n_nope + r;
         const float x0 = s[i0];
         const float x1 = s[i0 + 1];
         d[i0]     = x0 * c - x1 * sn;
         d[i0 + 1] = x0 * sn + x1 * c;
-    }
-    // Pass through any tail dims unchanged.
-    for (int i0 = n + (int)tpitg; i0 < args.ne00; i0 += 256) {
-        d[i0] = s[i0];
     }
 }
