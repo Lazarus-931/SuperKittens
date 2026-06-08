@@ -27,19 +27,43 @@ Three bugs fixed to close the loop (all in the prefill SSD + LM-head path):
    the LM-head GEMM writes all T rows; the (T-1) row read by argmax /
    get_last_logits was OOB → garbage/zero. Now `T_max * vocab_size`.
 
-`Mamba2Model.generate` re-prefills the growing sequence each step (HF
-`torch_forward` semantics).
+## O(1) DECODE — LANDED (dev-sk-mamba2-conv1d)
 
-### Remaining (decode fast-path — separate from this loop)
-`conv1d_silu` carries no decode state: a single-token forward zero-pads the
-previous K-1 conv inputs instead of reading `LayerState.conv_state`. The
-persistent single-step decode path (`forward([last])` reusing ssm_state) is
-therefore incoherent (`"Hi, and the same time, and the same as a few years…"`).
-`generate` works around it by re-prefilling (O(T^2)). To get an O(1)/token
-decode: thread `conv_state` through `conv1d_silu` (shift in the new token, read
-the prior K-1) and route L=1 through `mamba2_step_ref` (already
-signature-correct). `dump_layer` only exposes last-forward scratch, so per-layer
-parity is checked via the n_layers=k truncation trick (see temp/mamba2_validate).
+`Mamba2Model.generate` now prefills the prompt once, then runs **one token per
+step** (no re-prefill). Token-for-token identical to the prior O(T^2) re-prefill
+path **and** to HF `torch_forward` greedy (5 prompts, 64/64 each).
+
+The only missing piece was conv decode-state carry — the SSM kernels
+(`mamba2_ssd` / `_ref`) already read+persist `ssm_state`, so an L=1 forward
+continues the recurrence correctly. Two small kernels in `conv1d_silu.metal`
+close the loop:
+
+- `conv_state_capture` — after a prefill, stores that layer's last `K-1`
+  pre-conv `xBC` tokens into `LayerState.conv_state` (left-zero-padded when
+  `L < K-1`, matching HF `Mamba2Cache.update_conv_state(cache_init=True)`).
+- `conv1d_silu_step` — for an L=1 decode, convolves the new pre-conv token
+  against the carried `(K-1)`-token window, then rolls the window (drop oldest,
+  append the new token). Mirrors HF `causal_conv1d_update`.
+
+`dispatch_layer` branches on `is_decode` (= `seq==1`): prefill runs
+`conv1d_silu` + `conv_state_capture`; decode runs `conv1d_silu_step`.
+`get_last_logits` now keys its row off `last_seq` (=1 for decode), not
+`current_pos`, so the (T-1) logits row stays in bounds across steps.
+
+**Decode tok/s (this Mac, prompt "The history of the Roman empire", greedy):**
+
+| new tokens | O(T^2) re-prefill | O(1) | speedup |
+|-----------:|------------------:|-----:|--------:|
+| 32  | 31.3 | 49.0 | 1.57x |
+| 64  | 27.1 | 50.6 | 1.86x |
+| 128 | 17.0 | 43.0 | 2.53x |
+| 256 |  6.3 | 29.0 | 4.59x |
+
+The O(1) path holds roughly constant tok/s (mild decay = per-step CPU/dispatch
+overhead, 24 layer + LM-head dispatches synced per token); the re-prefill path
+collapses quadratically. Lab: `temp/mamba2_conv1d/` (gitignored) —
+`validate.py` (generate vs HF), `validate_o1.py` (o1 == reprefill == HF),
+`bench_len.py` (length sweep).
 
 ## SSD kernel — FIXED (dev-sk-mamba2-ssd-fix)
 

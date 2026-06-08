@@ -130,12 +130,13 @@ class Mamba2Model(Model):
         return self.get_last_logits()
 
     def generate(self, input_ids, *, max_new_tokens: int = 64, **kw):
-        """Greedy/sampled generation via full re-prefill of the growing sequence.
+        """Greedy/sampled generation, O(1) per decode step.
 
-        conv1d_silu carries no decode-time state (it zero-pads the previous
-        K-1 positions), so the persistent single-step path is incoherent.
-        Re-prefilling the whole sequence each step matches HF torch_forward
-        exactly. O(T^2) but fine for the 130m at short lengths.
+        Prefill the prompt once (captures per-layer conv_state + ssm_state),
+        then feed one token per step: conv1d_silu_step rolls the carried
+        (K-1)-token conv window and mamba2_ssd carries the SSM state, so no
+        re-prefill is needed. Token-for-token identical to the prior O(T^2)
+        re-prefill path and to HF torch_forward.
         """
         import numpy as np
         ids = [int(i) for i in np.asarray(input_ids, dtype=np.int32).reshape(-1)]
@@ -149,14 +150,18 @@ class Mamba2Model(Model):
             stops |= {int(x) for x in kw["eos_ids"]}
         if kw.get("eos_id") is not None:
             stops.add(int(kw["eos_id"]))
-        seq = list(ids)
-        out: list[int] = []
-        for _ in range(max_new_tokens):
-            self.reset()
-            arg = self.forward(seq)
+
+        self.reset()
+        arg = self.forward(ids)                 # prefill
+        nxt = int(arg) if greedy else self._sample(
+            self.get_last_logits(), temperature, top_p, top_k, rng)
+        out: list[int] = [nxt]
+        if nxt in stops:
+            return out
+        for _ in range(max_new_tokens - 1):
+            arg = self.forward([nxt])           # O(1) decode step
             nxt = int(arg) if greedy else self._sample(
                 self.get_last_logits(), temperature, top_p, top_k, rng)
-            seq.append(nxt)
             out.append(nxt)
             if nxt in stops:
                 break

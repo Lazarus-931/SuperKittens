@@ -58,3 +58,60 @@ void conv1d_silu(
         *(y + base + pos * C + ci) = half(acc);
     }
 }
+
+// Capture the last K-1 pre-conv tokens of a prefill into conv_state so the
+// O(1) decode step can continue the causal window. Left-zero-padded when
+// L < K-1 (matches HF Mamba2Cache.update_conv_state cache_init pad). Row j of
+// conv_state holds prefill position (L - (K-1) + j); the newest is row K-2.
+[[host_name("conv_state_capture")]]
+[[kernel]]
+void conv_state_capture(
+    device const half* x,           // (B, L, C) pre-conv xBC
+    device       half* conv_state,  // (B, K-1, C)
+    constant uint& B, constant uint& L, constant uint& C, constant uint& K,
+    uint3 tid [[thread_position_in_grid]])
+{
+    const uint c = tid.x;
+    const uint j = tid.y;           // 0..K-2
+    const uint b = tid.z;
+    if (c >= C || j >= K - 1 || b >= B) return;
+    const int sp = (int)L - (int)(K - 1) + (int)j;
+    half v = (sp >= 0) ? x[((size_t)b * L + (uint)sp) * C + c] : half(0);
+    conv_state[((size_t)b * (K - 1) + j) * C + c] = v;
+}
+
+// Single-step causal Conv1D + SiLU for O(1) decode. Convolves the new token's
+// pre-conv xBC against the carried (K-1)-token window, then rolls the window
+// (drop oldest, append the new pre-conv token). Mirrors HF causal_conv1d_update.
+//   y[c] = silu( bias[c] + sum_{j<K-1} w[c,j]*conv_state[j,c] + w[c,K-1]*x_new[c] )
+[[host_name("conv1d_silu_step")]]
+[[kernel]]
+void conv1d_silu_step(
+    device const half* x_new,       // (B, C) new token pre-conv xBC
+    device const half* weight,      // (C, K)
+    device const half* bias,        // (C,)
+    device       half* y,           // (B, C) conv+silu output
+    device       half* conv_state,  // (B, K-1, C) in-out
+    constant uint& B, constant uint& C, constant uint& K,
+    uint3 tid [[thread_position_in_grid]])
+{
+    const uint c = tid.x;
+    const uint b = tid.y;
+    if (c >= C || b >= B) return;
+
+    const size_t cs_base = (size_t)b * (K - 1) * C;
+    const float xn = float(x_new[(size_t)b * C + c]);
+
+    float acc = float(bias[c]);
+    for (uint j = 0; j < K - 1; ++j)
+        acc += float(conv_state[cs_base + (size_t)j * C + c]) * float(weight[c * K + j]);
+    acc += xn * float(weight[c * K + (K - 1)]);
+
+    y[(size_t)b * C + c] = half(acc / (1.0f + metal::fast::exp(-acc)));
+
+    // Roll the window: shift left, append the new pre-conv token.
+    for (uint j = 0; j + 1 < K - 1; ++j)
+        conv_state[cs_base + (size_t)j * C + c] =
+            conv_state[cs_base + (size_t)(j + 1) * C + c];
+    conv_state[cs_base + (size_t)(K - 2) * C + c] = half(xn);
+}
