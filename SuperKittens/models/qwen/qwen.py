@@ -65,6 +65,9 @@ QWEN_ABI = {
     "load_weights":     ([ctypes.c_void_p, ctypes.POINTER(_Weights)], ctypes.c_int),
     "forward":          ([ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
                           ctypes.c_uint32, ctypes.POINTER(ctypes.c_int32)], ctypes.c_int),
+    "prefill_chunked":  optional([ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
+                                  ctypes.c_uint32, ctypes.c_uint32,
+                                  ctypes.POINTER(ctypes.c_int32)], ctypes.c_int),
     "generate_n":       optional([ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
                                   ctypes.c_uint32, ctypes.POINTER(ctypes.c_int32),
                                   ctypes.c_uint32, ctypes.c_int32], ctypes.c_int),
@@ -228,6 +231,35 @@ class Qwen(Model):
             seq,
             out.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)))
         if rc: raise RuntimeError(f"forward failed: {rc}")
+        self._last_token = int(out[0])
+        return self._last_token
+
+    def prefill_chunked(self, input_ids, *, chunk_size: int = 0) -> int:
+        """Prefill a prompt in fixed-size chunks, carrying KV + position across.
+
+        Routes through ``sk_qwen_prefill_chunked`` so a prompt longer than the
+        per-step scratch (sized at ``seq_max``) still prefills: per-step memory
+        is bounded to ``chunk_size`` rows, not the full prompt. The chunk
+        boundary is numerically transparent (the fixed mha_causal), so the
+        returned next token (and ``_last_logits``) match a single forward of the
+        same prompt. ``chunk_size`` <= 0 uses ``seq_max`` (i.e. as few chunks as
+        the scratch allows). Does NOT reset; call ``reset()`` first for a fresh
+        sequence.
+        """
+        lib = _load()
+        if not hasattr(lib, "sk_qwen_prefill_chunked"):
+            raise RuntimeError("libsk.dylib has no sk_qwen_prefill_chunked symbol; rebuild dylib")
+        ids = np.ascontiguousarray(np.asarray(input_ids, dtype=np.int32)).reshape(-1)
+        out = np.empty((1,), dtype=np.int32)
+        cs = int(chunk_size) if chunk_size and chunk_size > 0 else 0
+        rc = lib.sk_qwen_prefill_chunked(
+            self._h,
+            ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            ctypes.c_uint32(ids.size),
+            ctypes.c_uint32(cs),
+            out.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)))
+        if rc:
+            raise RuntimeError(f"sk_qwen_prefill_chunked failed: {rc}")
         self._last_token = int(out[0])
         return self._last_token
 

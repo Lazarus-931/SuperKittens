@@ -55,6 +55,15 @@ sk_qwen_handle* sk_qwen_create(const sk_qwen_config* cfg);
 int  sk_qwen_load_weights(sk_qwen_handle* h, const sk_qwen_weights* w);
 int  sk_qwen_forward(sk_qwen_handle* h,
                      const int* input_ids, uint32_t seq, int* output_id);
+// Chunked prefill: process prompt_ids in fixed-size chunks (<= chunk_size, and
+// <= seq_max) through the per-step model forward, carrying KV cache + position
+// across chunks. Lets a prompt longer than seq_max prefill with scratch bounded
+// to one chunk (memory grows with chunk_size, not prompt_seq). On return,
+// output_id holds the greedy next token and get_last_logits the final-position
+// logits — identical to a single seq=prompt_seq forward. chunk_size 0 → seq_max.
+int  sk_qwen_prefill_chunked(sk_qwen_handle* h,
+                             const int* prompt_ids, uint32_t prompt_seq,
+                             uint32_t chunk_size, int* output_id);
 // WHY: per-token decode loop kept in C; avoids ctypes round-trip + np alloc
 // per step. Greedy only. Returns count of tokens written into out_tokens
 // (<= n_tokens; stops early on eos_id when eos_id >= 0).
