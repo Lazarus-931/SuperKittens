@@ -1,13 +1,20 @@
-"""nemotron.py — Llama-3.1-Nemotron-Nano-8B-v1 inference.
+"""nemotron.py — Llama-3.1-Nemotron-Nano-8B-v1 adapter over the dense core.
 
-Nano-8B is `model_type=llama` (LlamaForCausalLM) — i.e. the Qwen3 dense decoder
-minus per-head Q/K-norm, with Llama-3.1 RoPE (theta=500000 + "llama3" frequency
-scaling). It reuses the entire Qwen launcher/kernel stack; the only deltas are:
+Nano-8B is ``model_type=llama`` (LlamaForCausalLM) — the same dense decoder the
+shared :class:`DenseDecoder` core drives, configured for the Llama arch:
 
-  1. ``use_qk_norm=0`` — Llama has no per-head Q/K RMSNorm (gated in dispatch_layer).
-  2. ``bake_and_set_rope`` applies the llama3 piecewise inv_freq rescale so the
-     baked cos/sin tables match HF ``apply_rotary_pos_emb`` (the rope kernel only
-     consumes the tables, so no kernel change is needed).
+  1. ``use_qk_norm=0`` — Llama has no per-head Q/K RMSNorm (the core gates the
+     two per-head RMSNorm dispatches on this flag).
+  2. :meth:`bake_and_set_rope` applies the Llama-3.1 ``llama3`` piecewise
+     inv_freq rescale (theta=500000) so the baked cos/sin tables match HF
+     ``apply_rotary_pos_emb``. The RoPE kernel only consumes the tables, so no
+     kernel change is needed.
+  3. :meth:`_prepare_generate_ids` prepends ``<|begin_of_text|>`` — Llama-3
+     completion is BOS-sensitive (without it the model collapses to repeats).
+
+Nemotron is its OWN adapter (a :class:`DenseDecoder`, NOT a ``Qwen``): it shares
+the launcher/kernels but carries its own model identity, loader config, RoPE
+bake, and generation prelude.
 
 Usage:
     import SuperKittens as sk
@@ -21,7 +28,7 @@ from pathlib import Path
 
 import numpy as np
 
-from SuperKittens.models.qwen.qwen import Qwen
+from SuperKittens.models.dense.dense_decoder import DenseDecoder
 
 
 def _llama3_inv_freq(head_dim: int, theta: float, *,
@@ -49,10 +56,11 @@ def _llama3_inv_freq(head_dim: int, theta: float, *,
     return out
 
 
-class Nemotron(Qwen):
-    """Llama-3.1-Nemotron-Nano-8B-v1 handle (Qwen launcher, Llama-arch config)."""
+class Nemotron(DenseDecoder):
+    """Llama-3.1-Nemotron-Nano-8B-v1 handle (own adapter; shared dense core)."""
 
-    # Llama3 RoPE scaling, captured from config.json by from_spec. None → plain RoPE.
+    # Llama3 RoPE scaling, captured from config.json/spec by from_spec.
+    # None → plain RoPE (matches the DenseDecoder default).
     _rope_scaling: dict | None = None
 
     def bake_and_set_rope(self) -> None:
@@ -79,9 +87,9 @@ class Nemotron(Qwen):
     def from_spec(cls, spec, **overrides) -> "Nemotron":
         """Build from a registry ModelSpec.
 
-        Reuses Qwen.from_spec for the heavy lifting (config.json → Config, GGUF
-        load, tokenizer attach) but forces use_qk_norm=0 and captures the llama3
-        rope_scaling block so bake_and_set_rope rescales inv_freq correctly.
+        Uses the shared :meth:`DenseDecoder.from_spec` for config/GGUF/tokenizer,
+        forcing ``use_qk_norm=0`` (Llama arch) and capturing the ``llama3``
+        rope_scaling block so :meth:`bake_and_set_rope` rescales inv_freq.
         """
         sk_root = Path(__file__).resolve().parents[3]
         snap = Path(overrides.get("snapshot")
@@ -97,7 +105,7 @@ class Nemotron(Qwen):
         overrides.setdefault("use_qk_norm", 0)
         m = super().from_spec(spec, **overrides)
         m._rope_scaling = rope_scaling
-        # Qwen.from_spec already baked plain RoPE; re-bake with llama3 scaling.
+        # DenseDecoder.from_spec already baked plain RoPE; re-bake with llama3.
         m.bake_and_set_rope()
         return m
 
@@ -108,12 +116,12 @@ class Nemotron(Qwen):
         b = getattr(self.tokenizer, "bos_id", None) if self.tokenizer else None
         return int(b) if b is not None else 128000
 
-    def generate(self, input_ids, **kw):
+    def _prepare_generate_ids(self, input_ids) -> np.ndarray:
         # Llama-3 completion is BOS-sensitive: prepend <|begin_of_text|> unless
-        # the prompt already starts with it. chat() routes through here too, so
-        # templated turns also get the leading BOS.
+        # the prompt already starts with it. chat() routes through generate too,
+        # so templated turns also get the leading BOS.
         ids = list(np.asarray(input_ids, dtype=np.int64).reshape(-1))
         bos = self._bos_id()
         if not ids or ids[0] != bos:
             ids = [bos] + ids
-        return super().generate(np.array(ids, dtype=np.int32), **kw)
+        return np.array(ids, dtype=np.int32)
