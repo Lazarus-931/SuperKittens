@@ -50,7 +50,14 @@ def unified_12b_config() -> Gemma4Config:
         rope_theta_global=1_000_000.0,
         rope_theta_local=10_000.0,
         final_logit_softcap=30.0,
-        full_rope_global=1,
+        # HF "proportional" rope on global layers rotates only the first
+        # partial_rotary_factor*head_dim = 0.25*512 = 128 dims (rope_angles=64
+        # nonzero inv_freq pairs; the rest are zeroed). inv_freq there is
+        # 1/(1e6^(arange(0,128,2)/512)) == 1/(1e6^(arange(0,64)/256)), which is
+        # exactly the first 64 entries of _bake_rope(512, 1e6). So the E-variant
+        # default (rot_dims = head_dim*0.25 = 128) is HF-correct; full_rope_global
+        # (rotate all 512) over-rotates and breaks coherence.
+        full_rope_global=0,
         apply_layer_scalar=1,
     )
 
