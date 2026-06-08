@@ -45,8 +45,10 @@ Numerical refs and roofline are sibling modules (`numeric_ref.py`, `roofline.py`
 - `temp/` — gitignored experiment dirs.
 
 ## Open architectural state
-- **Plumbing phases 1-4** landed under `dev-plumbing` (sampler, ICB args, WeightLoader, Executor) but are foundation-only. ICB perf win is expected but unmeasured — the bench gates a follow-up PR.
-- **`mamba2_ssd.metal`** is numerically wrong (missing softplus / dt*B*x / D*x / n_groups). Launcher falls back to `mamba2_ssd_ref`. See `models/ssm/mamba2/STATUS.md`.
+- **Decode on M4 base is GPU-bandwidth-bound** (~99% GPU-wait; CPU-encode 0.4-0.7% of wall). ICB / dispatch-fusion / encode-side levers are dead for decode — measure the GPU-wait, not the kernel. **Q4_K_M is the decode sweet spot**; sub-Q4 (Q2_K/Q3_K) is a compute-bound net loss (q3k matvec ~67 GB/s vs q4k ~107). Q3_K/Q5_K are kept only as fit-enablers ([PR #63]). Q4_K_M decode on main: 4B 38.48 / 8B 21.09 / 14B 11.28 tok/s.
+- **Plumbing phases 1-4** landed under `dev-plumbing` (sampler, ICB args, WeightLoader, Executor) but are foundation-only. ICB perf win was expected but never landed — confirmed dead for decode (see GPU-bandwidth-bound finding above).
+- **Batched GEMM (`gemm_mma`, [PR #55] pending)** wires seq>1 prefill through an MMA kernel (f16/Q8_0/Q4_K): TTFT 2.5-5.8×, decode unchanged. Spec-decode still net-negative on M4 4B (draft tax + accept ceiling > verify saving); 8B under test. `gemm_mma_smallm` is the short-seq variant.
+- **`mamba2_ssd.metal`** was numerically wrong (missing softplus / dt*B*x / D*x / n_groups); the launcher fell back to `mamba2_ssd_ref`. **[PR #60]** rewrites it HF-correct (= ref, ~2.7× faster); **[PR #62]** closes 130m e2e (coherent, = HF token-for-token, ~50 tok/s decode). Both pending review. See `models/ssm/mamba2/STATUS.md`.
 - **`down_scatter` n_int tail-drop bug** was fixed recently; the "fast" pre-fix numbers were a kernel skipping 27-33% of work. Check `git log` on `kernels/moe/down_scatter.metal` if perf benches feel off.
 - **`mha_causal`** in `kernels/attn/attn.metal` IS the production attention with the right GQA design for Apple Silicon. Lab attempts to replace it with a uzu-style direct-K kernel won 5/6 shapes but regressed qwen3-8B kv=128 (0.79×) due to losing GQA amortization. Don't blindly try to "make it faster" — TG-staged Br=2 design is structurally right.
 - **Q4_K MoE port** (~4× over fp16 swiglu_pair) is proven in an out-of-tree lab. Ready for in-tree promotion when DSv2-Lite / Qwen3-MoE-A3B end-to-end wire up.
