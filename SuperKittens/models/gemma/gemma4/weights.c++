@@ -694,6 +694,14 @@ extern "C" int sk_gemma4_load_gguf(sk_gemma4_handle* hp, const char* path) {
             return true;
         };
 
+        // attention_k_eq_v: gemma4_unified's full-attention (global) layers have
+        // NO attn_v tensor — V shares the K projection (HF v_proj is None,
+        // value_states = key_states pre-norm). The K weight doubles as the V
+        // weight; the qkv_norm kernel already norms V without scale, and V is
+        // never RoPE'd (kv_cache_write stores the un-rotated v_tmp). Local (SWA)
+        // layers have a real attn_v.
+        const char* v_src = get_layer(L, "attn_v.weight") ? "attn_v.weight" : "attn_k.weight";
+
         if (body_q8) {
             if (!load_proj_q8("attn_output.weight", h->weights.w_out_q8, h->out_q8_off[L], Nq * dm)) return -26;
             if (!load_proj_q8("ffn_gate.weight",    h->weights.w_gate_q8, h->gate_q8_off[L], dm * ni)) return -27;
@@ -701,7 +709,7 @@ extern "C" int sk_gemma4_load_gguf(sk_gemma4_handle* hp, const char* path) {
             if (!load_proj_q8("ffn_down.weight",    h->weights.w_down_q8, h->down_q8_off[L], ni * dm)) return -29;
             if (!load_proj_q8("attn_q.weight",      h->weights.w_q_q8, h->q_q8_off[L], Nq  * dm)) return -30;
             if (!load_proj_q8("attn_k.weight",      h->weights.w_k_q8, h->k_q8_off[L], Nkv * dm)) return -32;
-            if (!load_proj_q8("attn_v.weight",      h->weights.w_v_q8, h->v_q8_off[L], Nkv * dm)) return -33;
+            if (!load_proj_q8(v_src,                h->weights.w_v_q8, h->v_q8_off[L], Nkv * dm)) return -33;
         } else {
             if (!load_proj_tx("attn_output.weight", h->weights.w_out, o_off, Nq, dm)) return -26;
             if (!load_proj_tx("ffn_gate.weight",    h->weights.w_gate, gate_off, dm, ni)) return -27;
@@ -720,7 +728,7 @@ extern "C" int sk_gemma4_load_gguf(sk_gemma4_handle* hp, const char* path) {
             };
             if (!qkv_tx("attn_q.weight", Nq,  0))         return -30;
             if (!qkv_tx("attn_k.weight", Nkv, Nq))        return -32;
-            if (!qkv_tx("attn_v.weight", Nkv, Nq + Nkv))  return -33;
+            if (!qkv_tx(v_src,           Nkv, Nq + Nkv))  return -33;
         }
     }
     return 0;
