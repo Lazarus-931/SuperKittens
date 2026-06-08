@@ -228,6 +228,18 @@ extern "C" int sk_gemma4_load_from_store(sk_gemma4_handle* hp, sk::WeightStore* 
         uint8_t* dst        = (uint8_t*)h->weights.w_lm_head_q8->contents();
         const size_t n_elems = (size_t)c.vocab_size * dm;
         sk::quantize_q8_0_bf16(src, n_elems, dst);
+
+        // Embed-Q8 (opt-in, SK_GEMMA4_EMBED_Q8=1): the lm_head Q8 buffer is the
+        // tied (scaled) token embed in Q8 — so once it's built we can free the
+        // resident bf16 embed table (~1.3 GB at E4B). dispatch_model then runs
+        // embedding_lookup_q8_bf16 (gather+dequant from w_lm_head_q8) and loops
+        // the Q8 matvec for the T>1 prefill LM-head. Gated off by default.
+        const char* eenv = std::getenv("SK_GEMMA4_EMBED_Q8");
+        const bool embed_q8 = eenv && (eenv[0] == '1');
+        if (embed_q8) {
+            h->weights.w_embed->release();
+            h->weights.w_embed = nullptr;
+        }
     }
 
     // per_layer_model_projection: HF tensor shape (n_layers*ple_dim, d_model)
@@ -252,17 +264,27 @@ extern "C" int sk_gemma4_load_from_store(sk_gemma4_handle* hp, sk::WeightStore* 
         }
     }
 
-    if (c.has_ple && h->weights.w_ple_table) {
+    if (c.has_ple && (h->weights.w_ple_table || h->weights.w_ple_table_q8)) {
         const char* nm = "model.language_model.embed_tokens_per_layer.weight";
         auto* v = store->get(nm);
         if (!v) {
             std::fprintf(stderr, "gemma4 weights: PLE tensor '%s' not found; leaving zero\n", nm);
         } else {
-            const size_t ple_elems = v->nbytes / 2;
-            uint16_t* dst = (uint16_t*)h->weights.w_ple_table->contents();
-            copy_bf16_from(dst, v->data, v->dtype, ple_elems);
+            const size_t ple_elems = (v->dtype == sk::Dtype::F32)
+                                     ? v->nbytes / 4 : v->nbytes / 2;
             const float ple_scale = std::sqrt((float)c.ple_dim);
-            scale_bf16_inplace(dst, ple_elems, ple_scale);
+            if (h->weights.w_ple_table) {
+                uint16_t* dst = (uint16_t*)h->weights.w_ple_table->contents();
+                copy_bf16_from(dst, v->data, v->dtype, ple_elems);
+                scale_bf16_inplace(dst, ple_elems, ple_scale);
+            } else {
+                // Q8 path: stage scaled bf16 then block-quantize into w_ple_table_q8.
+                std::vector<uint16_t> staging(ple_elems);
+                copy_bf16_from(staging.data(), v->data, v->dtype, ple_elems);
+                scale_bf16_inplace(staging.data(), ple_elems, ple_scale);
+                uint8_t* dst = (uint8_t*)h->weights.w_ple_table_q8->contents();
+                sk::quantize_q8_0_bf16(staging.data(), ple_elems, dst);
+            }
         }
     }
 

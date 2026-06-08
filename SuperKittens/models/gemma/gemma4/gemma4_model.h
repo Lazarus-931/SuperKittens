@@ -984,7 +984,11 @@ struct ModelParams {
 struct ModelPSOs {
     LayerPSOs layer;
     MTL::ComputePipelineState* embedding_lookup;
+    // Optional Q8_0 gather+dequant variants (nullable; engaged when the
+    // matching Q8 buffer is allocated). Let the bf16 embed/PLE table be freed.
+    MTL::ComputePipelineState* embedding_lookup_q8 = nullptr;
     MTL::ComputePipelineState* ple_lookup;
+    MTL::ComputePipelineState* ple_lookup_q8       = nullptr;
     MTL::ComputePipelineState* ple_context_mix;
     MTL::ComputePipelineState* argmax;
     MTL::ComputePipelineState* logit_softcap;
@@ -1009,6 +1013,11 @@ struct ModelWeights {
     // q8_0_matvec_bf16 (decode-only, T=1). nullptr → bf16 fallback.
     MTL::Buffer* w_lm_head_q8 = nullptr;
     MTL::Buffer* w_ple_table;                 // (vocab, n_layers, PLE_dim), null if !has_ple
+    // Optional Q8_0-packed PLE table (decode + prefill). When non-null the
+    // ple-lookup runs gemma4_ple_lookup_q8 (gather+dequant) and the bf16
+    // w_ple_table above is left unallocated — the dominant E4B resident-memory
+    // win (bf16 PLE is ~5.6 GB at E4B; Q8 ~3.0 GB).
+    MTL::Buffer* w_ple_table_q8 = nullptr;     // (vocab, n_layers*PLE_dim) q8_0
     MTL::Buffer* w_per_layer_input_gate;      // (n_layers, PLE_dim, d_model)
     MTL::Buffer* w_per_layer_projection;      // (n_layers, d_model, PLE_dim)
     MTL::Buffer* w_layer_scalar;              // (n_layers,) fp32
@@ -1122,19 +1131,35 @@ inline void dispatch_model(
 {
     const uint32_t T = M.batch * M.seq;
 
-    // A. Input embedding
+    // A. Input embedding. Q8 path (gather+dequant from the tied lm_head Q8
+    // buffer) when the bf16 embed table was freed; else the bf16 gather.
     {
         auto* enc = cmd->computeCommandEncoder();
-        enc->setComputePipelineState(P.embedding_lookup);
-        enc->setBuffer(W.w_embed,   0, 0);
-        enc->setBuffer(B.input_ids, 0, 1);
-        enc->setBuffer(B.x_a,       0, 2);
-        enc->setBytes(&T,            4, 3);
-        enc->setBytes(&M.d_model,    4, 4);
-        enc->setBytes(&M.vocab_size, 4, 5);
-        const uint32_t D4 = M.d_model / 4;
-        enc->dispatchThreadgroups(MTL::Size((D4 + 127) / 128, T, 1),
-                                  MTL::Size(128, 1, 1));
+        const bool embed_q8 = (W.w_embed == nullptr)
+                           && (W.w_lm_head_q8 != nullptr)
+                           && (P.embedding_lookup_q8 != nullptr);
+        if (embed_q8) {
+            enc->setComputePipelineState(P.embedding_lookup_q8);
+            enc->setBuffer(W.w_lm_head_q8, 0, 0);
+            enc->setBuffer(B.input_ids,    0, 1);
+            enc->setBuffer(B.x_a,          0, 2);
+            enc->setBytes(&T,            4, 3);
+            enc->setBytes(&M.d_model,    4, 4);
+            enc->setBytes(&M.vocab_size, 4, 5);
+            enc->dispatchThreadgroups(MTL::Size((M.d_model + 255) / 256, T, 1),
+                                      MTL::Size(256, 1, 1));
+        } else {
+            enc->setComputePipelineState(P.embedding_lookup);
+            enc->setBuffer(W.w_embed,   0, 0);
+            enc->setBuffer(B.input_ids, 0, 1);
+            enc->setBuffer(B.x_a,       0, 2);
+            enc->setBytes(&T,            4, 3);
+            enc->setBytes(&M.d_model,    4, 4);
+            enc->setBytes(&M.vocab_size, 4, 5);
+            const uint32_t D4 = M.d_model / 4;
+            enc->dispatchThreadgroups(MTL::Size((D4 + 127) / 128, T, 1),
+                                      MTL::Size(128, 1, 1));
+        }
         enc->endEncoding();
     }
 
@@ -1146,17 +1171,33 @@ inline void dispatch_model(
     // A.1 Per-Layer Embedding table lookup (one-time per forward).
     if (M.has_ple) {
         auto* enc = cmd->computeCommandEncoder();
-        enc->setComputePipelineState(P.ple_lookup);
-        enc->setBuffer(W.w_ple_table,      0, 0);
-        enc->setBuffer(B.input_ids,        0, 1);
-        enc->setBuffer(B.per_layer_inputs, 0, 2);
-        enc->setBytes(&T,             4, 3);
-        enc->setBytes(&M.n_layers,    4, 4);
-        enc->setBytes(&M.ple_dim,     4, 5);
-        enc->setBytes(&M.vocab_size,  4, 6);
-        const uint32_t P4 = M.ple_dim / 4u;
-        enc->dispatchThreads(MTL::Size(P4, M.n_layers, T),
-                             MTL::Size(32, 1, 1));
+        const bool ple_q8 = (W.w_ple_table == nullptr)
+                         && (W.w_ple_table_q8 != nullptr)
+                         && (P.ple_lookup_q8 != nullptr);
+        if (ple_q8) {
+            enc->setComputePipelineState(P.ple_lookup_q8);
+            enc->setBuffer(W.w_ple_table_q8,   0, 0);
+            enc->setBuffer(B.input_ids,        0, 1);
+            enc->setBuffer(B.per_layer_inputs, 0, 2);
+            enc->setBytes(&T,             4, 3);
+            enc->setBytes(&M.n_layers,    4, 4);
+            enc->setBytes(&M.ple_dim,     4, 5);
+            enc->setBytes(&M.vocab_size,  4, 6);
+            enc->dispatchThreads(MTL::Size(M.ple_dim, M.n_layers, T),
+                                 MTL::Size(32, 1, 1));
+        } else {
+            enc->setComputePipelineState(P.ple_lookup);
+            enc->setBuffer(W.w_ple_table,      0, 0);
+            enc->setBuffer(B.input_ids,        0, 1);
+            enc->setBuffer(B.per_layer_inputs, 0, 2);
+            enc->setBytes(&T,             4, 3);
+            enc->setBytes(&M.n_layers,    4, 4);
+            enc->setBytes(&M.ple_dim,     4, 5);
+            enc->setBytes(&M.vocab_size,  4, 6);
+            const uint32_t P4 = M.ple_dim / 4u;
+            enc->dispatchThreads(MTL::Size(P4, M.n_layers, T),
+                                 MTL::Size(32, 1, 1));
+        }
         enc->endEncoding();
 
         // A.2 Context-aware projection: emb @ w_per_layer_model_projection → (T, n_layers*ple_dim).
@@ -1496,26 +1537,31 @@ inline void dispatch_model(
     // q8_0_matvec_bf16 PSO is available, route through the Q8_0 matvec for a
     // ~3.8x speedup vs the bf16 tile-MMA at decode shapes. Falls back to the
     // bf16 GEMM for prefill (T>1) and when the Q8_0 buffer is absent.
+    const bool have_q8_lm_head =
+        (W.w_lm_head_q8 != nullptr) && (P.layer.q8_0_matvec_bf16 != nullptr);
+    // T=1 always routes Q8 (fast). For T>1 the bf16 GEMM needs w_embed; when the
+    // bf16 embed was freed (embed-Q8 on) we must loop the Q8 matvec per row.
     const bool use_q8_lm_head =
-        (T == 1) && (W.w_lm_head_q8 != nullptr) && (P.layer.q8_0_matvec_bf16 != nullptr);
+        have_q8_lm_head && ((T == 1) || (W.w_embed == nullptr));
 
     if (use_q8_lm_head) {
-        auto* enc = cmd->computeCommandEncoder();
-        enc->setComputePipelineState(P.layer.q8_0_matvec_bf16);
         uint32_t K_v = M.d_model;
         uint32_t N_v = M.vocab_size;
-        enc->setBuffer(nxt,             0, 0);
-        enc->setBuffer(W.w_lm_head_q8,  0, 1);
-        enc->setBuffer(B.logits,        0, 2);
-        enc->setBytes(&K_v, 4, 3);
-        enc->setBytes(&N_v, 4, 4);
-        // NR0 = 2 rows per threadgroup; NSG = 4 simdgroups (NW=32 each) per TG.
-        const uint32_t NR0 = 2;
-        const uint32_t NSG = 4;
-        const uint32_t NW  = 32;
-        enc->dispatchThreadgroups(MTL::Size((N_v + NR0 - 1) / NR0, 1, 1),
-                                  MTL::Size(NW * NSG, 1, 1));
-        enc->endEncoding();
+        const uint32_t NR0 = 2, NSG = 4, NW = 32;
+        const size_t in_row_bytes  = (size_t)M.d_model * 2;     // bf16 activation
+        const size_t out_row_bytes = (size_t)M.vocab_size * 2;  // bf16 logits
+        for (uint32_t r = 0; r < T; ++r) {
+            auto* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(P.layer.q8_0_matvec_bf16);
+            enc->setBuffer(nxt,            (size_t)r * in_row_bytes,  0);
+            enc->setBuffer(W.w_lm_head_q8, 0,                         1);
+            enc->setBuffer(B.logits,       (size_t)r * out_row_bytes, 2);
+            enc->setBytes(&K_v, 4, 3);
+            enc->setBytes(&N_v, 4, 4);
+            enc->dispatchThreadgroups(MTL::Size((N_v + NR0 - 1) / NR0, 1, 1),
+                                      MTL::Size(NW * NSG, 1, 1));
+            enc->endEncoding();
+        }
     } else {
         auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(P.layer.gemm);

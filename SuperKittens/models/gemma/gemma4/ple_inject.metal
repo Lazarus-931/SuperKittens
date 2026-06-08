@@ -153,6 +153,49 @@ void gemma4_ple_lookup(
     reinterpret_cast<device bfloat4*>(per_layer_inputs + dst_off)[p4] = v;
 }
 
+// Q8_0 block: half d (per-32 scale) + int8 qs[32] → 34 bytes / 32 weights.
+// Matches kernels/gemm/q8_0_matvec_bf16.metal's q8b_block.
+struct __attribute__((packed)) g4_q8_block { half d; int8_t qs[32]; };
+
+// gemma4_ple_lookup_q8 — Q8_0 PLE-table gather + dequant.
+// PLE table stored Q8_0 row-major (V, n_layers*P); each row is gathered for
+// token id and dequantized into per_layer_inputs[T, n_layers, P] (bf16). One
+// thread per output element (no 4-vec: Q8 dequant is per-element).
+[[host_name("gemma4_ple_lookup_q8")]]
+[[kernel]]
+void gemma4_ple_lookup_q8(
+    device const uchar*  ple_table_q8     [[buffer(0)]],   // (V, n_layers*P) q8_0
+    device const int*    ids              [[buffer(1)]],   // (T,)
+    device       bfloat* per_layer_inputs [[buffer(2)]],   // (T, n_layers, P)
+    constant uint& T                      [[buffer(3)]],
+    constant uint& n_layers               [[buffer(4)]],
+    constant uint& P                      [[buffer(5)]],
+    constant uint& V                      [[buffer(6)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    const uint t = gid.z;
+    const uint L = gid.y;
+    const uint p = gid.x;
+    if (t >= T || L >= n_layers || p >= P) return;
+
+    const uint row_len = n_layers * P;          // elems per token row
+    const uint col     = L * P + p;              // elem index within the row
+    int  id  = ids[t];
+    bool oob = (id < 0) || ((uint)id >= V);
+
+    bfloat val = bfloat(0);
+    if (!oob) {
+        const uint nb_row = row_len / 32u;       // blocks per token row
+        device const g4_q8_block* row =
+            (device const g4_q8_block*)(ple_table_q8) + (size_t)id * nb_row;
+        const uint blk = col >> 5;               // /32
+        const uint lane = col & 31u;
+        val = bfloat((float)row[blk].qs[lane] * (float)row[blk].d);
+    }
+    const uint dst = (t * n_layers + L) * P + p;
+    per_layer_inputs[dst] = val;
+}
+
 static inline float gelu_approx(float x) {
     const float c0 = 0.7978845608028654f;     // sqrt(2/pi)
     const float c1 = 0.044715f;
