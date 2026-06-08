@@ -39,5 +39,30 @@ poll w/ SHORT ssh every 60-90s, /tmp/sk_bench.lock mkdir-mutex. Clamp cache_max
 Report: spec tok/s vs plain 4b-q4km decode (ratio per K), accept/step, lossless.
 OLD = 0.36-0.64x; is it now >1.0x?
 
+## BENCH RESULT (lexie, M4 16GB, qwen3-4b-q4km target + qwen3-0.6b draft, N=64, reps=5)
+Baseline plain 4b-q4km decode = 39.4 tok/s (25.3 ms/token). LOSSLESS=True everywhere.
+| prompt      | K | spec t/s | ratio | accept/K | tok/fwd |
+|-------------|---|----------|-------|----------|---------|
+| creative    | 2 | 21.98    | 0.557 | 0.88     | 1.88    |
+| creative    | 4 | 25.45    | 0.645 | 2.05     | 3.05    |
+| creative    | 6 | 26.50    | 0.672 | 2.76     | 3.76    |
+| low-entropy | 2 | 23.33    | 0.592 | 0.97     | 2.00    |
+| low-entropy | 4 | 33.38    | 0.849 | 2.94     | 4.00    |
+| low-entropy | 6 | 34.61    | 0.882 | 3.85     | 4.92    |
+
+STILL A LOSS (0.56-0.88x), though improved from the old 0.36-0.64x. Lossless holds.
+
+## WHY it still loses (time_target.py + time_dbg.py diagnostics)
+- target seq=1 decode = 25.3 ms; draft 0.6B seq=1 = 6.92 ms (27% of a target decode).
+- verify forward floor is too high: seq=3 = 63.7 ms (2.53x a decode), seq=5/7 = 76 ms.
+  The small-M kernel helps ONLY at seq=3 (63.7 vs MMA 74.9 ms); at seq>=5 Q4_K routes
+  to MMA (gemm_sm_wins Q4_K only M<=4) and both plateau at ~76 ms. A 4B-Q4KM decode is
+  bandwidth-bound (~2.5GB weights/token); the multi-row forward is dequant/compute-bound
+  so it does NOT collapse to ~1x a decode the way the isolated GEMM microbench implied.
+- all-rows LM head adds 6.6/13.0/19.5 ms at seq 3/5/7 (K+1 Q6_K full-vocab projections).
+- break-even mean-accept: K=2 -> 2.32 (impossible), K=4 -> 3.61, K=6 -> 4.42. Actual
+  accept tops out at 3.85 (low-entropy K=6) < break-even. Draft tax (K*6.92 ms) dominates.
+
 ## Local-only artifacts (NOT committed)
-- `_snap_06b/` symlink snapshot, `local_lossless.py` harness (kept, harmless).
+- `_snap_06b/` symlink snapshot, `local_lossless.py`, `repro.py`, `fit_check.py`,
+  `time_dbg.py` (kept, harmless local harnesses).

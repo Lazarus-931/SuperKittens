@@ -29,8 +29,13 @@ def main():
     ap.add_argument("--draft", default="qwen3-0.6b")
     ap.add_argument("--cache-max", type=int, default=1024)
     a = ap.parse_args()
-    tgt = sk.load(a.model, cache_max=a.cache_max)
-    drf = sk.load(a.draft, cache_max=a.cache_max)
+    import os
+    tkw = dict(cache_max=a.cache_max); dkw = dict(cache_max=a.cache_max)
+    if os.environ.get("SK_TGT_SNAP"): tkw["snapshot"] = os.environ["SK_TGT_SNAP"]
+    if os.environ.get("SK_DRF_SNAP"): dkw["snapshot"] = os.environ["SK_DRF_SNAP"]
+    tgt = sk.load(a.model, **tkw)
+    drf = sk.load(a.draft, **dkw)
+    tgt.set_lm_head_all_rows(True)
     prompt = np.random.default_rng(0).integers(10, 4000, size=16).astype(np.int32)
     print(f"=== target={a.model} draft={a.draft} ===", flush=True)
     t1 = time_seq(tgt, prompt, 1)

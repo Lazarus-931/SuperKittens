@@ -113,8 +113,15 @@ def main():
     log(f"=== specbench target={args.target} draft={args.draft} n={args.n} "
         f"K={args.K} cache_max={args.cache_max} reps={args.reps} ===")
     t_load = time.perf_counter()
-    target = sk.load(args.target, cache_max=args.cache_max)
-    draft = sk.load(args.draft, cache_max=args.cache_max)
+    # SK_TGT_SNAP / SK_DRF_SNAP let a bench host point at local gguf snapshot dirs
+    # (no config.json needed; dims fall back to the registry spec).
+    import os
+    tkw = dict(cache_max=args.cache_max)
+    dkw = dict(cache_max=args.cache_max)
+    if os.environ.get("SK_TGT_SNAP"): tkw["snapshot"] = os.environ["SK_TGT_SNAP"]
+    if os.environ.get("SK_DRF_SNAP"): dkw["snapshot"] = os.environ["SK_DRF_SNAP"]
+    target = sk.load(args.target, **tkw)
+    draft = sk.load(args.draft, **dkw)
     # WHY: PR#56 prefill projects only the last LM-head row; verify reads all K+1.
     target.set_lm_head_all_rows(True)
     log(f"loaded both models in {time.perf_counter()-t_load:.1f}s")
