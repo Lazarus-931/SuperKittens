@@ -65,6 +65,22 @@ int  sk_qwen_generate_n(sk_qwen_handle* h,
 void sk_qwen_reset(sk_qwen_handle* h);
 void sk_qwen_destroy(sk_qwen_handle* h);
 
+// Copy the first n_rows RELATIVE rows of the logits buffer (each vocab_size fp16)
+// from the most recent forward. Returns -2 if n_rows > seq of that forward.
+// WHY: spec-decode verify reads per-position logits for all K verify tokens; the
+// LM head writes one full V-row per position at relative rows 0..seq-1 (only
+// when sk_qwen_set_lm_head_all_rows is enabled; default writes the last row only).
+int  sk_qwen_get_logits_rows(sk_qwen_handle* h, void* out_fp16, uint32_t n_rows);
+
+// KV-cache cursor get/set. WHY: spec-decode rewinds the cursor to discard the KV
+// entries of rejected verify tokens. set returns -2 if pos > cache_max.
+int  sk_qwen_get_pos(sk_qwen_handle* h);
+int  sk_qwen_set_pos(sk_qwen_handle* h, uint32_t pos);
+
+// Toggle per-position LM-head projection (all rows of a seq>1 forward). Off by
+// default (last-row-only prefill). Spec-decode verify enables it.
+int  sk_qwen_set_lm_head_all_rows(sk_qwen_handle* h, uint32_t on);
+
 // Debug: limit forward to first N layers (0 = all). Affects subsequent forward calls.
 // When < cfg.n_layers, the post-loop final_norm + LM head still run on the
 // partial residual stream, so get_last_logits returns logits from the prefix.

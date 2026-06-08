@@ -866,6 +866,11 @@ struct ModelParams {
     // Debug knobs (default = full model, no capture)
     uint32_t layers_run     = 0;   // 0 → all n_layers; else only first N
     int32_t  capture_layer  = -1;  // if >=0, copy post-layer residual to capture_buf
+
+    // WHY: prefill projects the LM head for row T-1 only (the other rows are
+    // dead vocab×d_model work for generation). Spec-decode verify needs
+    // per-position logits for all T rows, so it sets this to project rows 0..T-1.
+    uint32_t lm_head_all_rows = 0;
 };
 
 struct ModelPSOs {
@@ -1127,12 +1132,15 @@ inline void dispatch_model(
     // the head projects just row T-1 — the other T-1 rows are vocab×d_model of
     // dead work. The last row is written to logits row (T-1) so get_last_logits'
     // current_pos-1 offset is unchanged; argmax (below) reads that same row.
+    // Spec-decode verify sets lm_head_all_rows to project every row 0..T-1.
     {
-        const uint32_t last = T - 1u;
         const uint32_t M_v = 1u, K_v = M.d_model, N_v = M.vocab_size;
-        const size_t   off_A = (size_t)last * K_v * 2;
-        const size_t   off_C = (size_t)last * N_v * 2;
+        const uint32_t r0 = M.lm_head_all_rows ? 0u : (T - 1u);
         MTL::Buffer* w_head = W.w_lm_head ? W.w_lm_head : W.w_embed;
+
+      for (uint32_t r = r0; r < T; ++r) {
+        const size_t off_A = (size_t)r * K_v * 2;
+        const size_t off_C = (size_t)r * N_v * 2;
 
         if (W.dt_lm_head == sk::Dtype::Q8_0 && W.w_lm_head &&
             P.layer.q8_0_matvec != nullptr) {
@@ -1204,6 +1212,7 @@ inline void dispatch_model(
                                       MTL::Size(64, 1, 1));
             enc->endEncoding();
         }
+      }
     }
 
     // E. Argmax → output_id
