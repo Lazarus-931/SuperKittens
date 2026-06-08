@@ -26,6 +26,7 @@ struct Handle {
     std::vector<size_t>   mlp_gate_off_e;
     std::vector<size_t>   mlp_down_off_e;
     std::vector<int32_t>  kv_source_layer;
+    std::vector<float>    layer_scalar_host;   // gemma4_unified per-layer output scale
 
     // Per-layer byte offsets into the Q8_0 body buffers (empty if Q8 body off).
     std::vector<size_t>   q_q8_off;
@@ -139,6 +140,7 @@ extern "C" sk_gemma4_handle* sk_gemma4_create(const sk_gemma4_config* cfg) {
     h->mlp_gate_off_e.resize(nL);
     h->mlp_down_off_e.resize(nL);
     h->kv_source_layer.assign(nL, -1);
+    h->layer_scalar_host.assign(nL, 1.0f);  // gemma4_unified: populated by the GGUF loader
     {
         size_t cum_gate = 0, cum_down = 0;
         for (uint32_t L = 0; L < nL; ++L) {
@@ -493,6 +495,8 @@ extern "C" int sk_gemma4_forward(sk_gemma4_handle* hp,
     mp.vocab_size         = h->cfg.vocab_size;
     mp.ple_dim            = h->cfg.ple_dim;
     mp.has_ple            = (h->cfg.has_ple != 0);
+    mp.full_rope_global   = (h->cfg.full_rope_global != 0);
+    mp.apply_layer_scalar = (h->cfg.apply_layer_scalar != 0);
     mp.eps                = h->cfg.eps;
     mp.final_logit_softcap = h->cfg.final_logit_softcap;
     mp.current_pos        = h->current_pos;
@@ -500,6 +504,7 @@ extern "C" int sk_gemma4_forward(sk_gemma4_handle* hp,
     mp.mlp_gate_off_e     = h->mlp_gate_off_e.data();
     mp.mlp_down_off_e     = h->mlp_down_off_e.data();
     mp.kv_source_layer    = h->kv_source_layer.data();
+    mp.layer_scalar_host  = h->layer_scalar_host.data();
     mp.dump_enabled       = h->dump_enabled;
 
     auto* cmd = q->commandBuffer();

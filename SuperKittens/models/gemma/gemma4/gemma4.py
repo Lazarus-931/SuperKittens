@@ -32,6 +32,8 @@ class _Config(ctypes.Structure):
         ("final_logit_softcap", ctypes.c_float),
         ("use_double_wide_mlp",  ctypes.c_uint32),
         ("num_kv_shared_layers", ctypes.c_uint32),
+        ("full_rope_global",     ctypes.c_uint32),
+        ("apply_layer_scalar",   ctypes.c_uint32),
     ]
 
 
@@ -55,6 +57,7 @@ GEMMA4_ABI = {
     "destroy":                ([ctypes.c_void_p], None),
     "load_safetensors":       ([ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int),
     "load_safetensors_index": ([ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int),
+    "load_gguf":              optional([ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int),
     "set_rope_tables":        ([ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
                                 ctypes.c_void_p, ctypes.c_void_p], ctypes.c_int),
     "get_last_logits":        ([ctypes.c_void_p, ctypes.c_void_p], ctypes.c_int),
@@ -94,6 +97,9 @@ class Gemma4Config(CtypesConfig):
     partial_rotary_factor_full: float = 0.25
     num_kv_shared_layers: int = 0
     use_double_wide_mlp: bool = False
+    # gemma4_unified deltas (0 = E-variant gemma4 behaviour).
+    full_rope_global: int = 0
+    apply_layer_scalar: int = 0
     layer_types: tuple = ()
     batch: int = 1
     seq_max: int = 256       # prefill cap; sized for scratch buffers (per-dispatch overhead scales with bound buffer size on Apple GPUs)

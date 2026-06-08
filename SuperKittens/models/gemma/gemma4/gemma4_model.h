@@ -83,6 +83,7 @@ struct LayerParams {
     uint32_t n_int          = 12288;
     uint32_t ple_dim        = 256;
     uint32_t rot_dims       = 0;       // 0 = rotate full head_dim (default)
+    bool     full_rope_global = false; // gemma4_unified: full RoPE on global layers (E-variant: partial 0.25)
     float    eps            = 1e-5f;
 
     // Per-call (varies per layer + decode position)
@@ -348,9 +349,9 @@ inline void dispatch_layer(
     if (use_qkv_fused) {
         auto* enc = E.get();
         enc->setComputePipelineState(P.qkv_norm_rope_partial_t1);
-        uint32_t rot_dims = p.rot_dims
-                            ? p.rot_dims
-                            : (uint32_t)(p.head_dim * 0.25f);
+        uint32_t rot_dims = p.full_rope_global ? p.head_dim
+                            : (p.rot_dims ? p.rot_dims
+                                          : (uint32_t)(p.head_dim * 0.25f));
         enc->setBuffer(B.qkv_packed, 0,         0);
         enc->setBuffer(B.gamma_q,    off_gamma, 1);
         enc->setBuffer(B.gamma_k,    off_gamma, 2);
@@ -415,12 +416,13 @@ inline void dispatch_layer(
     if (!use_qkv_fused) {
         auto* enc = E.get();
         if (p.is_global) {
-            // Gemma4 full_attention uses standard partial RoPE (HF
-            // modeling_gemma4.py:1229,1245 with partial_rotary_factor=0.25),
-            // NOT p-RoPE. rot_dims = head_dim * 0.25.
-            uint32_t rot_dims = p.rot_dims
-                                ? p.rot_dims
-                                : (uint32_t)(p.head_dim * 0.25f);
+            // Gemma4 E-variant full_attention uses partial RoPE 0.25; the
+            // gemma4_unified proportional rotary rotates the FULL global head_dim
+            // (rope.dimension_count == global_head_dim), so full_rope_global picks
+            // rot_dims = head_dim.
+            uint32_t rot_dims = p.full_rope_global ? p.head_dim
+                                : (p.rot_dims ? p.rot_dims
+                                              : (uint32_t)(p.head_dim * 0.25f));
             enc->setComputePipelineState(P.rope_partial);
             enc->setBuffer(B.q_norm, 0, 0);
             enc->setBuffer(B.q_norm, 0, 1);
@@ -956,6 +958,8 @@ struct ModelParams {
     uint32_t vocab_size         = 256000;
     uint32_t ple_dim            = 256;
     bool     has_ple            = true;
+    bool     full_rope_global   = false;   // gemma4_unified: full RoPE on global layers
+    bool     apply_layer_scalar = false;   // gemma4_unified: per-layer output scale (no PLE)
     float    eps                = 1e-5f;
     float    final_logit_softcap = 0.0f;   // 0 = disabled
 
@@ -967,6 +971,7 @@ struct ModelParams {
     const size_t*   mlp_gate_off_e     = nullptr;  // cumulative dm*sum n_int_l (elements)
     const size_t*   mlp_down_off_e     = nullptr;  // cumulative sum n_int_l*dm  (elements)
     const int32_t*  kv_source_layer    = nullptr;  // -1 if not shared, else source idx
+    const float*    layer_scalar_host  = nullptr;  // per-layer output scale (gemma4_unified); length n_layers
 
     // Dump infra (per-layer activation stash). If enabled, dispatch_model
     // appends blit copies of named buffers' last-position rows into
@@ -1307,6 +1312,7 @@ inline void dispatch_model(
                               ? M.head_dim_local : M.head_dim_global;
         lp.window         = M.window;
         lp.is_global      = is_global;
+        lp.full_rope_global = M.full_rope_global;
         lp.prope_p_pairs  = M.prope_p_pairs;
         lp.d_model        = M.d_model;
         lp.n_int          = M.n_int_per_layer ? M.n_int_per_layer[L] : M.n_int;
@@ -1416,6 +1422,25 @@ inline void dispatch_model(
         lb.y_out      = nxt;
 
         dispatch_layer(cmd, P.layer, lb, lp);
+
+        // gemma4_unified: per-layer output scale (HF `hidden_states *= layer_scalar`).
+        // The E-variant applies layer_scalar only inside the PLE inject; unified has
+        // no PLE, so scale the layer-output residual stream (nxt) here. Reuses the
+        // bf16×const scale kernel (logit_descale) with this layer's host scalar.
+        if (M.apply_layer_scalar && M.layer_scalar_host && P.logit_descale) {
+            const float scl = M.layer_scalar_host[L];
+            if (scl != 1.0f) {
+                auto* enc = cmd->computeCommandEncoder();
+                enc->setComputePipelineState(P.logit_descale);
+                enc->setBuffer(nxt, 0, 0);
+                uint32_t n = T * M.d_model;
+                enc->setBytes(&n,   4, 1);
+                enc->setBytes(&scl, 4, 2);
+                uint32_t groups = ((n / 4u) + 127u) / 128u;
+                enc->dispatchThreadgroups(MTL::Size(groups, 1, 1), MTL::Size(128, 1, 1));
+                enc->endEncoding();
+            }
+        }
 
         // DUMP per-layer (before PLE inject so x_norm/attn/mlp are
         // pristine; we re-dump "out" after PLE).
