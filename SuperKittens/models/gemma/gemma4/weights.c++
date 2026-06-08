@@ -23,6 +23,19 @@ struct Handle {
     std::vector<size_t>   mlp_gate_off_e;
     std::vector<size_t>   mlp_down_off_e;
     std::vector<int32_t>  kv_source_layer;
+
+    // Layout must match launcher.c++'s Handle (the pointer is reinterpret_cast
+    // across both TUs); these per-layer Q8_0 byte-offset tables are populated
+    // by the launcher's alloc and read here when quantizing the body weights.
+    std::vector<size_t>   q_q8_off;
+    std::vector<size_t>   k_q8_off;
+    std::vector<size_t>   v_q8_off;
+    std::vector<size_t>   out_q8_off;
+    std::vector<size_t>   gate_q8_off;
+    std::vector<size_t>   up_q8_off;
+    std::vector<size_t>   down_q8_off;
+
+    bool dump_enabled = false;
 };
 }}
 
@@ -148,6 +161,30 @@ inline void scale_bf16_inplace(uint16_t* p, size_t n, float scale) {
     }
 }
 
+// Host-quantize an HF body tensor to Q8_0 at dst[byte_off]. The tensor is
+// stored HF-native [N, K] row-major; q8_0_matvec_bf16 reads that layout
+// directly, so no transpose. Materializes to a bf16 staging buffer first
+// (handles bf16/fp16/fp32 source) then runs the vDSP block quantizer.
+bool quantize_into_q8(MTL::Buffer* dst, size_t byte_off, sk::WeightStore* store,
+                      const std::string& name, size_t n_elems)
+{
+    auto* v = store->get(name);
+    if (!v) { std::fprintf(stderr, "gemma4 weights(q8): missing tensor '%s'\n", name.c_str()); return false; }
+    if (v->nbytes / 2 != n_elems && v->dtype != sk::Dtype::F32) {
+        // bf16/fp16 are 2 bytes/elem; fp32 is 4.
+        if (!((v->dtype == sk::Dtype::F32) && (v->nbytes / 4 == n_elems))) {
+            std::fprintf(stderr, "gemma4 weights(q8): size mismatch '%s' got %zu expect %zu elems\n",
+                         name.c_str(), v->nbytes / 2, n_elems);
+            return false;
+        }
+    }
+    std::vector<uint16_t> staging(n_elems);
+    copy_bf16_from(staging.data(), v->data, v->dtype, n_elems);
+    uint8_t* out = (uint8_t*)dst->contents() + byte_off;
+    sk::quantize_q8_0_bf16(staging.data(), n_elems, out);
+    return true;
+}
+
 }
 
 extern "C" int sk_gemma4_load_from_store(sk_gemma4_handle* hp, sk::WeightStore* store) {
@@ -229,8 +266,9 @@ extern "C" int sk_gemma4_load_from_store(sk_gemma4_handle* hp, sk::WeightStore* 
         }
     }
 
-    auto* qkv_base   = (char*)h->weights.w_qkv->contents();
-    auto* w_out_base = (char*)h->weights.w_out->contents();
+    const bool body_q8 = (h->weights.w_q_q8 != nullptr);
+    auto* qkv_base   = h->weights.w_qkv ? (char*)h->weights.w_qkv->contents() : nullptr;
+    auto* w_out_base = h->weights.w_out ? (char*)h->weights.w_out->contents() : nullptr;
 
     for (uint32_t L = 0; L < c.n_layers; ++L) {
         const bool     is_global = ((L % c.local_period) == (c.local_period - 1));
@@ -265,61 +303,87 @@ extern "C" int sk_gemma4_load_from_store(sk_gemma4_handle* hp, sk::WeightStore* 
                               layer_key(L, "self_attn.k_norm.weight"), hd)) return -25;
         }
 
-        if (!copy_transpose_bf16(h->weights.w_out, o_off, store,
-                                 layer_key(L, "self_attn.o_proj.weight"), Nq, dm)) return -26;
+        if (body_q8) {
+            // HF-native [N, K]: o_proj [dm, Nq]; gate/up [ni, dm]; down [dm, ni].
+            if (!quantize_into_q8(h->weights.w_out_q8,  h->out_q8_off[L],  store,
+                                  layer_key(L, "self_attn.o_proj.weight"), Nq * dm)) return -26;
+            if (!quantize_into_q8(h->weights.w_gate_q8, h->gate_q8_off[L], store,
+                                  layer_key(L, "mlp.gate_proj.weight"), dm * ni)) return -27;
+            if (!quantize_into_q8(h->weights.w_up_q8,   h->up_q8_off[L],   store,
+                                  layer_key(L, "mlp.up_proj.weight"),   dm * ni)) return -28;
+            if (!quantize_into_q8(h->weights.w_down_q8, h->down_q8_off[L], store,
+                                  layer_key(L, "mlp.down_proj.weight"), ni * dm)) return -29;
+        } else {
+            if (!copy_transpose_bf16(h->weights.w_out, o_off, store,
+                                     layer_key(L, "self_attn.o_proj.weight"), Nq, dm)) return -26;
 
-        if (!copy_transpose_bf16(h->weights.w_gate, gate_off, store,
-                                 layer_key(L, "mlp.gate_proj.weight"), dm, ni)) return -27;
-        if (!copy_transpose_bf16(h->weights.w_up,   gate_off, store,
-                                 layer_key(L, "mlp.up_proj.weight"),   dm, ni)) return -28;
-        if (!copy_transpose_bf16(h->weights.w_down, down_off, store,
-                                 layer_key(L, "mlp.down_proj.weight"), ni, dm)) return -29;
+            if (!copy_transpose_bf16(h->weights.w_gate, gate_off, store,
+                                     layer_key(L, "mlp.gate_proj.weight"), dm, ni)) return -27;
+            if (!copy_transpose_bf16(h->weights.w_up,   gate_off, store,
+                                     layer_key(L, "mlp.up_proj.weight"),   dm, ni)) return -28;
+            if (!copy_transpose_bf16(h->weights.w_down, down_off, store,
+                                     layer_key(L, "mlp.down_proj.weight"), ni, dm)) return -29;
+        }
 
-        auto* q_v = store->get(layer_key(L, "self_attn.q_proj.weight"));
-        if (!q_v) {
-            std::fprintf(stderr, "gemma4 weights: missing q_proj for layer %u\n", L);
-            return -30;
-        }
-        const size_t qb = Nq  * dm * 2;
-        if (q_v->nbytes != qb) {
-            std::fprintf(stderr, "gemma4 weights: q_proj size mismatch layer %u\n", L);
-            return -31;
-        }
-        uint16_t* layer = (uint16_t*)(qkv_base + qkv_off);
-        auto tx_into = [&](const void* src_v, sk::Dtype dt, size_t out_rows, size_t out_cols, size_t col_off) {
-            const uint16_t* s = (const uint16_t*)src_v;
-            const bool is_bf16 = (dt == sk::Dtype::BF16);
-            for (size_t i = 0; i < out_rows; ++i) {
-                for (size_t j = 0; j < out_cols; ++j) {
-                    uint16_t x = s[j * out_rows + i];
-                    if (is_bf16) {
-                        layer[i * qkvN + col_off + j] = x;
-                    } else {
-                        uint32_t f = fp16_to_fp32_bits(x);
-                        layer[i * qkvN + col_off + j] = fp32_bits_to_bf16(f);
+        if (body_q8) {
+            // Q/K/V stay HF-native [N, K] (no transpose). KV-shared layers have
+            // no k/v_proj tensors; their Q8 K/V slabs stay zero (the K/V matvec
+            // output is discarded — KV comes from the source layer's cache).
+            if (!quantize_into_q8(h->weights.w_q_q8, h->q_q8_off[L], store,
+                                  layer_key(L, "self_attn.q_proj.weight"), Nq * dm)) return -30;
+            if (!is_kv_shared) {
+                if (!quantize_into_q8(h->weights.w_k_q8, h->k_q8_off[L], store,
+                                      layer_key(L, "self_attn.k_proj.weight"), Nkv * dm)) return -32;
+                if (!quantize_into_q8(h->weights.w_v_q8, h->v_q8_off[L], store,
+                                      layer_key(L, "self_attn.v_proj.weight"), Nkv * dm)) return -33;
+            }
+        } else {
+            auto* q_v = store->get(layer_key(L, "self_attn.q_proj.weight"));
+            if (!q_v) {
+                std::fprintf(stderr, "gemma4 weights: missing q_proj for layer %u\n", L);
+                return -30;
+            }
+            const size_t qb = Nq  * dm * 2;
+            if (q_v->nbytes != qb) {
+                std::fprintf(stderr, "gemma4 weights: q_proj size mismatch layer %u\n", L);
+                return -31;
+            }
+            uint16_t* layer = (uint16_t*)(qkv_base + qkv_off);
+            auto tx_into = [&](const void* src_v, sk::Dtype dt, size_t out_rows, size_t out_cols, size_t col_off) {
+                const uint16_t* s = (const uint16_t*)src_v;
+                const bool is_bf16 = (dt == sk::Dtype::BF16);
+                for (size_t i = 0; i < out_rows; ++i) {
+                    for (size_t j = 0; j < out_cols; ++j) {
+                        uint16_t x = s[j * out_rows + i];
+                        if (is_bf16) {
+                            layer[i * qkvN + col_off + j] = x;
+                        } else {
+                            uint32_t f = fp16_to_fp32_bits(x);
+                            layer[i * qkvN + col_off + j] = fp32_bits_to_bf16(f);
+                        }
                     }
                 }
+            };
+            tx_into(q_v->data, q_v->dtype, dm, Nq,  0);
+            if (!is_kv_shared) {
+                auto* k_v = store->get(layer_key(L, "self_attn.k_proj.weight"));
+                auto* v_v = store->get(layer_key(L, "self_attn.v_proj.weight"));
+                if (!k_v || !v_v) {
+                    std::fprintf(stderr, "gemma4 weights: missing k/v_proj for layer %u\n", L);
+                    return -32;
+                }
+                const size_t kb = Nkv * dm * 2;
+                const size_t vb = Nkv * dm * 2;
+                if (k_v->nbytes != kb || v_v->nbytes != vb) {
+                    std::fprintf(stderr, "gemma4 weights: kv size mismatch layer %u\n", L);
+                    return -33;
+                }
+                tx_into(k_v->data, k_v->dtype, dm, Nkv, Nq);
+                tx_into(v_v->data, v_v->dtype, dm, Nkv, Nq + Nkv);
             }
-        };
-        tx_into(q_v->data, q_v->dtype, dm, Nq,  0);
-        if (!is_kv_shared) {
-            auto* k_v = store->get(layer_key(L, "self_attn.k_proj.weight"));
-            auto* v_v = store->get(layer_key(L, "self_attn.v_proj.weight"));
-            if (!k_v || !v_v) {
-                std::fprintf(stderr, "gemma4 weights: missing k/v_proj for layer %u\n", L);
-                return -32;
-            }
-            const size_t kb = Nkv * dm * 2;
-            const size_t vb = Nkv * dm * 2;
-            if (k_v->nbytes != kb || v_v->nbytes != vb) {
-                std::fprintf(stderr, "gemma4 weights: kv size mismatch layer %u\n", L);
-                return -33;
-            }
-            tx_into(k_v->data, k_v->dtype, dm, Nkv, Nq);
-            tx_into(v_v->data, v_v->dtype, dm, Nkv, Nq + Nkv);
         }
 
-        (void)w_out_base;
+        (void)w_out_base; (void)qkvN;
 
         if (c.has_ple) {
             const size_t ple_dim = (size_t)c.ple_dim;
