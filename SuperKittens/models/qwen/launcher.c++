@@ -348,19 +348,45 @@ static int run_step(Handle* h, MTL::CommandQueue* q, uint32_t seq);
 // the mha_causal current_pos>0 interior logits), so the final-position result
 // matches a single seq=prompt_seq forward. Caller has the queue + input/rope
 // buffers; this fills them per chunk. Returns 0 on success.
+//
+// WHY rebalance the tail: the logits come from the LAST chunk's last row, and a
+// small final chunk takes a different GEMM path than the full-width MMA prefill:
+// seq==1 routes the whole forward through the T==1 decode kernels, and seq in
+// [2..GEMM_SM_MAXM] takes the small-M matvec (PR #59). Both differ ~1e-2 from
+// the MMA path, so a tiny final chunk makes the final-position logits diverge
+// from a single seq=prompt_seq forward (which, at prompt_seq > MAXM, takes the
+// MMA path). When the final chunk would land in [1..MAXM], grow it so it is
+// > MAXM: either fold the whole remainder into one final chunk (when it fits in
+// seq_max) or pull just enough from this chunk that both halves stay > MAXM.
+// A whole prompt of seq <= MAXM is left alone — single-forward of the same
+// prompt takes the same path, so they still match. (Interior chunks only matter
+// when chunk_step itself is <= MAXM, a degenerate config that also makes the
+// interior KV take the sm path; callers use chunk_step >> MAXM, e.g. 64/128.)
 static int run_prefill_chunked(Handle* h, MTL::CommandQueue* q,
                                const int* prompt_ids, uint32_t prompt_seq,
                                uint32_t chunk_step) {
     int32_t* in_ids = (int32_t*)h->bufs.input_ids->contents();
     int32_t* pos    = (int32_t*)h->bufs.rope_pos->contents();
-    for (uint32_t s = 0; s < prompt_seq; s += chunk_step) {
-        const uint32_t this_seq = (prompt_seq - s < chunk_step)
-                                  ? (prompt_seq - s) : chunk_step;
+    const uint32_t seq_max = h->cfg.seq_max;
+    for (uint32_t s = 0; s < prompt_seq; ) {
+        const uint32_t remaining = prompt_seq - s;
+        uint32_t this_seq = (remaining < chunk_step) ? remaining : chunk_step;
+        if (this_seq < remaining) {
+            const uint32_t tail = remaining - this_seq;
+            if (tail >= 1 && tail <= GEMM_SM_MAXM) {
+                if (remaining <= seq_max) {
+                    this_seq = remaining;  // one final chunk; remaining > MAXM
+                } else if (remaining >= 2u * (GEMM_SM_MAXM + 1u)) {
+                    this_seq = remaining - (GEMM_SM_MAXM + 1u);  // both halves > MAXM
+                }
+            }
+        }
         if (h->current_pos + this_seq > h->cfg.cache_max) return -4;
         std::memcpy(in_ids, prompt_ids + s, (size_t)this_seq * sizeof(int32_t));
         for (uint32_t i = 0; i < this_seq; ++i)
             pos[i] = (int32_t)(h->current_pos + i);
         if (int rc = run_step(h, q, this_seq)) return rc;
+        s += this_seq;
     }
     return 0;
 }
@@ -435,6 +461,12 @@ extern "C" int sk_qwen_prefill_chunked(sk_qwen_handle* hp,
     uint32_t step = (chunk_size == 0) ? h->cfg.seq_max : chunk_size;
     if (step > h->cfg.seq_max) step = h->cfg.seq_max;
     if (step == 0) return -2;
+    // Floor the step above the divergent small-M band: a chunk_step <= MAXM
+    // makes every interior chunk take the sm/decode GEMM path, whose KV differs
+    // ~1e-2 from the MMA prefill and so breaks single-forward bit-equivalence
+    // (the tail-rebalance in run_prefill_chunked can only fix the final chunk).
+    if (step <= meow::qwen::GEMM_SM_MAXM) step = meow::qwen::GEMM_SM_MAXM + 1u;
+    if (step > h->cfg.seq_max) step = h->cfg.seq_max;
     if (h->current_pos + prompt_seq > h->cfg.cache_max) return -4;
 
     auto* q = sk::bindings_queue();
