@@ -21,6 +21,9 @@ struct Handle {
     std::vector<LayerCache> layer_caches;
     std::vector<MTL::Buffer*> k_caches;
     std::vector<MTL::Buffer*> v_caches;
+    // Q8_0-KV cache buffers (parallel to k_caches/v_caches when kv_q8 active).
+    bool kv_q8 = false;
+    std::vector<MTL::Buffer*> kq_caches, vq_caches, ks_caches, vs_caches;
 
     uint32_t layers_run     = 0;
     int32_t  capture_layer  = -1;
@@ -55,6 +58,28 @@ static bool resolve_psos(ModelPSOs& P) {
     P.layer.q8_0_matvec    = sk::bindings_pso("q8_0_matvec");  // optional; nullptr OK
     P.layer.q4k_matvec     = sk::bindings_pso("q4k_matvec");   // optional; nullptr OK
     P.layer.q6k_matvec     = sk::bindings_pso("q6k_matvec");   // optional; nullptr OK
+    P.layer.q3k_matvec     = sk::bindings_pso("q3k_matvec");   // optional; nullptr OK
+    P.layer.q5k_matvec     = sk::bindings_pso("q5k_matvec");   // optional; nullptr OK
+    // Batched (seq>1) MMA GEMM for prefill. All optional; absence falls back to
+    // the per-row matvec loop in encode_quant_gemm. SK_NO_GEMM_MMA=1 forces the
+    // matvec-loop prefill (A/B bench of the batched path against the per-row one).
+    // Small-M (seq 2..8) multi-RHS matvec for Q8_0/Q4_K (spec-decode verify,
+    // short prefill). SK_NO_GEMM_SM=1 forces the BN=32 MMA / matvec-loop path
+    // for the small-M band (A/B of the sm kernel against the MMA floor).
+    const bool no_sm = getenv("SK_NO_GEMM_SM") != nullptr;
+    if (getenv("SK_NO_GEMM_MMA")) {
+        P.layer.gemm_mma_f16 = P.layer.gemm_mma_bf16 = P.layer.gemm_mma_q8_0 =
+            P.layer.gemm_mma_q4k = P.layer.gemm_mma_q6k = nullptr;
+        P.layer.gemm_mma_q8_0_sm = P.layer.gemm_mma_q4k_sm = nullptr;
+    } else {
+        P.layer.gemm_mma_f16   = sk::bindings_pso("gemm_mma_f16");
+        P.layer.gemm_mma_bf16  = sk::bindings_pso("gemm_mma_bf16");
+        P.layer.gemm_mma_q8_0  = sk::bindings_pso("gemm_mma_q8_0");
+        P.layer.gemm_mma_q4k   = sk::bindings_pso("gemm_mma_q4k");
+        P.layer.gemm_mma_q6k   = sk::bindings_pso("gemm_mma_q6k");
+        P.layer.gemm_mma_q8_0_sm = no_sm ? nullptr : sk::bindings_pso("gemm_mma_q8_0_sm");
+        P.layer.gemm_mma_q4k_sm  = no_sm ? nullptr : sk::bindings_pso("gemm_mma_q4k_sm");
+    }
     P.layer.q8_0_swiglu_m1 = sk::bindings_pso("q8_0_swiglu_m1");  // optional; nullptr OK
     P.layer.q8_0_swiglu_prenorm_m1 = sk::bindings_pso("q8_0_swiglu_prenorm_m1");  // optional
     P.layer.q8_0_matvec_addres = sk::bindings_pso("q8_0_matvec_addres");  // optional
@@ -70,6 +95,12 @@ static bool resolve_psos(ModelPSOs& P) {
         P.layer.attn_combine = sk::bindings_pso("mha_decode_combine");  // optional; nullptr OK
     }
     P.layer.kv_cache_write = sk::bindings_pso("kv_cache_write");
+    // Q8_0-KV path (optional; nullptr OK). dispatch_layer only takes it when the
+    // handle allocated Q8 caches (SK_KV_Q8) AND all three resolve.
+    P.layer.kv_cache_write_q8 = sk::bindings_pso("kv_cache_write_q8");
+    P.layer.attn_q8           = sk::bindings_pso("mha_causal_q8");
+    if (!getenv("SK_NO_SPLIT_ATTN"))
+        P.layer.attn_split_q8 = sk::bindings_pso("mha_decode_split_q8");
     P.layer.add            = sk::bindings_pso("add_f16");
     P.layer.add_rmsnorm    = sk::bindings_pso("add_rmsnorm");
     P.layer.gated_mlp      = sk::bindings_pso("gated_mlp");
@@ -159,16 +190,46 @@ extern "C" sk_qwen_handle* sk_qwen_create(const sk_qwen_config* cfg) {
     h->weights.w_lm_head       = cfg->tie_word_embeddings ? nullptr
                                   : alloc_zero(dev, (size_t)cfg->vocab_size * cfg->d_model * 2);
 
-    // Per-layer K, V caches (full cache; GQA → n_kv_heads not n_heads)
+    // Per-layer K, V caches (full cache; GQA → n_kv_heads not n_heads).
+    // SK_KV_Q8=1 stores K/V as Q8_0 (int8 + per-32-block fp16 scale) instead of
+    // fp16: ~0.53× the cache bytes (128B int8 + 4×2B scale vs 256B fp16 per
+    // 128-d token) and ~half the attention KV read traffic at long context.
+    // Requires the three Q8 PSOs; if any is missing we silently keep fp16.
+    h->kv_q8 = getenv("SK_KV_Q8") != nullptr
+               && h->psos.layer.kv_cache_write_q8 != nullptr
+               && h->psos.layer.attn_q8 != nullptr;
     h->layer_caches.resize(cfg->n_layers);
     h->k_caches.resize(cfg->n_layers);
     h->v_caches.resize(cfg->n_layers);
-    for (uint32_t L = 0; L < cfg->n_layers; ++L) {
-        const size_t kv_bytes = (size_t)cfg->batch * cfg->n_kv_heads * cfg->cache_max * hd * 2;
-        h->k_caches[L] = alloc_zero(dev, kv_bytes);
-        h->v_caches[L] = alloc_zero(dev, kv_bytes);
-        h->layer_caches[L].k = h->k_caches[L];
-        h->layer_caches[L].v = h->v_caches[L];
+    if (h->kv_q8) {
+        const uint32_t nblk = hd / 32u;
+        const size_t n_tok = (size_t)cfg->batch * cfg->n_kv_heads * cfg->cache_max;
+        const size_t q_bytes = n_tok * hd;            // int8
+        const size_t s_bytes = n_tok * nblk * 2;      // fp16 scales
+        h->kq_caches.resize(cfg->n_layers);
+        h->vq_caches.resize(cfg->n_layers);
+        h->ks_caches.resize(cfg->n_layers);
+        h->vs_caches.resize(cfg->n_layers);
+        for (uint32_t L = 0; L < cfg->n_layers; ++L) {
+            h->kq_caches[L] = alloc_zero(dev, q_bytes);
+            h->vq_caches[L] = alloc_zero(dev, q_bytes);
+            h->ks_caches[L] = alloc_zero(dev, s_bytes);
+            h->vs_caches[L] = alloc_zero(dev, s_bytes);
+            h->layer_caches[L].kq = h->kq_caches[L];
+            h->layer_caches[L].vq = h->vq_caches[L];
+            h->layer_caches[L].ks = h->ks_caches[L];
+            h->layer_caches[L].vs = h->vs_caches[L];
+            h->k_caches[L] = nullptr;
+            h->v_caches[L] = nullptr;
+        }
+    } else {
+        for (uint32_t L = 0; L < cfg->n_layers; ++L) {
+            const size_t kv_bytes = (size_t)cfg->batch * cfg->n_kv_heads * cfg->cache_max * hd * 2;
+            h->k_caches[L] = alloc_zero(dev, kv_bytes);
+            h->v_caches[L] = alloc_zero(dev, kv_bytes);
+            h->layer_caches[L].k = h->k_caches[L];
+            h->layer_caches[L].v = h->v_caches[L];
+        }
     }
     h->weights.layer_caches = h->layer_caches.data();
 
@@ -317,8 +378,60 @@ extern "C" void sk_qwen_reset(sk_qwen_handle* hp) {
 }
 
 namespace meow { namespace qwen {
+static int run_step(Handle* h, MTL::CommandQueue* q, uint32_t seq);
+
 // WHY: one-step driver shared between sk_qwen_forward and the in-C decode
 // loop. Caller has already memcpy'd input_ids + rope_pos for `seq` tokens.
+// WHY: prefill a prompt in chunks of <= chunk_step tokens, carrying KV + pos
+// across chunks. Each chunk is one run_step; the seq_max-sized scratch only has
+// to cover chunk_step rows, so a prompt longer than seq_max prefills with
+// bounded memory. The chunk boundary is numerically transparent (PR #54 fixed
+// the mha_causal current_pos>0 interior logits), so the final-position result
+// matches a single seq=prompt_seq forward. Caller has the queue + input/rope
+// buffers; this fills them per chunk. Returns 0 on success.
+//
+// WHY rebalance the tail: the logits come from the LAST chunk's last row, and a
+// small final chunk takes a different GEMM path than the full-width MMA prefill:
+// seq==1 routes the whole forward through the T==1 decode kernels, and seq in
+// [2..GEMM_SM_MAXM] takes the small-M matvec (PR #59). Both differ ~1e-2 from
+// the MMA path, so a tiny final chunk makes the final-position logits diverge
+// from a single seq=prompt_seq forward (which, at prompt_seq > MAXM, takes the
+// MMA path). When the final chunk would land in [1..MAXM], grow it so it is
+// > MAXM: either fold the whole remainder into one final chunk (when it fits in
+// seq_max) or pull just enough from this chunk that both halves stay > MAXM.
+// A whole prompt of seq <= MAXM is left alone — single-forward of the same
+// prompt takes the same path, so they still match. (Interior chunks only matter
+// when chunk_step itself is <= MAXM, a degenerate config that also makes the
+// interior KV take the sm path; callers use chunk_step >> MAXM, e.g. 64/128.)
+static int run_prefill_chunked(Handle* h, MTL::CommandQueue* q,
+                               const int* prompt_ids, uint32_t prompt_seq,
+                               uint32_t chunk_step) {
+    int32_t* in_ids = (int32_t*)h->bufs.input_ids->contents();
+    int32_t* pos    = (int32_t*)h->bufs.rope_pos->contents();
+    const uint32_t seq_max = h->cfg.seq_max;
+    for (uint32_t s = 0; s < prompt_seq; ) {
+        const uint32_t remaining = prompt_seq - s;
+        uint32_t this_seq = (remaining < chunk_step) ? remaining : chunk_step;
+        if (this_seq < remaining) {
+            const uint32_t tail = remaining - this_seq;
+            if (tail >= 1 && tail <= GEMM_SM_MAXM) {
+                if (remaining <= seq_max) {
+                    this_seq = remaining;  // one final chunk; remaining > MAXM
+                } else if (remaining >= 2u * (GEMM_SM_MAXM + 1u)) {
+                    this_seq = remaining - (GEMM_SM_MAXM + 1u);  // both halves > MAXM
+                }
+            }
+        }
+        if (h->current_pos + this_seq > h->cfg.cache_max) return -4;
+        std::memcpy(in_ids, prompt_ids + s, (size_t)this_seq * sizeof(int32_t));
+        for (uint32_t i = 0; i < this_seq; ++i)
+            pos[i] = (int32_t)(h->current_pos + i);
+        if (int rc = run_step(h, q, this_seq)) return rc;
+        s += this_seq;
+    }
+    return 0;
+}
+
 static int run_step(Handle* h, MTL::CommandQueue* q, uint32_t seq) {
     ModelParams mp;
     mp.batch          = h->cfg.batch;
@@ -342,6 +455,7 @@ static int run_step(Handle* h, MTL::CommandQueue* q, uint32_t seq) {
     mp.rope_beta_slow  = h->cfg.rope_beta_slow;
     mp.layers_run      = h->layers_run;
     mp.capture_layer   = h->capture_layer;
+    mp.kv_q8           = h->kv_q8;
     h->last_seq        = seq;
 
     auto* cmd = q->commandBuffer();
@@ -379,13 +493,41 @@ extern "C" int sk_qwen_forward(sk_qwen_handle* hp,
     return 0;
 }
 
+extern "C" int sk_qwen_prefill_chunked(sk_qwen_handle* hp,
+                                       const int* prompt_ids, uint32_t prompt_seq,
+                                       uint32_t chunk_size, int* output_id) {
+    if (!hp || !prompt_ids || !output_id) return -1;
+    auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
+    if (prompt_seq == 0) return -2;
+    if (h->cfg.batch != 1) return -5;  // chunked prefill is batch=1
+    uint32_t step = (chunk_size == 0) ? h->cfg.seq_max : chunk_size;
+    if (step > h->cfg.seq_max) step = h->cfg.seq_max;
+    if (step == 0) return -2;
+    // Floor the step above the divergent small-M band: a chunk_step <= MAXM
+    // makes every interior chunk take the sm/decode GEMM path, whose KV differs
+    // ~1e-2 from the MMA prefill and so breaks single-forward bit-equivalence
+    // (the tail-rebalance in run_prefill_chunked can only fix the final chunk).
+    if (step <= meow::qwen::GEMM_SM_MAXM) step = meow::qwen::GEMM_SM_MAXM + 1u;
+    if (step > h->cfg.seq_max) step = h->cfg.seq_max;
+    if (h->current_pos + prompt_seq > h->cfg.cache_max) return -4;
+
+    auto* q = sk::bindings_queue();
+    if (!q) return -3;
+
+    if (int rc = meow::qwen::run_prefill_chunked(h, q, prompt_ids, prompt_seq, step))
+        return rc;
+
+    std::memcpy(output_id, h->bufs.output_id->contents(), sizeof(int32_t));
+    return 0;
+}
+
 extern "C" int sk_qwen_generate_n(sk_qwen_handle* hp,
                                   const int* prompt_ids, uint32_t prompt_seq,
                                   int* out_tokens, uint32_t n_tokens,
                                   int32_t eos_id) {
     if (!hp || !prompt_ids || !out_tokens) return -1;
     auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
-    if (prompt_seq == 0 || prompt_seq > h->cfg.seq_max) return -2;
+    if (prompt_seq == 0) return -2;
     if (n_tokens == 0) return 0;
     if (h->current_pos + prompt_seq > h->cfg.cache_max) return -4;
     if (h->cfg.batch != 1) return -5;  // greedy multi-token loop is batch=1
@@ -393,15 +535,13 @@ extern "C" int sk_qwen_generate_n(sk_qwen_handle* hp,
     auto* q = sk::bindings_queue();
     if (!q) return -3;
 
-    // Prefill on the prompt: produces argmax for next token in output_id.
-    std::memcpy(h->bufs.input_ids->contents(), prompt_ids,
-                (size_t)prompt_seq * sizeof(int32_t));
-    {
-        int32_t* pos = (int32_t*)h->bufs.rope_pos->contents();
-        for (uint32_t i = 0; i < prompt_seq; ++i)
-            pos[i] = (int32_t)(h->current_pos + i);
-    }
-    if (int rc = meow::qwen::run_step(h, q, prompt_seq)) return rc;
+    // Prefill on the prompt (chunked at seq_max so a prompt longer than the
+    // scratch buffers still prefills): leaves the next-token argmax in
+    // output_id. The chunk boundary is transparent, so the result is identical
+    // to a single seq=prompt_seq forward.
+    if (int rc = meow::qwen::run_prefill_chunked(h, q, prompt_ids, prompt_seq,
+                                                 h->cfg.seq_max))
+        return rc;
 
     int32_t* in_ids  = (int32_t*)h->bufs.input_ids->contents();
     int32_t* rope    = (int32_t*)h->bufs.rope_pos->contents();
@@ -439,8 +579,14 @@ extern "C" int sk_qwen_get_last_logits(sk_qwen_handle* hp, void* out_fp16) {
     auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
     const size_t V = h->cfg.vocab_size;
     const size_t row_bytes = V * sizeof(uint16_t);
-    if (h->current_pos == 0) return -2;
-    const size_t last_row = (size_t)(h->current_pos - 1);
+    // The LM head writes the last position's logits at STEP-LOCAL row
+    // last_seq-1 (indexed within the forward, not by absolute position). Using
+    // current_pos-1 reads the right row only on the first prefill from pos 0;
+    // for any later forward (decode T=1, or a later chunked-prefill chunk) it
+    // reads a stale row, and once current_pos passes seq_max it reads OOB of the
+    // seq_max-sized logits buffer. Always read last_seq-1.
+    if (h->last_seq == 0) return -2;
+    const size_t last_row = (size_t)(h->last_seq - 1);
     const char* src = (const char*)h->bufs.logits->contents() + last_row * row_bytes;
     std::memcpy(out_fp16, src, row_bytes);
     return 0;
@@ -494,6 +640,10 @@ extern "C" void sk_qwen_destroy(sk_qwen_handle* hp) {
     if (h->gguf_mmap) { delete h->gguf_mmap; h->gguf_mmap = nullptr; }
     for (auto* b : h->k_caches) rel(b);
     for (auto* b : h->v_caches) rel(b);
+    for (auto* b : h->kq_caches) rel(b);
+    for (auto* b : h->vq_caches) rel(b);
+    for (auto* b : h->ks_caches) rel(b);
+    for (auto* b : h->vs_caches) rel(b);
     rel(h->bufs.input_ids); rel(h->bufs.output_id);
     rel(h->bufs.x_a); rel(h->bufs.x_b); rel(h->bufs.logits); rel(h->bufs.rope_pos);
     rel(h->bufs.cos_tbl); rel(h->bufs.sin_tbl);
