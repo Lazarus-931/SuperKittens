@@ -831,7 +831,9 @@ inline void dispatch_layer(
         a.nb00 = blk_b; a.nb01 = row_blk; a.nb02 = slab;
         a.ne10 = (int32_t)in_dim; a.ne11 = 1; a.ne12 = 1; a.ne13 = 1;
         a.nb10 = sizeof(float); a.nb11 = (uint64_t)in_dim * sizeof(float); a.nb12 = a.nb11;
-        a.ne0 = (int32_t)out_rows; a.ne1 = 1; a.nb1 = (uint64_t)out_rows * sizeof(float);
+        // ne1 = top_k so the dst base offset (idx + iid1*ne1)*ne0 separates each
+        // (token, slot) output into [T, top_k, out_rows]; ne1=1 collapsed s+t (prefill T>1 bug).
+        a.ne0 = (int32_t)out_rows; a.ne1 = (int32_t)p.top_k; a.nb1 = (uint64_t)out_rows * sizeof(float);
         a.nr0 = (int32_t)NR0;
         auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(pso);
@@ -873,7 +875,7 @@ inline void dispatch_layer(
     encode_mv_id(P.moe_mv_down, false, B.w_down, (size_t)L * down_layer,
                  B.moe_mid_f32, B.moe_down_f32, p.n_int, p.d_model);
 
-    // Weighted scatter-add: y_out = residual + scale * Σ score[s] * down[s].
+    // Weighted scatter-add over all T tokens: y_out[t] = residual[t] + scale*Σ score[t,s]*down[t,s].
     {
         const float scale = p.routed_scaling;
         auto* enc = cmd->computeCommandEncoder();
@@ -885,7 +887,7 @@ inline void dispatch_layer(
         enc->setBytes(&p.d_model, 4, 4);
         enc->setBytes(&p.top_k,   4, 5);
         enc->setBytes(&scale,     4, 6);
-        enc->dispatchThreadgroups(MTL::Size((p.d_model + 255) / 256, 1, 1),
+        enc->dispatchThreadgroups(MTL::Size((p.d_model + 255) / 256, T, 1),
                                   MTL::Size(256, 1, 1));
         enc->endEncoding();
     }
@@ -1030,7 +1032,7 @@ struct ModelBuffers {
 };
 
 inline void dispatch_model(
-    MTL::CommandBuffer* cmd,
+    MTL::CommandBuffer*& cmd,
     const ModelPSOs&    P,
     const ModelWeights& W,
     ModelBuffers&       B,
@@ -1169,6 +1171,27 @@ inline void dispatch_model(
 
         dispatch_layer(cmd, P.layer, lb, lp);
 
+        if (getenv("SK_DS_DBGL")) {
+            MTL::CommandQueue* dbgq = cmd->commandQueue();
+            cmd->commit();
+            cmd->waitUntilCompleted();
+            const uint16_t* hs = (const uint16_t*)nxt->contents();
+            const uint32_t n = T * M.d_model;
+            double sumsq = 0.0; float mx = -1e30f, mn = 1e30f; int nbad = 0;
+            for (uint32_t i = 0; i < n; ++i) {
+                uint16_t hh = hs[i];
+                uint32_t s=(hh>>15)&1,e=(hh>>10)&0x1f,m=hh&0x3ff,bits;
+                if(e==0){ if(m==0)bits=s<<31; else { uint32_t ee=127-15+1; while(!(m&0x400)){m<<=1;ee--;} m&=0x3ff; bits=(s<<31)|(ee<<23)|(m<<13);} }
+                else if(e==0x1f){ bits=(s<<31)|(0xffu<<23)|(m<<13); nbad++; }
+                else bits=(s<<31)|((e-15+127)<<23)|(m<<13);
+                float f; std::memcpy(&f,&bits,4);
+                sumsq += (double)f*f; mx = f>mx?f:mx; mn = f<mn?f:mn;
+            }
+            std::fprintf(stderr, "[SK_DS_DBGL] L=%u L2=%.3f min=%.3f max=%.3f naninf=%d\n",
+                         L, sqrt(sumsq), mn, mx, nbad);
+            cmd = dbgq->commandBuffer();
+        }
+
         MTL::Buffer* tmp = cur; cur = nxt; nxt = tmp;
     }
 
@@ -1237,12 +1260,16 @@ inline void dispatch_model(
                 enc->endEncoding();
             }
         } else {
+            // Next-token prediction needs the LAST row's argmax only; output_id
+            // holds one int, so bind logits at the last row and dispatch 1 TG
+            // (grid=T wrote out[1..T-1] OOB and returned row 0's argmax).
+            const size_t last_off = (size_t)(T - 1) * M.vocab_size * sizeof(uint16_t);
             auto* enc = cmd->computeCommandEncoder();
             enc->setComputePipelineState(P.argmax);
-            enc->setBuffer(B.logits,    0, 0);
+            enc->setBuffer(B.logits,    last_off, 0);
             enc->setBuffer(B.output_id, 0, 1);
             enc->setBytes(&M.vocab_size, 4, 2);
-            enc->dispatchThreadgroups(MTL::Size(T, 1, 1), MTL::Size(1024, 1, 1));
+            enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(1024, 1, 1));
             enc->endEncoding();
         }
     }
