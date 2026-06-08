@@ -44,4 +44,53 @@ void kv_cache_write(
     reinterpret_cast<device half4*>(v_cache + out_row)[d4] = v;
 }
 
+// Q8_0 KV write. Each new (B,H_kv,seq_in,D) row is split into D/32 blocks of 32
+// elements; per block we store one fp16 scale (max|x|/127) and 32 int8 values.
+// Layout: qs in (B,H_kv,cache_size,D) int8, sc in (B,H_kv,cache_size,D/32) fp16.
+// One simdgroup of 32 lanes owns one (bh, t_in, block): each lane holds 1 elt,
+// simd-reduce the block absmax, quantize, store. D must be a multiple of 32.
+[[host_name("kv_cache_write_q8")]]
+[[kernel]]
+void kv_cache_write_q8(
+    device const half* new_k       [[buffer(0)]],
+    device const half* new_v       [[buffer(1)]],
+    device       char* k_cache_q   [[buffer(2)]],   // (B,H_kv,cache_size,D) int8
+    device       char* v_cache_q   [[buffer(3)]],
+    device       half* k_cache_s   [[buffer(4)]],   // (B,H_kv,cache_size,D/32) fp16
+    device       half* v_cache_s   [[buffer(5)]],
+    constant uint& B               [[buffer(6)]],
+    constant uint& H_kv            [[buffer(7)]],
+    constant uint& D_head          [[buffer(8)]],
+    constant uint& seq_in          [[buffer(9)]],
+    constant uint& pos             [[buffer(10)]],
+    constant uint& cache_size      [[buffer(11)]],
+    uint3 gid  [[thread_position_in_grid]],
+    uint  lane [[thread_index_in_simdgroup]])
+{
+    const uint nblk = D_head / 32u;                 // blocks per head row
+    const uint blk  = gid.x >> 5;                    // 32 lanes per block
+    const uint t_in = gid.y;
+    const uint bh   = gid.z;
+    if (blk >= nblk || t_in >= seq_in || bh >= B * H_kv) return;
+
+    const uint buf_t = (pos + t_in) % cache_size;
+    const size_t in_row  = ((size_t)bh * seq_in     + t_in)  * D_head + blk * 32u;
+    const size_t out_row = ((size_t)bh * cache_size + buf_t) * D_head + blk * 32u;
+    const size_t sc_row  = ((size_t)bh * cache_size + buf_t) * nblk   + blk;
+
+    const float kf = float(new_k[in_row + lane]);
+    const float vf = float(new_v[in_row + lane]);
+    const float kd = simd_max(fabs(kf)) / 127.0f;
+    const float vd = simd_max(fabs(vf)) / 127.0f;
+    const float kinv = kd > 0.0f ? 1.0f / kd : 0.0f;
+    const float vinv = vd > 0.0f ? 1.0f / vd : 0.0f;
+
+    k_cache_q[out_row + lane] = (char)round(kf * kinv);
+    v_cache_q[out_row + lane] = (char)round(vf * vinv);
+    if (lane == 0) {
+        k_cache_s[sc_row] = half(kd);
+        v_cache_s[sc_row] = half(vd);
+    }
+}
+
 } // namespace meow::ops::kv_cache

@@ -146,6 +146,76 @@ class Model:
         return self.tokenizer.decode(out_ids, skip_special=True)
 
 
+def _unified_memory_bytes() -> int:
+    """Total unified memory in bytes (hw.memsize); 0 if unavailable."""
+    import subprocess
+    try:
+        return int(subprocess.check_output(["sysctl", "-n", "hw.memsize"]).strip())
+    except Exception:
+        return 0
+
+
+def memory_aware_cache_max(
+    *, requested_cache_max: int, seq_max: int,
+    weight_bytes: int, n_layers: int, n_kv_heads: int, head_dim: int,
+    d_model: int, n_int: int, n_heads: int, vocab_size: int,
+    headroom_gib: float = 6.0, total_mem_bytes: int | None = None,
+    kv_q8: bool = False,
+) -> int:
+    """Clamp ``requested_cache_max`` so weights + KV + prefill scratch fit memory.
+
+    The KV cache is the only large allocation that scales with cache_max
+    (n_layers · n_kv_heads · head_dim · 2[K+V] · 2[fp16] bytes per token), so a
+    default cache_max of 32768 silently OOMs a 14B-Q4 (~9 GB weights) on a 16 GB
+    box. Prefill scratch (dominated by the seq_max·vocab logits buffer) scales
+    with seq_max, not cache_max, and is treated as a fixed cost here.
+
+    Returns the largest cache_max ≤ requested that leaves ``headroom_gib`` free,
+    floored at 256 and never raised above the request. If memory can't be
+    queried, returns the request unchanged.
+
+    The 6 GiB default headroom is empirical, not just "OS reserve": measured on
+    derek (M4, 16 GiB) the real resident set at cache_max=2048 was ~4.5 GiB
+    above what this byte model accounts for — OS/desktop, the Metal runtime,
+    mmap page-table slack, and page rounding all sit outside it. Smaller
+    headroom over-commits a 16 GiB box and it thrashes the VM compressor
+    (decode stalls to a crawl) instead of OOM-killing, which is worse. Keep the
+    margin conservative; the win over a hand-set cache_max is fitting at all
+    without a manual override, not squeezing the last KV slot.
+    """
+    total = total_mem_bytes if total_mem_bytes is not None else _unified_memory_bytes()
+    if total <= 0 or weight_bytes <= 0:
+        return requested_cache_max
+
+    # fp16: head_dim*2 bytes per K (or V). Q8_0: head_dim int8 + (head_dim/32)
+    # fp16 block scales. ×2 for K and V.
+    per_kv = (head_dim + (head_dim // 32) * 2) if kv_q8 else (head_dim * 2)
+    kv_per_tok = n_layers * n_kv_heads * per_kv * 2
+    cos_sin_per_slot = (head_dim // 2) * 2 * 2
+
+    # Prefill scratch (fp16), keyed off seq_max. Mirrors the seq_max-scaled
+    # alloc_zero calls in the qwen launcher; a coarse over-estimate is fine
+    # because it is conservative (we under-allocate KV rather than OOM).
+    qkv_N = (n_heads + 2 * n_kv_heads) * head_dim
+    scratch = (
+        seq_max * vocab_size * 2          # logits (dominant)
+        + seq_max * d_model * 2 * 8       # x_a/x_b/x_norm/o_proj/y_attn/m_in/mlp_out/capture
+        + seq_max * qkv_N * 2             # qkv_packed
+        + seq_max * n_heads * head_dim * 2 * 3
+        + seq_max * n_int * 2 * 2         # gate_buf/up_buf
+        + seq_max * n_kv_heads * head_dim * 2 * 5
+    )
+
+    headroom = int(headroom_gib * (1024 ** 3))
+    avail_for_kv = total - weight_bytes - scratch - headroom
+    if avail_for_kv <= 0:
+        return max(256, min(requested_cache_max, 256))
+
+    fitted = int(avail_for_kv // (kv_per_tok + cos_sin_per_slot))
+    fitted = max(256, (fitted // 256) * 256)
+    return min(requested_cache_max, fitted)
+
+
 def resolve_weights_dir(name: str, variant_to_dir: dict[str, str]) -> Path:
     if name in variant_to_dir:
         dir_name = variant_to_dir[name]
