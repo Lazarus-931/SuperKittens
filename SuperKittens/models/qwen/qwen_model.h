@@ -22,6 +22,7 @@ struct LayerParams {
     uint32_t n_int        = 27392;
     float    eps          = 1e-6f;
     uint32_t use_qk_norm  = 1;  // 0 for Llama-arch (Nemotron-Nano): skip per-head Q/K RMSNorm
+    uint32_t rope_interleaved = 0;  // 1 = interleaved/NORM RoPE (Llama GGUF, type 0); 0 = NeoX split-half (Qwen3, type 2)
 
     uint32_t layer_idx    = 0;
     uint32_t kv_buf_start = 0;
@@ -71,7 +72,8 @@ struct LayerPSOs {
     MTL::ComputePipelineState* q8_0_swiglu_prenorm_m1 = nullptr;  // fused residual+rmsnorm+swiglu (M=1)
     MTL::ComputePipelineState* q8_0_matvec_addres = nullptr;  // matvec + residual add (M=1)
     MTL::ComputePipelineState* split_packed;      // (T, A+B) → (T, A) + (T, B)
-    MTL::ComputePipelineState* rope_qk;           // split-half RoPE on Q, K
+    MTL::ComputePipelineState* rope_qk;           // split-half (NeoX) RoPE on Q, K (Qwen3)
+    MTL::ComputePipelineState* rope_qk_il = nullptr;  // interleaved (NORM) RoPE (Llama GGUF); used when rope_interleaved=1
     MTL::ComputePipelineState* attn;              // mha_causal (d=128, GQA)
     // Flash-decoding split-K decode attention (long-ctx). Both non-null together.
     MTL::ComputePipelineState* attn_split   = nullptr;  // mha_decode_split
@@ -581,13 +583,17 @@ inline void dispatch_layer(
     }
 
     // 5. RoPE on Q and K. RoPE-K writes a distinct buffer from RoPE-Q;
-    // dep on K-norm is honored by the barrier before RoPE-Q.
+    // dep on K-norm is honored by the barrier before RoPE-Q. Llama GGUFs
+    // (rope type 0, converter-permuted Q/K) need interleaved-pair rotation;
+    // Qwen3 (type 2) needs split-half. Same cos/sin tables either way.
     {
         const size_t cs_off = (size_t)p.write_pos * (hd / 2) * 2;
-        encode_rope_qk_inplace(enc, P.rope_qk, B.q,
+        MTL::ComputePipelineState* rope_pso =
+            (p.rope_interleaved && P.rope_qk_il) ? P.rope_qk_il : P.rope_qk;
+        encode_rope_qk_inplace(enc, rope_pso, B.q,
                                B.cos_tbl, cs_off, B.sin_tbl, cs_off,
                                p.seq, p.n_heads, hd);
-        encode_rope_qk_inplace(enc, P.rope_qk, B.k_tmp,
+        encode_rope_qk_inplace(enc, rope_pso, B.k_tmp,
                                B.cos_tbl, cs_off, B.sin_tbl, cs_off,
                                p.seq, p.n_kv_heads, hd,
                                /*barrier_before=*/false);
@@ -925,6 +931,7 @@ struct ModelParams {
     uint32_t vocab_size   = 151936;
     float    eps          = 1e-6f;
     uint32_t use_qk_norm  = 1;  // 0 for Llama-arch (Nemotron-Nano): skip per-head Q/K RMSNorm
+    uint32_t rope_interleaved = 0;  // 1 = interleaved/NORM RoPE (Llama GGUF, type 0); 0 = NeoX (Qwen3, type 2)
     uint32_t current_pos  = 0;
 
     // RoPE
@@ -1114,6 +1121,7 @@ inline void dispatch_model(
         lp.n_int        = M.n_int;
         lp.eps          = M.eps;
         lp.use_qk_norm  = M.use_qk_norm;
+        lp.rope_interleaved = M.rope_interleaved;
         lp.layer_idx    = L;
         lp.kv_buf_start = kv_buf_start;
         lp.kv_len       = kv_len;

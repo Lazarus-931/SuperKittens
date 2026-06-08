@@ -103,6 +103,13 @@ class Nemotron(DenseDecoder):
             rope_scaling = dict(spec.dims.get("rope_scaling")) if spec.dims.get("rope_scaling") else None
 
         overrides.setdefault("use_qk_norm", 0)
+        # Llama GGUFs store Q/K permuted for GGML rope type 0 (interleaved/NORM):
+        # the HF->GGUF converter permutes q_proj/k_proj so NORM rope reproduces HF
+        # rotate_half. The shared core's default RoPE kernel is split-half (NeoX,
+        # GGML type 2, correct for Qwen3); applying it to Llama's permuted weights
+        # scrambles positions (incoherent past ~1 token). Select the interleaved
+        # kernel for the Llama arch.
+        overrides.setdefault("rope_interleaved", 1)
         m = super().from_spec(spec, **overrides)
         m._rope_scaling = rope_scaling
         # DenseDecoder.from_spec already baked plain RoPE; re-bake with llama3.

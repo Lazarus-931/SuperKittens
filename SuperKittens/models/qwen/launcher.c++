@@ -85,6 +85,7 @@ static bool resolve_psos(ModelPSOs& P) {
     P.layer.q8_0_matvec_addres = sk::bindings_pso("q8_0_matvec_addres");  // optional
     P.layer.split_packed   = sk::bindings_pso("split_packed");
     P.layer.rope_qk        = sk::bindings_pso("qwen_rope_qk");
+    P.layer.rope_qk_il     = sk::bindings_pso("qwen_rope_qk_interleaved");  // optional; Llama-arch only
     P.layer.attn           = sk::bindings_pso("mha_causal");
     // SK_NO_SPLIT_ATTN=1 forces the mha_causal path everywhere (A/B + bisection).
     if (getenv("SK_NO_SPLIT_ATTN")) {
@@ -446,6 +447,7 @@ static int run_step(Handle* h, MTL::CommandQueue* q, uint32_t seq) {
     mp.vocab_size     = h->cfg.vocab_size;
     mp.eps            = h->cfg.eps;
     mp.use_qk_norm    = h->cfg.use_qk_norm;
+    mp.rope_interleaved = h->cfg.rope_interleaved;
     mp.current_pos    = h->current_pos;
     mp.rope_n_ctx_orig = h->cfg.rope_n_ctx_orig;
     mp.rope_freq_base  = h->cfg.rope_freq_base;
