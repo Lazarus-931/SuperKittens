@@ -72,7 +72,9 @@ static bool resolve_psos(ModelPSOs& P) {
     P.layer.q8_0_matvec_bf16   = sk::bindings_pso("q8_0_matvec_bf16");
     P.layer.geglu_mul          = sk::bindings_pso("gemma4_geglu_mul");
     P.embedding_lookup     = sk::bindings_pso("embedding_lookup_bf16");
+    P.embedding_lookup_q8  = sk::bindings_pso("embedding_lookup_q8_bf16");  // optional
     P.ple_lookup           = sk::bindings_pso("gemma4_ple_lookup");
+    P.ple_lookup_q8        = sk::bindings_pso("gemma4_ple_lookup_q8");       // optional
     P.ple_context_mix      = sk::bindings_pso("gemma4_ple_context_mix");
     P.argmax               = sk::bindings_pso("argmax_bf16");
     // Optional 2-pass argmax (nullable; both must be non-null to engage).
@@ -201,9 +203,27 @@ extern "C" sk_gemma4_handle* sk_gemma4_create(const sk_gemma4_config* cfg) {
             h->weights.w_lm_head_q8 = nullptr;
         }
     }
-    h->weights.w_ple_table     = cfg->has_ple
-                                  ? alloc_zero(dev, (size_t)cfg->vocab_size * cfg->n_layers * cfg->ple_dim * 2)
-                                  : nullptr;
+    // PLE table: Q8_0 by default (SK_GEMMA4_PLE_Q8=0 to keep bf16). Q8 is the
+    // dominant E4B resident-memory win — the bf16 PLE table is ~5.6 GB at E4B
+    // (vocab 262144 × n_layers 42 × ple_dim 256 × 2). Q8 ~3.0 GB; weights.c++
+    // quantizes the scaled bf16 PLE into it. When Q8 is on the bf16 table is
+    // left unallocated and gemma4_ple_lookup_q8 gathers+dequants on-device.
+    bool ple_q8 = false;
+    if (cfg->has_ple) {
+        const char* env = std::getenv("SK_GEMMA4_PLE_Q8");
+        const bool want = !env || (env[0] != '0');
+        const size_t row_len = (size_t)cfg->n_layers * cfg->ple_dim;
+        ple_q8 = want && (row_len % 32 == 0) && h->psos.ple_lookup_q8;
+    }
+    if (cfg->has_ple && ple_q8) {
+        const size_t n_elems  = (size_t)cfg->vocab_size * cfg->n_layers * cfg->ple_dim;
+        h->weights.w_ple_table_q8 = alloc_zero(dev, (n_elems / 32) * 34);
+        h->weights.w_ple_table    = nullptr;
+    } else {
+        h->weights.w_ple_table     = cfg->has_ple
+                                      ? alloc_zero(dev, (size_t)cfg->vocab_size * cfg->n_layers * cfg->ple_dim * 2)
+                                      : nullptr;
+    }
     h->weights.w_per_layer_input_gate      = cfg->has_ple
                                   ? alloc_zero(dev, (size_t)cfg->n_layers * cfg->ple_dim * cfg->d_model * 2)
                                   : nullptr;
@@ -644,6 +664,7 @@ extern "C" void sk_gemma4_destroy(sk_gemma4_handle* hp) {
 
     auto rel = [](MTL::Buffer* b) { if (b) b->release(); };
     rel(h->weights.w_embed); rel(h->weights.w_lm_head_q8); rel(h->weights.w_ple_table);
+    rel(h->weights.w_ple_table_q8);
     rel(h->weights.w_per_layer_input_gate);
     rel(h->weights.w_per_layer_projection);
     rel(h->weights.w_layer_scalar);

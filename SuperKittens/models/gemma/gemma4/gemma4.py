@@ -125,10 +125,15 @@ def _preset(name: str) -> Gemma4Config:
                             head_dim_local=256, head_dim_global=512,
                             vocab_size=262144, window=4096, has_ple=True, ple_dim=256)
     if n in ("e4b",):
-        return Gemma4Config(n_layers=35, local_period=6, d_model=2560, n_int=10240,
+        # Verified against google/gemma-4-E4B-it config.json (text_config):
+        # 42 layers, full_attention at L%6==5, head_dim_global=512, GQA 4:1
+        # (8 Q / 2 KV heads), 18 KV-shared tail layers, double-wide MLP off.
+        return Gemma4Config(n_layers=42, local_period=6, d_model=2560, n_int=10240,
                             n_heads=8, n_kv_heads_local=2, n_kv_heads_global=2,
-                            head_dim_local=256, head_dim_global=256,
-                            vocab_size=262144, window=4096, has_ple=True, ple_dim=256)
+                            head_dim_local=256, head_dim_global=512,
+                            vocab_size=262144, window=512, has_ple=True, ple_dim=256,
+                            num_kv_shared_layers=18, use_double_wide_mlp=False,
+                            final_logit_softcap=30.0)
     # gemma-4-12B-it: model_type "gemma4_unified" — structurally different from
     # the E2B/E4B/31B "gemma4" arch and not yet supported by this adapter. Preset
     # carries the real config.json dims so from_spec doesn't raise, but loading
