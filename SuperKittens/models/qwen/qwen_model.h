@@ -217,14 +217,18 @@ inline MTL::ComputePipelineState* gemm_sm_pso(const LayerPSOs& P, sk::Dtype dt) 
     }
 }
 
-// True when the small-M multi-RHS matvec is the measured winner for (dt, M):
-// Q8_0 wins the whole 2..8 band; Q4_K's MMA already beats it at M>=4, so sm is
-// only chosen for Q4_K at M<=2.
+// True when the small-M multi-RHS matvec is the measured winner for (dt, M)
+// on M4 (lexie bench). Q8_0: sm wins the whole 2..8 band — its MMA floor is
+// 3.5-6.4x a decode regardless of M, while sm is 1.0/1.5/2.3-2.8x at M=2/4/8.
+// Q4_K: MMA floor is lower (2.4-3.1x), so sm wins M<=4 (1.3-2.4x vs MMA 2.4-
+// 3.1x) but MMA overtakes at M=8 (sm 4.4-5.5x). Note Q4_K M=4 on small-K
+// gate/up (K=2560) is ~break-even (sm 2.89x vs MMA 2.64x); the large-K
+// down/8B projections that dominate a forward favor sm at M=4, so M<=4.
 inline bool gemm_sm_wins(sk::Dtype dt, uint32_t M) {
     if (M <= 1 || M > GEMM_SM_MAXM) return false;
     switch (dt) {
         case sk::Dtype::Q8_0: return true;
-        case sk::Dtype::Q4_K: return M <= 2;
+        case sk::Dtype::Q4_K: return M <= 4;
         default:              return false;
     }
 }
@@ -764,7 +768,8 @@ inline void dispatch_layer(
         if (pso_gate != nullptr) {
             encode_quant_gemm(enc, pso_gate, B.m_in, 0, B.w_gate, off_w_gate,
                               B.gate_buf, 0, T, p.n_int, p.d_model, /*ldC=*/0,
-                              gemm_mma_pso(P, B.dt_gate));
+                              gemm_mma_pso(P, B.dt_gate),
+                              gemm_sm_pso(P, B.dt_gate), gemm_sm_wins(B.dt_gate, T));
         } else {
             encode_gemm_fallback(enc, P.gemm, P.gemv_m1, B.m_in, 0, B.w_gate, off_w_gate,
                                  B.gate_buf, T, p.n_int, p.d_model);
@@ -772,7 +777,8 @@ inline void dispatch_layer(
         if (pso_up != nullptr) {
             encode_quant_gemm(enc, pso_up, B.m_in, 0, B.w_up, off_w_up,
                               B.up_buf, 0, T, p.n_int, p.d_model, /*ldC=*/0,
-                              gemm_mma_pso(P, B.dt_up));
+                              gemm_mma_pso(P, B.dt_up),
+                              gemm_sm_pso(P, B.dt_up), gemm_sm_wins(B.dt_up, T));
         } else {
             encode_gemm_fallback(enc, P.gemm, P.gemv_m1, B.m_in, 0, B.w_up, off_w_up,
                                  B.up_buf, T, p.n_int, p.d_model);
@@ -811,7 +817,8 @@ inline void dispatch_layer(
         if (pso_down != nullptr) {
             encode_quant_gemm(enc, pso_down, B.up_buf, 0, B.w_down, off_w_down,
                               B.mlp_out, 0, T, p.d_model, p.n_int, /*ldC=*/0,
-                              gemm_mma_pso(P, B.dt_down));
+                              gemm_mma_pso(P, B.dt_down),
+                              gemm_sm_pso(P, B.dt_down), gemm_sm_wins(B.dt_down, T));
         } else {
             encode_gemm_fallback(enc, P.gemm, P.gemv_m1, B.up_buf, 0, B.w_down, off_w_down,
                                  B.mlp_out, T, p.d_model, p.n_int);
