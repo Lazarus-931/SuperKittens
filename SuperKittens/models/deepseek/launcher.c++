@@ -440,6 +440,26 @@ extern "C" int sk_deepseek_forward(sk_deepseek_handle* hp,
 
     h->current_pos += seq;
 
+    if (getenv("SK_DS_DEBUG")) {
+        const uint32_t V = h->cfg.vocab_size;
+        const uint32_t T = seq;
+        const uint16_t* lg = (const uint16_t*)h->bufs.logits->contents();
+        const uint16_t* row = lg + (size_t)(T - 1) * V;   // last position
+        auto h2f = [](uint16_t h) {
+            uint32_t s=(h>>15)&1,e=(h>>10)&0x1f,m=h&0x3ff,bits;
+            if(e==0){ if(m==0)bits=s<<31; else { e=127-15+1; while(!(m&0x400)){m<<=1;e--;} m&=0x3ff; bits=(s<<31)|(e<<23)|(m<<13);} }
+            else if(e==0x1f) bits=(s<<31)|(0xff<<23)|(m<<13);
+            else bits=(s<<31)|((e-15+127)<<23)|(m<<13);
+            float f; std::memcpy(&f,&bits,4); return f; };
+        int top[10]; float topv[10];
+        for(int k=0;k<10;k++){top[k]=-1;topv[k]=-1e30f;}
+        for(uint32_t v=0; v<V; ++v){ float f=h2f(row[v]);
+            for(int k=0;k<10;k++){ if(f>topv[k]){ for(int j=9;j>k;j--){topv[j]=topv[j-1];top[j]=top[j-1];} topv[k]=f; top[k]=(int)v; break; } } }
+        std::fprintf(stderr, "[SK_DS_DEBUG] pos=%u logits top10:", h->current_pos-1);
+        for(int k=0;k<10;k++) std::fprintf(stderr, " %d=%.3f", top[k], topv[k]);
+        std::fprintf(stderr, "\n");
+    }
+
     std::memcpy(output_id, h->bufs.output_id->contents(),
                 (size_t)h->cfg.batch * sizeof(int32_t));
     return 0;

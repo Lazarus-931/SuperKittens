@@ -22,23 +22,25 @@ kernel void deepseek_moe_swiglu_f32(
     mid[gid] = silu * up[gid];
 }
 
-// Weighted scatter-add: out[d] = residual[d] + sum_s score[s] * down[s, d].
-// down is [S, d_model] fp32, score is [S] fp16 (router top_score), residual and
-// out are [d_model] fp16. One thread per output column accumulates across slots.
+// Weighted scatter-add over T tokens: out[t,d] = residual[t,d] + sum_s score[t,s]*down[t,s,d].
+// down is [T, S, D] fp32, score [T, S] fp16, residual/out [T, D] fp16. gid.x=d, gid.y=t.
 [[host_name("deepseek_moe_scatter_add_f32")]]
 kernel void deepseek_moe_scatter_add_f32(
-        device const float * down     [[buffer(0)]],   // [S, D] fp32
-        device const half  * score    [[buffer(1)]],   // [S] fp16
-        device const half  * residual [[buffer(2)]],   // [D] fp16
-        device       half  * out      [[buffer(3)]],   // [D] fp16
+        device const float * down     [[buffer(0)]],   // [T, S, D] fp32
+        device const half  * score    [[buffer(1)]],   // [T, S] fp16
+        device const half  * residual [[buffer(2)]],   // [T, D] fp16
+        device       half  * out      [[buffer(3)]],   // [T, D] fp16
         constant uint &      D         [[buffer(4)]],
         constant uint &      S         [[buffer(5)]],
         constant float &     scale     [[buffer(6)]],   // routed_scaling_factor
-        uint gid [[thread_position_in_grid]]) {
-    if (gid >= D) return;
-    float acc = float(residual[gid]);
+        uint2 gid [[thread_position_in_grid]]) {
+    const uint d = gid.x, t = gid.y;
+    if (d >= D) return;
+    const device float * down_t = down + (size_t)t * S * D;
+    const device half  * score_t = score + (size_t)t * S;
+    float acc = float(residual[(size_t)t * D + d]);
     for (uint s = 0; s < S; ++s) {
-        acc += scale * float(score[s]) * down[(size_t)s * D + gid];
+        acc += scale * float(score_t[s]) * down_t[(size_t)s * D + d];
     }
-    out[gid] = half(acc);
+    out[(size_t)t * D + d] = half(acc);
 }
