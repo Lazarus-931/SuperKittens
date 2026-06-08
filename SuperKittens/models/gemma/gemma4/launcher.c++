@@ -525,6 +525,12 @@ extern "C" int sk_gemma4_forward(sk_gemma4_handle* hp,
     meow::gemma4::dispatch_model(cmd, h->psos, h->weights, h->bufs, mp);
     cmd->commit();
     cmd->waitUntilCompleted();
+    if (cmd->status() == MTL::CommandBufferStatusError) {
+        auto* e = cmd->error();
+        std::fprintf(stderr, "gemma4 forward: command buffer ERROR (status=%ld): %s\n",
+                     (long)(e ? e->code() : -1),
+                     e && e->localizedDescription() ? e->localizedDescription()->utf8String() : "?");
+    }
     cmd->release();
 
     h->current_pos += seq;
