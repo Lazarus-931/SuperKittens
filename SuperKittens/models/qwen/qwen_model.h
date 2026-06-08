@@ -76,6 +76,10 @@ struct LayerPSOs {
     MTL::ComputePipelineState* attn_split   = nullptr;  // mha_decode_split
     MTL::ComputePipelineState* attn_combine = nullptr;  // mha_decode_combine
     MTL::ComputePipelineState* kv_cache_write;
+    // Q8_0-KV path (gated by SK_KV_Q8). All three non-null together or disabled.
+    MTL::ComputePipelineState* kv_cache_write_q8 = nullptr;
+    MTL::ComputePipelineState* attn_q8           = nullptr;  // mha_causal_q8
+    MTL::ComputePipelineState* attn_split_q8     = nullptr;  // mha_decode_split_q8
     MTL::ComputePipelineState* add;
     MTL::ComputePipelineState* add_rmsnorm;
     MTL::ComputePipelineState* gated_mlp;
@@ -109,9 +113,16 @@ struct LayerBuffers {
     MTL::Buffer* cos_tbl;             // (cache_size, head_dim/2) fp16
     MTL::Buffer* sin_tbl;             // (cache_size, head_dim/2) fp16
 
-    // Per-layer KV caches
+    // Per-layer KV caches. fp16 path uses k_cache/v_cache. Q8_0 path
+    // (kv_q8=true) uses k_cache_q/v_cache_q (int8 (cache,D)) +
+    // k_cache_s/v_cache_s (fp16 (cache,D/32) block scales).
     MTL::Buffer* k_cache;             // (cache_size, n_kv_heads, head_dim)
     MTL::Buffer* v_cache;
+    MTL::Buffer* k_cache_q = nullptr;
+    MTL::Buffer* v_cache_q = nullptr;
+    MTL::Buffer* k_cache_s = nullptr;
+    MTL::Buffer* v_cache_s = nullptr;
+    bool         kv_q8     = false;
 
     // Scratch (reused across layers)
     MTL::Buffer* x_norm;
@@ -590,18 +601,36 @@ inline void dispatch_layer(
 
     // 6. KV cache write.
     enc_barrier(enc);
-    enc->setComputePipelineState(P.kv_cache_write);
-    enc->setBuffer(k_in,     0, 0);
-    enc->setBuffer(v_in,     0, 1);
-    enc->setBuffer(B.k_cache, 0, 2);
-    enc->setBuffer(B.v_cache, 0, 3);
-    enc->setBytes(&p.batch,       4, 4);
-    enc->setBytes(&p.n_kv_heads,  4, 5);
-    enc->setBytes(&hd,            4, 6);
-    enc->setBytes(&p.seq,         4, 7);
-    enc->setBytes(&p.write_pos,   4, 8);
-    enc->setBytes(&p.cache_size,  4, 9);
-    {
+    if (B.kv_q8) {
+        enc->setComputePipelineState(P.kv_cache_write_q8);
+        enc->setBuffer(k_in,        0, 0);
+        enc->setBuffer(v_in,        0, 1);
+        enc->setBuffer(B.k_cache_q, 0, 2);
+        enc->setBuffer(B.v_cache_q, 0, 3);
+        enc->setBuffer(B.k_cache_s, 0, 4);
+        enc->setBuffer(B.v_cache_s, 0, 5);
+        enc->setBytes(&p.batch,       4, 6);
+        enc->setBytes(&p.n_kv_heads,  4, 7);
+        enc->setBytes(&hd,            4, 8);
+        enc->setBytes(&p.seq,         4, 9);
+        enc->setBytes(&p.write_pos,   4, 10);
+        enc->setBytes(&p.cache_size,  4, 11);
+        // One 32-lane simdgroup per (block, t, bh); nblk = hd/32 blocks per row.
+        const uint32_t nblk = hd / 32u;
+        enc->dispatchThreads(MTL::Size(nblk * 32u, p.seq, p.batch * p.n_kv_heads),
+                             MTL::Size(32, 1, 1));
+    } else {
+        enc->setComputePipelineState(P.kv_cache_write);
+        enc->setBuffer(k_in,     0, 0);
+        enc->setBuffer(v_in,     0, 1);
+        enc->setBuffer(B.k_cache, 0, 2);
+        enc->setBuffer(B.v_cache, 0, 3);
+        enc->setBytes(&p.batch,       4, 4);
+        enc->setBytes(&p.n_kv_heads,  4, 5);
+        enc->setBytes(&hd,            4, 6);
+        enc->setBytes(&p.seq,         4, 7);
+        enc->setBytes(&p.write_pos,   4, 8);
+        enc->setBytes(&p.cache_size,  4, 9);
         const uint32_t D4 = hd / 4;
         enc->dispatchThreads(MTL::Size(D4, p.seq, p.batch * p.n_kv_heads),
                              MTL::Size(32, 4, 1));
@@ -623,7 +652,8 @@ inline void dispatch_layer(
         constexpr uint32_t NS = 4u;
         const uint32_t kv_gate = (Hg_attn <= 2u) ? 384u : 1024u;
         const bool use_split = (p.seq == 1) && (kv_len >= kv_gate)
-                               && (P.attn_split != nullptr)
+                               && (B.kv_q8 ? (P.attn_split_q8 != nullptr)
+                                           : (P.attn_split != nullptr))
                                && (P.attn_combine != nullptr)
                                && (B.attn_pm != nullptr);
         if (use_split) {
@@ -631,19 +661,37 @@ inline void dispatch_layer(
             uint32_t n_splits = (kv_len + 255u) / 256u;
             if (n_splits < 1u) n_splits = 1u;
             if (n_splits > SPLITS) n_splits = SPLITS;
-            enc->setComputePipelineState(P.attn_split);
-            enc->setBuffer(q_in,       0, 0);
-            enc->setBuffer(B.k_cache,  0, 1);
-            enc->setBuffer(B.v_cache,  0, 2);
-            enc->setBuffer(B.attn_pm,  0, 3);
-            enc->setBuffer(B.attn_ps,  0, 4);
-            enc->setBuffer(B.attn_po,  0, 5);
-            enc->setBytes(&p.seq,         4, 6);
-            enc->setBytes(&p.n_heads,     4, 7);
-            enc->setBytes(&p.n_kv_heads,  4, 8);
-            enc->setBytes(&kv_len,        4, 9);
-            enc->setBytes(&cache_stride,  4, 10);
-            enc->setBytes(&n_splits,      4, 11);
+            if (B.kv_q8) {
+                enc->setComputePipelineState(P.attn_split_q8);
+                enc->setBuffer(q_in,        0, 0);
+                enc->setBuffer(B.k_cache_q, 0, 1);
+                enc->setBuffer(B.v_cache_q, 0, 2);
+                enc->setBuffer(B.k_cache_s, 0, 3);
+                enc->setBuffer(B.v_cache_s, 0, 4);
+                enc->setBuffer(B.attn_pm,  0, 5);
+                enc->setBuffer(B.attn_ps,  0, 6);
+                enc->setBuffer(B.attn_po,  0, 7);
+                enc->setBytes(&p.seq,         4, 8);
+                enc->setBytes(&p.n_heads,     4, 9);
+                enc->setBytes(&p.n_kv_heads,  4, 10);
+                enc->setBytes(&kv_len,        4, 11);
+                enc->setBytes(&cache_stride,  4, 12);
+                enc->setBytes(&n_splits,      4, 13);
+            } else {
+                enc->setComputePipelineState(P.attn_split);
+                enc->setBuffer(q_in,       0, 0);
+                enc->setBuffer(B.k_cache,  0, 1);
+                enc->setBuffer(B.v_cache,  0, 2);
+                enc->setBuffer(B.attn_pm,  0, 3);
+                enc->setBuffer(B.attn_ps,  0, 4);
+                enc->setBuffer(B.attn_po,  0, 5);
+                enc->setBytes(&p.seq,         4, 6);
+                enc->setBytes(&p.n_heads,     4, 7);
+                enc->setBytes(&p.n_kv_heads,  4, 8);
+                enc->setBytes(&kv_len,        4, 9);
+                enc->setBytes(&cache_stride,  4, 10);
+                enc->setBytes(&n_splits,      4, 11);
+            }
             enc->dispatchThreadgroups(
                 MTL::Size(p.n_kv_heads, n_splits, p.batch),
                 MTL::Size(NS * 32, 1, 1));
@@ -661,6 +709,22 @@ inline void dispatch_layer(
             enc->dispatchThreadgroups(
                 MTL::Size(p.n_heads, 1, p.batch),
                 MTL::Size(32, 1, 1));
+        } else if (B.kv_q8) {
+            enc->setComputePipelineState(P.attn_q8);
+            enc->setBuffer(q_in,        0, 0);
+            enc->setBuffer(B.k_cache_q, 0, 1);
+            enc->setBuffer(B.v_cache_q, 0, 2);
+            enc->setBuffer(B.k_cache_s, 0, 3);
+            enc->setBuffer(B.v_cache_s, 0, 4);
+            enc->setBuffer(B.attn_out,  0, 5);
+            enc->setBytes(&p.seq,         4, 6);
+            enc->setBytes(&p.n_heads,     4, 7);
+            enc->setBytes(&p.n_kv_heads,  4, 8);
+            enc->setBytes(&kv_len,        4, 9);
+            enc->setBytes(&cache_stride,  4, 10);
+            enc->dispatchThreadgroups(
+                MTL::Size(p.n_kv_heads, (p.seq + 1) / 2, p.batch),
+                MTL::Size(Hg_attn * 2 * 32, 1, 1));
         } else {
             enc->setComputePipelineState(P.attn);
             enc->setBuffer(q_in,       0, 0);
@@ -870,6 +934,8 @@ struct ModelParams {
     // Debug knobs (default = full model, no capture)
     uint32_t layers_run     = 0;   // 0 → all n_layers; else only first N
     int32_t  capture_layer  = -1;  // if >=0, copy post-layer residual to capture_buf
+
+    bool     kv_q8          = false;  // Q8_0 KV cache write + attention
 };
 
 struct ModelPSOs {
@@ -895,6 +961,11 @@ struct ModelPSOs {
 struct LayerCache {
     MTL::Buffer* k;
     MTL::Buffer* v;
+    // Q8_0-KV buffers (populated only when the handle ran with SK_KV_Q8).
+    MTL::Buffer* kq = nullptr;
+    MTL::Buffer* vq = nullptr;
+    MTL::Buffer* ks = nullptr;
+    MTL::Buffer* vs = nullptr;
 };
 
 struct ModelWeights {
@@ -1077,6 +1148,11 @@ inline void dispatch_model(
         lb.sin_tbl         = B.sin_tbl;
         lb.k_cache         = W.layer_caches[L].k;
         lb.v_cache         = W.layer_caches[L].v;
+        lb.k_cache_q       = W.layer_caches[L].kq;
+        lb.v_cache_q       = W.layer_caches[L].vq;
+        lb.k_cache_s       = W.layer_caches[L].ks;
+        lb.v_cache_s       = W.layer_caches[L].vs;
+        lb.kv_q8           = M.kv_q8;
         lb.x_norm          = B.x_norm;
         lb.qkv_packed      = B.qkv_packed;
         lb.q               = B.q;

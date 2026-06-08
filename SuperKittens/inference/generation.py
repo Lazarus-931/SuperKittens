@@ -160,6 +160,7 @@ def memory_aware_cache_max(
     weight_bytes: int, n_layers: int, n_kv_heads: int, head_dim: int,
     d_model: int, n_int: int, n_heads: int, vocab_size: int,
     headroom_gib: float = 6.0, total_mem_bytes: int | None = None,
+    kv_q8: bool = False,
 ) -> int:
     """Clamp ``requested_cache_max`` so weights + KV + prefill scratch fit memory.
 
@@ -186,7 +187,10 @@ def memory_aware_cache_max(
     if total <= 0 or weight_bytes <= 0:
         return requested_cache_max
 
-    kv_per_tok = n_layers * n_kv_heads * head_dim * 2 * 2
+    # fp16: head_dim*2 bytes per K (or V). Q8_0: head_dim int8 + (head_dim/32)
+    # fp16 block scales. ×2 for K and V.
+    per_kv = (head_dim + (head_dim // 32) * 2) if kv_q8 else (head_dim * 2)
+    kv_per_tok = n_layers * n_kv_heads * per_kv * 2
     cos_sin_per_slot = (head_dim // 2) * 2 * 2
 
     # Prefill scratch (fp16), keyed off seq_max. Mirrors the seq_max-scaled
