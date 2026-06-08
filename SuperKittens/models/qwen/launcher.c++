@@ -465,6 +465,12 @@ static int run_step(Handle* h, MTL::CommandQueue* q, uint32_t seq) {
     dispatch_model(cmd, h->psos, h->weights, h->bufs, mp);
     cmd->commit();
     cmd->waitUntilCompleted();
+    // SK_QWEN_GPUPROF: per-step GPU-busy time (GPUEnd-GPUStart). Compared against
+    // host wall/token it isolates the GPU-wait fraction — the lever that matters
+    // for a bandwidth-bound decode. No behavior change (timestamp readback only).
+    if (getenv("SK_QWEN_GPUPROF"))
+        std::fprintf(stderr, "[gpuprof] gpu_busy_us=%.1f\n",
+                     (cmd->GPUEndTime() - cmd->GPUStartTime()) * 1e6);
     cmd->release();
     h->current_pos += seq;
     return 0;
