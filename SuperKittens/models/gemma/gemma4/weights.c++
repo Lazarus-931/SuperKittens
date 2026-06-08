@@ -70,7 +70,16 @@ inline uint32_t fp16_to_fp32_bits(uint16_t h16) {
     uint32_t s = (uint32_t)(h16 >> 15) & 1u;
     uint32_t e = (uint32_t)(h16 >> 10) & 0x1Fu;
     uint32_t m = (uint32_t)h16 & 0x3FFu;
-    if (e == 0)       return (s << 31);
+    if (e == 0) {
+        // Subnormal (or zero). K-quant super-block scales are routinely fp16
+        // subnormals (~1e-5); flushing them to zero zeroes whole dequant blocks.
+        // Renormalize: value = (-1)^s * 2^-14 * (m/1024).
+        if (m == 0) return (s << 31);
+        e = 1u;
+        while ((m & 0x400u) == 0u) { m <<= 1; --e; }
+        m &= 0x3FFu;
+        return (s << 31) | ((e + 112u) << 23) | (m << 13);
+    }
     if (e == 31)      return (s << 31) | (0xFFu << 23) | (m << 13);
     return (s << 31) | ((e + 112u) << 23) | (m << 13);
 }
@@ -245,15 +254,6 @@ void dequant_q4_k_bf16(uint16_t* dst, const uint8_t* src, size_t n) {
 
 void dequant_q6_k_bf16(uint16_t* dst, const uint8_t* src, size_t n) {
     const size_t nb = n / 256;
-    if (n > 1000000000ull) {
-        std::fprintf(stderr, "Q6KDEQ: n=%zu nb=%zu src=%p dst=%p\n", n, nb, (void*)src, (void*)dst);
-        for (size_t bb = 1604; bb <= 1607; ++bb) {
-            const uint8_t* pp = src + bb*210;
-            uint16_t dd; std::memcpy(&dd, pp+208, 2);
-            std::fprintf(stderr, "  rawd blk %zu: d_bits=%04x ql0=%02x qh0=%02x sc0=%d\n",
-                bb, dd, pp[0], pp[128], (int)(int8_t)pp[192]);
-        }
-    }
     for (size_t b = 0; b < nb; ++b) {
         const uint8_t* p = src + b * 210;
         const uint8_t* ql = p;
@@ -276,11 +276,6 @@ void dequant_q6_k_bf16(uint16_t* dst, const uint8_t* src, size_t n) {
                 put(nn+l+96, d * (float)sc[is+6] * (float)q4);
             }
             ql += 64; qh += 32; sc += 8;
-        }
-        if (n > 1000000000ull && (b == 1605 || b == 1606)) {
-            size_t nz=0; for(int i=0;i<256;++i) if(out[i]&0x7fff) nz++;
-            std::fprintf(stderr, "Q6KDEQ blk %zu: d=%g nz=%zu out[0..2]=%04x %04x %04x\n",
-                b, (double)d, nz, out[0], out[1], out[2]);
         }
     }
 }
@@ -649,16 +644,8 @@ extern "C" int sk_gemma4_load_gguf(sk_gemma4_handle* hp, const char* path) {
         };
         if (h->weights.w_embed) {
             auto* dst = (uint16_t*)h->weights.w_embed->contents();
-            std::fprintf(stderr, "gemma4 EMBED-DBG: dtype=%d nbytes=%zu n_embed=%zu w_embed.len=%zu vocab=%u dm=%zu\n",
-                (int)v->dtype, v->nbytes, n_embed, h->weights.w_embed->length(), c.vocab_size, dm);
             if (!deq_range(dst, 0, n_embed)) { std::fprintf(stderr, "gemma4 gguf: bad token_embd dtype\n"); return -11; }
             scale_bf16_inplace(dst, n_embed, esc);
-            {
-                double s=0; size_t nzr=0;
-                for (size_t i=0;i<dm;++i){ uint16_t bb=dst[107*dm+i]; if(bb&0x7fff)nzr++; }
-                std::fprintf(stderr, "gemma4 EMBED-DBG: row107 nnz=%zu/%zu  row0[0..3]=%04x %04x %04x %04x\n",
-                    nzr, dm, dst[0],dst[1],dst[2],dst[3]);
-            }
         } else {
             if (!h->weights.w_lm_head_q8) { std::fprintf(stderr, "gemma4 gguf: EMBED_Q8 but no lm_head_q8\n"); return -11; }
             auto* q8dst = (uint8_t*)h->weights.w_lm_head_q8->contents();
