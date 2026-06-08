@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace sk {
 
@@ -25,6 +26,10 @@ struct _BindState {
     MTL::CommandQueue* q   = nullptr;
     MTL::Library*      lib = nullptr;
     MTL::Library*      lib_src = nullptr;
+    // SK_METAL_SRC_FALLBACK may be a colon-separated list of .metal files; each
+    // compiles into its own library so file-scope globals (constant/enum) in
+    // different files don't collide as they would in one concatenated source.
+    std::vector<MTL::Library*> lib_srcs;
 };
 inline _BindState& _bs() { static _BindState s; return s; }
 
@@ -61,19 +66,30 @@ inline void bindings_init() {
     // Supplies functions missing from the prebuilt metallib. No-op when unset.
     const char* src_path = getenv("SK_METAL_SRC_FALLBACK");
     if (src_path && src_path[0]) {
-        std::string src;
-        if (_slurp_file(src_path, src)) {
-            auto* opt = MTL::CompileOptions::alloc()->init();
-            NS::Error* serr = nullptr;
-            bs.lib_src = bs.dev->newLibrary(NS::String::string(src.c_str(), NS::UTF8StringEncoding),
-                                            opt, &serr);
-            opt->release();
-            if (!bs.lib_src && serr) {
-                std::fprintf(stderr, "[sk] SK_METAL_SRC_FALLBACK compile failed: %s\n",
-                             serr->localizedDescription()->utf8String());
+        std::string list(src_path);
+        size_t start = 0;
+        while (start <= list.size()) {
+            size_t sep = list.find(':', start);
+            std::string one = list.substr(start, sep == std::string::npos ? std::string::npos : sep - start);
+            start = (sep == std::string::npos) ? list.size() + 1 : sep + 1;
+            if (one.empty()) continue;
+            std::string src;
+            if (_slurp_file(one.c_str(), src)) {
+                auto* opt = MTL::CompileOptions::alloc()->init();
+                NS::Error* serr = nullptr;
+                auto* l = bs.dev->newLibrary(NS::String::string(src.c_str(), NS::UTF8StringEncoding),
+                                             opt, &serr);
+                opt->release();
+                if (l) {
+                    bs.lib_srcs.push_back(l);
+                    if (!bs.lib_src) bs.lib_src = l;  // keep first for back-compat accessor
+                } else if (serr) {
+                    std::fprintf(stderr, "[sk] SK_METAL_SRC_FALLBACK compile failed (%s): %s\n",
+                                 one.c_str(), serr->localizedDescription()->utf8String());
+                }
+            } else {
+                std::fprintf(stderr, "[sk] SK_METAL_SRC_FALLBACK unreadable: %s\n", one.c_str());
             }
-        } else {
-            std::fprintf(stderr, "[sk] SK_METAL_SRC_FALLBACK unreadable: %s\n", src_path);
         }
     }
 }
@@ -82,7 +98,7 @@ inline MTL::Function* _resolve_fn(const char* name) {
     auto& bs = _bs();
     auto* nm = NS::String::string(name, NS::UTF8StringEncoding);
     if (bs.lib) { if (auto* fn = bs.lib->newFunction(nm)) return fn; }
-    if (bs.lib_src) { if (auto* fn = bs.lib_src->newFunction(nm)) return fn; }
+    for (auto* l : bs.lib_srcs) { if (l) { if (auto* fn = l->newFunction(nm)) return fn; } }
     if (getenv("SK_BINDINGS_DEBUG")) std::fprintf(stderr, "[sk] UNRESOLVED fn: %s\n", name);
     return nullptr;
 }
@@ -159,14 +175,13 @@ inline MTL::Function* bindings_function(const char* name,
         auto* fn = fcv ? bs.lib->newFunction(nm, fcv, &err) : bs.lib->newFunction(nm);
         if (fn) return fn;
     }
-    if (bs.lib_src) {
-        NS::Error* serr = nullptr;
-        auto* fn = fcv ? bs.lib_src->newFunction(nm, fcv, &serr) : bs.lib_src->newFunction(nm);
+    NS::Error* serr = nullptr;
+    for (auto* l : bs.lib_srcs) {
+        if (!l) continue;
+        auto* fn = fcv ? l->newFunction(nm, fcv, &serr) : l->newFunction(nm);
         if (fn) return fn;
-        if (out_err) *out_err = serr;
-        return nullptr;
     }
-    if (out_err) *out_err = err;
+    if (out_err) *out_err = bs.lib_srcs.empty() ? err : serr;
     return nullptr;
 }
 
