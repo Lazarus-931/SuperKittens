@@ -58,15 +58,22 @@ static bool resolve_psos(ModelPSOs& P) {
     // Batched (seq>1) MMA GEMM for prefill. All optional; absence falls back to
     // the per-row matvec loop in encode_quant_gemm. SK_NO_GEMM_MMA=1 forces the
     // matvec-loop prefill (A/B bench of the batched path against the per-row one).
+    // Small-M (seq 2..8) multi-RHS matvec for Q8_0/Q4_K (spec-decode verify,
+    // short prefill). SK_NO_GEMM_SM=1 forces the BN=32 MMA / matvec-loop path
+    // for the small-M band (A/B of the sm kernel against the MMA floor).
+    const bool no_sm = getenv("SK_NO_GEMM_SM") != nullptr;
     if (getenv("SK_NO_GEMM_MMA")) {
         P.layer.gemm_mma_f16 = P.layer.gemm_mma_bf16 = P.layer.gemm_mma_q8_0 =
             P.layer.gemm_mma_q4k = P.layer.gemm_mma_q6k = nullptr;
+        P.layer.gemm_mma_q8_0_sm = P.layer.gemm_mma_q4k_sm = nullptr;
     } else {
         P.layer.gemm_mma_f16   = sk::bindings_pso("gemm_mma_f16");
         P.layer.gemm_mma_bf16  = sk::bindings_pso("gemm_mma_bf16");
         P.layer.gemm_mma_q8_0  = sk::bindings_pso("gemm_mma_q8_0");
         P.layer.gemm_mma_q4k   = sk::bindings_pso("gemm_mma_q4k");
         P.layer.gemm_mma_q6k   = sk::bindings_pso("gemm_mma_q6k");
+        P.layer.gemm_mma_q8_0_sm = no_sm ? nullptr : sk::bindings_pso("gemm_mma_q8_0_sm");
+        P.layer.gemm_mma_q4k_sm  = no_sm ? nullptr : sk::bindings_pso("gemm_mma_q4k_sm");
     }
     P.layer.q8_0_swiglu_m1 = sk::bindings_pso("q8_0_swiglu_m1");  // optional; nullptr OK
     P.layer.q8_0_swiglu_prenorm_m1 = sk::bindings_pso("q8_0_swiglu_prenorm_m1");  // optional

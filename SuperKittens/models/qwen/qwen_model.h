@@ -57,6 +57,13 @@ struct LayerPSOs {
     MTL::ComputePipelineState* gemm_mma_q8_0 = nullptr;
     MTL::ComputePipelineState* gemm_mma_q4k  = nullptr;
     MTL::ComputePipelineState* gemm_mma_q6k  = nullptr;
+    // Small-M (seq 2..8) multi-RHS matvec: the MMA tile cost is M-independent, so
+    // at small M (spec-decode verify, short prefill) it pays a fixed ~5x-a-decode
+    // floor for Q8_0. These read each weight once and apply it to all M rows in
+    // registers (no MMA tile floor). Bit-exact vs the matvec. Q8_0 wins M<=8;
+    // Q4_K's MMA is already near-optimal at M>=4 so sm is used only for M<=2.
+    MTL::ComputePipelineState* gemm_mma_q8_0_sm = nullptr;
+    MTL::ComputePipelineState* gemm_mma_q4k_sm  = nullptr;
     MTL::ComputePipelineState* q8_0_swiglu_m1 = nullptr;  // fused Q8_0 gate+up+SiLU·mul (M=1)
     MTL::ComputePipelineState* q8_0_swiglu_prenorm_m1 = nullptr;  // fused residual+rmsnorm+swiglu (M=1)
     MTL::ComputePipelineState* q8_0_matvec_addres = nullptr;  // matvec + residual add (M=1)
@@ -199,6 +206,33 @@ inline MTL::ComputePipelineState* gemm_mma_pso(const LayerPSOs& P, sk::Dtype dt)
     }
 }
 
+enum : uint32_t { GEMM_SM_MAXM = 8 };
+
+// Small-M PSO for dtype dt, or nullptr if dt has no sm kernel (only Q8_0/Q4_K).
+inline MTL::ComputePipelineState* gemm_sm_pso(const LayerPSOs& P, sk::Dtype dt) {
+    switch (dt) {
+        case sk::Dtype::Q8_0: return P.gemm_mma_q8_0_sm;
+        case sk::Dtype::Q4_K: return P.gemm_mma_q4k_sm;
+        default:              return nullptr;
+    }
+}
+
+// True when the small-M multi-RHS matvec is the measured winner for (dt, M)
+// on M4 (lexie bench). Q8_0: sm wins the whole 2..8 band — its MMA floor is
+// 3.5-6.4x a decode regardless of M, while sm is 1.0/1.5/2.3-2.8x at M=2/4/8.
+// Q4_K: MMA floor is lower (2.4-3.1x), so sm wins M<=4 (1.3-2.4x vs MMA 2.4-
+// 3.1x) but MMA overtakes at M=8 (sm 4.4-5.5x). Note Q4_K M=4 on small-K
+// gate/up (K=2560) is ~break-even (sm 2.89x vs MMA 2.64x); the large-K
+// down/8B projections that dominate a forward favor sm at M=4, so M<=4.
+inline bool gemm_sm_wins(sk::Dtype dt, uint32_t M) {
+    if (M <= 1 || M > GEMM_SM_MAXM) return false;
+    switch (dt) {
+        case sk::Dtype::Q8_0: return true;
+        case sk::Dtype::Q4_K: return M <= 4;
+        default:              return false;
+    }
+}
+
 // Encode one batched MMA GEMM: A (fp16 [M,K]) × W ([N,K] quant/fp16) → C
 // (fp16 [M,N], row stride ldC). BM=8 rows × BN=32 cols per threadgroup.
 inline void encode_gemm_mma(
@@ -223,6 +257,30 @@ inline void encode_gemm_mma(
         MTL::Size(64, 1, 1));
 }
 
+// Encode the small-M multi-RHS matvec (seq 2..8). Same bindings as gemm_mma but
+// the matvec launch geometry (NR0=2 rows/TG, 128 threads); M is a uniform and
+// the kernel holds all M rows in registers.
+inline void encode_gemm_sm(
+    MTL::ComputeCommandEncoder* enc, MTL::ComputePipelineState* pso,
+    MTL::Buffer* A, size_t off_A,
+    MTL::Buffer* W, size_t off_W,
+    MTL::Buffer* C, size_t off_C,
+    uint32_t M, uint32_t N, uint32_t K, uint32_t ldC)
+{
+    enc_barrier(enc);
+    enc->setComputePipelineState(pso);
+    enc->setBuffer(A, off_A, 0);
+    enc->setBuffer(W, off_W, 1);
+    enc->setBuffer(C, off_C, 2);
+    enc->setBytes(&M, 4, 3);
+    enc->setBytes(&N, 4, 4);
+    enc->setBytes(&K, 4, 5);
+    enc->setBytes(&ldC, 4, 6);
+    constexpr uint32_t NR0 = 2;
+    enc->dispatchThreadgroups(MTL::Size((N + NR0 - 1) / NR0, 1, 1),
+                              MTL::Size(128, 1, 1));
+}
+
 // Encode a quant matvec (M rows, looping over rows for M>1). Mirrors
 // encode_q8_0_gemm but parameterized on the PSO so Q4_K/Q6_K route here too.
 // ldC = output row stride in elements (defaults to N). For the split-QKV path
@@ -234,9 +292,18 @@ inline void encode_quant_gemm(
     MTL::Buffer* W, size_t off_W,
     MTL::Buffer* C, size_t off_C,
     uint32_t M, uint32_t N, uint32_t K, uint32_t ldC = 0,
-    MTL::ComputePipelineState* pso_mma = nullptr)
+    MTL::ComputePipelineState* pso_mma = nullptr,
+    MTL::ComputePipelineState* pso_sm = nullptr,
+    bool sm_wins = false)
 {
     if (ldC == 0) ldC = N;
+    // Small-M (seq 2..8 where measured best): the multi-RHS matvec reads each
+    // weight once and applies it to all M rows in registers, avoiding the BM=8
+    // MMA tile's M-independent fixed floor. Bit-exact vs the per-row matvec.
+    if (sm_wins && pso_sm != nullptr) {
+        encode_gemm_sm(enc, pso_sm, A, off_A, W, off_W, C, off_C, M, N, K, ldC);
+        return;
+    }
     // Prefill (M>1): one MMA GEMM amortizes the weight read across all M rows,
     // so a T-token forward costs ≪ T× the per-row matvec. Decode (M==1) keeps
     // the matvec — its NR0=2 geometry beats the BM=8 MMA tile at one row.
@@ -458,10 +525,12 @@ inline void dispatch_layer(
             // during prefill (T>1).
             encode_quant_gemm(enc, pso_qkv, B.x_norm, 0, B.w_qkv, off_w_qkv,
                               B.qkv_packed, 0, T, qN + kvN, p.d_model, qkv_N,
-                              gemm_mma_pso(P, B.dt_qkv));
+                              gemm_mma_pso(P, B.dt_qkv),
+                              gemm_sm_pso(P, B.dt_qkv), gemm_sm_wins(B.dt_qkv, T));
             encode_quant_gemm(enc, pso_v, B.x_norm, 0, B.w_v, B.w_v_inner_off,
                               B.qkv_packed, (size_t)(qN + kvN) * 2, T, kvN, p.d_model, qkv_N,
-                              gemm_mma_pso(P, B.dt_v));
+                              gemm_mma_pso(P, B.dt_v),
+                              gemm_sm_pso(P, B.dt_v), gemm_sm_wins(B.dt_v, T));
         } else {
             encode_gemm_fallback(enc, P.gemm, P.gemv_m1, B.x_norm, 0, B.w_qkv, off_w_qkv,
                                  B.qkv_packed, T, qkv_N, p.d_model);
@@ -469,7 +538,8 @@ inline void dispatch_layer(
     } else if (pso_qkv != nullptr) {
         encode_quant_gemm(enc, pso_qkv, B.x_norm, 0, B.w_qkv, off_w_qkv,
                           B.qkv_packed, 0, T, qkv_N, p.d_model, /*ldC=*/0,
-                          gemm_mma_pso(P, B.dt_qkv));
+                          gemm_mma_pso(P, B.dt_qkv),
+                          gemm_sm_pso(P, B.dt_qkv), gemm_sm_wins(B.dt_qkv, T));
     } else {
         encode_gemm_fallback(enc, P.gemm, P.gemv_m1, B.x_norm, 0, B.w_qkv, off_w_qkv,
                              B.qkv_packed, T, qkv_N, p.d_model);
@@ -616,7 +686,8 @@ inline void dispatch_layer(
     if (pso_o != nullptr) {
         encode_quant_gemm(enc, pso_o, attn_o_in, 0, B.w_o, off_w_o,
                           B.o_proj, 0, T, p.d_model, p.n_heads * hd, /*ldC=*/0,
-                          gemm_mma_pso(P, B.dt_o));
+                          gemm_mma_pso(P, B.dt_o),
+                          gemm_sm_pso(P, B.dt_o), gemm_sm_wins(B.dt_o, T));
     } else {
         encode_gemm_fallback(enc, P.gemm, P.gemv_m1, attn_o_in, 0, B.w_o, off_w_o,
                              B.o_proj, T, p.d_model, p.n_heads * hd);
@@ -697,7 +768,8 @@ inline void dispatch_layer(
         if (pso_gate != nullptr) {
             encode_quant_gemm(enc, pso_gate, B.m_in, 0, B.w_gate, off_w_gate,
                               B.gate_buf, 0, T, p.n_int, p.d_model, /*ldC=*/0,
-                              gemm_mma_pso(P, B.dt_gate));
+                              gemm_mma_pso(P, B.dt_gate),
+                              gemm_sm_pso(P, B.dt_gate), gemm_sm_wins(B.dt_gate, T));
         } else {
             encode_gemm_fallback(enc, P.gemm, P.gemv_m1, B.m_in, 0, B.w_gate, off_w_gate,
                                  B.gate_buf, T, p.n_int, p.d_model);
@@ -705,7 +777,8 @@ inline void dispatch_layer(
         if (pso_up != nullptr) {
             encode_quant_gemm(enc, pso_up, B.m_in, 0, B.w_up, off_w_up,
                               B.up_buf, 0, T, p.n_int, p.d_model, /*ldC=*/0,
-                              gemm_mma_pso(P, B.dt_up));
+                              gemm_mma_pso(P, B.dt_up),
+                              gemm_sm_pso(P, B.dt_up), gemm_sm_wins(B.dt_up, T));
         } else {
             encode_gemm_fallback(enc, P.gemm, P.gemv_m1, B.m_in, 0, B.w_up, off_w_up,
                                  B.up_buf, T, p.n_int, p.d_model);
@@ -744,7 +817,8 @@ inline void dispatch_layer(
         if (pso_down != nullptr) {
             encode_quant_gemm(enc, pso_down, B.up_buf, 0, B.w_down, off_w_down,
                               B.mlp_out, 0, T, p.d_model, p.n_int, /*ldC=*/0,
-                              gemm_mma_pso(P, B.dt_down));
+                              gemm_mma_pso(P, B.dt_down),
+                              gemm_sm_pso(P, B.dt_down), gemm_sm_wins(B.dt_down, T));
         } else {
             encode_gemm_fallback(enc, P.gemm, P.gemv_m1, B.up_buf, 0, B.w_down, off_w_down,
                                  B.mlp_out, T, p.d_model, p.n_int);
