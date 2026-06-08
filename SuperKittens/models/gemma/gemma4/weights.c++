@@ -604,12 +604,23 @@ extern "C" int sk_gemma4_load_gguf(sk_gemma4_handle* hp, const char* path) {
     std::vector<uint16_t> stg, tx;
 
     // token_embd → w_embed (then *= sqrt(d_model)); tied lm_head packs Q8.
+    // Dequant straight into the device buffer (no vocab*dm bf16 staging vector —
+    // that 2 GB transient OOMs a 16 GB box on top of the ~12.7 GB Q8 body).
     {
         auto* v = store.get("token_embd.weight");
         if (!v) { std::fprintf(stderr, "gemma4 gguf: missing token_embd.weight\n"); return -10; }
-        if (!gguf_to_bf16(stg, v, (size_t)c.vocab_size * dm)) return -11;
-        std::memcpy(h->weights.w_embed->contents(), stg.data(), stg.size()*2);
-        scale_bf16_inplace((uint16_t*)h->weights.w_embed->contents(), stg.size(), std::sqrt((float)dm));
+        const size_t n_embed = (size_t)c.vocab_size * dm;
+        auto* dst = (uint16_t*)h->weights.w_embed->contents();
+        switch (v->dtype) {
+            case sk::Dtype::BF16: std::memcpy(dst, v->data, n_embed*2); break;
+            case sk::Dtype::F16:
+            case sk::Dtype::F32:  copy_bf16_from(dst, v->data, v->dtype, n_embed); break;
+            case sk::Dtype::Q8_0: dequant_q8_0_bf16(dst, (const uint8_t*)v->data, n_embed); break;
+            case sk::Dtype::Q4_K: dequant_q4_k_bf16(dst, (const uint8_t*)v->data, n_embed); break;
+            case sk::Dtype::Q6_K: dequant_q6_k_bf16(dst, (const uint8_t*)v->data, n_embed); break;
+            default: std::fprintf(stderr, "gemma4 gguf: unsupported token_embd dtype\n"); return -11;
+        }
+        scale_bf16_inplace(dst, n_embed, std::sqrt((float)dm));
     }
     {
         auto* v = store.get("output_norm.weight");
