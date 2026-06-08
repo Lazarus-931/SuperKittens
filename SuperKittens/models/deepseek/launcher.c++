@@ -128,6 +128,11 @@ static bool resolve_psos(ModelPSOs& P, uint32_t dk, uint32_t dv) {
     P.layer.moe_swiglu_f32  = sk::bindings_pso("deepseek_moe_swiglu_f32");
     P.layer.moe_scatter_add = sk::bindings_pso("deepseek_moe_scatter_add_f32");
 
+    // Native K-quant matvec (decode) so dense/attn/shared/LM-head stay quantized.
+    P.layer.q4k_matvec  = sk::bindings_pso("q4k_matvec");
+    P.layer.q6k_matvec  = sk::bindings_pso("q6k_matvec");
+    P.layer.q8_0_matvec = sk::bindings_pso("q8_0_matvec");
+
     P.embedding_lookup = sk::bindings_pso("embedding_lookup");
     P.argmax           = sk::bindings_pso("argmax");
     P.argmax_partial   = sk::bindings_pso("argmax_partial");
@@ -157,6 +162,9 @@ static bool resolve_psos(ModelPSOs& P, uint32_t dk, uint32_t dv) {
     _CK("moe_mul_mv_id_q8_0",    P.layer.moe_mv_down);
     _CK("moe_swiglu_f32",        P.layer.moe_swiglu_f32);
     _CK("moe_scatter_add_f32",   P.layer.moe_scatter_add);
+    _CK("q4k_matvec",            P.layer.q4k_matvec);
+    _CK("q6k_matvec",            P.layer.q6k_matvec);
+    _CK("q8_0_matvec",           P.layer.q8_0_matvec);
     _CK("embedding_lookup", P.embedding_lookup);
     _CK("argmax",         P.argmax);
     #undef _CK
