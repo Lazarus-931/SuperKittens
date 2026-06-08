@@ -812,16 +812,16 @@ inline void dispatch_layer(
         uint64_t nb10; uint64_t nb11; uint64_t nb12;
         int32_t  ne0; int32_t ne1; uint64_t nb1; int32_t nr0; char _p1[4];
     };
-    const uint32_t NR0 = 2;   // N_R0 for both q4_K and q8_0
+    const uint32_t NR0 = 2;   // N_R0 for q4_K, q8_0 and q5_0
     // is_q4k=true: Q4_K weights (block 144 B / 256), q4_K impl strides
     //   first_row=(x*NSG+sg)*nr0 → NSG*nr0 rows per tg.x, no shmem reduce.
-    // is_q4k=false: Q8_0 weights (block 34 B / 32), q8_0 impl r0=x*nr0 → nr0
-    //   rows per tg.x, simdgroup-tree reduce via shmem.
+    // is_q4k=false: Q5_0 weights (block 22 B / 32), q5_0 impl r0=x*nr0 → nr0
+    //   rows per tg.x, simdgroup-tree reduce via shmem (same shape as q8_0).
     auto encode_mv_id = [&](MTL::ComputePipelineState* pso, bool is_q4k,
                             MTL::Buffer* w, size_t w_off, MTL::Buffer* src1,
                             MTL::Buffer* dst, uint32_t in_dim, uint32_t out_rows) {
         const uint32_t blk_w = is_q4k ? 256u : 32u;
-        const uint64_t blk_b = is_q4k ? 144u : 34u;
+        const uint64_t blk_b = is_q4k ? 144u : 22u;
         const uint64_t row_blk = (uint64_t)(in_dim / blk_w) * blk_b;    // nb01
         const uint64_t slab    = (uint64_t)out_rows * row_blk;          // nb02
         ArgsMulMvId a{};
@@ -850,9 +850,9 @@ inline void dispatch_layer(
         enc->endEncoding();
     };
 
-    // Per-layer byte strides: gate/up Q4_K (144 B/256), down Q8_0 (34 B/32).
+    // Per-layer byte strides: gate/up Q4_K (144 B/256), down Q5_0 (22 B/32).
     const size_t gate_layer = (size_t)p.n_expert * p.n_int * (p.d_model / 256) * 144;
-    const size_t down_layer = (size_t)p.n_expert * p.d_model * (p.n_int / 32) * 34;
+    const size_t down_layer = (size_t)p.n_expert * p.d_model * (p.n_int / 32) * 22;
     encode_mv_id(P.moe_mv_gate, true, B.w_gate, (size_t)L * gate_layer,
                  B.moe_x_f32, B.moe_gate_f32, p.d_model, p.n_int);
     encode_mv_id(P.moe_mv_gate, true, B.w_up,   (size_t)L * gate_layer,

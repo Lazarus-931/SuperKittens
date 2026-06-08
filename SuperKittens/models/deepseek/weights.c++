@@ -122,6 +122,37 @@ void quantize_row_q8_0(uint8_t* dst, const float* src, size_t n_elems) {
     }
 }
 
+// Quantize a contiguous fp32 row to Q5_0 blocks (22 B / 32 weights), matching
+// ggml quantize_row_q5_0_ref: symmetric 5-bit, scale from the max-magnitude
+// signed value, q = clamp(round(x/d)+16, 0, 31); bit 4 packed into qh.
+void quantize_row_q5_0(uint8_t* dst, const float* src, size_t n_elems) {
+    const size_t nb = n_elems / 32;
+    for (size_t b = 0; b < nb; ++b) {
+        const float* x = src + b * 32;
+        float amax = 0.f, max = 0.f;
+        for (int i = 0; i < 32; ++i) {
+            const float v = x[i];
+            if (std::fabs(v) > amax) { amax = std::fabs(v); max = v; }
+        }
+        const float d  = max / -16.f;
+        const float id = d != 0.f ? 1.f / d : 0.f;
+        uint8_t* p = dst + b * 22;
+        const uint16_t dh = f32_to_fp16_bits(d);
+        std::memcpy(p, &dh, 2);
+        uint8_t* qh = p + 2;
+        uint8_t* qs = p + 6;
+        uint32_t qh_bits = 0;
+        for (int i = 0; i < 16; ++i) {
+            const int q0 = std::max(0, std::min(31, (int)(x[i]      * id + 16.5f)));
+            const int q1 = std::max(0, std::min(31, (int)(x[i + 16] * id + 16.5f)));
+            qs[i] = (uint8_t)((q0 & 0x0F) | ((q1 & 0x0F) << 4));
+            qh_bits |= (uint32_t)((q0 >> 4) & 1) << i;
+            qh_bits |= (uint32_t)((q1 >> 4) & 1) << (i + 16);
+        }
+        std::memcpy(qh, &qh_bits, 4);
+    }
+}
+
 void dequant_q8_0_to_f32(float* dst, const uint8_t* src, size_t n_elems) {
     const size_t nb = n_elems / 32;
     for (size_t b = 0; b < nb; ++b) {
@@ -450,9 +481,11 @@ extern "C" int sk_deepseek_load_from_store(sk_deepseek_handle* hp, sk::WeightSto
         }
     }
 
-    // Per-layer routed-expert slab byte sizes (gate/up Q4_K, down Q8_0).
+    // Per-layer routed-expert slab byte sizes (gate/up Q4_K, down Q5_0).
+    // down requantized Q8_0→Q5_0 (22 B/32) to drop resident below the 16 GB
+    // swap line; ni=1408 is 32-aligned (44 blocks/row) so no tail drop.
     const size_t gate_bytes_per_layer = (size_t)E * ni * (dm / 256) * 144;
-    const size_t down_bytes_per_layer = (size_t)E * dm * (ni / 32) * 34;
+    const size_t down_bytes_per_layer = (size_t)E * dm * (ni / 32) * 22;
 
     for (uint32_t L = 0; L < c.n_layers; ++L) {
         std::fprintf(stderr, "ds load: layer %u/%u\n", L, c.n_layers); std::fflush(stderr);
@@ -604,12 +637,13 @@ extern "C" int sk_deepseek_load_from_store(sk_deepseek_handle* hp, sk::WeightSto
             std::memcpy((char*)h->weights.w_up->contents()   + gate_off, uv->data, gate_bytes_per_layer);
 
             // down_exps dtype varies per layer (Q8_0 / Q5_0 in Q4_K_M). Requantize
-            // to a uniform Q8_0 so the q8_0 per-expert matvec sees one layout.
-            // Process row-by-row off the mmap'd source so the fp32 temp stays
-            // tiny — a whole-layer f32 buffer is ~0.7 GB and OOMs the 16 GB box.
+            // to a uniform Q5_0 so the q5_0 per-expert matvec sees one layout and
+            // resident drops below the swap line (down is robust to 5-bit). Process
+            // row-by-row off the mmap'd source so the fp32 temp stays tiny — a
+            // whole-layer f32 buffer is ~0.7 GB and OOMs the 16 GB box.
             {
                 const size_t rows = (size_t)E * dm;        // each row length ni
-                const size_t row_bytes = (ni / 32) * 34;   // Q8_0 bytes/row
+                const size_t row_bytes = (ni / 32) * 22;   // Q5_0 bytes/row
                 uint8_t* d = (uint8_t*)h->weights.w_down->contents() + down_off;
                 const uint8_t* src = (const uint8_t*)dv2->data;
                 // Source bytes-per-row depends on the source quant.
@@ -626,7 +660,7 @@ extern "C" int sk_deepseek_load_from_store(sk_deepseek_handle* hp, sk::WeightSto
                     else if (dv2->dtype == sk::Dtype::Q6_K) dequant_q6_k_to_f32(row.data(), srow, ni);
                     else if (dv2->dtype == sk::Dtype::Q4_K) dequant_q4_k_to_f32(row.data(), srow, ni);
                     else { std::fprintf(stderr, "ds weights: down_exps L%u unsupported dtype\n", L); return -36; }
-                    quantize_row_q8_0(d + r * row_bytes, row.data(), ni);
+                    quantize_row_q5_0(d + r * row_bytes, row.data(), ni);
                 }
             }
         }

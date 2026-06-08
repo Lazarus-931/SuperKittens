@@ -151,6 +151,83 @@ static inline void q8_0_mv_impl(
     helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
 }
 
+// Per-row Q5_0 matvec inner loop — identical reduction shape to q8_0_mv_impl,
+// but each lane dequantizes its NQ=8 weights from the 22 B/32 Q5_0 block
+// (5th-bit plane in qh + 4-bit lows in qs). ne00 % 32 == 0 is the only
+// alignment requirement; n_int=1408 → 44 blocks/row, NO tail drop.
+template<short NR0>
+static inline void q5_0_mv_impl(
+        ds4_metal_args_mul_mv args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NQ = 8;
+
+    const int nb = args.ne00 / QK5_0;
+
+    const int r0 = tgpig.x * NR0;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const uint i12 = im % args.ne12;
+    const uint i13 = im / args.ne12;
+
+    const uint64_t offset1 = r1*args.nb11 + i12*args.nb12 + i13*args.nb13;
+    device const float * y = (device const float *)(src1 + offset1);
+
+    device const block_q5_0 * ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const uint64_t offset0 = (r0 + row)*args.nb01 +
+                                 (i12/args.r2)*args.nb02 +
+                                 (i13/args.r3)*args.nb03;
+        ax[row] = (device const block_q5_0 *)((device char *)src0 + offset0);
+    }
+
+    float sumf[NR0] = { 0.f };
+
+    const short ix = tiisg/(NW/NQ);   // 0..3  — block step within the simdgroup
+    const short il = tiisg%(NW/NQ);   // 0..3  — which 8-wide slice of the block
+    const int   ib0 = sgitg*NQ + ix;
+
+    float yl[NQ];
+    device const float * yb = y + ib0*QK5_0 + il*NQ;
+
+    for (int ib = ib0; ib < nb; ib += NSG*NQ) {
+        for (short i = 0; i < NQ; ++i) yl[i] = yb[i];
+
+        for (short row = 0; row < NR0; ++row) {
+            uint32_t qh;
+            qh = (uint32_t)ax[row][ib].qh[0]
+               | ((uint32_t)ax[row][ib].qh[1] <<  8)
+               | ((uint32_t)ax[row][ib].qh[2] << 16)
+               | ((uint32_t)ax[row][ib].qh[3] << 24);
+            device const uint8_t * qs = ax[row][ib].qs;
+            float sumq = 0.f;
+            FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                const short w     = il*NQ + i;          // 0..31 weight index
+                const short bi    = w & 15;             // byte holding this nibble
+                const short shift = (w < 16) ? 0 : 4;   // low/high nibble
+                const int   lo    = (qs[bi] >> shift) & 0x0F;
+                const int   hi    = (int)((qh >> w) & 1) << 4;
+                sumq += float((lo | hi) - 16) * yl[i];
+            }
+            sumf[row] += sumq * float(ax[row][ib].d);
+        }
+        yb += NSG*NQ*QK5_0;
+    }
+
+    device float * dst_f32 = (device float *)dst +
+        (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+
+    helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+}
+
 // Decode-time expert matvec.  The ids tensor selects the routed expert for each
 // slot (tgpig.z), then the q8_0 row kernel runs against that expert's weight
 // slice without CPU-side per-expert dispatches.
@@ -717,6 +794,25 @@ kernel void deepseek_mul_mv_id_q4_K(
     device       char * dst_cur;
     mul_mv_id_resolve(args, src0s, src1, dst, ids, tgpig, args0, src0_cur, src1_cur, dst_cur);
     q4_K_mv_impl<N_R0_Q4_K>(args0, src0_cur, src1_cur, dst_cur, shmem, tgpig, tiisg, sgitg);
+}
+
+[[host_name("deepseek_mul_mv_id_q5_0")]]
+kernel void deepseek_mul_mv_id_q5_0(
+        constant ds4_metal_args_mul_mv_id & args,
+        device const char * src0s,
+        device const char * src1,
+        device       char * dst,
+        device const char * ids,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    ds4_metal_args_mul_mv args0;
+    device const char * src0_cur;
+    device const char * src1_cur;
+    device       char * dst_cur;
+    mul_mv_id_resolve(args, src0s, src1, dst, ids, tgpig, args0, src0_cur, src1_cur, dst_cur);
+    q5_0_mv_impl<N_R0_Q5_0>(args0, src0_cur, src1_cur, dst_cur, shmem, tgpig, tiisg, sgitg);
 }
 
 [[host_name("deepseek_mul_mv_id_iq2_xxs")]]
