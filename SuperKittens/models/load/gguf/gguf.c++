@@ -49,6 +49,7 @@ bool ggml_to_dtype(uint32_t t, Dtype* out) {
         case 14: *out = Dtype::Q6_K;    return true;
         case 16: *out = Dtype::IQ2_XXS; return true;
         case 8:  *out = Dtype::Q8_0;    return true;
+        case 6:  *out = Dtype::Q5_0;    return true;
         default: return false;
     }
 }

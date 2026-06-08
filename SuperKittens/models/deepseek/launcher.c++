@@ -67,6 +67,29 @@ static MTL::ComputePipelineState* resolve_fa_vec_pso(MTL::Library* lib,
     return pso;
 }
 
+// PSO factory for the q4_K per-expert matvec + shared_swiglu, which read
+// FC slot 600 (NSG, short) and 601 (nxpsg, short).
+static MTL::ComputePipelineState* resolve_mvid_pso(MTL::Library* lib,
+                                                   MTL::Device* dev,
+                                                   const char* name) {
+    auto* fcv = MTL::FunctionConstantValues::alloc()->init();
+    int16_t nsg = 4, nxpsg = 4;
+    fcv->setConstantValue(&nsg,   MTL::DataTypeShort, NS::UInteger(600));
+    fcv->setConstantValue(&nxpsg, MTL::DataTypeShort, NS::UInteger(601));
+    NS::Error* err = nullptr;
+    auto* fn = lib->newFunction(
+        NS::String::string(name, NS::UTF8StringEncoding), fcv, &err);
+    fcv->release();
+    if (!fn) {
+        std::fprintf(stderr, "ds: mvid newFunction failed (%s): %s\n",
+                     name, err ? err->localizedDescription()->utf8String() : "?");
+        return nullptr;
+    }
+    auto* pso = dev->newComputePipelineState(fn, &err);
+    fn->release();
+    return pso;
+}
+
 static bool resolve_psos(ModelPSOs& P, uint32_t dk, uint32_t dv) {
     P.layer.rmsnorm        = sk::bindings_pso("rmsnorm");
     P.layer.rmsnorm_t1     = sk::bindings_pso("rmsnorm_t1");  // optional T=1 fast path
@@ -81,6 +104,7 @@ static bool resolve_psos(ModelPSOs& P, uint32_t dk, uint32_t dv) {
     P.layer.cast_f2h       = sk::bindings_pso("cast_f32_to_f16");
     P.layer.causal_mask_fill = sk::bindings_pso("causal_mask_fill");
     P.layer.gated_mlp      = sk::bindings_pso("gated_mlp");
+    P.layer.silu_mul       = sk::bindings_pso("silu_mul_f16");
     P.layer.kv_up_pair     = sk::bindings_pso("kv_up_pair");
     P.layer.split_packed       = sk::bindings_pso("split_packed");
 
@@ -92,6 +116,22 @@ static bool resolve_psos(ModelPSOs& P, uint32_t dk, uint32_t dv) {
 
     P.layer.flash_attn_vec = resolve_fa_vec_pso(
         sk::bindings_library(), sk::bindings_device(), dk, dv);
+
+    // V2-Lite MLA + Q4_K MoE path.
+    P.layer.router_v2     = sk::bindings_pso("moe_router");
+    P.layer.mla_decode_v2 = sk::bindings_pso("kernel_mla_decode_v2_f16_dk192_dv128");
+    P.layer.mla_kv_write  = sk::bindings_pso("deepseek_mla_kv_write");
+    P.layer.moe_mv_gate   = resolve_mvid_pso(
+        sk::bindings_library(), sk::bindings_device(), "deepseek_mul_mv_id_q4_K");
+    P.layer.moe_mv_down   = resolve_mvid_pso(
+        sk::bindings_library(), sk::bindings_device(), "deepseek_mul_mv_id_q8_0");
+    P.layer.moe_swiglu_f32  = sk::bindings_pso("deepseek_moe_swiglu_f32");
+    P.layer.moe_scatter_add = sk::bindings_pso("deepseek_moe_scatter_add_f32");
+
+    // Native K-quant matvec (decode) so dense/attn/shared/LM-head stay quantized.
+    P.layer.q4k_matvec  = sk::bindings_pso("q4k_matvec");
+    P.layer.q6k_matvec  = sk::bindings_pso("q6k_matvec");
+    P.layer.q8_0_matvec = sk::bindings_pso("q8_0_matvec");
 
     P.embedding_lookup = sk::bindings_pso("embedding_lookup");
     P.argmax           = sk::bindings_pso("argmax");
@@ -111,14 +151,20 @@ static bool resolve_psos(ModelPSOs& P, uint32_t dk, uint32_t dv) {
     _CK("cast_f32_to_f16", P.layer.cast_f2h);
     _CK("causal_mask_fill", P.layer.causal_mask_fill);
     _CK("gated_mlp",      P.layer.gated_mlp);
+    _CK("silu_mul_f16",   P.layer.silu_mul);
     _CK("kv_up_pair",     P.layer.kv_up_pair);
     _CK("split_packed",       P.layer.split_packed);
     _CK("moe_router",            P.layer.moe.router);
-    _CK("moe_swiglu_pair",       P.layer.moe.swiglu_pair);
-    _CK("moe_down_scatter",      P.layer.moe.down_scatter);
-    _CK("moe_swiglu_pair_iq2xxs", P.layer.moe.swiglu_pair_iq2xxs);
-    _CK("moe_down_scatter_q2k",   P.layer.moe.down_scatter_q2k);
-    _CK("flash_attn_vec", P.layer.flash_attn_vec);
+    _CK("moe_router(v2)",        P.layer.router_v2);
+    _CK("mla_decode_v2",         P.layer.mla_decode_v2);
+    _CK("mla_kv_write",          P.layer.mla_kv_write);
+    _CK("moe_mul_mv_id_q4_K",    P.layer.moe_mv_gate);
+    _CK("moe_mul_mv_id_q8_0",    P.layer.moe_mv_down);
+    _CK("moe_swiglu_f32",        P.layer.moe_swiglu_f32);
+    _CK("moe_scatter_add_f32",   P.layer.moe_scatter_add);
+    _CK("q4k_matvec",            P.layer.q4k_matvec);
+    _CK("q6k_matvec",            P.layer.q6k_matvec);
+    _CK("q8_0_matvec",           P.layer.q8_0_matvec);
     _CK("embedding_lookup", P.embedding_lookup);
     _CK("argmax",         P.argmax);
     #undef _CK
@@ -154,9 +200,14 @@ extern "C" sk_deepseek_handle* sk_deepseek_create(const sk_deepseek_config* cfg)
     // Patch F: separate buffer for lm_head. Loader aliases (sets to w_embed) for tied case.
     h->weights.w_lm_head       = alloc_zero(dev, (size_t)cfg->vocab_size * cfg->d_model * 2);
     h->weights.w_pre_attn_norm = alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * 2);
-    h->weights.w_q_a           = alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * cfg->q_lora_rank * 2);
-    h->weights.w_q_a_norm      = alloc_zero(dev, (size_t)cfg->n_layers * cfg->q_lora_rank * 2);
-    h->weights.w_q_b           = alloc_zero(dev, (size_t)cfg->n_layers * cfg->q_lora_rank * cfg->n_heads * dk * 2);
+    // V2-Lite has no Q-LoRA: q_proj maps d_model -> n_heads*dk directly and the
+    // loader writes it into w_q_b. Size w_q_b for max(q_lora_rank, d_model) as
+    // the input dim so both paths fit. w_q_a / w_q_a_norm get a 1-elem stub.
+    const uint32_t q_in = cfg->q_lora_rank ? cfg->q_lora_rank : cfg->d_model;
+    const uint32_t q_lr1 = cfg->q_lora_rank ? cfg->q_lora_rank : 1u;
+    h->weights.w_q_a           = alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * q_lr1 * 2);
+    h->weights.w_q_a_norm      = alloc_zero(dev, (size_t)cfg->n_layers * q_lr1 * 2);
+    h->weights.w_q_b           = alloc_zero(dev, (size_t)cfg->n_layers * q_in * cfg->n_heads * dk * 2);
     h->weights.w_kv_a          = alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * (cfg->kv_lora_rank + cfg->qk_rope_dim) * 2);
     h->weights.w_kv_a_norm     = alloc_zero(dev, (size_t)cfg->n_layers * cfg->kv_lora_rank * 2);
     h->weights.w_kv_b          = alloc_zero(dev, (size_t)cfg->n_layers * cfg->kv_lora_rank
@@ -169,25 +220,39 @@ extern "C" sk_deepseek_handle* sk_deepseek_create(const sk_deepseek_config* cfg)
     h->weights.w_shared_up   = alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * cfg->shared_n_int * 2);
     h->weights.w_shared_down = alloc_zero(dev, (size_t)cfg->n_layers * cfg->shared_n_int * cfg->d_model * 2);
 
+    // Leading-dense-layer MLP (fp16), sized for the first_k_dense_replace layers.
+    {
+        const uint32_t fkd  = cfg->first_k_dense_replace ? cfg->first_k_dense_replace : 1u;
+        const uint32_t dint = cfg->dense_n_int ? cfg->dense_n_int : cfg->shared_n_int;
+        h->weights.w_dense_gate = alloc_zero(dev, (size_t)fkd * cfg->d_model * dint * 2);
+        h->weights.w_dense_up   = alloc_zero(dev, (size_t)fkd * cfg->d_model * dint * 2);
+        h->weights.w_dense_down = alloc_zero(dev, (size_t)fkd * dint * cfg->d_model * 2);
+    }
+
     h->weights.w_router = alloc_zero(dev, (size_t)cfg->n_layers * cfg->d_model * cfg->n_expert * 2);
     // Patch G: per-layer e_score_correction_bias (fp32). Allocated unconditionally;
     // loader leaves zeros for V2-Lite, kernel ignores when has_bias=0.
     h->weights.router_bias = alloc_zero(dev, (size_t)cfg->n_layers * cfg->n_expert * 4);
-    // Routed-expert weights. INT2_DS4 layout (ds4 production):
-    //   W_gate/W_up: (E, N_int, D / 256) block_iq2_xxs   →  66 bytes / 256 weights
-    //   W_down     : (E, D, N_int / 256) block_q2_K      →  84 bytes / 256 weights
-    // FP16 layout:  256 weights → 512 bytes (2 bytes each).
+    // Routed-expert weights. V2-Lite Q4_K_M (moe_quant==2): gate/up are Q4_K
+    // (144 B / 256 weights), DOWN is Q8_0 (34 B / 32 weights). INT2_DS4 keeps
+    // the ds4 V4-Flash layout. Layer 0 is dense (leading_dense_block_count=1)
+    // and stores its wide MLP in the shared-expert buffers instead — the routed
+    // buffers reserve a full per-layer slab for every layer for simple indexing.
     const bool   int2     = (cfg->moe_quant == 1);
-    const size_t up_bytes_per_blk    = int2 ? 66 : 512;
-    const size_t down_bytes_per_blk  = int2 ? 84 : 512;
+    const bool   q4k      = (cfg->moe_quant == 2);
+    const size_t gate_blk = int2 ? 66 : (q4k ? 144 : 512);   // per 256 weights
+    const size_t down_q8_blk = 34;                            // per 32 weights
     const size_t n_blocks_gate_per_e = (size_t)cfg->n_int * (cfg->d_model / 256);
-    const size_t n_blocks_down_per_e = (size_t)cfg->d_model * (cfg->n_int / 256);
+    const size_t n_blocks_down_per_e = q4k
+        ? (size_t)cfg->d_model * (cfg->n_int / 32)            // Q8_0: 32-wide blocks
+        : (size_t)cfg->d_model * (cfg->n_int / 256);
+    const size_t down_blk = q4k ? down_q8_blk : (int2 ? 84 : 512);
     h->weights.w_gate = alloc_zero(dev, (size_t)cfg->n_layers * cfg->n_expert *
-                                        n_blocks_gate_per_e * up_bytes_per_blk);
+                                        n_blocks_gate_per_e * gate_blk);
     h->weights.w_up   = alloc_zero(dev, (size_t)cfg->n_layers * cfg->n_expert *
-                                        n_blocks_gate_per_e * up_bytes_per_blk);
+                                        n_blocks_gate_per_e * gate_blk);
     h->weights.w_down = alloc_zero(dev, (size_t)cfg->n_layers * cfg->n_expert *
-                                        n_blocks_down_per_e * down_bytes_per_blk);
+                                        n_blocks_down_per_e * down_blk);
 
     // Per-layer K, V caches (cache the full decompressed K/V).
     h->layer_caches.resize(cfg->n_layers);
@@ -214,13 +279,18 @@ extern "C" sk_deepseek_handle* sk_deepseek_create(const sk_deepseek_config* cfg)
     h->bufs.rope_pos    = alloc_zero(dev, (size_t)T_max * sizeof(int32_t));
 
     h->bufs.x_norm      = alloc_zero(dev, x_bytes);
-    h->bufs.q_a         = alloc_zero(dev, (size_t)T_max * cfg->q_lora_rank * 2);
+    h->bufs.q_a         = alloc_zero(dev, (size_t)T_max * (cfg->q_lora_rank ? cfg->q_lora_rank : 1u) * 2);
     h->bufs.q_packed    = alloc_zero(dev, (size_t)T_max * cfg->n_heads * dk * 2);
     h->bufs.q_packed_f32 = alloc_zero(dev, (size_t)T_max * cfg->n_heads * dk * 4);
     h->bufs.k_pe_f32     = alloc_zero(dev, (size_t)T_max * cfg->qk_rope_dim * 4);
     h->bufs.attn_out_f32 = alloc_zero(dev, (size_t)T_max * cfg->n_heads * cfg->v_head_dim * 4);
     h->bufs.causal_mask  = alloc_zero(dev, (size_t)cfg->seq_max * cfg->cache_max * 2);
     h->bufs.kv_a_packed = alloc_zero(dev, (size_t)T_max * (cfg->kv_lora_rank + cfg->qk_rope_dim) * 2);
+    // split_packed writes the compressed-KV latent (c_kv) and the RoPE part
+    // (k_pe) out of kv_a_packed; both are read downstream (kv_a_norm, RoPE,
+    // kv_up). They were never allocated → NULL bindings (undefined GPU reads).
+    h->bufs.c_kv        = alloc_zero(dev, (size_t)T_max * cfg->kv_lora_rank * 2);
+    h->bufs.k_pe        = alloc_zero(dev, (size_t)T_max * cfg->qk_rope_dim * 2);
     h->bufs.k_no_pe     = alloc_zero(dev, (size_t)T_max * cfg->n_heads * cfg->qk_nope_dim * 2);
     h->bufs.v           = alloc_zero(dev, (size_t)T_max * cfg->n_heads * cfg->v_head_dim * 2);
     h->bufs.attn_out    = alloc_zero(dev, (size_t)T_max * cfg->n_heads * cfg->v_head_dim * 2);
@@ -229,9 +299,22 @@ extern "C" sk_deepseek_handle* sk_deepseek_create(const sk_deepseek_config* cfg)
     h->bufs.m_in        = alloc_zero(dev, x_bytes);
     h->bufs.shared_mid  = alloc_zero(dev, (size_t)T_max * cfg->shared_n_int * 2);
     h->bufs.shared_out  = alloc_zero(dev, x_bytes);
+    // Dense/shared MLP scratch sized for the widest n_int (dense MLP, e.g. 10944).
+    {
+        const uint32_t dni = cfg->dense_n_int ? cfg->dense_n_int : cfg->shared_n_int;
+        const uint32_t max_n_int = (dni > cfg->shared_n_int) ? dni : cfg->shared_n_int;
+        h->bufs.mlp_gate = alloc_zero(dev, (size_t)T_max * max_n_int * 2);
+        h->bufs.mlp_up   = alloc_zero(dev, (size_t)T_max * max_n_int * 2);
+    }
     h->bufs.moe_top_idx   = alloc_zero(dev, (size_t)T_max * cfg->top_k * sizeof(int32_t));
     h->bufs.moe_top_score = alloc_zero(dev, (size_t)T_max * cfg->top_k * 2);
     h->bufs.moe_hidden    = alloc_zero(dev, (size_t)T_max * cfg->top_k * cfg->n_int * 2);
+    // fp32 scratch for the per-expert mul_mv_id MoE path.
+    h->bufs.moe_x_f32     = alloc_zero(dev, (size_t)T_max * cfg->d_model * 4);
+    h->bufs.moe_gate_f32  = alloc_zero(dev, (size_t)T_max * cfg->top_k * cfg->n_int * 4);
+    h->bufs.moe_up_f32    = alloc_zero(dev, (size_t)T_max * cfg->top_k * cfg->n_int * 4);
+    h->bufs.moe_mid_f32   = alloc_zero(dev, (size_t)T_max * cfg->top_k * cfg->n_int * 4);
+    h->bufs.moe_down_f32  = alloc_zero(dev, (size_t)T_max * cfg->top_k * cfg->d_model * 4);
 
     // 2-pass argmax scratch.
     {
@@ -321,6 +404,7 @@ extern "C" int sk_deepseek_forward(sk_deepseek_handle* hp,
     mp.d_model        = h->cfg.d_model;
     mp.n_int          = h->cfg.n_int;
     mp.shared_n_int   = h->cfg.shared_n_int;
+    mp.dense_n_int    = h->cfg.dense_n_int ? h->cfg.dense_n_int : h->cfg.shared_n_int;
     mp.n_heads        = h->cfg.n_heads;
     mp.qk_nope_dim    = h->cfg.qk_nope_dim;
     mp.qk_rope_dim    = h->cfg.qk_rope_dim;
@@ -361,6 +445,26 @@ extern "C" int sk_deepseek_forward(sk_deepseek_handle* hp,
 
     h->current_pos += seq;
 
+    if (getenv("SK_DS_DEBUG")) {
+        const uint32_t V = h->cfg.vocab_size;
+        const uint32_t T = seq;
+        const uint16_t* lg = (const uint16_t*)h->bufs.logits->contents();
+        const uint16_t* row = lg + (size_t)(T - 1) * V;   // last position
+        auto h2f = [](uint16_t h) {
+            uint32_t s=(h>>15)&1,e=(h>>10)&0x1f,m=h&0x3ff,bits;
+            if(e==0){ if(m==0)bits=s<<31; else { e=127-15+1; while(!(m&0x400)){m<<=1;e--;} m&=0x3ff; bits=(s<<31)|(e<<23)|(m<<13);} }
+            else if(e==0x1f) bits=(s<<31)|(0xff<<23)|(m<<13);
+            else bits=(s<<31)|((e-15+127)<<23)|(m<<13);
+            float f; std::memcpy(&f,&bits,4); return f; };
+        int top[10]; float topv[10];
+        for(int k=0;k<10;k++){top[k]=-1;topv[k]=-1e30f;}
+        for(uint32_t v=0; v<V; ++v){ float f=h2f(row[v]);
+            for(int k=0;k<10;k++){ if(f>topv[k]){ for(int j=9;j>k;j--){topv[j]=topv[j-1];top[j]=top[j-1];} topv[k]=f; top[k]=(int)v; break; } } }
+        std::fprintf(stderr, "[SK_DS_DEBUG] pos=%u logits top10:", h->current_pos-1);
+        for(int k=0;k<10;k++) std::fprintf(stderr, " %d=%.3f", top[k], topv[k]);
+        std::fprintf(stderr, "\n");
+    }
+
     std::memcpy(output_id, h->bufs.output_id->contents(),
                 (size_t)h->cfg.batch * sizeof(int32_t));
     return 0;
@@ -380,6 +484,7 @@ extern "C" void sk_deepseek_destroy(sk_deepseek_handle* hp) {
     rel(h->weights.w_kv_a); rel(h->weights.w_kv_a_norm); rel(h->weights.w_kv_b);
     rel(h->weights.w_o); rel(h->weights.w_pre_mlp_norm); rel(h->weights.w_final_norm);
     rel(h->weights.w_shared_gate); rel(h->weights.w_shared_up); rel(h->weights.w_shared_down);
+    rel(h->weights.w_dense_gate); rel(h->weights.w_dense_up); rel(h->weights.w_dense_down);
     rel(h->weights.w_router); rel(h->weights.w_gate); rel(h->weights.w_up); rel(h->weights.w_down);
     for (auto* b : h->k_caches) rel(b);
     for (auto* b : h->v_caches) rel(b);
@@ -390,9 +495,13 @@ extern "C" void sk_deepseek_destroy(sk_deepseek_handle* hp) {
     rel(h->bufs.q_packed_f32); rel(h->bufs.k_pe_f32); rel(h->bufs.attn_out_f32);
     rel(h->bufs.causal_mask);
     rel(h->bufs.kv_a_packed); rel(h->bufs.k_no_pe); rel(h->bufs.v);
+    rel(h->bufs.c_kv); rel(h->bufs.k_pe);
     rel(h->bufs.attn_out); rel(h->bufs.o_proj); rel(h->bufs.y_attn);
     rel(h->bufs.m_in); rel(h->bufs.shared_mid); rel(h->bufs.shared_out);
+    rel(h->bufs.mlp_gate); rel(h->bufs.mlp_up);
     rel(h->bufs.moe_top_idx); rel(h->bufs.moe_top_score); rel(h->bufs.moe_hidden);
+    rel(h->bufs.moe_x_f32); rel(h->bufs.moe_gate_f32); rel(h->bufs.moe_up_f32);
+    rel(h->bufs.moe_mid_f32); rel(h->bufs.moe_down_f32);
     rel(h->bufs.argmax_val_buf); rel(h->bufs.argmax_idx_buf);
 
     delete h;

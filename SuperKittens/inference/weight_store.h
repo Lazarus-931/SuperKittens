@@ -16,6 +16,7 @@ enum class Dtype : uint8_t {
     Q8_0,
     Q6_K,
     Q3_K, Q5_K,
+    Q5_0,
 };
 
 // Bytes required to hold `n_elems` elements of dtype `d`.
@@ -26,6 +27,7 @@ inline size_t dtype_bytes(Dtype d, size_t n_elems) {
         case Dtype::F16:  return n_elems * 2;
         case Dtype::BF16: return n_elems * 2;
         case Dtype::Q8_0: return (n_elems / 32) * 34;
+        case Dtype::Q5_0: return (n_elems / 32) * 22;
         case Dtype::Q3_K: return (n_elems / 256) * 110;
         case Dtype::Q4_K: return (n_elems / 256) * 144;
         case Dtype::Q5_K: return (n_elems / 256) * 176;
