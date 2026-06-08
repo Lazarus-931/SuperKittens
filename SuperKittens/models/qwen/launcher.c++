@@ -456,6 +456,34 @@ extern "C" int sk_qwen_get_last_logits(sk_qwen_handle* hp, void* out_fp16) {
     return 0;
 }
 
+// WHY: the LM head writes one full V-row per input position at RELATIVE rows
+// 0..last_seq-1 of bufs.logits; spec-decode verify needs every row from the
+// K-token forward, not just the last. Copies the first n_rows rows.
+extern "C" int sk_qwen_get_logits_rows(sk_qwen_handle* hp, void* out_fp16, uint32_t n_rows) {
+    if (!hp || !out_fp16 || n_rows == 0) return -1;
+    auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
+    if (n_rows > h->last_seq) return -2;
+    const size_t row_bytes = (size_t)h->cfg.vocab_size * sizeof(uint16_t);
+    std::memcpy(out_fp16, h->bufs.logits->contents(), (size_t)n_rows * row_bytes);
+    return 0;
+}
+
+// WHY: spec-decode commits only J of K verified tokens; the K-J rejected KV
+// entries past prev_pos+J must be discarded by rewinding current_pos so the next
+// forward overwrites them. get/set pair exposes the cursor for that.
+extern "C" int sk_qwen_get_pos(sk_qwen_handle* hp) {
+    if (!hp) return -1;
+    return (int)reinterpret_cast<meow::qwen::Handle*>(hp)->current_pos;
+}
+
+extern "C" int sk_qwen_set_pos(sk_qwen_handle* hp, uint32_t pos) {
+    if (!hp) return -1;
+    auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
+    if (pos > h->cfg.cache_max) return -2;
+    h->current_pos = pos;
+    return 0;
+}
+
 extern "C" void sk_qwen_destroy(sk_qwen_handle* hp) {
     if (!hp) return;
     auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
