@@ -63,6 +63,8 @@ GEMMA4_ABI = {
     "get_last_logits":        ([ctypes.c_void_p, ctypes.c_void_p], ctypes.c_int),
     "set_dump_enabled":       ([ctypes.c_void_p, ctypes.c_int], None),
     "dump_layer":             ([ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p], ctypes.c_int),
+    "debug_weight":           optional([ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t,
+                                        ctypes.c_size_t, ctypes.c_void_p], ctypes.c_int),
 }
 
 
@@ -249,6 +251,14 @@ class Gemma4(Model):
         u32 = out.astype(np.uint32) << 16
         f32 = u32.view(np.float32)
         return f32.astype(np.float16)
+
+    def debug_weight_bytes(self, name: str, byte_off: int, nbytes: int) -> np.ndarray:
+        """Raw byte copy out of a named device weight buffer (debug only)."""
+        out = np.empty((nbytes,), dtype=np.uint8)
+        rc = _load().sk_gemma4_debug_weight(self._h, name.encode(), byte_off, nbytes, out.ctypes.data)
+        if rc:
+            raise RuntimeError(f"sk_gemma4_debug_weight({name!r}) failed: {rc}")
+        return out
 
     def last_logits(self) -> np.ndarray:
         out = np.empty((self.cfg.vocab_size,), dtype=np.uint16)

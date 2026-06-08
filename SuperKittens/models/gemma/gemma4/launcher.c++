@@ -689,6 +689,8 @@ extern "C" int sk_gemma4_debug_weight(sk_gemma4_handle* hp, const char* name,
     auto* h = reinterpret_cast<meow::gemma4::Handle*>(hp);
     MTL::Buffer* b = nullptr;
     #define X(s, f) if (std::strcmp(name, s) == 0) b = h->weights.f
+    X("w_embed", w_embed);
+    X("w_lm_head_q8", w_lm_head_q8);
     X("w_qkv", w_qkv);
     X("w_out", w_out);
     X("w_pre_attn_norm", w_pre_attn_norm);
