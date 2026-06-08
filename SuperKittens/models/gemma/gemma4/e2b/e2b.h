@@ -28,7 +28,7 @@ static inline sk_gemma4_config gemma4_e2b_config(void) {
                                       // common chat-prefill regime. Raise via override for long prompts.
     c.cache_max          = 8192;      // global KV cache cap (raise if more memory available)
     c.n_layers           = 35;
-    c.local_period       = 6;         // 5 local : 1 global
+    c.local_period       = 5;         // full_attention every 5th layer (real layer_types: L4,9,14,19,24,29,34)
     c.d_model            = 1536;
     c.n_int              = 6144;
     c.n_heads            = 8;         // E2B has 8 attention heads (HF config)
@@ -36,7 +36,7 @@ static inline sk_gemma4_config gemma4_e2b_config(void) {
     c.n_kv_heads_global  = 1;
     c.head_dim_local     = 256;
     c.head_dim_global    = 512;
-    c.window             = 4096;      // E-models: 4K SWA
+    c.window             = 512;       // real sliding_window for sliding_attention layers
     c.prope_p_pairs      = 64;
     c.vocab_size         = 262144;
     c.has_ple            = 1;

@@ -129,16 +129,21 @@ def _preset(name: str) -> Gemma4Config:
                             n_heads=8, n_kv_heads_local=2, n_kv_heads_global=2,
                             head_dim_local=256, head_dim_global=256,
                             vocab_size=262144, window=4096, has_ple=True, ple_dim=256)
-    # TODO: verify against real config
-    if n in ("26b", "26b-a4b"):
-        return Gemma4Config(n_layers=60, local_period=6, d_model=4608, n_int=12288,
-                            n_heads=16, n_kv_heads_local=16, n_kv_heads_global=4,
-                            window=1024, has_ple=False)
-    # TODO: verify against real config
+    # gemma-4-12B-it: model_type "gemma4_unified" — structurally different from
+    # the E2B/E4B/31B "gemma4" arch and not yet supported by this adapter. Preset
+    # carries the real config.json dims so from_spec doesn't raise, but loading
+    # weights will need a unified codepath.
+    if n in ("12b",):
+        return Gemma4Config(n_layers=48, local_period=6, d_model=3840, n_int=15360,
+                            n_heads=16, n_kv_heads_local=8, n_kv_heads_global=8,
+                            head_dim_local=256, head_dim_global=256,
+                            vocab_size=262144, window=1024, has_ple=True, ple_dim=256)
+    # gemma-4-31B-it: real config.json dims (model_type "gemma4").
     if n in ("31b",):
-        return Gemma4Config(n_layers=60, local_period=6, d_model=21504, n_int=86016,
-                            n_heads=32, n_kv_heads_local=32, n_kv_heads_global=16,
-                            window=1024, has_ple=False)
+        return Gemma4Config(n_layers=60, local_period=6, d_model=5376, n_int=21504,
+                            n_heads=32, n_kv_heads_local=16, n_kv_heads_global=16,
+                            head_dim_local=256, head_dim_global=256,
+                            vocab_size=262144, window=1024, has_ple=True, ple_dim=256)
     raise ValueError(f"unknown gemma4 variant: {name}")
 
 
@@ -357,7 +362,7 @@ class Gemma4(Model):
         variant = spec.dims.get("variant") if spec.dims else None
         if variant is None:
             # spec name is e.g. "gemma4-e2b"; pull suffix.
-            for v in ("e2b", "e4b", "26b", "31b"):
+            for v in ("e2b", "e4b", "12b", "31b"):
                 if v in spec.weight_dir.lower() or v in spec.adapter.lower() + spec.hf_repo.lower():
                     variant = v
                     break

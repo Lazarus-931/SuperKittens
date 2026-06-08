@@ -43,29 +43,31 @@ After LM head GEMM produces logits of shape `(batch, seq, vocab)`:
 logits = tanh(logits / cap) * cap     # cap = 30.0 for E2B/E4B
 ```
 
-## SK port status (as of 2026-05-12)
+## SK port status (E2B/E4B, as of 2026-06-08)
+
+The E2B port is complete and generates coherently on `main`. The PLE
+gate-act miscompute documented in the L0.out sections below was fixed at
+`50a5ee9`. All architecture-specific features are wired:
 
 ✅ Kernels: attn (mha_causal d=128, plus gemma4-specific d=256 local / d=512 global variants in `models/gemma/gemma4/attn.metal`), rope, rmsnorm, gemm, gated_mlp.
 ✅ Loader infra: `WeightStore`, safetensor reader, BF16→FP16 cast.
 ✅ Top-level: `sk.load("gemma4-e2b")`, registry.
-✅ Config reader: reads `text_config.head_dim`, `global_head_dim`, `hidden_size_per_layer_input` from `config.json`.
+✅ Config reader: reads `text_config.head_dim`, `global_head_dim`, `hidden_size_per_layer_input`, `sliding_window`, `num_kv_shared_layers`, `use_double_wide_mlp`, `final_logit_softcapping`, `rope_parameters.full_attention.partial_rotary_factor` from `config.json`.
+✅ **Per-layer n_int** (double-wide MLP): kv-shared layers (L ≥ `n_layers − num_kv_shared_layers`) get `n_int × 2`. `launcher.c++` / `weights.c++` size per-layer MLP offsets via the `use_double_wide_mlp` flag.
+✅ **KV sharing** (`num_kv_shared_layers`): shared layers carry no k/v/k_norm/v_norm tensors and reuse K/V from the last non-shared layer of the same type (`launcher.c++`, `weights.c++`).
+✅ **V-norm**: V gets no-gamma rmsnorm (`y = x * inv_rms`) in `qkv_norm.metal` / `gemma4_qkv_norm_rope_partial_t1.metal`.
+✅ **Partial RoPE**: full_attention layers rotate only `partial_rotary_factor * head_dim` dims via `rope_partial` (decode fast path fuses it in `qkv_norm_rope_partial_t1`).
+✅ **Final logit softcap**: `gemma4_logit_softcap` kernel applies `tanh(logits/cap)*cap` (cap=30) after the LM head.
+✅ **Layer types**: SK keys off `local_period` (E2B period-5 ⇒ full_attention at L4,9,14,19,24,29,34, matching the real `layer_types[]` exactly).
 
-❌ **Per-layer n_int** (double-wide MLP): SK assumes uniform `n_int` across layers. Needs per-layer offsets in launcher allocation and `dispatch_layer`.
-❌ **KV sharing** (`num_kv_shared_layers`): SK expects every layer to load k/v/k_norm/v_norm tensors. For L≥15 these tensors don't exist in the checkpoint.
-❌ **V-norm**: not applied. Add a no-gamma rmsnorm step on V before attention.
-❌ **Partial RoPE**: full-attention layers in SK currently rotate the whole head; need to rotate only `partial_rotary_factor * head_dim` dims.
-❌ **Final logit softcap**: not applied. Trivial new kernel or fused into argmax.
 ❌ **AltUp**: skipped intentionally — single-stream simplification. Acceptable for v0.
-❌ **Layer types array**: SK computes via `local_period`; should read `text_config.layer_types[]` directly.
-❌ **HF comparison harness**: no per-layer diff against reference.
+❌ **`gemma4_unified` variant** (gemma-4-12B-it): structurally different arch (`Gemma4UnifiedForConditionalGeneration`); not supported by this adapter.
+~ **Per-layer `layer_types[]` array**: read into the Python config but not threaded to C (the C side uses `local_period`); correct for E2B/E4B/31B's regular period, would need wiring for any model with an irregular layer-type pattern.
 
-## Recommended porting order
+## HF comparison harness
 
-1. HF reference activation dump (one-shot, lets every later step be verified).
-2. Layer_types reader + per-layer n_int + KV sharing (together — they all reshape the weight loader).
-3. V-norm + partial RoPE + softcap (kernel additions).
-4. PLE pipeline validation (already wired structurally).
-5. End-to-end logit comparison vs HF.
+`temp/gemma4_validate/{dump_hf_gemma4.py, layer_diff_all.py}` (gitignored) dumps
+HF reference activations and diffs them against SK's `dump_layer` taps.
 
 ## L0.out diagnostic note (2026-05-13, derek)
 

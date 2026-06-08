@@ -66,15 +66,20 @@ SPECS: dict[str, ModelSpec] = {
         config_path="text_config",
         dims=dict(variant="e4b"),
     ),
-    "gemma4-26b": ModelSpec(
+    # NOTE: gemma-4-12B-it is model_type "gemma4_unified" (arch
+    # Gemma4UnifiedForConditionalGeneration), NOT the same arch as E2B/E4B/31B
+    # (model_type "gemma4"). The unified variant differs structurally and is not
+    # yet supported by this adapter — listed so the repo is discoverable, but
+    # loading it will need a unified codepath. (`gemma-4-26B-it` does not exist.)
+    "gemma4-12b": ModelSpec(
         family="gemma4",
         adapter="SuperKittens.models.gemma.gemma4.gemma4:Gemma4",
-        hf_repo="google/gemma-4-26B-it",
-        weight_dir="gemma-4-26B-it",
+        hf_repo="google/gemma-4-12B-it",
+        weight_dir="gemma-4-12B-it",
         default_quant=None,
         tokenizer_family="gemma4",
         config_path="text_config",
-        dims=dict(variant="26b"),
+        dims=dict(variant="12b"),
     ),
     "gemma4-31b": ModelSpec(
         family="gemma4",

@@ -17,7 +17,7 @@ resolve() {
     case "$1" in
         gemma4-e2b)         echo "google/gemma-4-E2B-it     gemma-4-E2B-it" ;;
         gemma4-e4b)         echo "google/gemma-4-E4B-it     gemma-4-E4B-it" ;;
-        gemma4-26b)         echo "google/gemma-4-26B-it     gemma-4-26B-it" ;;
+        gemma4-12b)         echo "google/gemma-4-12B-it     gemma-4-12B-it" ;;
         gemma4-31b)         echo "google/gemma-4-31B-it     gemma-4-31B-it" ;;
         qwen3-0.6b)         echo "Qwen/Qwen3-0.6B           Qwen3-0.6B" ;;
         qwen3-1.7b)         echo "Qwen/Qwen3-1.7B           Qwen3-1.7B" ;;
@@ -32,7 +32,7 @@ resolve() {
     esac
 }
 
-KNOWN="gemma4-e2b gemma4-e4b gemma4-26b gemma4-31b qwen3-0.6b qwen3-1.7b qwen3-8b qwen3-32b deepseek-v3 deepseek-v2-lite mamba2-130m mamba2-2.7b mamba-2.8b"
+KNOWN="gemma4-e2b gemma4-e4b gemma4-12b gemma4-31b qwen3-0.6b qwen3-1.7b qwen3-8b qwen3-32b deepseek-v3 deepseek-v2-lite mamba2-130m mamba2-2.7b mamba-2.8b"
 
 color() { printf "\033[1;36m%s\033[0m\n" "$*"; }
 warn()  { printf "\033[1;33m%s\033[0m\n" "$*"; }
