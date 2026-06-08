@@ -1192,13 +1192,6 @@ inline void dispatch_model(
             cmd = dbgq->commandBuffer();
         }
 
-        if (getenv("SK_DS_SYNC")) {
-            MTL::CommandQueue* sq = cmd->commandQueue();
-            cmd->commit();
-            cmd->waitUntilCompleted();
-            cmd = sq->commandBuffer();
-        }
-
         MTL::Buffer* tmp = cur; cur = nxt; nxt = tmp;
     }
 
