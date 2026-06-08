@@ -2,6 +2,7 @@
 
 #include "launcher.h"
 #include "qwen_model.h"
+#include "qwen_icb.h"
 #include "../../kernels/runtime_bindings.h"
 #include "../../inference/silicon/mmap_buffer.h"
 
@@ -35,6 +36,13 @@ struct Handle {
     // Each layer's slab is a separate file-range mmap; this vector owns the
     // MmapBuffer objects so they can be destroyed alongside the handle.
     std::vector<sk::silicon::MmapBuffer*> tensor_mmaps;
+
+    // Decode-graph ICB (T=1). Built lazily on first T=1 step (after weights →
+    // dtypes are known). nullptr when SK_QWEN_ICB unset, build fails, or the
+    // model's decode path isn't the generic-quant one qwen_icb records.
+    QwenDecodeIcb* decode_icb     = nullptr;
+    bool           icb_enabled    = false;
+    bool           icb_build_tried = false;
 };
 
 static MTL::Buffer* alloc_zero(MTL::Device* dev, size_t bytes) {
@@ -117,6 +125,7 @@ extern "C" sk_qwen_handle* sk_qwen_create(const sk_qwen_config* cfg) {
 
     auto* h = new meow::qwen::Handle();
     h->cfg = *cfg;
+    h->icb_enabled = (getenv("SK_QWEN_ICB") != nullptr);
     if (!meow::qwen::resolve_psos(h->psos)) { delete h; return nullptr; }
 
     using namespace meow::qwen;
@@ -344,6 +353,32 @@ static int run_step(Handle* h, MTL::CommandQueue* q, uint32_t seq) {
     mp.capture_layer   = h->capture_layer;
     h->last_seq        = seq;
 
+    // ICB-replay decode fast path (T=1 only). Build once (lazily, after weights
+    // → dtypes are known); on each token re-stamp cursor + RoPE offsets and
+    // replay the whole graph with a single executeCommandsInBuffer. Falls
+    // through to per-dispatch dispatch_model when the ICB is unavailable.
+    const bool want_icb = h->icb_enabled && seq == 1
+                          && h->layers_run == 0 && h->capture_layer < 0;
+    if (want_icb && !h->icb_build_tried) {
+        h->icb_build_tried = true;
+        h->decode_icb = qwen_icb_build(sk::bindings_device(),
+                                       h->psos, h->weights, h->bufs, mp);
+        if (!h->decode_icb)
+            std::fprintf(stderr, "qwen: ICB build unavailable; using per-dispatch decode\n");
+    }
+    if (want_icb && h->decode_icb) {
+        const uint32_t total_after = mp.current_pos + 1;
+        const uint32_t kv_len = (total_after < mp.cache_max) ? total_after : mp.cache_max;
+        qwen_icb_prepare(h->decode_icb, mp.current_pos, kv_len, mp.head_dim);
+        auto* cmd = q->commandBuffer();
+        qwen_icb_replay(h->decode_icb, cmd);
+        cmd->commit();
+        cmd->waitUntilCompleted();
+        cmd->release();
+        h->current_pos += seq;
+        return 0;
+    }
+
     auto* cmd = q->commandBuffer();
     dispatch_model(cmd, h->psos, h->weights, h->bufs, mp);
     cmd->commit();
@@ -507,5 +542,6 @@ extern "C" void sk_qwen_destroy(sk_qwen_handle* hp) {
     rel(h->bufs.argmax_val_buf); rel(h->bufs.argmax_idx_buf);
     rel(h->bufs.argmax_args);
     if (h->bufs.argmax_icb) { delete h->bufs.argmax_icb; h->bufs.argmax_icb = nullptr; }
+    if (h->decode_icb) { meow::qwen::qwen_icb_destroy(h->decode_icb); h->decode_icb = nullptr; }
     delete h;
 }
