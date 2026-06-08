@@ -93,6 +93,10 @@ int  sk_deepseek_forward(sk_deepseek_handle* h,
 void sk_deepseek_reset(sk_deepseek_handle* h);
 void sk_deepseek_destroy(sk_deepseek_handle* h);
 
+// Optional: print the SK_DS_PROFILE per-category GPU-time breakdown for the
+// given token count and reset the accumulators. No-op when profiling is off.
+void sk_deepseek_profile_report(uint64_t tokens);
+
 #ifdef __cplusplus
 }
 #endif

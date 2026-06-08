@@ -6,12 +6,67 @@
 #include <Metal/Metal.hpp>
 #include <cstdint>
 #include <cmath>
+#include <cstdlib>
+#include <cstdio>
+#include <cstring>
 
 #include "../../kernels/moe/moe_ffn.h"
 #include "../../inference/weight_store.h"
 
 namespace meow { namespace deepseek {
 inline float metal_sqrt_safe(float x) { return std::sqrt(x); }
+
+// SK_DS_PROFILE per-category GPU-time accumulator. When enabled, dispatch_model
+// commits a command buffer at each category boundary (PROF_MARK), reads its
+// GPU-only time (GPUEndTime-GPUStartTime), and adds it to the named bucket.
+// Off by default → single command buffer per token, zero overhead.
+struct Prof {
+    static constexpr int NCAT = 32;
+    const char* names[NCAT];
+    double secs[NCAT];
+    uint64_t calls[NCAT];
+    int n = 0;
+    bool on = false;
+    int find(const char* nm) {
+        for (int i = 0; i < n; ++i) if (std::strcmp(names[i], nm) == 0) return i;
+        names[n] = nm; secs[n] = 0.0; calls[n] = 0; return n++;
+    }
+    void add(const char* nm, double s) { int i = find(nm); secs[i] += s; calls[i] += 1; }
+    void report(uint64_t tokens) {
+        double tot = 0.0; for (int i = 0; i < n; ++i) tot += secs[i];
+        std::fprintf(stderr, "[SK_DS_PROFILE] %llu tokens; per-token GPU breakdown:\n",
+                     (unsigned long long)tokens);
+        for (int i = 0; i < n; ++i)
+            std::fprintf(stderr, "  %-22s %8.3f ms/tok  %5.1f%%  (%llu disp/tok)\n",
+                         names[i], secs[i] / tokens * 1e3,
+                         tot > 0 ? secs[i] / tot * 100.0 : 0.0,
+                         (unsigned long long)(calls[i] / (tokens ? tokens : 1)));
+        std::fprintf(stderr, "  %-22s %8.3f ms/tok  (GPU-only, excl CPU/commit)\n",
+                     "TOTAL", tot / tokens * 1e3);
+    }
+};
+// Single shared instance across all TUs (defined once in launcher.c++). An
+// inline function-local static was NOT being COMDAT-folded reliably between the
+// launcher.c++ and weights.c++ copies under -O3, so dispatch_model (inlined into
+// launcher.o) saw a different `on` flag than sk_deepseek_forward set.
+Prof& prof();
+
+// Commit `cmd`, wait, attribute its GPU time to `cat`, and reopen a fresh cmd
+// from the same queue. Only call when prof().on. `cmd` is always a retained
+// buffer (caller retains the first one); we release the just-committed buffer
+// and hand back a freshly retained one, so the caller's final release stays
+// balanced regardless of how many marks fired.
+inline void prof_mark(MTL::CommandBuffer*& cmd, const char* cat) {
+    MTL::CommandQueue* q = cmd->commandQueue();
+    cmd->commit();
+    cmd->waitUntilCompleted();
+    double s = cmd->GPUEndTime() - cmd->GPUStartTime();
+    prof().add(cat, s);
+    cmd->release();                 // release the retained, committed buffer
+    cmd = q->commandBuffer();       // autoreleased
+    cmd->retain();                  // keep alive until the next mark / final release
+}
+#define PROF_MARK(cmdref, cat) do { if (meow::deepseek::prof().on) meow::deepseek::prof_mark((cmdref), (cat)); } while (0)
 }}
 
 namespace meow {
@@ -142,6 +197,7 @@ struct LayerBuffers {
     sk::Dtype dt_sh_gate = sk::Dtype::F16;
     sk::Dtype dt_sh_up   = sk::Dtype::F16;
     sk::Dtype dt_sh_down = sk::Dtype::F16;
+    size_t    off_sh_down = 0;   // precomputed byte offset into w_shared_down for this layer
 
     MTL::Buffer* rope_pos;
 
@@ -300,7 +356,7 @@ inline void encode_rmsnorm(
 }
 
 inline void dispatch_attn(
-    MTL::CommandBuffer*  cmd,
+    MTL::CommandBuffer*& cmd,
     const LayerPSOs&     P,
     const LayerBuffers&  B,
     const LayerParams&   p)
@@ -506,6 +562,7 @@ inline void dispatch_attn(
         encode_cast(cmd, P.cast_f2h, B.k_pe_f32, B.k_pe,
                     T * p.qk_rope_dim);
     }
+    PROF_MARK(cmd, "attn_norm_qkv_rope");
 
     {
         const uint32_t k_out = p.n_heads * p.qk_nope_dim;
@@ -537,6 +594,7 @@ inline void dispatch_attn(
             MTL::Size(128, 1, 1));
         enc->endEncoding();
     }
+    PROF_MARK(cmd, "attn_kv_up");
 
     {
         // Assemble per-head K (dk=192: nope ++ shared rope) and V (dv=128) for
@@ -647,6 +705,7 @@ inline void dispatch_attn(
         encode_cast(cmd, P.cast_f2h, B.attn_out_f32, B.attn_out,
                     T * p.n_heads * p.v_head_dim);
     }
+    PROF_MARK(cmd, "attn_mla");
 
     {
         const uint32_t o_K = p.n_heads * p.v_head_dim;
@@ -654,6 +713,7 @@ inline void dispatch_attn(
         encode_proj(cmd, P, B.dt_o, B.w_o, off_w_o, B.attn_out, 0, B.o_proj, 0,
                     T, p.d_model, o_K);
     }
+    PROF_MARK(cmd, "attn_oproj");
 }
 
 // Unfused gated MLP: gate=x@Wg, up=x@Wu, mid=silu(gate)*up, out=mid@Wd.
@@ -661,7 +721,7 @@ inline void dispatch_attn(
 // is wrong (and overflows threadgroup scratch) for n_int > 64. DeepSeek shared
 // experts (2816) and the leading dense MLP (10944) both need this unfused path.
 inline void dispatch_gated_mlp_unfused(
-    MTL::CommandBuffer*  cmd,
+    MTL::CommandBuffer*& cmd,
     const LayerPSOs&     P,
     const LayerBuffers&  B,
     const LayerParams&   p,
@@ -676,6 +736,7 @@ inline void dispatch_gated_mlp_unfused(
                 T, n_int, p.d_model);
     encode_proj(cmd, P, dt_up,   w_up,   off_up,   B.m_in, 0, B.mlp_up,   0,
                 T, n_int, p.d_model);
+    PROF_MARK(cmd, "mlp_gate_up");
     {
         const uint32_t n = T * n_int;
         auto* enc = cmd->computeCommandEncoder();
@@ -690,10 +751,11 @@ inline void dispatch_gated_mlp_unfused(
     }
     encode_proj(cmd, P, dt_down, w_down, off_down, B.mlp_gate, 0, out, 0,
                 T, p.d_model, n_int);
+    PROF_MARK(cmd, "mlp_down");
 }
 
 inline void dispatch_shared_expert(
-    MTL::CommandBuffer*  cmd,
+    MTL::CommandBuffer*& cmd,
     const LayerPSOs&     P,
     const LayerBuffers&  B,
     const LayerParams&   p)
@@ -701,16 +763,17 @@ inline void dispatch_shared_expert(
     const uint32_t L = p.layer_idx;
     const size_t off_w_gate = (size_t)L * sk::dtype_bytes(B.dt_sh_gate, (size_t)p.shared_n_int * p.d_model);
     const size_t off_w_up   = (size_t)L * sk::dtype_bytes(B.dt_sh_up,   (size_t)p.shared_n_int * p.d_model);
-    const size_t off_w_down = (size_t)L * sk::dtype_bytes(B.dt_sh_down, (size_t)p.d_model * p.shared_n_int);
+    // off_sh_down is precomputed in dispatch_model: a uniform Q6_K-sized slot when
+    // the down slab is the mixed-quant native layout, else the fp16 L*stride.
     dispatch_gated_mlp_unfused(cmd, P, B, p,
                                B.w_shared_gate, off_w_gate, B.dt_sh_gate,
                                B.w_shared_up,   off_w_up,   B.dt_sh_up,
-                               B.w_shared_down, off_w_down, B.dt_sh_down,
+                               B.w_shared_down, B.off_sh_down, B.dt_sh_down,
                                p.shared_n_int, B.shared_out);
 }
 
 inline void dispatch_layer(
-    MTL::CommandBuffer*  cmd,
+    MTL::CommandBuffer*& cmd,
     const LayerPSOs&     P,
     const LayerBuffers&  B,
     const LayerParams&   p)
@@ -736,6 +799,7 @@ inline void dispatch_layer(
         enc->dispatchThreadgroups(MTL::Size(1, T, 1), MTL::Size(128, 1, 1));
         enc->endEncoding();
     }
+    PROF_MARK(cmd, "post_attn_addnorm");
 
     // Leading dense layers (L < first_k_dense_replace): a single wide gated MLP
     // (no shared/routed experts). y_out = y_attn + dense_mlp(m_in).
@@ -779,6 +843,7 @@ inline void dispatch_layer(
                                   MTL::Size(128, 1, 1));
         enc->endEncoding();
     }
+    PROF_MARK(cmd, "moe_shared_expert");
 
     // ── V2-Lite MoE: shared moe_router → per-expert mul_mv_id_q4_K (gate/up) →
     //    SwiGLU → mul_mv_id_q4_K (down) → weighted scatter-add into residual. ──
@@ -801,6 +866,7 @@ inline void dispatch_layer(
 
     // Routing input cast fp16 → fp32 (mul_mv_id reads fp32 activations).
     encode_cast(cmd, P.cast_h2f, B.m_in, B.moe_x_f32, T * p.d_model);
+    PROF_MARK(cmd, "moe_router");
 
     // Q4_K per-expert matvec: ne00=in_dim, ne01=out_rows, ne02=n_expert.
     // src0 stride: block=144 B / 256 weights. ids = top_idx (T*top_k ints).
@@ -857,6 +923,7 @@ inline void dispatch_layer(
                  B.moe_x_f32, B.moe_gate_f32, p.d_model, p.n_int);
     encode_mv_id(P.moe_mv_gate, true, B.w_up,   (size_t)L * gate_layer,
                  B.moe_x_f32, B.moe_up_f32,   p.d_model, p.n_int);
+    PROF_MARK(cmd, "moe_gate_up_q4k");
 
     // SwiGLU mid = silu(gate)*up over [top_k, n_int].
     {
@@ -871,9 +938,11 @@ inline void dispatch_layer(
                                   MTL::Size(256, 1, 1));
         enc->endEncoding();
     }
+    PROF_MARK(cmd, "moe_swiglu");
 
     encode_mv_id(P.moe_mv_down, false, B.w_down, (size_t)L * down_layer,
                  B.moe_mid_f32, B.moe_down_f32, p.n_int, p.d_model);
+    PROF_MARK(cmd, "moe_down_q5_0");
 
     // Weighted scatter-add over all T tokens: y_out[t] = residual[t] + scale*Σ score[t,s]*down[t,s].
     {
@@ -891,6 +960,7 @@ inline void dispatch_layer(
                                   MTL::Size(256, 1, 1));
         enc->endEncoding();
     }
+    PROF_MARK(cmd, "moe_scatter_add");
 }
 
 
@@ -987,6 +1057,9 @@ struct ModelWeights {
     sk::Dtype dt_sh_up   = sk::Dtype::F16;
     sk::Dtype dt_lm_head = sk::Dtype::F16;
     const sk::Dtype* dt_sh_down_per_L = nullptr;   // [n_layers]; F16 for dense layers
+    // Shared-down quant slab uses a uniform Q6_K-sized per-layer slot (the larger
+    // of Q4_K/Q6_K) so L*slot indexes it; the PSO is per-layer (dt_sh_down_per_L).
+    bool sh_down_uniform_q6k_slot = false;
 };
 
 struct ModelBuffers {
@@ -1054,6 +1127,7 @@ inline void dispatch_model(
                                   MTL::Size(128, 1, 1));
         enc->endEncoding();
     }
+    PROF_MARK(cmd, "embed_lookup");
 
     MTL::Buffer* cur = B.x_a;
     MTL::Buffer* nxt = B.x_b;
@@ -1135,6 +1209,12 @@ inline void dispatch_model(
         lb.dt_sh_gate      = W.dt_sh_gate;
         lb.dt_sh_up        = W.dt_sh_up;
         lb.dt_sh_down      = W.dt_sh_down_per_L ? W.dt_sh_down_per_L[L] : sk::Dtype::F16;
+        // Down slab offset: uniform Q6_K-sized slot for the mixed-quant native
+        // layout, else fp16 L*stride. Decouples the slab stride (uniform) from
+        // the per-layer matvec dtype (lb.dt_sh_down).
+        lb.off_sh_down     = W.sh_down_uniform_q6k_slot
+            ? (size_t)L * sk::dtype_bytes(sk::Dtype::Q6_K, (size_t)M.d_model * M.shared_n_int)
+            : (size_t)L * sk::dtype_bytes(lb.dt_sh_down, (size_t)M.d_model * M.shared_n_int);
         lb.rope_pos        = B.rope_pos;
         lb.c_kv_cache      = W.layer_caches[L].c_kv;
         lb.k_pe_cache      = W.layer_caches[L].k_pe;
@@ -1195,6 +1275,8 @@ inline void dispatch_model(
         MTL::Buffer* tmp = cur; cur = nxt; nxt = tmp;
     }
 
+    PROF_MARK(cmd, "layers_total");
+
     encode_rmsnorm(cmd, P.layer.rmsnorm, cur, W.w_final_norm, 0,
                    nxt, T, M.d_model, M.eps, P.layer.rmsnorm_t1);
 
@@ -1229,6 +1311,7 @@ inline void dispatch_model(
             enc->endEncoding();
         }
     }
+    PROF_MARK(cmd, "final_norm_lmhead");
 
     {
         const bool can_2pass = (T == 1u)
@@ -1273,6 +1356,7 @@ inline void dispatch_model(
             enc->endEncoding();
         }
     }
+    PROF_MARK(cmd, "argmax");
 }
 
 } // namespace deepseek

@@ -10,6 +10,11 @@
 
 namespace meow { namespace deepseek {
 
+// The single Prof instance (header declares `Prof& prof();`). Defined here so
+// every TU and every inlined dispatch_* shares one `on` flag and one set of
+// accumulators.
+Prof& prof() { static Prof p; return p; }
+
 struct Handle {
     sk_deepseek_config cfg;
     uint32_t           current_pos = 0;
@@ -378,6 +383,13 @@ extern "C" int sk_deepseek_load_weights(sk_deepseek_handle* hp,
     return 0;
 }
 
+extern "C" void sk_deepseek_profile_report(uint64_t tokens) {
+    auto& p = meow::deepseek::prof();
+    if (!p.on) return;
+    if (tokens > 0) p.report(tokens);
+    p.n = 0;   // reset accumulators (tokens==0 → reset-only, no print)
+}
+
 extern "C" void sk_deepseek_reset(sk_deepseek_handle* hp) {
     if (!hp) return;
     reinterpret_cast<meow::deepseek::Handle*>(hp)->current_pos = 0;
@@ -441,11 +453,30 @@ extern "C" int sk_deepseek_forward(sk_deepseek_handle* hp,
     mp.rope_scaling_factor   = h->cfg.rope_scaling_factor;
     mp.first_k_dense_replace = h->cfg.first_k_dense_replace;
 
+    // SK_DS_PROFILE: per-category GPU-time accumulation across decode tokens.
+    // dispatch_model commits a sub-command-buffer at each category boundary and
+    // reopens `cmd`; off by default → a single command buffer per token.
+    static bool prof_inited = false;
+    if (!prof_inited) {
+        const char* pe = getenv("SK_DS_PROFILE");
+        meow::deepseek::prof().on = (pe != nullptr && pe[0] != '\0' && pe[0] != '0');
+        prof_inited = true;
+    }
+    static uint64_t prof_tokens = 0;
+
     auto* cmd = q->commandBuffer();
+    cmd->retain();   // balanced by the release below regardless of prof path
     meow::deepseek::dispatch_model(cmd, h->psos, h->weights, h->bufs, mp);
     cmd->commit();
     cmd->waitUntilCompleted();
     cmd->release();
+
+    if (meow::deepseek::prof().on) {
+        prof_tokens += seq;
+        const char* every = getenv("SK_DS_PROFILE_EVERY");
+        uint64_t n = every ? (uint64_t)atoll(every) : 0;
+        if (n && prof_tokens % n == 0) meow::deepseek::prof().report(prof_tokens);
+    }
 
     h->current_pos += seq;
 

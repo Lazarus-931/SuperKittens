@@ -460,11 +460,43 @@ extern "C" int sk_deepseek_load_from_store(sk_deepseek_handle* hp, sk::WeightSto
     if (!realloc_slab(&h->weights.w_shared_gate, quant_sg, h->weights.dt_sh_gate, (size_t)sni * dm)) return -3;
     if (!realloc_slab(&h->weights.w_shared_up,   quant_su, h->weights.dt_sh_up,   (size_t)sni * dm)) return -3;
 
-    // Per-layer shared-down dtype (Q4_K_M alternates Q4_K/Q6_K). Kept fp16 here
-    // (mixed-dtype slab adds risk for ~0.2 GB; gate/up + attn carry the win).
+    // Shared-expert down (ffn_down_shexp) GGUF dtype alternates Q4_K/Q6_K per
+    // layer. The legacy path host-dequant'd it to fp16 and ran the dense
+    // gemm_fp16 at M=1 — measured ~10.9 ms/tok (30% of decode), ~3× the cost of
+    // the Q4_K gate/up matvec of the same width. Keep each layer's NATIVE GGUF
+    // blocks (Q4_K or Q6_K) and route the proven q4k_matvec/q6k_matvec (both
+    // exercised by gate/up + LM-head). Uniform per-layer slot stride = Q6_K
+    // bytes (the larger of the two) so the slab is indexed L*slot; a Q4_K layer
+    // packs its rows at Q4_K density from the slot base (tail unused). This adds
+    // no quantization step (lossless vs source) and drops ~0.18 GB vs fp16.
+    // SK_DS_SHDOWN_FP16=1 forces the legacy fp16 path (A/B).
+    const bool shdown_fp16 = (std::getenv("SK_DS_SHDOWN_FP16") != nullptr) || force_fp16;
     static std::vector<sk::Dtype> sh_down_dt;
     sh_down_dt.assign(c.n_layers, sk::Dtype::F16);
+    const size_t sh_down_slot = sk::dtype_bytes(sk::Dtype::Q6_K, (size_t)dm * sni);
+    if (!shdown_fp16) {
+        for (uint32_t L = 0; L < c.n_layers; ++L) {
+            if (L < (uint32_t)c.first_k_dense_replace) continue;  // dense: no shexp
+            auto* v = store->get(blk_key(L, "ffn_down_shexp.weight"));
+            sh_down_dt[L] = (v && is_quant_matvec(v->dtype)) ? v->dtype : sk::Dtype::F16;
+        }
+        // If any layer isn't a supported quant matvec dtype, fall back to fp16.
+        bool all_quant = true;
+        for (uint32_t L = (uint32_t)c.first_k_dense_replace; L < c.n_layers; ++L)
+            if (!is_quant_matvec(sh_down_dt[L])) { all_quant = false; break; }
+        if (all_quant) {
+            const size_t want = (size_t)c.n_layers * sh_down_slot;
+            if (h->weights.w_shared_down) h->weights.w_shared_down->release();
+            h->weights.w_shared_down = dev->newBuffer(want, MTL::ResourceStorageModeShared);
+            if (!h->weights.w_shared_down) return -3;
+            std::memset(h->weights.w_shared_down->contents(), 0, want);
+        } else {
+            for (auto& d : sh_down_dt) d = sk::Dtype::F16;   // revert to fp16 path
+        }
+    }
     h->weights.dt_sh_down_per_L = sh_down_dt.data();
+    const bool shdown_quant = !shdown_fp16 && is_quant_matvec(sh_down_dt[c.first_k_dense_replace]);
+    h->weights.sh_down_uniform_q6k_slot = shdown_quant;
 
     // LM head: keep Q6_K (largest per-token read) + q6k_matvec. Numerically
     // identical to the fp16 transB=1 head, just dequantized in-kernel.
@@ -592,8 +624,7 @@ extern "C" int sk_deepseek_load_from_store(sk_deepseek_handle* hp, sk::WeightSto
         }
 
         // Shared gate/up: GGUF stores [out=sni, in=dm] row-major = matvec layout.
-        // Kept quantized (Q4_K) + native matvec. Shared down stays fp16 (its
-        // GGUF dtype alternates Q4_K/Q6_K per layer; mixed slab deferred).
+        // Kept quantized (Q4_K) + native matvec.
         if (quant_sg) {
             const size_t sg_qoff = (size_t)L * sk::dtype_bytes(h->weights.dt_sh_gate, (size_t)sni * dm);
             if (!copy_quant_layer(h->weights.w_shared_gate, sg_qoff, store,
@@ -606,7 +637,14 @@ extern "C" int sk_deepseek_load_from_store(sk_deepseek_handle* hp, sk::WeightSto
                            blk_key(L, "ffn_up_shexp.weight"), h->weights.dt_sh_up, (size_t)sni * dm)) return -31;
         } else if (!copy_transpose_fp16(h->weights.w_shared_up, sh_gate_off, store,
                        blk_key(L, "ffn_up_shexp.weight"), dm, sni)) return -31;
-        if (!copy_transpose_fp16(h->weights.w_shared_down, sh_down_off, store,
+        if (shdown_quant) {
+            // Native Q4_K/Q6_K blocks at the uniform Q6_K-sized slot. GGUF stores
+            // ffn_down_shexp [out=dm, in=sni] row-major = the q{4,6}k_matvec
+            // [N=dm, K=sni] layout, so raw block copy (no transpose/dequant).
+            const size_t sh_down_qoff = (size_t)L * sh_down_slot;
+            if (!copy_quant_layer(h->weights.w_shared_down, sh_down_qoff, store,
+                           blk_key(L, "ffn_down_shexp.weight"), sh_down_dt[L], (size_t)dm * sni)) return -32;
+        } else if (!copy_transpose_fp16(h->weights.w_shared_down, sh_down_off, store,
                        blk_key(L, "ffn_down_shexp.weight"), sni, dm)) return -32;
         // Router W: moe_router reads W[D,N] (logit[e]=Σ_d x[d]·W[d,e]); GGUF
         // ffn_gate_inp logical [N=E, D] → transpose to [D, E].
