@@ -635,8 +635,16 @@ extern "C" int sk_gemma4_load_gguf(sk_gemma4_handle* hp, const char* path) {
         };
         if (h->weights.w_embed) {
             auto* dst = (uint16_t*)h->weights.w_embed->contents();
+            std::fprintf(stderr, "gemma4 EMBED-DBG: dtype=%d nbytes=%zu n_embed=%zu w_embed.len=%zu vocab=%u dm=%zu\n",
+                (int)v->dtype, v->nbytes, n_embed, h->weights.w_embed->length(), c.vocab_size, dm);
             if (!deq_range(dst, 0, n_embed)) { std::fprintf(stderr, "gemma4 gguf: bad token_embd dtype\n"); return -11; }
             scale_bf16_inplace(dst, n_embed, esc);
+            {
+                double s=0; size_t nzr=0;
+                for (size_t i=0;i<dm;++i){ uint16_t bb=dst[107*dm+i]; if(bb&0x7fff)nzr++; }
+                std::fprintf(stderr, "gemma4 EMBED-DBG: row107 nnz=%zu/%zu  row0[0..3]=%04x %04x %04x %04x\n",
+                    nzr, dm, dst[0],dst[1],dst[2],dst[3]);
+            }
         } else {
             if (!h->weights.w_lm_head_q8) { std::fprintf(stderr, "gemma4 gguf: EMBED_Q8 but no lm_head_q8\n"); return -11; }
             auto* q8dst = (uint8_t*)h->weights.w_lm_head_q8->contents();
