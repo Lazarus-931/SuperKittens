@@ -99,4 +99,10 @@ chase improvements, iterate on wins, never stop until the user says stop.
 | 40 | GQA amortization audit (mha_causal) — guard against regressions | LOW | TODO | |
 
 ## Log (newest first)
-- **[init]** Campaign branch `dev-sk-redesign` created off main 49f9174. development/PROGRESS.md seeded with operating model + 40-item backlog. Launching first wave (items 1, 8, 12–14, 17, 3).
+- **[wave-1 launch]** 5 worktree-isolated agents in flight (push own branch to remote; PR-only to main; bench derek/amelia, lexie down):
+  - #1 Fused qkv-norm-rope T1 kernel — `ae697bf8e4d955340` — branch `dev-sk-qkv-rope-fusion`
+  - #8 Batched GEMM (simdgroup_matrix MMA, seq>1; prefill/spec/DeepSeek-T>1 unblock) — `a0494e7e14793d0b5` — `dev-sk-batched-gemm`
+  - #12–14 DeepSeek-V2-Lite numerics→coherence + GPU-OOB (base dev-deepseek-e2e) — `a6583284df8beb960` — `dev-sk-deepseek-fix`
+  - #17 KV-cache quantization Q8_0 (short+long-ctx bench) — `a8c90d39fb2f2408a` — `dev-sk-kv-quant`
+  - #3 ICB multi-layer batching (measure the unmeasured ICB win) — `a629b5aecd7b79de6` — `dev-sk-icb-batch`
+- **[init]** Campaign branch `dev-sk-redesign` created off main 49f9174. PROGRESS.md seeded with operating model + 40-item backlog.
