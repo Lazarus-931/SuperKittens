@@ -40,7 +40,7 @@ chase improvements, iterate on wins, never stop until the user says stop.
 ### B. Batched GEMM / seq>1 (the big architectural lever)
 | # | Item | Pri | Status | Notes |
 |---|------|-----|--------|-------|
-| 8 | simdgroup_matrix (MMA 8×8) batched GEMM for seq>1 | HIGHEST | TODO | unblocks prefill+spec+DeepSeek-T>1 |
+| 8 | simdgroup_matrix (MMA 8×8) batched GEMM for seq>1 | HIGHEST | **WIN PR#55** | gemm_mma f16/q8_0/q4k; prefill 1.5-2.6× (Q8_0), sub-linear in seq; 72/72 numerics; decode unchanged (M==1→matvec) |
 | 9 | Prefill attention path T>1 (qwen + MLA) | HIGH | TODO | DeepSeek T>1 hangs today |
 | 10 | Spec-decode e2e (draft+target) after #8 | HIGH | TODO | 1.6–1.9× accept ceiling |
 | 11 | Chunked prefill using fixed mha_causal (PR #54) | MED | TODO | |
@@ -99,6 +99,8 @@ chase improvements, iterate on wins, never stop until the user says stop.
 | 40 | GQA amortization audit (mha_causal) — guard against regressions | LOW | TODO | |
 
 ## Log (newest first)
+- **[wave-1.1 follow-ups on #8]** `a0c01433283a43002` (#10 spec-decode re-test on dev-sk-batched-gemm → branch dev-sk-spec-decode) + `aa44764c981d38d20` (#8-ext: Q6_K/bf16 MMA loaders + Q4_K scale-cache + prefill-e2e/TTFT → branch dev-sk-gemm-mma-ext). Fleet now 6 in flight: #1 ae697b, #3 a629b5, #12 a65832, #17 a8c90d, #10 a0c014, #8-ext aa4476.
+- **[#8 WIN — batched GEMM]** `a0494e7e14793d0b5` done → `gemm_mma.metal` (f16/q8_0/q4k, simdgroup_float8x8, BM8×BN32×BK32, weight tile reused M-fold). Wired into qwen prefill (M>1→MMA, M==1→matvec; SK_NO_GEMM_MMA flag). **Numerics 72/72 ≤1e-3** (M=1..100). **Prefill amelia: Q8_0 1.5-2.6×, Q4_K 1.25-1.59×; per-position sub-linear (seq=8≈seq=1 cost, seq=128≈8-13× not 128×).** Branch `dev-sk-batched-gemm` pushed, **PR #55** open (not merged — for review). Unblocks: #10 spec-decode (should flip 0.54×), #9/#16 DeepSeek+qwen T>1 prefill e2e, Q6_K/bf16 MMA loaders, last-row-only LM head. Launching follow-ups: spec-decode re-test + gemm_mma dtype-extension/prefill-e2e.
 - **[wave-1 launch]** 5 worktree-isolated agents in flight (push own branch to remote; PR-only to main; bench derek/amelia, lexie down):
   - #1 Fused qkv-norm-rope T1 kernel — `ae697bf8e4d955340` — branch `dev-sk-qkv-rope-fusion`
   - #8 Batched GEMM (simdgroup_matrix MMA, seq>1; prefill/spec/DeepSeek-T>1 unblock) — `a0494e7e14793d0b5` — `dev-sk-batched-gemm`
