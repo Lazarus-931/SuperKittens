@@ -38,8 +38,8 @@ typedef struct {
     uint32_t chunk_size;     // 256
     uint32_t vocab_size;     // 50288
     float    rms_eps;        // 1e-5 (HF default)
-    float    time_step_min;  // softplus dt clamp lower (HF default 0.001)
-    float    time_step_max;  // softplus dt clamp upper (HF default 0.1)
+    float    dt_limit_min;   // HF time_step_limit[0] (default 0.0)
+    float    dt_limit_max;   // HF time_step_limit[1] (default +inf)
     uint32_t tie_word_embeddings;  // 1
 } sk_mamba2_config;
 

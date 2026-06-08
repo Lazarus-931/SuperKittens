@@ -23,6 +23,7 @@ namespace meow { namespace mamba2 {
 struct Handle {
     sk_mamba2_config cfg;
     uint32_t       current_pos;
+    uint32_t       last_seq;
     ModelPSOs      psos;
     ModelWeights   weights;
     ModelBuffers   bufs;

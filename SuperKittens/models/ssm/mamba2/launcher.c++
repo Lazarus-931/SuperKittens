@@ -18,6 +18,7 @@ namespace meow { namespace mamba2 {
 struct Handle {
     sk_mamba2_config cfg;
     uint32_t       current_pos = 0;
+    uint32_t       last_seq    = 0;   // T of the most recent forward (logits row = T-1)
     ModelPSOs    psos;
     ModelWeights weights;
     ModelBuffers bufs;
@@ -36,9 +37,11 @@ static bool resolve_psos(ModelPSOs& P) {
     P.layer.gemm         = sk::bindings_pso("gemm_fp16");
     P.layer.split_packed = sk::bindings_pso("split_packed");
     P.layer.conv1d_silu  = sk::bindings_pso("conv1d_silu");
-    // Prefer the reference (HF-signature-correct) kernels; fall back to legacy.
-    P.layer.mamba2_ssd   = sk::bindings_pso("mamba2_ssd_ref");
-    if (!P.layer.mamba2_ssd) P.layer.mamba2_ssd = sk::bindings_pso("mamba2_ssd");
+    P.layer.conv1d_silu_step   = sk::bindings_pso("conv1d_silu_step");
+    P.layer.conv_state_capture = sk::bindings_pso("conv_state_capture");
+    // Production SSD; ref kernel (same signature) is the numerical fallback.
+    P.layer.mamba2_ssd   = sk::bindings_pso("mamba2_ssd");
+    if (!P.layer.mamba2_ssd) P.layer.mamba2_ssd = sk::bindings_pso("mamba2_ssd_ref");
     P.layer.mamba2_step  = sk::bindings_pso("mamba2_step_ref");
     if (!P.layer.mamba2_step) P.layer.mamba2_step = sk::bindings_pso("mamba2_step");
     P.layer.gate_norm    = sk::bindings_pso("gate_norm");
@@ -58,6 +61,9 @@ static bool resolve_psos(ModelPSOs& P) {
     // ssd/step/split_packed/add are nice-to-have; warn only.
     if (!P.layer.mamba2_ssd)  std::fprintf(stderr, "mamba2 launcher: WARN no mamba2_ssd PSO\n");
     if (!P.layer.mamba2_step) std::fprintf(stderr, "mamba2 launcher: WARN no mamba2_step PSO\n");
+    // Without these the launcher falls back to O(T^2) re-prefill decode.
+    if (!P.layer.conv1d_silu_step)   std::fprintf(stderr, "mamba2 launcher: WARN no conv1d_silu_step PSO (no O(1) decode)\n");
+    if (!P.layer.conv_state_capture) std::fprintf(stderr, "mamba2 launcher: WARN no conv_state_capture PSO (no O(1) decode)\n");
     #undef _CK
     return true;
 }
@@ -122,7 +128,9 @@ extern "C" sk_mamba2_handle* sk_mamba2_create(const sk_mamba2_config* cfg) {
     h->bufs.ssd_out       = alloc_zero(dev, T_max * E * fp16);
     h->bufs.gated         = alloc_zero(dev, T_max * E * fp16);
     h->bufs.out_proj_out  = alloc_zero(dev, T_max * D * fp16);
-    h->bufs.logits        = alloc_zero(dev, (size_t)cfg->vocab_size * fp16);
+    // LM head GEMM writes all T rows; the (T-1) row read by argmax/get_last_logits
+    // is OOB if this is sized for one row only.
+    h->bufs.logits        = alloc_zero(dev, T_max * (size_t)cfg->vocab_size * fp16);
 
     // 2-pass argmax scratch.
     {
@@ -140,6 +148,7 @@ extern "C" void sk_mamba2_reset(sk_mamba2_handle* hp) {
     if (!hp) return;
     auto* h = reinterpret_cast<meow::mamba2::Handle*>(hp);
     h->current_pos = 0;
+    h->last_seq = 0;
     for (auto& s : h->layer_states) {
         if (s.conv_state) std::memset(s.conv_state->contents(), 0, s.conv_state->length());
         if (s.ssm_state)  std::memset(s.ssm_state->contents(),  0, s.ssm_state->length());
@@ -173,8 +182,8 @@ extern "C" int sk_mamba2_forward(sk_mamba2_handle* hp,
     mp.chunk_size   = h->cfg.chunk_size;
     mp.vocab_size   = h->cfg.vocab_size;
     mp.eps          = h->cfg.rms_eps;
-    mp.dt_min       = h->cfg.time_step_min;
-    mp.dt_max       = h->cfg.time_step_max;
+    mp.dt_min       = h->cfg.dt_limit_min;
+    mp.dt_max       = h->cfg.dt_limit_max;
 
     // Use a single shared device buffer for output_id (1 int32).
     static MTL::Buffer* s_out_id = nullptr;
@@ -192,6 +201,7 @@ extern "C" int sk_mamba2_forward(sk_mamba2_handle* hp,
     cmd->release();
 
     h->current_pos += seq;
+    h->last_seq = seq;
     int32_t v;
     std::memcpy(&v, s_out_id->contents(), sizeof(int32_t));
     *output_id = (int)v;
@@ -202,12 +212,11 @@ extern "C" int sk_mamba2_get_last_logits(sk_mamba2_handle* hp, void* out_fp16) {
     if (!hp || !out_fp16) return -1;
     auto* h = reinterpret_cast<meow::mamba2::Handle*>(hp);
     const size_t V = h->cfg.vocab_size;
-    // The last forward dispatched argmax on row (T-1). We need to know T.
-    // We don't track T across calls explicitly; in single-prompt usage T is
-    // the most recent seq. Conservatively the caller should know — they pass
-    // out_fp16 sized V*2 and we copy from offset (current_pos - 1) * V * 2.
-    if (h->current_pos == 0) return -2;
-    const size_t row = (size_t)(h->current_pos - 1);
+    // dispatch_model writes the LM head for all T rows of the most recent
+    // forward and argmaxes row (T-1). For O(1) decode T=1, so that row is 0 —
+    // tracking last_seq (not current_pos) keeps this in-bounds across steps.
+    if (h->last_seq == 0) return -2;
+    const size_t row = (size_t)(h->last_seq - 1);
     const char* src = (const char*)h->bufs.logits->contents() + row * V * 2;
     std::memcpy(out_fp16, src, V * 2);
     return 0;

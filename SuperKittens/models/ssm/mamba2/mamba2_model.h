@@ -25,6 +25,7 @@
 
 #include <Metal/Metal.hpp>
 #include <cstdint>
+#include <cmath>
 
 namespace meow {
 namespace mamba2 {
@@ -41,8 +42,9 @@ struct LayerParams {
     uint32_t conv_kernel  = 4;
     uint32_t chunk_size   = 256;
     float    eps          = 1e-5f;
-    float    dt_min       = 0.001f;
-    float    dt_max       = 0.1f;
+    // HF time_step_limit (default (0, inf)); time_step_{min,max} only bound dt_bias init.
+    float    dt_min       = 0.0f;
+    float    dt_max       = INFINITY;
 
     uint32_t layer_idx    = 0;
     uint32_t is_decode    = 0;      // 0 = prefill (chunked SSD), 1 = decode (single-step)
@@ -55,6 +57,8 @@ struct LayerPSOs {
     MTL::ComputePipelineState* gemm;          // gemm_fp16 (M=1 fast-path for decode)
     MTL::ComputePipelineState* split_packed;
     MTL::ComputePipelineState* conv1d_silu;
+    MTL::ComputePipelineState* conv1d_silu_step = nullptr;   // O(1) decode conv
+    MTL::ComputePipelineState* conv_state_capture = nullptr; // prefill conv_state init
     MTL::ComputePipelineState* mamba2_ssd;    // prefill chunked associative scan
     MTL::ComputePipelineState* mamba2_step;   // decode per-token recurrence
     MTL::ComputePipelineState* gate_norm;     // SiLU(z) * RMSNorm(y) γ
@@ -200,6 +204,44 @@ inline void encode_conv1d_silu(
     enc->endEncoding();
 }
 
+inline void encode_conv1d_silu_step(
+    MTL::CommandBuffer* cmd, MTL::ComputePipelineState* pso,
+    MTL::Buffer* x_new, MTL::Buffer* w, size_t off_w,
+    MTL::Buffer* bias, size_t off_b,
+    MTL::Buffer* y, MTL::Buffer* conv_state,
+    uint32_t Bn, uint32_t C, uint32_t K)
+{
+    auto* enc = cmd->computeCommandEncoder();
+    enc->setComputePipelineState(pso);
+    enc->setBuffer(x_new,      0,     0);
+    enc->setBuffer(w,          off_w, 1);
+    enc->setBuffer(bias,       off_b, 2);
+    enc->setBuffer(y,          0,     3);
+    enc->setBuffer(conv_state, 0,     4);
+    enc->setBytes(&Bn, 4, 5);
+    enc->setBytes(&C,  4, 6);
+    enc->setBytes(&K,  4, 7);
+    enc->dispatchThreads(MTL::Size(C, Bn, 1), MTL::Size(128, 1, 1));
+    enc->endEncoding();
+}
+
+inline void encode_conv_state_capture(
+    MTL::CommandBuffer* cmd, MTL::ComputePipelineState* pso,
+    MTL::Buffer* x, MTL::Buffer* conv_state,
+    uint32_t Bn, uint32_t L, uint32_t C, uint32_t K)
+{
+    auto* enc = cmd->computeCommandEncoder();
+    enc->setComputePipelineState(pso);
+    enc->setBuffer(x,          0, 0);
+    enc->setBuffer(conv_state, 0, 1);
+    enc->setBytes(&Bn, 4, 2);
+    enc->setBytes(&L,  4, 3);
+    enc->setBytes(&C,  4, 4);
+    enc->setBytes(&K,  4, 5);
+    enc->dispatchThreads(MTL::Size(C, K - 1, Bn), MTL::Size(128, 1, 1));
+    enc->endEncoding();
+}
+
 inline void encode_gate_norm(
     MTL::CommandBuffer* cmd, MTL::ComputePipelineState* pso,
     MTL::Buffer* ssm_out, MTL::Buffer* z,
@@ -309,10 +351,21 @@ inline void dispatch_layer(
     encode_split(cmd, P.split_packed, b.xBC_post, b.xBC, b.dt_raw,
                  T, C_in, H);
 
-    // 4. conv1d + silu on xBC (B=1, L=seq, C=C_in).
-    encode_conv1d_silu(cmd, P.conv1d_silu, b.xBC, b.w_conv, off_conv,
-                       b.w_conv_b, off_convb, b.xBC_post,
-                       p.batch, p.seq, C_in);
+    // 4. conv1d + silu on xBC (C = C_in). Decode (L=1) reads + rolls the carried
+    //    (K-1)-token conv_state; prefill convolves the whole seq (state starts
+    //    empty) and captures its last K-1 tokens for the first decode step.
+    if (p.is_decode && P.conv1d_silu_step && P.conv_state_capture) {
+        encode_conv1d_silu_step(cmd, P.conv1d_silu_step, b.xBC, b.w_conv, off_conv,
+                                b.w_conv_b, off_convb, b.xBC_post, b.conv_state,
+                                p.batch, C_in, K);
+    } else {
+        encode_conv1d_silu(cmd, P.conv1d_silu, b.xBC, b.w_conv, off_conv,
+                           b.w_conv_b, off_convb, b.xBC_post,
+                           p.batch, p.seq, C_in);
+        if (P.conv_state_capture)
+            encode_conv_state_capture(cmd, P.conv_state_capture, b.xBC, b.conv_state,
+                                      p.batch, p.seq, C_in, K);
+    }
 
     // 5. SSD reference. xBC_post layout: [x(T,E) | B(T,G*N) | C(T,G*N)] flat.
     const size_t off_x_in = 0;
@@ -338,6 +391,7 @@ inline void dispatch_layer(
         enc->setBytes(&Nv,       4, 14);
         enc->setBytes(&p.dt_min, 4, 15);
         enc->setBytes(&p.dt_max, 4, 16);
+        enc->setBytes(&C_in,     4, 17);   // x/B/C share the interleaved C_in token stride
         enc->dispatchThreadgroups(MTL::Size(p.batch * H, Pd, 1),
                                   MTL::Size(Nv, 1, 1));
         enc->endEncoding();
@@ -371,8 +425,8 @@ struct ModelParams {
     uint32_t chunk_size   = 256;
     uint32_t vocab_size   = 50288;
     float    eps          = 1e-5f;
-    float    dt_min       = 0.001f;
-    float    dt_max       = 0.1f;
+    float    dt_min       = 0.0f;
+    float    dt_max       = INFINITY;
 };
 
 inline void dispatch_model(

@@ -1,15 +1,107 @@
 # Mamba 2 SK port — STATUS
 
-## KNOWN BROKEN
+## END-TO-END COHERENT (dev-sk-mamba2-e2e)
 
-`mamba2_ssd.metal` is numerically incorrect and is **not** used by the launcher.
-Missing: softplus(dt + dt_bias), `dt * B * x` input gating, `D * x` skip,
-n_groups sharing for B/C. Signature takes `(Q, K, V, A_log[B,H,L])` — does not
-match HF Mamba2 SSD.
+mamba2-130m (`AntonV/mamba2-130m-hf`) generates **token-for-token identical**
+output to HF `torch_forward` greedy. Verified on 4 prompts (33/33, 35/35, 34/34,
+37/37 token match). Prompt "Hi" →
+`"Hi, I'm a newbie here. I'm a student at the University of California, Berkeley..."`.
+Prompt logits rel_L2 = 0.0008 vs HF (was 0.147 before the dt-clamp fix). Argmax 13.
+Decode probe ~50 tok/s on this laptop (HF fp32 baseline 14.48).
 
-The launcher routes around it to `mamba2_ssd_ref.metal` / `mamba2_step_ref.metal`
-(per-token recurrence, signature-correct). The chunked `mamba2_ssd.metal` needs
-a full rewrite before it can replace the ref path.
+Three bugs fixed to close the loop (all in the prefill SSD + LM-head path):
+
+1. **dt clamp** — launcher clamped dt to `time_step_{min,max}` = (0.001, 0.1).
+   Those only bound `dt_bias` init in HF; the *runtime* clamp is
+   `time_step_limit` = (0, inf). Now plumbed through as `dt_limit_{min,max}`
+   (config → C ABI → kernels). The kernels gate the +inf upper bound on a 1e30
+   sentinel (Metal compiles `-no-infs-fp-math`, so `clamp(x, 0, inf)` is unsafe).
+
+2. **interleaved x/B/C token stride** — both `mamba2_ssd.metal` and
+   `mamba2_ssd_ref.metal` indexed x with token-stride `H*P` and B/C with `G*N`,
+   but the launcher hands them ONE interleaved `[x(E)|B(G*N)|C(G*N)]` buffer
+   whose per-token stride is `C_in = E + 2*G*N`. Correct only for t=0; every
+   later token read the wrong region. Added an `XBC_stride` (=C_in) param.
+
+3. **logits buffer under-allocated** — `bufs.logits` was sized for ONE row but
+   the LM-head GEMM writes all T rows; the (T-1) row read by argmax /
+   get_last_logits was OOB → garbage/zero. Now `T_max * vocab_size`.
+
+## O(1) DECODE — LANDED (dev-sk-mamba2-conv1d)
+
+`Mamba2Model.generate` now prefills the prompt once, then runs **one token per
+step** (no re-prefill). Token-for-token identical to the prior O(T^2) re-prefill
+path **and** to HF `torch_forward` greedy (5 prompts, 64/64 each).
+
+The only missing piece was conv decode-state carry — the SSM kernels
+(`mamba2_ssd` / `_ref`) already read+persist `ssm_state`, so an L=1 forward
+continues the recurrence correctly. Two small kernels in `conv1d_silu.metal`
+close the loop:
+
+- `conv_state_capture` — after a prefill, stores that layer's last `K-1`
+  pre-conv `xBC` tokens into `LayerState.conv_state` (left-zero-padded when
+  `L < K-1`, matching HF `Mamba2Cache.update_conv_state(cache_init=True)`).
+- `conv1d_silu_step` — for an L=1 decode, convolves the new pre-conv token
+  against the carried `(K-1)`-token window, then rolls the window (drop oldest,
+  append the new token). Mirrors HF `causal_conv1d_update`.
+
+`dispatch_layer` branches on `is_decode` (= `seq==1`): prefill runs
+`conv1d_silu` + `conv_state_capture`; decode runs `conv1d_silu_step`.
+`get_last_logits` now keys its row off `last_seq` (=1 for decode), not
+`current_pos`, so the (T-1) logits row stays in bounds across steps.
+
+**Decode tok/s (this Mac, prompt "The history of the Roman empire", greedy):**
+
+| new tokens | O(T^2) re-prefill | O(1) | speedup |
+|-----------:|------------------:|-----:|--------:|
+| 32  | 31.3 | 49.0 | 1.57x |
+| 64  | 27.1 | 50.6 | 1.86x |
+| 128 | 17.0 | 43.0 | 2.53x |
+| 256 |  6.3 | 29.0 | 4.59x |
+
+The O(1) path holds roughly constant tok/s (mild decay = per-step CPU/dispatch
+overhead, 24 layer + LM-head dispatches synced per token); the re-prefill path
+collapses quadratically. Lab: `temp/mamba2_conv1d/` (gitignored) —
+`validate.py` (generate vs HF), `validate_o1.py` (o1 == reprefill == HF),
+`bench_len.py` (length sweep).
+
+## SSD kernel — FIXED (dev-sk-mamba2-ssd-fix)
+
+`mamba2_ssd.metal` was rewritten to the HF-correct signature
+(`x, dt_raw, A_log, B, C, D, dt_bias → y, ssm_state`) — same buffer layout as
+`mamba2_ssd_ref` so the launcher binds it unchanged. It now does
+softplus(dt + dt_bias) clamp, `dt * B * x` input gating, `D * x` skip, and
+n_groups B/C sharing.
+
+Design: grid `(B*H, P)`, one simdgroup (32 lanes) per (h,p) row, N/32 state
+elements per lane held in registers, per-token `C·s` reduction via a single
+`simd_sum` (no threadgroup barriers, no shared state). Algebraically the same
+selective-state recurrence as the ref and as HF `torch_forward`.
+
+The launcher now prefers `mamba2_ssd` (ref kernel is the numerical fallback).
+The legacy Q/K/V `sk_mamba2_ssd*` / `sk_mamba2_step` C stubs in `mamba2.{c++,h}`
+were removed (they would misbind the new signature; nothing referenced them).
+
+**Validation (local, this Mac, vs numpy oracle + HF + ref kernel):**
+- numpy oracle cross-checked against real HF `Mamba2Mixer.torch_forward`: rel_y
+  ~4e-8 (so the oracle is faithful).
+- new kernel vs oracle: **rel_y ≤ 2.1e-4** (fp16 output noise), fp32 state
+  rel ≤ 7e-7, across L ∈ {16,128,200,255,256,257,300,512,600,700} — incl.
+  L = chunk_size and L > chunk_size. Also n_groups=2 and batch=2 pass.
+- new vs ref kernel: rel_y ~4e-6; state-carry (prefill → decode steps) is
+  **bit-exact** vs one-shot.
+- argmax equivalence through an out_proj→lm_head-shaped fp16 projection:
+  **0 / 12296 token-position mismatches** vs the ref kernel ⇒ swapping kernels
+  cannot change a generated token, so the ref path's known HF-argmax-match /
+  coherent decode (see below) carries over unchanged.
+
+**Perf (single-layer SSD op, GPU-timed, min-of-reps, this Mac):**
+- new vs ref: **2.37x @ L=64, 2.65x @ L=256, 2.73x @ L=1024** (eliminates the
+  ref's per-token tree-reduction + scalar-broadcast threadgroup barriers).
+
+Lab: `temp/mamba2_ssd_fix/` (gitignored) — `ssd_ref_np.py` (oracle),
+`check_vs_hf.py`, `validate.py` / `validate_full.py`, `argmax_equiv.py`,
+`bench_ssd.py`, `metal_runner.py` (runtime-compile harness).
 
 ---
 
@@ -106,8 +198,8 @@ Need (mirroring qwen/qwen_model.h, qwen/launcher.{h,c++}, qwen/weights.{h,c++}):
 SuperKittens/models/ssm/mamba2/
 ├── conv1d_silu.metal      # usable
 ├── gate_norm.metal        # usable
-├── mamba2_ssd.metal       # signature wrong (needs rewrite per HF L398-586)
-├── mamba2_step.metal      # signature wrong (needs rewrite for decode)
+├── mamba2_ssd.metal       # FIXED: HF-correct sig, simd_sum scan (= ref, ~2.7x faster)
+├── mamba2_step.metal      # legacy Q/K/V sig (unused; decode uses mamba2_step_ref)
 ├── mamba2_block.h         # partial scaffold, not used yet
 ├── mamba2.{c++,h,py}      # legacy stubs, replace with launcher.{c++,h} + mamba2.py
 └── STATUS.md              # this file
