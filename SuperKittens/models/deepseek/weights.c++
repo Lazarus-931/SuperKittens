@@ -603,30 +603,35 @@ extern "C" int sk_deepseek_load_from_store(sk_deepseek_handle* hp, sk::WeightSto
             std::memcpy((char*)h->weights.w_gate->contents() + gate_off, gv->data, gate_bytes_per_layer);
             std::memcpy((char*)h->weights.w_up->contents()   + gate_off, uv->data, gate_bytes_per_layer);
 
-            // down_exps dtype varies per layer (Q8_0 / Q5_0 in Q4_K_M). Requantize
-            // to a uniform Q8_0 so the q8_0 per-expert matvec sees one layout.
-            // Process row-by-row off the mmap'd source so the fp32 temp stays
-            // tiny — a whole-layer f32 buffer is ~0.7 GB and OOMs the 16 GB box.
+            // down_exps target is Q8_0 (the q8_0 per-expert matvec layout, 34 B/32
+            // weights). n_int=1408 (5.5 superblocks) rules out the 256-aligned
+            // K-quants for down, so Q8_0 is its smallest kernel-supported dtype.
             {
                 const size_t rows = (size_t)E * dm;        // each row length ni
                 const size_t row_bytes = (ni / 32) * 34;   // Q8_0 bytes/row
                 uint8_t* d = (uint8_t*)h->weights.w_down->contents() + down_off;
                 const uint8_t* src = (const uint8_t*)dv2->data;
-                // Source bytes-per-row depends on the source quant.
-                size_t src_row_bytes = 0;
-                if (dv2->dtype == sk::Dtype::Q8_0)      src_row_bytes = (ni / 32) * 34;
-                else if (dv2->dtype == sk::Dtype::Q5_0) src_row_bytes = (ni / 32) * 22;
-                else if (dv2->dtype == sk::Dtype::Q6_K) src_row_bytes = (ni / 256) * 210;
-                else if (dv2->dtype == sk::Dtype::Q4_K) src_row_bytes = (ni / 256) * 144;
-                std::vector<float> row(ni);
-                for (size_t r = 0; r < rows; ++r) {
-                    const uint8_t* srow = src + r * src_row_bytes;
-                    if (dv2->dtype == sk::Dtype::Q8_0)      dequant_q8_0_to_f32(row.data(), srow, ni);
-                    else if (dv2->dtype == sk::Dtype::Q5_0) dequant_q5_0_to_f32(row.data(), srow, ni);
-                    else if (dv2->dtype == sk::Dtype::Q6_K) dequant_q6_k_to_f32(row.data(), srow, ni);
-                    else if (dv2->dtype == sk::Dtype::Q4_K) dequant_q4_k_to_f32(row.data(), srow, ni);
+                if (dv2->dtype == sk::Dtype::Q8_0) {
+                    // Q4_K_M down_exps is already Q8_0: raw-copy the block bytes.
+                    // The prior dequant→requant round-trip was identity-on-bytes
+                    // but allocated a per-row fp32 temp and burned CPU at load.
+                    std::memcpy(d, src, rows * row_bytes);
+                } else {
+                    // Non-Q8_0 source (other quant mixes): requant row-by-row off
+                    // the mmap so the fp32 temp stays one row, not a ~0.7 GB slab.
+                    size_t src_row_bytes = 0;
+                    if (dv2->dtype == sk::Dtype::Q5_0)      src_row_bytes = (ni / 32) * 22;
+                    else if (dv2->dtype == sk::Dtype::Q6_K) src_row_bytes = (ni / 256) * 210;
+                    else if (dv2->dtype == sk::Dtype::Q4_K) src_row_bytes = (ni / 256) * 144;
                     else { std::fprintf(stderr, "ds weights: down_exps L%u unsupported dtype\n", L); return -36; }
-                    quantize_row_q8_0(d + r * row_bytes, row.data(), ni);
+                    std::vector<float> row(ni);
+                    for (size_t r = 0; r < rows; ++r) {
+                        const uint8_t* srow = src + r * src_row_bytes;
+                        if (dv2->dtype == sk::Dtype::Q5_0)      dequant_q5_0_to_f32(row.data(), srow, ni);
+                        else if (dv2->dtype == sk::Dtype::Q6_K) dequant_q6_k_to_f32(row.data(), srow, ni);
+                        else                                    dequant_q4_k_to_f32(row.data(), srow, ni);
+                        quantize_row_q8_0(d + r * row_bytes, row.data(), ni);
+                    }
                 }
             }
         }
