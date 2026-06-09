@@ -195,6 +195,10 @@ struct ModelBuffers {
     MTL::Buffer* ssd_chunk_states = nullptr;
     MTL::Buffer* ssd_cumdecay     = nullptr;
     uint32_t     ssd_nc_max       = 0;
+
+    // Batched-lane prefill: gathered per-lane LAST x_norm rows (batch, d_model)
+    // fp16, so the LM head runs at M=n_lanes instead of M=batch*seq.
+    MTL::Buffer* lanes_x = nullptr;
 };
 
 // ── Encode helpers ──────────────────────────────────────────────────
@@ -714,6 +718,11 @@ struct ModelParams {
     // populate each request's conv/ssm state from its own prompt before the
     // lockstep batched decode. -1 (default) = lane 0 / no offset.
     int32_t  prefill_lane = -1;
+    // Batched-lane prefill: batch=N lanes prefilled in ONE forward. Only each
+    // lane's LAST row matters for its first token, so gather those N rows,
+    // run the LM head at M=N, and argmax per lane into output_id[0..N).
+    // 0 (default) keeps the single-stream / per-lane paths byte-identical.
+    uint32_t lanes_last = 0;
 };
 
 inline void dispatch_model(
@@ -807,18 +816,35 @@ inline void dispatch_model(
     encode_rmsnorm_mb(cmd, P.layer.rmsnorm, B.x, W.w_final_norm, 0,
                       B.x_norm, T, M.d_model, M.eps, P.layer.rmsnorm_t1);
 
+    // C2. Batched-lane prefill: only each lane's LAST row feeds its first
+    // token, so blit-gather those N rows and shrink the head to M=N (vs the
+    // (batch*seq, V) GEMM the flat layout would otherwise pay).
+    const bool lanes = (M.lanes_last > 0u) && (B.lanes_x != nullptr);
+    MTL::Buffer* head_in   = B.x_norm;
+    uint32_t     head_rows = T;
+    if (lanes) {
+        const size_t row_b = (size_t)M.d_model * 2;
+        auto* blit = cmd->blitCommandEncoder();
+        for (uint32_t r = 0; r < M.lanes_last; ++r)
+            blit->copyFromBuffer(B.x_norm, ((size_t)(r + 1) * M.seq - 1) * row_b,
+                                 B.lanes_x, (size_t)r * row_b, row_b);
+        blit->endEncoding();
+        head_in   = B.lanes_x;
+        head_rows = M.lanes_last;
+    }
+
     // D. LM head (tied): (T,D) x (V,D)^T → (T,V) logits. M=1 decode → gemv_t.
     if (!SK.lmhead) {
-    if (T == 1 && P.gemv_t) {
-        encode_gemv_t_2dtile_mb(cmd, P.gemv_t, B.x_norm, 0, W.w_embed, 0,
+    if (head_rows == 1 && P.gemv_t) {
+        encode_gemv_t_2dtile_mb(cmd, P.gemv_t, head_in, 0, W.w_embed, 0,
                                 B.logits, 0, M.vocab_size, M.d_model);
     } else {
         auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(P.layer.gemm);
-        const uint32_t M_v = T, K_v = M.d_model, N_v = M.vocab_size;
+        const uint32_t M_v = head_rows, K_v = M.d_model, N_v = M.vocab_size;
         uint32_t ldA = K_v, ldB = K_v, ldC = N_v;
         int transA = 0, transB = 1, has_bias = 0;
-        enc->setBuffer(B.x_norm,   0, 0);
+        enc->setBuffer(head_in,    0, 0);
         enc->setBuffer(W.w_embed,  0, 1);
         enc->setBuffer(B.logits,   0, 2);
         enc->setBytes(&M_v,      4, 3); enc->setBytes(&N_v,      4, 4);
@@ -840,11 +866,15 @@ inline void dispatch_model(
     //    keep the simple single-pass argmax per row (correctness over the ~us
     //    saving — argmax is a sliver of the bandwidth-bound decode step).
     if (!SK.argmax) {
-        const bool all_rows = (M.decode_all_rows && M.seq == 1u && T > 1u);
+        // lanes: logits holds one row per lane → per-lane argmax, like
+        // decode_all_rows but with head_rows rows.
+        const bool all_rows = lanes
+                           || (M.decode_all_rows && M.seq == 1u && T > 1u);
+        const uint32_t arg_rows = lanes ? head_rows : T;
         const bool can_2pass = P.argmax_partial && P.argmax_reduce
                             && B.argmax_val_buf && B.argmax_idx_buf;
         if (all_rows) {
-            for (uint32_t r = 0; r < T; ++r) {
+            for (uint32_t r = 0; r < arg_rows; ++r) {
                 const size_t row_off = (size_t)r * M.vocab_size * 2;
                 auto* enc = cmd->computeCommandEncoder();
                 enc->setComputePipelineState(P.argmax);

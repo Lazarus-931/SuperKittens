@@ -75,6 +75,11 @@ int  sk_mamba2_forward(sk_mamba2_handle* h,
 void sk_mamba2_reset_lane(sk_mamba2_handle* h, uint32_t lane);
 int  sk_mamba2_prefill_lane(sk_mamba2_handle* h, uint32_t lane,
                             const int* input_ids, uint32_t seq, int* output_id);
+// All n_req lanes' EQUAL-LENGTH prompts (lane-major input_ids[n_req*seq]) in
+// one batch=n_req forward; per-lane greedy first tokens in output_ids[0..n_req).
+int  sk_mamba2_prefill_batched(sk_mamba2_handle* h,
+                               const int* input_ids, uint32_t seq,
+                               uint32_t n_req, int* output_ids);
 int  sk_mamba2_decode_batched(sk_mamba2_handle* h,
                               const int* input_ids, uint32_t n_req, int* output_ids);
 // Dump intermediate tensor by name for HF parity testing. Names mirror

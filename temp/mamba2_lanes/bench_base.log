@@ -1,0 +1,8 @@
+loaded: batch=8 seq_max=512 batched_abi=False
+T=128 N=2: A_seq=84.23ms (base dylib, no batched ABI) | decode_after_A=186.0 tok/s (agg)
+T=128 N=4: A_seq=163.83ms (base dylib, no batched ABI) | decode_after_A=346.6 tok/s (agg)
+T=128 N=8: A_seq=322.19ms (base dylib, no batched ABI) | decode_after_A=592.5 tok/s (agg)
+T=256 N=2: A_seq=155.81ms (base dylib, no batched ABI) | decode_after_A=188.1 tok/s (agg)
+T=256 N=4: A_seq=306.05ms (base dylib, no batched ABI) | decode_after_A=345.6 tok/s (agg)
+T=256 N=8: A_seq=605.24ms (base dylib, no batched ABI) | decode_after_A=592.5 tok/s (agg)
+BENCH_DONE

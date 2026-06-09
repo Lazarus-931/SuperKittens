@@ -1,0 +1,8 @@
+loaded: batch=8 seq_max=512 batched_abi=True
+T=128 N=2: A_seq=84.74ms B_batched=70.21ms speedup=1.21x | decode_after_A=187.8 decode_after_B=187.8 tok/s (agg)
+T=128 N=4: A_seq=164.11ms B_batched=125.29ms speedup=1.31x | decode_after_A=348.8 decode_after_B=346.7 tok/s (agg)
+T=128 N=8: A_seq=322.15ms B_batched=237.79ms speedup=1.35x | decode_after_A=592.8 decode_after_B=591.1 tok/s (agg)
+T=256 N=2: A_seq=154.32ms B_batched=127.06ms speedup=1.21x | decode_after_A=188.1 decode_after_B=187.4 tok/s (agg)
+T=256 N=4: A_seq=306.37ms B_batched=237.49ms speedup=1.29x | decode_after_A=349.0 decode_after_B=349.3 tok/s (agg)
+T=256 N=8: A_seq=606.04ms B_batched=459.95ms speedup=1.32x | decode_after_A=591.6 decode_after_B=589.8 tok/s (agg)
+BENCH_DONE
