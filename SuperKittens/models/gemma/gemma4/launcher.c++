@@ -81,6 +81,7 @@ static bool resolve_psos(ModelPSOs& P) {
     P.layer.q4k_matvec_bf16    = sk::bindings_pso("q4k_matvec_bf16");   // optional (Q4_K body)
     P.layer.q6k_matvec_bf16    = sk::bindings_pso("q6k_matvec_bf16");   // optional (Q4_K body v/down Q6_K)
     P.layer.geglu_mul          = sk::bindings_pso("gemma4_geglu_mul");
+    P.layer.q8_0_geglu_bf16_m1 = sk::bindings_pso("q8_0_geglu_bf16_m1");  // optional (Q8 MLP fused front)
     P.embedding_lookup     = sk::bindings_pso("embedding_lookup_bf16");
     P.embedding_lookup_q8  = sk::bindings_pso("embedding_lookup_q8_bf16");  // optional
     P.ple_lookup           = sk::bindings_pso("gemma4_ple_lookup");

@@ -63,6 +63,31 @@ inline void enc_q8_matvec(
     }
 }
 
+// Fused gate+up Q8_0 matvec + gelu*mul (decode T=1). x (bf16 [M,K]) read once
+// for both W_gate, W_up (Q8_0 [N,K]); writes gelu_tanh(gate)*up -> C (bf16 [M,N]).
+// SAME dispatch shape as enc_q8_matvec.
+inline void enc_q8_geglu(
+    MTL::ComputeCommandEncoder* enc, MTL::ComputePipelineState* pso,
+    MTL::Buffer* x, size_t off_x_bytes,
+    MTL::Buffer* Wg, size_t off_Wg_bytes,
+    MTL::Buffer* Wu, size_t off_Wu_bytes,
+    MTL::Buffer* C, size_t off_C_bytes,
+    uint32_t M, uint32_t N, uint32_t K, uint32_t ldC)
+{
+    enc->setComputePipelineState(pso);
+    const uint32_t NR0 = 2;
+    for (uint32_t m = 0; m < M; ++m) {
+        enc->setBuffer(x,  off_x_bytes + (size_t)m * K * 2, 0);
+        enc->setBuffer(Wg, off_Wg_bytes,                    1);
+        enc->setBuffer(Wu, off_Wu_bytes,                    2);
+        enc->setBuffer(C,  off_C_bytes + (size_t)m * ldC * 2, 3);
+        enc->setBytes(&K, 4, 4);
+        enc->setBytes(&N, 4, 5);
+        enc->dispatchThreadgroups(MTL::Size((N + NR0 - 1) / NR0, 1, 1),
+                                  MTL::Size(128, 1, 1));
+    }
+}
+
 // Encode one K-quant (Q4_K=144B/256 or Q6_K=210B/256) matvec/GEMM with the
 // SAME binding+dispatch shape as enc_q8_matvec: A (bf16 [M,K]) × W (kquant
 // [N,K] row-major) → C (bf16 [M,N], row stride ldC). pso is q4k_matvec_bf16 or
@@ -171,6 +196,7 @@ struct LayerPSOs {
     MTL::ComputePipelineState* q4k_matvec_bf16    = nullptr; // M=1 Q4_K × bf16 matvec → bf16 (Q4_K body, fit-16GB)
     MTL::ComputePipelineState* q6k_matvec_bf16    = nullptr; // M=1 Q6_K × bf16 matvec → bf16 (Q4_K_M v/down Q6_K rows)
     MTL::ComputePipelineState* geglu_mul          = nullptr; // gelu(gate)*up elementwise (Q8 MLP)
+    MTL::ComputePipelineState* q8_0_geglu_bf16_m1 = nullptr; // fused gate+up Q8 matvec + gelu*mul (Q8 MLP front, decode T=1)
 };
 
 struct LayerBuffers {
@@ -733,25 +759,38 @@ inline void dispatch_layer(
             const uint32_t M  = T_mlp;
             const uint32_t Ni = p.n_int;
             const uint32_t Dm = p.d_model;
-            // gate -> m_int_scratch, up -> m_up_scratch (both [M, Ni], K=Dm).
-            {
+            // Fused front (pure-Q8 body only): gelu(gate)*up -> m_int_scratch in
+            // one dispatch (x read once, no m_up_scratch round-trip). Q4_K body
+            // keeps the split path (per-layer gate/up may differ Q4K/Q6K).
+            static bool _disable_q8_geglu = (std::getenv("SK_GEMMA4_DISABLE_Q8_GEGLU") != nullptr);
+            const bool use_q8_geglu = !_disable_q8_geglu && !B.body_kquant
+                                   && (P.q8_0_geglu_bf16_m1 != nullptr);
+            if (use_q8_geglu) {
                 auto* enc = E.get();
-                enc_body(enc, p.enc_gate, B.m_in, 0, B.w_gate_q8, B.gate_q8_off,
-                         B.m_int_scratch, 0, M, Ni, Dm, Ni);
-                enc_body(enc, p.enc_up, B.m_in, 0, B.w_up_q8, B.up_q8_off,
-                         B.m_up_scratch, 0, M, Ni, Dm, Ni);
-            }
-            // gelu(gate)*up -> m_int_scratch.
-            {
-                auto* enc = E.get();
-                enc->setComputePipelineState(P.geglu_mul);
-                enc->setBuffer(B.m_int_scratch, 0, 0);
-                enc->setBuffer(B.m_up_scratch,  0, 1);
-                enc->setBuffer(B.m_int_scratch, 0, 2);
-                uint32_t n = M * Ni;
-                enc->setBytes(&n, 4, 3);
-                enc->dispatchThreadgroups(MTL::Size((n / 4u + 127u) / 128u, 1, 1),
-                                          MTL::Size(128, 1, 1));
+                enc_q8_geglu(enc, P.q8_0_geglu_bf16_m1, B.m_in, 0,
+                             B.w_gate_q8, B.gate_q8_off, B.w_up_q8, B.up_q8_off,
+                             B.m_int_scratch, 0, M, Ni, Dm, Ni);
+            } else {
+                // gate -> m_int_scratch, up -> m_up_scratch (both [M, Ni], K=Dm).
+                {
+                    auto* enc = E.get();
+                    enc_body(enc, p.enc_gate, B.m_in, 0, B.w_gate_q8, B.gate_q8_off,
+                             B.m_int_scratch, 0, M, Ni, Dm, Ni);
+                    enc_body(enc, p.enc_up, B.m_in, 0, B.w_up_q8, B.up_q8_off,
+                             B.m_up_scratch, 0, M, Ni, Dm, Ni);
+                }
+                // gelu(gate)*up -> m_int_scratch.
+                {
+                    auto* enc = E.get();
+                    enc->setComputePipelineState(P.geglu_mul);
+                    enc->setBuffer(B.m_int_scratch, 0, 0);
+                    enc->setBuffer(B.m_up_scratch,  0, 1);
+                    enc->setBuffer(B.m_int_scratch, 0, 2);
+                    uint32_t n = M * Ni;
+                    enc->setBytes(&n, 4, 3);
+                    enc->dispatchThreadgroups(MTL::Size((n / 4u + 127u) / 128u, 1, 1),
+                                              MTL::Size(128, 1, 1));
+                }
             }
             // down: m_out = m_int @ W_down (K=Ni, N=Dm).
             {
