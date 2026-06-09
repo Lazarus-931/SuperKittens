@@ -878,14 +878,14 @@ inline void dispatch_layer(
         uint64_t nb10; uint64_t nb11; uint64_t nb12;
         int32_t  ne0; int32_t ne1; uint64_t nb1; int32_t nr0; char _p1[4];
     };
-    const uint32_t NR0 = 2;   // N_R0 for q4_K, q8_0 and q5_0
-    // is_q4k=true: Q4_K weights (block 144 B / 256), q4_K impl strides
-    //   first_row=(x*NSG+sg)*nr0 → NSG*nr0 rows per tg.x, no shmem reduce.
-    // is_q4k=false: Q5_0 weights (block 22 B / 32), q5_0 impl r0=x*nr0 → nr0
-    //   rows per tg.x, simdgroup-tree reduce via shmem (same shape as q8_0).
+    // Both quant paths use the independent-simdgroup-per-row impl: each of the
+    // NSG=4 simdgroups owns its own nr0 rows over the full K, single simd_sum,
+    // no cross-simdgroup shmem reduce. → NSG*nr0 rows per tg.x. Q4_K nr0=2
+    // (N_R0_Q4_K), Q5_0 nr0=4 (N_R0_Q5_0, raised from 2 with the layout switch).
     auto encode_mv_id = [&](MTL::ComputePipelineState* pso, bool is_q4k,
                             MTL::Buffer* w, size_t w_off, MTL::Buffer* src1,
                             MTL::Buffer* dst, uint32_t in_dim, uint32_t out_rows) {
+        const uint32_t NR0   = is_q4k ? 2u : 4u;   // N_R0_Q4_K / N_R0_Q5_0
         const uint32_t blk_w = is_q4k ? 256u : 32u;
         const uint64_t blk_b = is_q4k ? 144u : 22u;
         const uint64_t row_blk = (uint64_t)(in_dim / blk_w) * blk_b;    // nb01
@@ -909,7 +909,7 @@ inline void dispatch_layer(
         enc->setBuffer(dst,  0,     3);
         enc->setBuffer(B.moe_top_idx, 0, 4);
         enc->setThreadgroupMemoryLength(NR0 * 32 * sizeof(float), 0);
-        const uint32_t rows_per_tg = is_q4k ? (4u * NR0) : NR0;   // NSG=4
+        const uint32_t rows_per_tg = 4u * NR0;   // NSG=4 × nr0 rows
         enc->dispatchThreadgroups(
             MTL::Size((out_rows + rows_per_tg - 1) / rows_per_tg, 1, T * p.top_k),
             MTL::Size(4 * 32, 1, 1));   // NSG=4

@@ -16,7 +16,7 @@ using namespace metal;
 #define QK5_0           32
 #define N_SIMDWIDTH     32
 #define N_R0_Q8_0        2
-#define N_R0_Q5_0        2
+#define N_R0_Q5_0        4
 #define N_SG_Q8_0        4
 #define FC_MUL_MV      600
 #define FC_MUL_MM      700
