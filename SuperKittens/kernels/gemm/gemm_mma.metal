@@ -29,8 +29,18 @@
 //   6: uint ldC
 //
 // Dispatch (host): grid (ceil(N/BN), ceil(M/BM), 1), threadgroup (32*NSG,1,1).
-//   BM=8 rows, BN=32 cols, BK=32. NSG=2 simdgroups; each owns BN/NSG=16 output
-//   columns (MC=2 8-wide tiles) and all BM=8 rows (MR=1).
+//   BM=32 rows, BN=32 cols, BK=32. NSG=2 simdgroups; each owns BN/NSG=16 output
+//   columns (MC=2 8-wide tiles) and all BM=32 rows (MR=4 8-row tiles).
+//
+// WHY BM=32 (was 8): the quant tile-loaders (q4k/q6k/q8) are the prefill
+// bottleneck — measured ~50 GB/s effective vs the f16 path's ~114 (near the M4
+// ceiling), so the dequant-on-load caps throughput. BM is the weight-read
+// amortization factor: a forward of M rows reads each weight tile ceil(M/BM)
+// times, so raising BM 8→32 cuts weight traffic 4× and the per-row MMA stays
+// cheap below the loader. Measured on M4 base, gate N=9728 K=2560 M=512:
+// q4k 1.76× / q8 2.08× / q6 2.23× / f16 1.44×; e2e qwen3-4B-Q4_K_M prefill
+// ~1.5–1.6× TTFT. Bit-exact vs BM=8 (same K-reduction order). BM=64 regresses
+// (register/occupancy). Decode (M=1) never uses this kernel — it stays the matvec.
 
 #include <metal_stdlib>
 #include <metal_simdgroup_matrix>
@@ -42,7 +52,7 @@ using namespace metal;
 
 namespace skmma {
 
-enum : uint { BM = 8, BN = 32, BK = 32, NSG = 2, MR = 1, MC = 2 };
+enum : uint { BM = 32, BN = 32, BK = 32, NSG = 2, MR = 4, MC = 2 };
 
 struct __attribute__((packed)) q8_block { half d; int8_t qs[32]; };
 
@@ -246,20 +256,22 @@ inline void load_W_q6k(threadgroup half* Ws,
         LOAD_W(Ws, W, bc, k0, N, K, lid);                                      \
         threadgroup_barrier(mem_flags::mem_threadgroup);                       \
         for (uint k = 0; k < BK / 8; ++k) {                                    \
-            simdgroup_half8x8 a;                                               \
-            simdgroup_load(a, As + (0 * 8) * BK + k * 8, BK);                  \
+            simdgroup_half8x8 a[MR];                                           \
+            for (uint r = 0; r < MR; ++r)                                      \
+                simdgroup_load(a[r], As + (r * 8) * BK + k * 8, BK);           \
             for (uint c = 0; c < MC; ++c) {                                    \
                 simdgroup_half8x8 b;                                           \
                 simdgroup_load(b, Ws + (k * 8) * BN + c0 + c * 8, BN);         \
-                simdgroup_multiply_accumulate(acc[0][c], a, b, acc[0][c]);     \
+                for (uint r = 0; r < MR; ++r)                                  \
+                    simdgroup_multiply_accumulate(acc[r][c], a[r], b, acc[r][c]); \
             }                                                                  \
         }                                                                      \
         threadgroup_barrier(mem_flags::mem_threadgroup);                       \
     }                                                                          \
     threadgroup float Cs[BM * BN];                                             \
-    for (uint c = 0; c < MC; ++c) {                                            \
-        simdgroup_store(acc[0][c], Cs + c0 + c * 8, BN);                       \
-    }                                                                          \
+    for (uint r = 0; r < MR; ++r)                                              \
+        for (uint c = 0; c < MC; ++c)                                          \
+            simdgroup_store(acc[r][c], Cs + (r * 8) * BN + c0 + c * 8, BN);    \
     threadgroup_barrier(mem_flags::mem_threadgroup);                          \
     for (uint i = lid; i < BM * BN; i += 64) {                                 \
         const uint r = i / BN, cc = i % BN;                                    \
