@@ -54,6 +54,23 @@ inline uint32_t splitk_ks() {
     }();
     return v;
 }
+// Chunked SSD prefill (mamba2_ssd_chunked.metal): SK_MAMBA2_SSD_CHUNKED=1
+// selects it for T>1; SK_MAMBA2_SSD_CHUNK=<Q> sets the chunk size. Read fresh
+// each call (not static) so one process can A/B without reloading the model.
+inline bool ssd_chunked_enabled() {
+    const char* e = std::getenv("SK_MAMBA2_SSD_CHUNKED");
+    return e && e[0] == '1';
+}
+inline uint32_t ssd_chunk_q() {
+    const char* e = std::getenv("SK_MAMBA2_SSD_CHUNK");
+    if (e) { int v = std::atoi(e); if (v >= 32) return (uint32_t)v; }
+    // Sweep on M4 base (130m, T=128/512/1024): TTFT improves monotonically with
+    // Q — the GPU is already saturated at B*H*(P/4) threadgroups, so chunk
+    // parallelism buys nothing and pass 3's extra C reads cost; the win comes
+    // from the p-blocked scan. Largest measured Q is the empirical optimum.
+    return 1024u;
+}
+
 inline const SkipFlags& skip_flags() {
     static SkipFlags s = []{
         SkipFlags f; const char* e = std::getenv("SK_MAMBA_SKIP");
@@ -105,6 +122,14 @@ struct LayerPSOs {
     MTL::ComputePipelineState* conv1d_silu_step = nullptr;   // O(1) decode conv
     MTL::ComputePipelineState* conv_state_capture = nullptr; // prefill conv_state init
     MTL::ComputePipelineState* mamba2_ssd;    // prefill chunked associative scan
+    // Flag-gated chunked-scan prefill (SK_MAMBA2_SSD_CHUNKED=1); all three or none.
+    MTL::ComputePipelineState* ssd_chunk_scan = nullptr;
+    MTL::ComputePipelineState* ssd_chunk_prop = nullptr;
+    MTL::ComputePipelineState* ssd_chunk_fix  = nullptr;
+    // p-blocked (4 rows/simdgroup) scan/fix: B/C reads shared 4×. Preferred when
+    // P % 4 == 0 and Nstate <= 128; SK_MAMBA2_SSD_PB=1 forces the plain pair.
+    MTL::ComputePipelineState* ssd_chunk_scan_pb4 = nullptr;
+    MTL::ComputePipelineState* ssd_chunk_fix_pb4  = nullptr;
     MTL::ComputePipelineState* mamba2_step;   // decode per-token recurrence
     MTL::ComputePipelineState* gate_norm;     // SiLU(z) * RMSNorm(y) γ
     MTL::ComputePipelineState* add;
@@ -165,6 +190,11 @@ struct ModelBuffers {
 
     // split-K out_proj partials (KS, d_model) fp32.
     MTL::Buffer* splitk_partial = nullptr;
+
+    // Chunked-SSD prefill scratch (fp32): (B, nc_max, H, P, N) and (B, seq_max, H).
+    MTL::Buffer* ssd_chunk_states = nullptr;
+    MTL::Buffer* ssd_cumdecay     = nullptr;
+    uint32_t     ssd_nc_max       = 0;
 };
 
 // ── Encode helpers ──────────────────────────────────────────────────
@@ -439,6 +469,9 @@ struct DispatchBufs {
     MTL::Buffer* w_norm;
     MTL::Buffer* w_out_proj;
     MTL::Buffer* splitk_partial = nullptr;   // (KS, d_model) fp32 scratch
+    MTL::Buffer* ssd_chunk_states = nullptr; // (B, nc_max, H, P, N) fp32 scratch
+    MTL::Buffer* ssd_cumdecay     = nullptr; // (B, seq_max, H) fp32 scratch
+    uint32_t     ssd_nc_max       = 0;
 };
 
 inline void dispatch_layer(
@@ -519,6 +552,90 @@ inline void dispatch_layer(
     const size_t off_B_in = (size_t)E * fp16;
     const size_t off_C_in = (size_t)(E + Gv * Nv) * fp16;
     if (!SK.ssd) {
+        // Chunked-scan prefill. NC=1 is valid (pass 3 early-outs on the zero
+        // incoming state) and still wins via the p-blocked scan's shared B/C
+        // reads — the serial kernel re-reads B/C once per p-row.
+        uint32_t Qc = 0, NC = 0;
+        const bool chunked = !p.is_decode && p.seq > 1 && ssd_chunked_enabled()
+            && P.ssd_chunk_scan && P.ssd_chunk_prop && P.ssd_chunk_fix
+            && b.ssd_chunk_states && b.ssd_cumdecay
+            && ((Qc = ssd_chunk_q()),
+                (NC = (p.seq + Qc - 1) / Qc),
+                (NC >= 1 && NC <= b.ssd_nc_max));
+        if (chunked) {
+            const char* pbe = std::getenv("SK_MAMBA2_SSD_PB");
+            const bool pb4 = P.ssd_chunk_scan_pb4 && P.ssd_chunk_fix_pb4
+                && (Pd % 4 == 0) && Nv <= 128
+                && !(pbe && pbe[0] == '1');
+            const uint32_t grid_p = pb4 ? Pd / 4 : Pd;
+            {
+                auto* enc = cmd->computeCommandEncoder();
+                enc->setComputePipelineState(pb4 ? P.ssd_chunk_scan_pb4
+                                                 : P.ssd_chunk_scan);
+                enc->setBuffer(b.xBC_post,  off_x_in, 0);
+                enc->setBuffer(b.dt_raw,    0,        1);
+                enc->setBuffer(b.w_A_log,   off_A,    2);
+                enc->setBuffer(b.xBC_post,  off_B_in, 3);
+                enc->setBuffer(b.xBC_post,  off_C_in, 4);
+                enc->setBuffer(b.w_D,       off_D,    5);
+                enc->setBuffer(b.w_dt_bias, off_dtb,  6);
+                enc->setBuffer(b.ssd_out,          0, 7);
+                enc->setBuffer(b.ssd_chunk_states, 0, 8);
+                enc->setBuffer(b.ssd_cumdecay,     0, 9);
+                enc->setBytes(&p.batch,  4, 10);
+                enc->setBytes(&p.seq,    4, 11);
+                enc->setBytes(&H,        4, 12);
+                enc->setBytes(&Pd,       4, 13);
+                enc->setBytes(&Gv,       4, 14);
+                enc->setBytes(&Nv,       4, 15);
+                enc->setBytes(&p.dt_min, 4, 16);
+                enc->setBytes(&p.dt_max, 4, 17);
+                enc->setBytes(&C_in,     4, 18);
+                enc->setBytes(&Qc,       4, 19);
+                enc->setBytes(&NC,       4, 20);
+                enc->dispatchThreadgroups(MTL::Size(p.batch * H, grid_p, NC),
+                                          MTL::Size(32, 1, 1));
+                enc->endEncoding();
+            }
+            {
+                auto* enc = cmd->computeCommandEncoder();
+                enc->setComputePipelineState(P.ssd_chunk_prop);
+                enc->setBuffer(b.ssd_chunk_states, 0,               0);
+                enc->setBuffer(b.ssd_cumdecay,     0,               1);
+                enc->setBuffer(b.ssm_state,        b.ssm_state_off, 2);
+                enc->setBytes(&p.batch, 4, 3);
+                enc->setBytes(&p.seq,   4, 4);
+                enc->setBytes(&H,       4, 5);
+                enc->setBytes(&Pd,      4, 6);
+                enc->setBytes(&Nv,      4, 7);
+                enc->setBytes(&Qc,      4, 8);
+                enc->setBytes(&NC,      4, 9);
+                enc->dispatchThreadgroups(MTL::Size(p.batch * H, Pd, 1),
+                                          MTL::Size(32, 1, 1));
+                enc->endEncoding();
+            }
+            {
+                auto* enc = cmd->computeCommandEncoder();
+                enc->setComputePipelineState(pb4 ? P.ssd_chunk_fix_pb4
+                                                 : P.ssd_chunk_fix);
+                enc->setBuffer(b.xBC_post,         off_C_in, 0);
+                enc->setBuffer(b.ssd_cumdecay,     0,        1);
+                enc->setBuffer(b.ssd_chunk_states, 0,        2);
+                enc->setBuffer(b.ssd_out,          0,        3);
+                enc->setBytes(&p.batch, 4, 4);
+                enc->setBytes(&p.seq,   4, 5);
+                enc->setBytes(&H,       4, 6);
+                enc->setBytes(&Pd,      4, 7);
+                enc->setBytes(&Gv,      4, 8);
+                enc->setBytes(&Nv,      4, 9);
+                enc->setBytes(&C_in,    4, 10);
+                enc->setBytes(&Qc,      4, 11);
+                enc->setBytes(&NC,      4, 12);
+                enc->dispatchThreadgroups(MTL::Size(p.batch * H, grid_p, NC),
+                                          MTL::Size(32, 1, 1));
+                enc->endEncoding();
+            }
+        } else {
         auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(P.mamba2_ssd);
         enc->setBuffer(b.xBC_post,  off_x_in, 0);
@@ -542,6 +659,7 @@ inline void dispatch_layer(
         enc->dispatchThreadgroups(MTL::Size(p.batch * H, Pd, 1),
                                   MTL::Size(Nv, 1, 1));
         enc->endEncoding();
+        }
     }
 
     // 6. gate_norm
@@ -677,6 +795,9 @@ inline void dispatch_model(
         db.w_norm       = W.w_norm;
         db.w_out_proj   = W.w_out_proj;
         db.splitk_partial = B.splitk_partial;
+        db.ssd_chunk_states = B.ssd_chunk_states;
+        db.ssd_cumdecay     = B.ssd_cumdecay;
+        db.ssd_nc_max       = B.ssd_nc_max;
 
         dispatch_layer(cmd, P.layer, lp, db);
     }
