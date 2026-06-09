@@ -289,6 +289,136 @@ void fa_dN(
 }
 
 
+// ── D=64 decode-only (seq==1) attention ───────────────────────────────────
+// WHY: fa_dN<…,64> reuses the Br=2 prefill layout at decode too (NT=Hg*Br*32),
+// so at seq==1 the r==1 simdgroups (half the threadgroup) compute nothing —
+// their q_row=1 is out of range. A naive Br=1 (one simdgroup/head, no smem)
+// loses the cooperative K/V HBM amortisation and regresses ~0.5-0.7x. This
+// keeps the identical Bc=64 smem staging + Br=2 math loop but with Br=1: Hg
+// simdgroups (Hg*32 threads) do BOTH the cooperative load and the compute, so
+// no lane is idle. Output is bit-identical to fa_dN<true,64> at seq==1 (same
+// tile walk, same fp16 reductions). Gated head_dim==64 && seq==1 in the host;
+// the D=128 path and the seq>1 prefill path stay on fa_dN, byte-identical.
+template<uint D>
+[[kernel, max_total_threads_per_threadgroup(256)]]
+void mha_decode_dN_br1(
+    device const half* Q          [[buffer(0)]],
+    device const half* K          [[buffer(1)]],
+    device const half* V          [[buffer(2)]],
+    device half*       O          [[buffer(3)]],
+    constant uint&    seq         [[buffer(4)]],
+    constant uint&   nheads       [[buffer(5)]],
+    constant uint& n_kv_heads     [[buffer(6)]],
+    constant uint& kv_len         [[buffer(7)]],
+    constant uint& cache_stride   [[buffer(8)]],
+    uint3 gid  [[threadgroup_position_in_grid]],
+    uint  lid  [[thread_index_in_threadgroup]],
+    uint  simd [[simdgroup_index_in_threadgroup]],
+    uint  lane [[thread_index_in_simdgroup]])
+{
+    constexpr uint VW = D / 32, NB = D / VW, Bc = 64;
+    using hvec = typename vec_t<VW>::h;
+    using fvec = typename vec_t<VW>::f;
+
+    const uint kv_head = gid.x;
+    const uint batch   = gid.z;
+    const uint Hg      = nheads / n_kv_heads;
+    const uint NT      = Hg * 32u;
+    const uint head    = kv_head * Hg + simd;
+    const bool active  = (simd < Hg) && (head < nheads) && (kv_head < n_kv_heads);
+
+    const size_t q_off  = (size_t)(batch * nheads     + head)    * seq          * D;
+    const size_t kv_off = (size_t)(batch * n_kv_heads + kv_head) * cache_stride * D;
+
+    threadgroup hvec k_smem[Bc * NB];
+    threadgroup hvec v_smem[Bc * NB];
+
+    const float scale = 1.0f / sqrt(float(D));
+    fvec q_reg = active
+        ? fvec(reinterpret_cast<const device hvec*>(Q + q_off)[lane]) * scale
+        : fvec(0.0f);
+
+    float m = -INFINITY, s = 0.0f;
+    fvec  acc = fvec(0.0f);
+
+    const uint full_tiles  = kv_len / Bc;
+    const uint partial_lim = kv_len - full_tiles * Bc;
+
+    for (uint t = 0; t < full_tiles; ++t) {
+        const uint c0 = t * Bc;
+        for (uint i = lid; i < Bc * NB; i += NT) {
+            const uint rr = i / NB, dd = i % NB, col = c0 + rr;
+            k_smem[i] = reinterpret_cast<const device hvec*>(K + kv_off + (size_t)col * D)[dd];
+            v_smem[i] = reinterpret_cast<const device hvec*>(V + kv_off + (size_t)col * D)[dd];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint j = 0; j < Bc; j += 2) {
+            hvec k0 = k_smem[j * NB + lane], k1 = k_smem[(j+1) * NB + lane];
+            float s0 = simd_sum(dot(q_reg, fvec(k0)));
+            float s1 = simd_sum(dot(q_reg, fvec(k1)));
+            float new_m = max(m, max(s0, s1));
+            float alpha = metal::fast::exp(m - new_m);
+            float b0    = metal::fast::exp(s0 - new_m);
+            float b1    = metal::fast::exp(s1 - new_m);
+            m   = new_m;
+            s   = fma(s, alpha, b0 + b1);
+            acc *= alpha;
+            acc += b0 * fvec(v_smem[j * NB + lane]);
+            acc += b1 * fvec(v_smem[(j+1) * NB + lane]);
+        }
+        threadgroup_barrier(mem_flags::mem_none);
+    }
+
+    if (partial_lim > 0) {
+        const uint c0 = full_tiles * Bc;
+        for (uint i = lid; i < Bc * NB; i += NT) {
+            const uint rr = i / NB, dd = i % NB, col = c0 + rr;
+            if (col < kv_len) {
+                k_smem[i] = reinterpret_cast<const device hvec*>(K + kv_off + (size_t)col * D)[dd];
+                v_smem[i] = reinterpret_cast<const device hvec*>(V + kv_off + (size_t)col * D)[dd];
+            } else {
+                k_smem[i] = hvec(0.0h);
+                v_smem[i] = hvec(0.0h);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint j = 0;
+        for (; j + 1 < partial_lim; j += 2) {
+            hvec k0 = k_smem[j * NB + lane], k1 = k_smem[(j+1) * NB + lane];
+            float s0 = simd_sum(dot(q_reg, fvec(k0)));
+            float s1 = simd_sum(dot(q_reg, fvec(k1)));
+            float new_m = max(m, max(s0, s1));
+            float alpha = metal::fast::exp(m - new_m);
+            float b0    = metal::fast::exp(s0 - new_m);
+            float b1    = metal::fast::exp(s1 - new_m);
+            m   = new_m;
+            s   = fma(s, alpha, b0 + b1);
+            acc *= alpha;
+            acc += b0 * fvec(v_smem[j * NB + lane]);
+            acc += b1 * fvec(v_smem[(j+1) * NB + lane]);
+        }
+        if (j < partial_lim) {
+            float score = simd_sum(dot(q_reg, fvec(k_smem[j * NB + lane])));
+            float new_m = max(m, score);
+            float alpha = metal::fast::exp(m - new_m);
+            float beta  = metal::fast::exp(score - new_m);
+            m   = new_m;
+            s   = fma(s, alpha, beta);
+            acc *= alpha;
+            acc += beta * fvec(v_smem[j * NB + lane]);
+        }
+        threadgroup_barrier(mem_flags::mem_none);
+    }
+
+    if (active) {
+        const float inv_s = s > 0.0f ? 1.0f / s : 0.0f;
+        reinterpret_cast<device hvec*>(O + q_off)[lane] = hvec(acc * inv_s);
+    }
+}
+
+
 // ── Prefill-specialized attention (seq>1) ─────────────────────────────────
 // Same flash math + GQA design as fa_d128, but BR query rows per threadgroup
 // (vs Br=2 in the decode-tuned fa_d128). BR is the K/V-tile reuse factor: each
@@ -876,6 +1006,14 @@ template [[host_name("mha_causal_64")]]
 
 template [[host_name("mha_noncausal_64")]]
 [[kernel]] void fa_dN<false, 64>(
+    device const half*, device const half*, device const half*, device half*,
+    constant uint&, constant uint&, constant uint&, constant uint&, constant uint&,
+    uint3, uint, uint, uint);
+
+// D=64 decode-only (seq==1) Br=1: no idle simdgroups. Bit-identical to
+// fa_dN<true,64> at seq==1; host gates head_dim==64 && seq==1 && !split/!q8.
+template [[host_name("mha_decode_d64")]]
+[[kernel]] void mha_decode_dN_br1<64>(
     device const half*, device const half*, device const half*, device half*,
     constant uint&, constant uint&, constant uint&, constant uint&, constant uint&,
     uint3, uint, uint, uint);

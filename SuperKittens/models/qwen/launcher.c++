@@ -105,6 +105,10 @@ static bool resolve_psos(ModelPSOs& P, uint32_t head_dim) {
     // mha_causal path at prefill too (A/B).
     P.layer.attn_prefill   = (head_dim == 128 && !getenv("SK_NO_PREFILL_ATTN"))
                                  ? sk::bindings_pso("mha_causal_prefill") : nullptr;
+    // D=64 decode-only (seq==1) Br=1 variant: no idle simdgroups, bit-identical to
+    // mha_causal_64. SK_NO_D64_DECODE=1 forces the fa_dN<…,64> Br=2 path (A/B).
+    P.layer.attn_decode_d64 = (head_dim == 64 && !getenv("SK_NO_D64_DECODE"))
+                                 ? sk::bindings_pso("mha_decode_d64") : nullptr;
     // SK_NO_SPLIT_ATTN=1 forces the mha_causal path everywhere (A/B + bisection).
     if (getenv("SK_NO_SPLIT_ATTN")) {
         P.layer.attn_split = nullptr;

@@ -75,6 +75,8 @@ DEEPSEEK_ABI = {
     "load_gguf":    optional([ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int),
     "forward":      ([ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
                       ctypes.c_uint32, ctypes.POINTER(ctypes.c_int32)], ctypes.c_int),
+    "forward_batched": optional([ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
+                                 ctypes.POINTER(ctypes.c_int32)], ctypes.c_int),
     "reset":        ([ctypes.c_void_p], None),
     "destroy":      ([ctypes.c_void_p], None),
 }
@@ -274,6 +276,61 @@ class DeepSeek(Model):
 
     def forward(self, input_ids) -> int:
         return int(self._forward(input_ids)[0])
+
+    # batched lockstep decode (N requests step together; per-lane KV)
+    def _forward_batched(self, tokens) -> np.ndarray:
+        """One lockstep decode step over cfg.batch lanes. `tokens` is a length-
+        batch int32 array (current token per lane). Returns batch next-tokens."""
+        lib = _load()
+        if not hasattr(lib, "sk_deepseek_forward_batched"):
+            raise RuntimeError("libsk.dylib has no sk_deepseek_forward_batched; rebuild dylib")
+        ids = np.ascontiguousarray(np.asarray(tokens, dtype=np.int32)).reshape(-1)
+        if ids.size != self.cfg.batch:
+            raise ValueError(f"_forward_batched expects {self.cfg.batch} tokens, got {ids.size}")
+        out = np.empty((self.cfg.batch,), dtype=np.int32)
+        rc = lib.sk_deepseek_forward_batched(
+            self._h,
+            ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            out.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)))
+        if rc: raise RuntimeError(f"forward_batched failed: {rc}")
+        return out
+
+    def generate_batched(self, prompts, *, max_new_tokens: int = 64,
+                         eos_id=None, eos_ids=None) -> list:
+        """Greedy lockstep batched decode over cfg.batch prompts (each list[int]).
+        Prompts are fed token-by-token at seq==1 up to the longest prompt, then
+        free decode. Returns batch generated-token lists (excluding the prompt)."""
+        N = self.cfg.batch
+        prompts = [list(p) for p in prompts]
+        if len(prompts) != N:
+            raise ValueError(f"generate_batched expects {N} prompts, got {len(prompts)}")
+        stops = set()
+        if eos_ids: stops |= {int(x) for x in eos_ids}
+        if eos_id is not None: stops.add(int(eos_id))
+        if not stops and self.tokenizer is not None:
+            t_eos = getattr(self.tokenizer, "eos_ids", None)
+            if t_eos: stops |= {int(x) for x in t_eos}
+        self.reset()
+        max_p = max(len(p) for p in prompts)
+        out = [[] for _ in range(N)]
+        done = [False] * N
+        cur = np.zeros(N, dtype=np.int32)
+        for s in range(max_p):
+            for i, p in enumerate(prompts):
+                cur[i] = p[s] if s < len(p) else p[-1]
+            nxt = self._forward_batched(cur)
+            for i, p in enumerate(prompts):
+                if s == len(p) - 1:
+                    tok = int(nxt[i]); out[i].append(tok); cur[i] = tok
+                    if tok in stops: done[i] = True
+        for _ in range(max_new_tokens - 1):
+            if all(done): break
+            nxt = self._forward_batched(cur)
+            for i in range(N):
+                if done[i]: continue
+                tok = int(nxt[i]); out[i].append(tok); cur[i] = tok
+                if tok in stops: done[i] = True
+        return out
 
     # ── tokenizer + chat API ─────────────────────────────────────────
     def attach_tokenizer(self, tokenizer) -> "DeepSeek":

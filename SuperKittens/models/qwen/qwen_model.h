@@ -78,6 +78,7 @@ struct LayerPSOs {
     MTL::ComputePipelineState* rope_qk_il = nullptr;  // interleaved (NORM) RoPE (Llama GGUF); used when rope_interleaved=1
     MTL::ComputePipelineState* attn;              // mha_causal (GQA); D-specific (128/64)
     MTL::ComputePipelineState* attn_prefill = nullptr;  // mha_causal_prefill (BR=8); seq>1, D=128 only
+    MTL::ComputePipelineState* attn_decode_d64 = nullptr;  // mha_decode_d64 (Br=1, seq==1, D=64 only)
     // Flash-decoding split-K decode attention (long-ctx). Both non-null together.
     MTL::ComputePipelineState* attn_split   = nullptr;  // mha_decode_split (D-specific)
     MTL::ComputePipelineState* attn_combine = nullptr;  // mha_decode_combine (D-specific)
@@ -799,8 +800,13 @@ inline void dispatch_layer(
             constexpr uint32_t PBR = 8u;
             const bool use_prefill = (p.seq > 1) && (P.attn_prefill != nullptr)
                                      && (Hg_attn * PBR * 32u <= 1024u);
-            MTL::ComputePipelineState* pso_a = use_prefill ? P.attn_prefill : P.attn;
-            const uint32_t br = use_prefill ? PBR : 2u;
+            // D=64 decode (seq==1): Br=1 variant uses Hg*32 threads (no idle
+            // simdgroups), bit-identical to fa_dN<…,64>'s Br=2 path. Same 9
+            // buffers in the same order, only the grid/tg differ.
+            const bool use_d64 = (p.seq == 1) && (P.attn_decode_d64 != nullptr);
+            MTL::ComputePipelineState* pso_a =
+                use_d64 ? P.attn_decode_d64 : (use_prefill ? P.attn_prefill : P.attn);
+            const uint32_t br = use_prefill ? PBR : (use_d64 ? 1u : 2u);
             enc->setComputePipelineState(pso_a);
             enc->setBuffer(q_in,       0, 0);
             enc->setBuffer(B.k_cache,  0, 1);

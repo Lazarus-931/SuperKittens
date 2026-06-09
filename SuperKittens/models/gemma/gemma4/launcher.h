@@ -92,6 +92,14 @@ int sk_gemma4_forward(sk_gemma4_handle* h,
                       const int* input_ids, uint32_t seq,
                       int* output_id);
 
+// Batched lockstep decode (N concurrent requests share current_pos, each its own
+// KV slice). input_ids is batch*seq int32 (request-major), output_id receives
+// `batch` greedy next tokens. Requires the handle's cfg.batch == N and seq==1.
+// At batch==1 / seq>1 this is undefined; use sk_gemma4_forward there.
+int sk_gemma4_forward_batched(sk_gemma4_handle* h,
+                              const int* input_ids, uint32_t seq,
+                              int* output_id);
+
 // Reset the per-sequence KV-cache cursor (does NOT zero the cache buffers;
 // stale data is shadowed once new K/V is written over it).
 void sk_gemma4_reset(sk_gemma4_handle* h);

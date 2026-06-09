@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from SuperKittens.inference.c_binder import bind, CtypesConfig
+from SuperKittens.inference.c_binder import bind, optional, CtypesConfig
 from SuperKittens.inference.generation import Model
 
 
@@ -94,6 +94,13 @@ class Mamba2Model(Model):
         "destroy":          ([ctypes.c_void_p], None),
         "dump_layer":       ([ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t], ctypes.c_int),
         "get_last_logits":  ([ctypes.c_void_p, ctypes.c_void_p], ctypes.c_int),
+        # Batched-decode serving (optional — present only in batched dylibs).
+        "reset_lane":       optional([ctypes.c_void_p, ctypes.c_uint32], None),
+        "prefill_lane":     optional([ctypes.c_void_p, ctypes.c_uint32,
+                                      ctypes.POINTER(ctypes.c_int), ctypes.c_uint32,
+                                      ctypes.POINTER(ctypes.c_int)], ctypes.c_int),
+        "decode_batched":   optional([ctypes.c_void_p, ctypes.POINTER(ctypes.c_int),
+                                      ctypes.c_uint32, ctypes.POINTER(ctypes.c_int)], ctypes.c_int),
     }
 
     def __init__(self, cfg: Mamba2Config, lib_path: str | None = None):
@@ -165,6 +172,54 @@ class Mamba2Model(Model):
             out.append(nxt)
             if nxt in stops:
                 break
+        return out
+
+    def generate_batched(self, prompts, *, max_new_tokens: int = 64):
+        """Greedy lockstep batched decode of N requests (serving path).
+
+        Each prompt is prefilled into its own lane's conv+ssm state, then the
+        decode runs all N lanes in lockstep: every step projects N rows through
+        ONE weight read (in/out_proj GEMM at M=N) — the weight-read amortization
+        that makes aggregate tok/s scale with N. Per-lane SSM state isolation
+        means each lane's tokens match its single-stream M=1 run.
+
+        prompts: list of token-id lists (len <= cfg.batch). Returns list of
+        per-lane generated token-id lists (greedy).
+        """
+        import ctypes as C
+        N = len(prompts)
+        if N == 0:
+            return []
+        if N > self.cfg.batch:
+            raise ValueError(f"N={N} > cfg.batch={self.cfg.batch}")
+        if not hasattr(self._lib, "sk_mamba2_decode_batched"):
+            raise RuntimeError("dylib missing batched-decode ABI")
+
+        # Per-lane prefill: each request's prompt -> its lane's state.
+        cur = [0] * N
+        out = [[] for _ in range(N)]
+        for lane, ids in enumerate(prompts):
+            self._lib.sk_mamba2_reset_lane(self._h, lane)
+            arr = (C.c_int * len(ids))(*[int(x) for x in ids])
+            o = C.c_int(0)
+            rc = self._lib.sk_mamba2_prefill_lane(self._h, lane, arr, len(ids), C.byref(o))
+            if rc != 0:
+                raise RuntimeError(f"prefill_lane({lane}) rc={rc}")
+            cur[lane] = int(o.value)
+            out[lane].append(cur[lane])
+
+        # Lockstep batched decode.
+        inbuf  = (C.c_int * N)()
+        outbuf = (C.c_int * N)()
+        for _ in range(max_new_tokens - 1):
+            for lane in range(N):
+                inbuf[lane] = cur[lane]
+            rc = self._lib.sk_mamba2_decode_batched(self._h, inbuf, N, outbuf)
+            if rc != 0:
+                raise RuntimeError(f"decode_batched rc={rc}")
+            for lane in range(N):
+                cur[lane] = int(outbuf[lane])
+                out[lane].append(cur[lane])
         return out
 
     def dump(self, tag: str):

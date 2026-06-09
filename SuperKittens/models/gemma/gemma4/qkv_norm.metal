@@ -98,4 +98,72 @@ void gemma4_qkv_norm(
     }
 }
 
+
+// Batched-decode variant: writes Q/K/V in BATCH-MAJOR (batch, n_heads, q_seq,
+// head_dim) layout so the downstream kv_cache_write + attention (both indexed
+// (B,H,seq,D)) read the right per-lane rows. The non-batched gemma4_qkv_norm
+// writes HEAD-MAJOR (H,T,D); at batch==1 the two coincide, so M=1 is unchanged
+// and this is only dispatched at batch>1. t in [0,T=batch*q_seq): lane b=t/q_seq,
+// seq-pos s=t%q_seq.
+[[host_name("gemma4_qkv_norm_batched")]]
+[[kernel]]
+void gemma4_qkv_norm_batched(
+    device const bfloat* qkv          [[buffer(0)]],
+    device const bfloat* gamma_q      [[buffer(1)]],
+    device const bfloat* gamma_k      [[buffer(2)]],
+    device       bfloat* q_out        [[buffer(3)]],
+    device       bfloat* k_out        [[buffer(4)]],
+    device       bfloat* v_out        [[buffer(5)]],
+    constant uint& T                [[buffer(6)]],
+    constant uint& n_heads          [[buffer(7)]],
+    constant uint& n_kv_heads       [[buffer(8)]],
+    constant uint& head_dim         [[buffer(9)]],
+    constant float& eps             [[buffer(10)]],
+    constant uint& q_seq            [[buffer(11)]],
+    uint2 gid  [[threadgroup_position_in_grid]],
+    uint  tid  [[thread_index_in_threadgroup]])
+{
+    const uint slot = gid.x;
+    const uint t    = gid.y;
+    if (t >= T) return;
+
+    const uint q_end  = n_heads;
+    const uint k_end  = n_heads + n_kv_heads;
+    const uint kv_end = n_heads + 2u * n_kv_heads;
+    if (slot >= kv_end) return;
+
+    const uint qkv_stride = kv_end * head_dim;
+    const size_t qkv_row_off = (size_t)t * qkv_stride;
+    const uint slot_off = slot * head_dim;
+    const size_t row_off = qkv_row_off + slot_off;
+
+    float x = (tid < head_dim) ? (float)qkv[row_off + tid] : 0.0f;
+
+    threadgroup float scratch[32];
+    float ssq = tg_sum_sq(scratch, x * x, tid, head_dim);
+    float inv_rms = rsqrt(ssq / (float)head_dim + eps);
+    if (tid >= head_dim) return;
+
+    const uint b = t / q_seq;     // lane
+    const uint s = t % q_seq;     // seq position within lane
+
+    float y;
+    if (slot < q_end) {
+        const uint head = slot;
+        y = x * inv_rms * (float)gamma_q[tid];
+        size_t out_off = (((size_t)(b * n_heads + head) * q_seq) + s) * head_dim + tid;
+        q_out[out_off] = bfloat(y);
+    } else if (slot < k_end) {
+        const uint head = slot - q_end;
+        y = x * inv_rms * (float)gamma_k[tid];
+        size_t out_off = (((size_t)(b * n_kv_heads + head) * q_seq) + s) * head_dim + tid;
+        k_out[out_off] = bfloat(y);
+    } else {
+        const uint head = slot - k_end;
+        y = x * inv_rms;
+        size_t out_off = (((size_t)(b * n_kv_heads + head) * q_seq) + s) * head_dim + tid;
+        v_out[out_off] = bfloat(y);
+    }
+}
+
 } // namespace meow::gemma4::qkvn

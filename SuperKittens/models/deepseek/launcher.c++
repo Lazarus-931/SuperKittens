@@ -15,6 +15,8 @@ namespace meow { namespace deepseek {
 // accumulators.
 Prof& prof() { static Prof p; return p; }
 
+int& moe_mma_override() { static int v = -1; return v; }
+
 struct Handle {
     sk_deepseek_config cfg;
     uint32_t           current_pos = 0;
@@ -132,13 +134,30 @@ static bool resolve_psos(ModelPSOs& P, uint32_t dk, uint32_t dv) {
     P.layer.router_partial = sk::bindings_pso("moe_router_partial");  // split-D occupancy router
     P.layer.router_reduce  = sk::bindings_pso("moe_router_reduce");
     P.layer.mla_decode_v2 = sk::bindings_pso("kernel_mla_decode_v2_f16_dk192_dv128");
-    P.layer.mla_kv_write  = sk::bindings_pso("deepseek_mla_kv_write");
+    // Batch-aware kv_write (per-lane KV [batch,H,cache,dk]; backward-compatible at
+    // batch==1). New host_name so it resolves from SK_METAL_SRC_FALLBACK rather
+    // than the (stale, batch-blind) deepseek_mla_kv_write baked into the metallib.
+    P.layer.mla_kv_write  = sk::bindings_pso("deepseek_mla_kv_write_b");
     P.layer.moe_mv_gate   = resolve_mvid_pso(
         sk::bindings_library(), sk::bindings_device(), "deepseek_mul_mv_id_q4_K");
     P.layer.moe_mv_down   = resolve_mvid_pso(
         sk::bindings_library(), sk::bindings_device(), "deepseek_mul_mv_id_q5_0");
     P.layer.moe_swiglu_f32  = sk::bindings_pso("deepseek_moe_swiglu_f32");
     P.layer.moe_scatter_add = sk::bindings_pso("deepseek_moe_scatter_add_f32");
+    // T>1 grouped MoE expert matvec (additive, prefill-only; nullptr -> per-slot fallback).
+    P.layer.moe_group_build = sk::bindings_pso("deepseek_moe_group_build");
+    P.layer.moe_mv_gate_grp = resolve_mvid_pso(
+        sk::bindings_library(), sk::bindings_device(), "deepseek_mul_mv_id_q4_K_grp");
+    P.layer.moe_mv_down_grp = resolve_mvid_pso(
+        sk::bindings_library(), sk::bindings_device(), "deepseek_mul_mv_id_q5_0_grp");
+    // T>1 MMA-tiled grouped MoE (simdgroup_float8x8); nullptr -> per-slot fallback.
+    P.layer.moe_mma_gate_grp = sk::bindings_pso("deepseek_moe_mma_q4k_grp");
+    P.layer.moe_mma_down_grp = sk::bindings_pso("deepseek_moe_mma_q5_0_grp");
+    // Batched MMA GEMM (qwen kernel, shared) for T>1 dense projections.
+    P.layer.gemm_mma_f16  = sk::bindings_pso("gemm_mma_f16");
+    P.layer.gemm_mma_q4k  = sk::bindings_pso("gemm_mma_q4k");
+    P.layer.gemm_mma_q6k  = sk::bindings_pso("gemm_mma_q6k");
+    P.layer.gemm_mma_q8_0 = sk::bindings_pso("gemm_mma_q8_0");
 
     // Native K-quant matvec (decode) so dense/attn/shared/LM-head stay quantized.
     P.layer.q4k_matvec  = sk::bindings_pso("q4k_matvec");
@@ -169,7 +188,7 @@ static bool resolve_psos(ModelPSOs& P, uint32_t dk, uint32_t dv) {
     _CK("moe_router",            P.layer.moe.router);
     _CK("moe_router(v2)",        P.layer.router_v2);
     _CK("mla_decode_v2",         P.layer.mla_decode_v2);
-    _CK("mla_kv_write",          P.layer.mla_kv_write);
+    _CK("mla_kv_write_b",        P.layer.mla_kv_write);
     _CK("moe_mul_mv_id_q4_K",    P.layer.moe_mv_gate);
     _CK("moe_mul_mv_id_q5_0",    P.layer.moe_mv_down);
     _CK("moe_swiglu_f32",        P.layer.moe_swiglu_f32);
@@ -330,6 +349,9 @@ extern "C" sk_deepseek_handle* sk_deepseek_create(const sk_deepseek_config* cfg)
     h->bufs.moe_up_f32    = alloc_zero(dev, (size_t)T_max * cfg->top_k * cfg->n_int * 4);
     h->bufs.moe_mid_f32   = alloc_zero(dev, (size_t)T_max * cfg->top_k * cfg->n_int * 4);
     h->bufs.moe_down_f32  = alloc_zero(dev, (size_t)T_max * cfg->top_k * cfg->d_model * 4);
+    // T>1 grouped MoE: per-expert offsets + slot lists (counting sort scratch).
+    h->bufs.moe_group_off   = alloc_zero(dev, (size_t)(cfg->n_expert + 1) * sizeof(int32_t));
+    h->bufs.moe_group_slots = alloc_zero(dev, (size_t)T_max * cfg->top_k * sizeof(int32_t));
 
     // 2-pass argmax scratch.
     {
@@ -387,6 +409,10 @@ extern "C" int sk_deepseek_load_weights(sk_deepseek_handle* hp,
     cp(h->weights.w_up,            w->w_up);
     cp(h->weights.w_down,          w->w_down);
     return 0;
+}
+
+extern "C" void sk_deepseek_set_moe_mma(int v) {
+    meow::deepseek::moe_mma_override() = v;
 }
 
 extern "C" void sk_deepseek_profile_report(uint64_t tokens) {
@@ -511,6 +537,94 @@ extern "C" int sk_deepseek_forward(sk_deepseek_handle* hp,
     return 0;
 }
 
+// Batched lockstep decode: `batch` requests step together at the SAME absolute
+// position (current_pos), each owning its own KV-cache region (per-lane MLA
+// isolation in deepseek_mla_kv_write). input_ids is `batch` int32 (one current
+// token per lane, lane-major). output_id receives `batch` int32 (one greedy
+// next-token per lane). seq is fixed at 1 (prompts are driven token-by-token at
+// seq==1). batch==1 reduces to the single-stream forward byte-for-byte.
+extern "C" int sk_deepseek_forward_batched(sk_deepseek_handle* hp,
+                                           const int* input_ids, int* output_id) {
+    if (!hp || !input_ids || !output_id) return -1;
+    auto* h = reinterpret_cast<meow::deepseek::Handle*>(hp);
+    if (h->cfg.batch < 1) return -5;
+    if (h->current_pos + 1u > h->cfg.cache_max) return -4;
+
+    auto* q = sk::bindings_queue();
+    if (!q) return -3;
+
+    std::memcpy(h->bufs.input_ids->contents(), input_ids,
+                (size_t)h->cfg.batch * sizeof(int32_t));
+
+    // All lanes share the absolute position; rope_interleave_f32 reads
+    // pos[i3*ne01 + i1] = pos[lane*1 + 0] = pos[lane], so fill one per lane.
+    int32_t* pos = (int32_t*)h->bufs.rope_pos->contents();
+    for (uint32_t b = 0; b < h->cfg.batch; ++b) pos[b] = (int32_t)h->current_pos;
+
+    meow::deepseek::ModelParams mp;
+    mp.batch          = h->cfg.batch;
+    mp.seq            = 1u;
+    mp.n_layers       = h->cfg.n_layers;
+    mp.d_model        = h->cfg.d_model;
+    mp.n_int          = h->cfg.n_int;
+    mp.shared_n_int   = h->cfg.shared_n_int;
+    mp.dense_n_int    = h->cfg.dense_n_int ? h->cfg.dense_n_int : h->cfg.shared_n_int;
+    mp.n_heads        = h->cfg.n_heads;
+    mp.qk_nope_dim    = h->cfg.qk_nope_dim;
+    mp.qk_rope_dim    = h->cfg.qk_rope_dim;
+    mp.v_head_dim     = h->cfg.v_head_dim;
+    mp.q_lora_rank    = h->cfg.q_lora_rank;
+    mp.kv_lora_rank   = h->cfg.kv_lora_rank;
+    mp.n_expert       = h->cfg.n_expert;
+    mp.top_k          = h->cfg.top_k;
+    mp.cache_max      = h->cfg.cache_max;
+    mp.moe_quant      = (h->cfg.moe_quant == 1) ? meow::deepseek::MoeQuant::INT2_DS4
+                                                : meow::deepseek::MoeQuant::FP16;
+    mp.vocab_size     = h->cfg.vocab_size;
+    mp.eps            = h->cfg.eps;
+    mp.current_pos    = h->current_pos;
+    mp.rope_n_ctx_orig = h->cfg.rope_n_ctx_orig;
+    mp.rope_freq_base  = h->cfg.rope_freq_base;
+    mp.rope_freq_scale = h->cfg.rope_freq_scale;
+    mp.rope_ext_factor = h->cfg.rope_ext_factor;
+    mp.rope_attn_factor = h->cfg.rope_attn_factor;
+    mp.rope_beta_fast  = h->cfg.rope_beta_fast;
+    mp.rope_beta_slow  = h->cfg.rope_beta_slow;
+    mp.has_q_lora            = (h->cfg.has_q_lora != 0);
+    mp.router_has_bias       = (h->cfg.router_has_bias != 0);
+    mp.rope_interleave       = (h->cfg.rope_interleave != 0);
+    mp.norm_topk_prob        = (h->cfg.norm_topk_prob != 0);
+    mp.n_group               = h->cfg.n_group;
+    mp.topk_group            = h->cfg.topk_group;
+    mp.routed_scaling        = h->cfg.routed_scaling_factor;
+    mp.mscale_all_dim        = h->cfg.mscale_all_dim;
+    mp.rope_scaling_factor   = h->cfg.rope_scaling_factor;
+    mp.first_k_dense_replace = h->cfg.first_k_dense_replace;
+    mp.decode_all_rows       = 1u;
+
+    auto* cmd = q->commandBuffer();
+    cmd->retain();
+    meow::deepseek::dispatch_model(cmd, h->psos, h->weights, h->bufs, mp);
+    cmd->commit();
+    cmd->waitUntilCompleted();
+    if (std::getenv("SK_DS_GPUPROF"))
+        std::fprintf(stderr, "[gpuprof] gpu_busy_us=%.1f\n",
+                     (cmd->GPUEndTime() - cmd->GPUStartTime()) * 1e6);
+    if (cmd->status() == MTL::CommandBufferStatusError) {
+        auto* e = cmd->error();
+        std::fprintf(stderr, "ds forward_batched: command buffer ERROR (status=%ld): %s\n",
+                     (long)(e ? e->code() : -1),
+                     e && e->localizedDescription() ? e->localizedDescription()->utf8String() : "?");
+    }
+    cmd->release();
+
+    h->current_pos += 1u;
+
+    std::memcpy(output_id, h->bufs.output_id->contents(),
+                (size_t)h->cfg.batch * sizeof(int32_t));
+    return 0;
+}
+
 extern "C" void sk_deepseek_destroy(sk_deepseek_handle* hp) {
     if (!hp) return;
     auto* h = reinterpret_cast<meow::deepseek::Handle*>(hp);
@@ -541,6 +655,7 @@ extern "C" void sk_deepseek_destroy(sk_deepseek_handle* hp) {
     rel(h->bufs.m_in); rel(h->bufs.shared_mid); rel(h->bufs.shared_out);
     rel(h->bufs.mlp_gate); rel(h->bufs.mlp_up);
     rel(h->bufs.moe_top_idx); rel(h->bufs.moe_top_score); rel(h->bufs.moe_hidden);
+    rel(h->bufs.moe_group_off); rel(h->bufs.moe_group_slots);
     rel(h->bufs.moe_x_f32); rel(h->bufs.moe_gate_f32); rel(h->bufs.moe_up_f32);
     rel(h->bufs.moe_mid_f32); rel(h->bufs.moe_down_f32);
     rel(h->bufs.argmax_val_buf); rel(h->bufs.argmax_idx_buf);

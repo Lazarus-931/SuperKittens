@@ -11,8 +11,8 @@ using namespace metal;
 
 // Assemble + cache-write for ONE decode step (T tokens, decode T usually 1).
 // K cache layout: [head, cache_max, 192] fp16; V cache: [head, cache_max, 128].
-[[host_name("deepseek_mla_kv_write")]]
-kernel void deepseek_mla_kv_write(
+[[host_name("deepseek_mla_kv_write_b")]]
+kernel void deepseek_mla_kv_write_b(
         device const half * k_nope   [[buffer(0)]],   // [T, H, 128] fp16
         device const half * k_pe     [[buffer(1)]],   // [T, 64]     fp16 (shared)
         device const half * v        [[buffer(2)]],   // [T, H, 128] fp16
@@ -25,17 +25,24 @@ kernel void deepseek_mla_kv_write(
         constant uint &     v_dim     [[buffer(9)]],   // 128
         constant uint &     cache_max [[buffer(10)]],
         constant uint &     write_pos [[buffer(11)]],
+        constant uint &     seq       [[buffer(12)]],  // tokens/lane this step (1 at decode)
         uint3 gid [[thread_position_in_grid]]) {
-    const uint t = gid.z;   // token in this step
+    const uint t = gid.z;   // token in this step (lane-major: b*seq + s)
     const uint h = gid.y;   // head
     const uint i = gid.x;   // element within the dk row (0..dk-1)
     const uint dk = qk_nope + qk_rope;
     if (t >= T || h >= H || i >= dk) return;
 
-    const uint pos = write_pos + t;
+    // Per-lane KV isolation: cache is [batch, head, cache_max, dk|dv]. t=b*seq+s;
+    // lane b writes its own region at pos=write_pos+s. batch==1 (prefill/single-
+    // stream decode) gives b==0,s==t -> original [head,cache,dim] byte-identical.
+    const uint b = (seq > 1u) ? (t / seq) : t;
+    const uint s = (seq > 1u) ? (t % seq) : 0u;
+    const uint pos = write_pos + s;
     if (pos >= cache_max) return;
 
-    device half * krow = k_cache + ((size_t)h * cache_max + pos) * dk;
+    device half * kbase = k_cache + (size_t)b * H * cache_max * dk;
+    device half * krow  = kbase + ((size_t)h * cache_max + pos) * dk;
     if (i < qk_nope) {
         krow[i] = k_nope[((size_t)t * H + h) * qk_nope + i];
     } else {
@@ -44,7 +51,8 @@ kernel void deepseek_mla_kv_write(
     }
 
     if (i < v_dim) {
-        device half * vrow = v_cache + ((size_t)h * cache_max + pos) * v_dim;
+        device half * vbase = v_cache + (size_t)b * H * cache_max * v_dim;
+        device half * vrow  = vbase + ((size_t)h * cache_max + pos) * v_dim;
         vrow[i] = v[((size_t)t * H + h) * v_dim + i];
     }
 }

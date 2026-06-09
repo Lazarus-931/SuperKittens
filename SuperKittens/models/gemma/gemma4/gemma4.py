@@ -53,6 +53,8 @@ GEMMA4_ABI = {
     "load_weights":           ([ctypes.c_void_p, ctypes.POINTER(_Weights)], ctypes.c_int),
     "forward":                ([ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
                                 ctypes.c_uint32, ctypes.POINTER(ctypes.c_int32)], ctypes.c_int),
+    "forward_batched":        optional([ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
+                                ctypes.c_uint32, ctypes.POINTER(ctypes.c_int32)], ctypes.c_int),
     "reset":                  ([ctypes.c_void_p], None),
     "destroy":                ([ctypes.c_void_p], None),
     "load_safetensors":       ([ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int),
@@ -219,6 +221,25 @@ class Gemma4(Model):
             out.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)))
         if ret:
             raise RuntimeError(f"sk_gemma4_forward failed: {ret}")
+        return out
+
+    def forward_batched(self, input_ids: np.ndarray) -> np.ndarray:
+        """Batched lockstep decode: input_ids is (batch,) or (batch,1) int32 (one
+        token per request); returns (batch,) int32 next tokens. Requires cfg.batch
+        == N. Body projections read each weight once (M=N MMA GEMM); each lane has
+        its own KV slice for the SWA attention. M=1 falls back to forward()."""
+        ids = np.ascontiguousarray(input_ids, dtype=np.int32).reshape(-1)
+        assert ids.size == self.cfg.batch, f"need batch={self.cfg.batch} tokens, got {ids.size}"
+        out = np.empty((self.cfg.batch,), dtype=np.int32)
+        fn = getattr(_load(), "sk_gemma4_forward_batched", None)
+        if fn is None:
+            raise RuntimeError("libsk.dylib has no sk_gemma4_forward_batched; rebuild dylib")
+        ret = fn(self._h,
+                 ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+                 1,
+                 out.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)))
+        if ret:
+            raise RuntimeError(f"sk_gemma4_forward_batched failed: {ret}")
         return out
 
     def set_dump_enabled(self, enabled: bool):

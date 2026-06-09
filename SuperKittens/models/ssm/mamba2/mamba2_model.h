@@ -338,15 +338,15 @@ inline void encode_conv1d_silu_step(
     MTL::Buffer* x_new, MTL::Buffer* w, size_t off_w,
     MTL::Buffer* bias, size_t off_b,
     MTL::Buffer* y, MTL::Buffer* conv_state,
-    uint32_t Bn, uint32_t C, uint32_t K)
+    uint32_t Bn, uint32_t C, uint32_t K, size_t off_cs = 0)
 {
     auto* enc = cmd->computeCommandEncoder();
     enc->setComputePipelineState(pso);
-    enc->setBuffer(x_new,      0,     0);
-    enc->setBuffer(w,          off_w, 1);
-    enc->setBuffer(bias,       off_b, 2);
-    enc->setBuffer(y,          0,     3);
-    enc->setBuffer(conv_state, 0,     4);
+    enc->setBuffer(x_new,      0,      0);
+    enc->setBuffer(w,          off_w,  1);
+    enc->setBuffer(bias,       off_b,  2);
+    enc->setBuffer(y,          0,      3);
+    enc->setBuffer(conv_state, off_cs, 4);
     enc->setBytes(&Bn, 4, 5);
     enc->setBytes(&C,  4, 6);
     enc->setBytes(&K,  4, 7);
@@ -357,12 +357,12 @@ inline void encode_conv1d_silu_step(
 inline void encode_conv_state_capture(
     MTL::CommandBuffer* cmd, MTL::ComputePipelineState* pso,
     MTL::Buffer* x, MTL::Buffer* conv_state,
-    uint32_t Bn, uint32_t L, uint32_t C, uint32_t K)
+    uint32_t Bn, uint32_t L, uint32_t C, uint32_t K, size_t off_cs = 0)
 {
     auto* enc = cmd->computeCommandEncoder();
     enc->setComputePipelineState(pso);
-    enc->setBuffer(x,          0, 0);
-    enc->setBuffer(conv_state, 0, 1);
+    enc->setBuffer(x,          0,      0);
+    enc->setBuffer(conv_state, off_cs, 1);
     enc->setBytes(&Bn, 4, 2);
     enc->setBytes(&L,  4, 3);
     enc->setBytes(&C,  4, 4);
@@ -424,6 +424,11 @@ struct DispatchBufs {
     MTL::Buffer* out_proj_out;
     MTL::Buffer* conv_state;
     MTL::Buffer* ssm_state;
+    // Per-lane state offset (bytes) into conv_state / ssm_state. 0 = lane 0
+    // (single-stream / batched dispatch from lane 0). A per-lane prefill points
+    // these at lane i so the b=0 kernel write lands in lane i's state slot.
+    size_t       conv_state_off = 0;
+    size_t       ssm_state_off  = 0;
     MTL::Buffer* w_pre_norm;
     MTL::Buffer* w_in_proj;
     MTL::Buffer* w_conv;
@@ -498,14 +503,14 @@ inline void dispatch_layer(
     if (p.is_decode && P.conv1d_silu_step && P.conv_state_capture) {
         encode_conv1d_silu_step(cmd, P.conv1d_silu_step, b.xBC, b.w_conv, off_conv,
                                 b.w_conv_b, off_convb, b.xBC_post, b.conv_state,
-                                p.batch, C_in, K);
+                                p.batch, C_in, K, b.conv_state_off);
     } else {
         encode_conv1d_silu(cmd, P.conv1d_silu, b.xBC, b.w_conv, off_conv,
                            b.w_conv_b, off_convb, b.xBC_post,
                            p.batch, p.seq, C_in);
         if (P.conv_state_capture)
             encode_conv_state_capture(cmd, P.conv_state_capture, b.xBC, b.conv_state,
-                                      p.batch, p.seq, C_in, K);
+                                      p.batch, p.seq, C_in, K, b.conv_state_off);
     }
     }
 
@@ -523,8 +528,8 @@ inline void dispatch_layer(
         enc->setBuffer(b.xBC_post,  off_C_in, 4);
         enc->setBuffer(b.w_D,       off_D,    5);
         enc->setBuffer(b.w_dt_bias, off_dtb,  6);
-        enc->setBuffer(b.ssd_out,   0,        7);
-        enc->setBuffer(b.ssm_state, 0,        8);
+        enc->setBuffer(b.ssd_out,   0,               7);
+        enc->setBuffer(b.ssm_state, b.ssm_state_off, 8);
         enc->setBytes(&p.batch,  4, 9);
         enc->setBytes(&p.seq,    4, 10);
         enc->setBytes(&H,        4, 11);
@@ -582,6 +587,15 @@ struct ModelParams {
     float    eps          = 1e-5f;
     float    dt_min       = 0.0f;
     float    dt_max       = INFINITY;
+    // Batched-decode: when seq==1 and batch=N>1, argmax every row so each
+    // request (lane) gets its own next-token (output_id[0..N]). Default 0 keeps
+    // the single-row (last-position) argmax byte-identical.
+    uint32_t decode_all_rows = 0;
+    // Per-lane prefill: dispatch batch=1 but write state into lane `prefill_lane`
+    // of the (batch=N) state buffers (offset = lane * per-lane bytes). Used to
+    // populate each request's conv/ssm state from its own prompt before the
+    // lockstep batched decode. -1 (default) = lane 0 / no offset.
+    int32_t  prefill_lane = -1;
 };
 
 inline void dispatch_model(
@@ -645,6 +659,14 @@ inline void dispatch_model(
         db.out_proj_out = B.out_proj_out;
         db.conv_state   = states[L].conv_state;
         db.ssm_state    = states[L].ssm_state;
+        if (M.prefill_lane >= 0) {
+            const size_t C_in = M.intermediate + 2 * (size_t)M.n_groups * M.state_size;
+            const size_t conv_lane = (size_t)(M.conv_kernel - 1) * C_in * 2;  // fp16
+            const size_t ssm_lane  = (size_t)M.n_heads * M.head_dim
+                                   * M.state_size * sizeof(float);
+            db.conv_state_off = (size_t)M.prefill_lane * conv_lane;
+            db.ssm_state_off  = (size_t)M.prefill_lane * ssm_lane;
+        }
         db.w_pre_norm   = W.w_pre_norm;
         db.w_in_proj    = W.w_in_proj;
         db.w_conv       = W.w_conv;
@@ -690,12 +712,29 @@ inline void dispatch_model(
     }
     }
 
-    // E. Argmax over LAST token row only
+    // E. Argmax. Single-stream / prefill: LAST row only -> output_id[0].
+    //    Batched-decode (decode_all_rows, seq==1): every row r -> output_id[r],
+    //    one next-token per request lane. The 2-pass reduce writes a single int,
+    //    so per-row it needs its own partials region; with a shared scratch we
+    //    keep the simple single-pass argmax per row (correctness over the ~us
+    //    saving — argmax is a sliver of the bandwidth-bound decode step).
     if (!SK.argmax) {
-        const size_t last_off = (size_t)(T - 1) * M.vocab_size * 2;
+        const bool all_rows = (M.decode_all_rows && M.seq == 1u && T > 1u);
         const bool can_2pass = P.argmax_partial && P.argmax_reduce
                             && B.argmax_val_buf && B.argmax_idx_buf;
-        if (can_2pass) {
+        if (all_rows) {
+            for (uint32_t r = 0; r < T; ++r) {
+                const size_t row_off = (size_t)r * M.vocab_size * 2;
+                auto* enc = cmd->computeCommandEncoder();
+                enc->setComputePipelineState(P.argmax);
+                enc->setBuffer(B.logits,  row_off,             0);
+                enc->setBuffer(output_id, (size_t)r * sizeof(int32_t), 1);
+                enc->setBytes(&M.vocab_size, 4, 2);
+                enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(1024, 1, 1));
+                enc->endEncoding();
+            }
+        } else if (can_2pass) {
+            const size_t last_off = (size_t)(T - 1) * M.vocab_size * 2;
             constexpr uint32_t ELTS_PER_TG = 16384u;
             const uint32_t n_blocks = (M.vocab_size + ELTS_PER_TG - 1u) / ELTS_PER_TG;
             {
@@ -721,6 +760,7 @@ inline void dispatch_model(
                 enc->endEncoding();
             }
         } else {
+            const size_t last_off = (size_t)(T - 1) * M.vocab_size * 2;
             auto* enc = cmd->computeCommandEncoder();
             enc->setComputePipelineState(P.argmax);
             enc->setBuffer(B.logits,  last_off, 0);

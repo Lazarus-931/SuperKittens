@@ -90,6 +90,11 @@ sk_deepseek_handle* sk_deepseek_create(const sk_deepseek_config* cfg);
 int  sk_deepseek_load_weights(sk_deepseek_handle* h, const sk_deepseek_weights* w);
 int  sk_deepseek_forward(sk_deepseek_handle* h,
                          const int* input_ids, uint32_t seq, int* output_id);
+// Batched lockstep decode: `batch` requests step together at current_pos, each
+// with its own KV region. input_ids = batch int32 (one token/lane), output_id =
+// batch int32 (one greedy next-token/lane). batch==1 == single-stream forward.
+int  sk_deepseek_forward_batched(sk_deepseek_handle* h,
+                                 const int* input_ids, int* output_id);
 void sk_deepseek_reset(sk_deepseek_handle* h);
 void sk_deepseek_destroy(sk_deepseek_handle* h);
 
