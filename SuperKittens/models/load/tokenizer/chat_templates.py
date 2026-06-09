@@ -110,4 +110,5 @@ CHAT_TEMPLATES = {
     "llama": llama_template,
     "nemotron": llama_template,
     "mistral": mistral_template,
+    "yi": qwen_template,
 }

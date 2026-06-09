@@ -225,6 +225,25 @@ SPECS: dict[str, ModelSpec] = {
                   eps=1e-6, rope_freq_base=1_000_000.0, tie_word_embeddings=1,
                   use_qk_norm=0, rope_interleaved=0, attn_qkv_bias=1),
     ),
+    # Yi-1.5-6B-Chat (01.AI): model_type "llama" (LlamaForCausalLM) — a Llama-style
+    # dense decoder from a distinct vendor. Reuses the qwen launcher/kernels; the Yi
+    # adapter sets use_qk_norm=0 and rope_interleaved=1 (Llama GGUF NORM rope,
+    # theta=5e6, no llama3 rescale). Untied LM head (output.weight, Q6_K). vocab 64000.
+    # attention_bias=False (no QKV bias). Chat is ChatML (<|im_start|>/<|im_end|>).
+    # Q4_K_M (~3.67 GB) fits a 16 GB mini.
+    "yi-1.5-6b-chat": ModelSpec(
+        family="yi",
+        adapter="SuperKittens.models.yi.yi:Yi",
+        hf_repo="01-ai/Yi-1.5-6B-Chat",
+        weight_dir="Yi-1.5-6B-Chat-GGUF",
+        gguf_name="Yi-1.5-6B-Chat-Q4_K_M.gguf",
+        default_quant="q4_k_m",
+        tokenizer_family="yi",
+        dims=dict(n_layers=32, d_model=4096, n_heads=32, n_kv_heads=4,
+                  head_dim=128, n_int=11008, vocab_size=64000,
+                  eps=1e-6, rope_freq_base=5_000_000.0, tie_word_embeddings=0,
+                  use_qk_norm=0),
+    ),
     "qwen3-1.7b": ModelSpec(
         family="qwen3",
         adapter="SuperKittens.models.qwen.qwen:Qwen",
