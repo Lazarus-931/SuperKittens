@@ -444,6 +444,39 @@ static int run_prefill_chunked(Handle* h, MTL::CommandQueue* q,
     return 0;
 }
 
+// WHY: pipeline-parallel run_layers/resume_from_hidden need the same fully
+// populated ModelParams as run_step. Mirror it here (run_step itself is left
+// inline + untouched so the production M=1 path stays byte-identical).
+static ModelParams fill_params(Handle* h, uint32_t seq) {
+    ModelParams mp;
+    mp.batch          = h->cfg.batch;
+    mp.seq            = seq;
+    mp.n_layers       = h->cfg.n_layers;
+    mp.d_model        = h->cfg.d_model;
+    mp.n_heads        = h->cfg.n_heads;
+    mp.n_kv_heads     = h->cfg.n_kv_heads;
+    mp.head_dim       = h->cfg.head_dim;
+    mp.n_int          = h->cfg.n_int;
+    mp.cache_max      = h->cfg.cache_max;
+    mp.vocab_size     = h->cfg.vocab_size;
+    mp.eps            = h->cfg.eps;
+    mp.use_qk_norm    = h->cfg.use_qk_norm;
+    mp.rope_interleaved = h->cfg.rope_interleaved;
+    mp.attn_qkv_bias  = h->cfg.attn_qkv_bias;
+    mp.current_pos    = h->current_pos;
+    mp.rope_n_ctx_orig = h->cfg.rope_n_ctx_orig;
+    mp.rope_freq_base  = h->cfg.rope_freq_base;
+    mp.rope_freq_scale = h->cfg.rope_freq_scale;
+    mp.rope_ext_factor = h->cfg.rope_ext_factor;
+    mp.rope_attn_factor = h->cfg.rope_attn_factor;
+    mp.rope_beta_fast  = h->cfg.rope_beta_fast;
+    mp.rope_beta_slow  = h->cfg.rope_beta_slow;
+    mp.layers_run      = h->layers_run;
+    mp.capture_layer   = h->capture_layer;
+    mp.kv_q8           = h->kv_q8;
+    return mp;
+}
+
 static int run_step(Handle* h, MTL::CommandQueue* q, uint32_t seq) {
     ModelParams mp;
     mp.batch          = h->cfg.batch;
@@ -590,6 +623,93 @@ extern "C" int sk_qwen_forward_batched(sk_qwen_handle* hp,
     if (rc) return rc;
 
     std::memcpy(output_id, h->bufs.output_id->contents(),
+                (size_t)h->cfg.batch * sizeof(int32_t));
+    return 0;
+}
+
+// Pipeline-parallel stage 1: embed (when start_layer==0) + layers
+// [start_layer, end_layer), then copy the post-window residual stream
+// (seq * d_model fp16) out to out_hidden. KV for this stage's layers is written
+// at the current position; current_pos advances by seq (this handle owns
+// [start_layer, end_layer)'s KV). out_hidden may be null to skip the copy-out
+// (e.g. a single-process A->B chain that hands off via resume on the next call).
+extern "C" int sk_qwen_run_layers(sk_qwen_handle* hp,
+                                  const int* input_ids, uint32_t seq,
+                                  uint32_t start_layer, uint32_t end_layer,
+                                  void* out_hidden) {
+    if (!hp || !input_ids) return -1;
+    auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
+    if (seq == 0 || seq > h->cfg.seq_max) return -2;
+    if (start_layer >= end_layer || end_layer > h->cfg.n_layers) return -6;
+    if (h->current_pos + seq > h->cfg.cache_max) return -4;
+
+    auto* q = sk::bindings_queue();
+    if (!q) return -3;
+
+    std::memcpy(h->bufs.input_ids->contents(), input_ids,
+                (size_t)h->cfg.batch * seq * sizeof(int32_t));
+    int32_t* pos = (int32_t*)h->bufs.rope_pos->contents();
+    for (uint32_t i = 0; i < seq; ++i) pos[i] = (int32_t)(h->current_pos + i);
+
+    meow::qwen::ModelParams mp = meow::qwen::fill_params(h, seq);
+    h->last_seq = seq;
+
+    auto* cmd = q->commandBuffer();
+    meow::qwen::dispatch_layer_range(cmd, h->psos, h->weights, h->bufs, mp,
+                                     start_layer, end_layer,
+                                     /*do_embed=*/start_layer == 0,
+                                     /*do_tail=*/false);
+    cmd->commit();
+    cmd->waitUntilCompleted();
+    cmd->release();
+    h->current_pos += seq;
+
+    if (out_hidden) {
+        const size_t bytes = (size_t)h->cfg.batch * seq * h->cfg.d_model * 2;
+        std::memcpy(out_hidden, h->bufs.x_a->contents(), bytes);
+    }
+    return 0;
+}
+
+// Pipeline-parallel final stage: load an incoming hidden state (seq * d_model
+// fp16) into the residual buffer, run layers [start_layer, n_layers), then
+// final RMSNorm + LM head + argmax -> *out_token. KV for this stage's layers is
+// written at the current position; current_pos advances by seq (this handle
+// owns [start_layer, n_layers)'s KV). seq must match the producing stage.
+extern "C" int sk_qwen_resume_from_hidden(sk_qwen_handle* hp,
+                                          const void* hidden, uint32_t seq,
+                                          uint32_t start_layer, int* out_token) {
+    if (!hp || !hidden || !out_token) return -1;
+    auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
+    if (seq == 0 || seq > h->cfg.seq_max) return -2;
+    if (start_layer >= h->cfg.n_layers) return -6;
+    if (h->current_pos + seq > h->cfg.cache_max) return -4;
+
+    auto* q = sk::bindings_queue();
+    if (!q) return -3;
+
+    // RoPE positions for this stage's layers (same absolute positions the
+    // producing stage used; this handle tracks them via its own current_pos).
+    int32_t* pos = (int32_t*)h->bufs.rope_pos->contents();
+    for (uint32_t i = 0; i < seq; ++i) pos[i] = (int32_t)(h->current_pos + i);
+
+    const size_t bytes = (size_t)h->cfg.batch * seq * h->cfg.d_model * 2;
+    std::memcpy(h->bufs.x_a->contents(), hidden, bytes);
+
+    meow::qwen::ModelParams mp = meow::qwen::fill_params(h, seq);
+    h->last_seq = seq;
+
+    auto* cmd = q->commandBuffer();
+    meow::qwen::dispatch_layer_range(cmd, h->psos, h->weights, h->bufs, mp,
+                                     start_layer, h->cfg.n_layers,
+                                     /*do_embed=*/false,
+                                     /*do_tail=*/true);
+    cmd->commit();
+    cmd->waitUntilCompleted();
+    cmd->release();
+    h->current_pos += seq;
+
+    std::memcpy(out_token, h->bufs.output_id->contents(),
                 (size_t)h->cfg.batch * sizeof(int32_t));
     return 0;
 }
@@ -759,4 +879,32 @@ extern "C" void sk_qwen_destroy(sk_qwen_handle* hp) {
     rel(h->bufs.argmax_args);
     if (h->bufs.argmax_icb) { delete h->bufs.argmax_icb; h->bufs.argmax_icb = nullptr; }
     delete h;
+}
+
+// Sum of the per-layer bulk weight buffer bytes actually resident on this handle
+// (qkv/o/gate/up/down + split V). Dedupes the default fan-out case (all entries
+// alias one big buffer). This is the metric that ~halves when a stage loads only
+// its layer slice via sk_qwen_load_gguf_range — the pipeline-parallel memory win.
+extern "C" uint64_t sk_qwen_resident_weight_bytes(sk_qwen_handle* hp) {
+    if (!hp) return 0;
+    auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
+    std::vector<MTL::Buffer*> seen;
+    uint64_t total = 0;
+    auto add_vec = [&](const std::vector<MTL::Buffer*>& v) {
+        for (auto* b : v) {
+            if (!b) continue;
+            bool dup = false;
+            for (auto* s : seen) if (s == b) { dup = true; break; }
+            if (dup) continue;
+            seen.push_back(b);
+            total += (uint64_t)b->length();
+        }
+    };
+    add_vec(h->weights.w_qkv);
+    add_vec(h->weights.w_o);
+    add_vec(h->weights.w_gate);
+    add_vec(h->weights.w_up);
+    add_vec(h->weights.w_down);
+    add_vec(h->weights.w_v);
+    return total;
 }

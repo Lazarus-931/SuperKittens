@@ -486,10 +486,19 @@ bool read_to_fp16(uint16_t* out, const sk::TensorView* v, size_t n_elems) {
 
 }  // namespace
 
-extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
-    if (!hp || !path) return -1;
-    auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
+// Shared GGUF loader. Loads ONLY layers [start_layer, end_layer); the embedding
+// is loaded when with_embed, the final norm + LM head when with_head. The full
+// loader sk_qwen_load_gguf delegates here with (0, n_layers, true, true) so its
+// behavior is byte-identical. The range form (sk_qwen_load_gguf_range) lets a
+// pipeline stage resident-allocate only its layer slice — layers outside
+// [start,end) keep null weight buffers (the dispatch only indexes W.w_*[L] for
+// L in its run window), so two stages hold disjoint halves of the model.
+static int load_gguf_range_impl(meow::qwen::Handle* h, const char* path,
+                                uint32_t start_layer, uint32_t end_layer,
+                                bool with_embed, bool with_head) {
+    if (!h || !path) return -1;
     const auto& c = h->cfg;
+    if (start_layer >= end_layer || end_layer > c.n_layers) return -60;
 
     auto* dev = sk::bindings_device();
     if (!dev) return -2;
@@ -523,18 +532,28 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
     const size_t ni   = c.n_int;
 
     // ── Norms + embedding (fp16 buffers, dequant from F32/Q8_0 as needed) ──
-    {
+    // with_embed gates the embedding gather (stage 0). For a TIED head the LM
+    // head reuses w_embed, so the head stage also needs it — handled below.
+    if (with_embed) {
         auto* v = store.get("token_embd.weight");
         if (!v) { std::fprintf(stderr, "gguf: missing token_embd.weight\n"); return -10; }
         if (!read_to_fp16((uint16_t*)h->weights.w_embed->contents(), v,
                           (size_t)c.vocab_size * dm)) return -11;
     }
-    {
+    if (with_head) {
         auto* v = store.get("output_norm.weight");
         if (!v) { std::fprintf(stderr, "gguf: missing output_norm.weight\n"); return -12; }
         if (!read_to_fp16((uint16_t*)h->weights.w_final_norm->contents(), v, dm)) return -13;
     }
-    {
+    if (with_head) {
+        // Tied head reuses token_embd; if this stage didn't load embed (not
+        // stage 0) the tied head still needs it — load it now.
+        if (c.tie_word_embeddings && !with_embed) {
+            auto* ve = store.get("token_embd.weight");
+            if (!ve) { std::fprintf(stderr, "gguf: missing token_embd.weight (tied head)\n"); return -10; }
+            if (!read_to_fp16((uint16_t*)h->weights.w_embed->contents(), ve,
+                              (size_t)c.vocab_size * dm)) return -11;
+        }
         // LM head keeps Q8_0 layout (V × D row-major) to enable
         // the q8_0_matvec fast path. Tied models reuse token_embd; untied use
         // output.weight. Either way, allocate a Q8_0-sized w_lm_head buffer.
@@ -881,7 +900,10 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
     };
 
     char nbuf[128];
-    for (uint32_t L = 0; L < c.n_layers; ++L) {
+    // Resident-alloc ONLY this stage's layer slice. Layers outside [start,end)
+    // keep null w_*[L] (the dispatch never indexes them on this stage), so two
+    // minis hold disjoint halves of the model.
+    for (uint32_t L = start_layer; L < end_layer; ++L) {
         const size_t pre_off   = (size_t)L * dm * 2;
         const size_t qnorm_off = (size_t)L * hd * 2;
 
@@ -935,4 +957,20 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
 
     ::close(gguf_fd);
     return 0;
+}
+
+extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
+    if (!hp || !path) return -1;
+    auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
+    return load_gguf_range_impl(h, path, 0, h->cfg.n_layers,
+                                /*with_embed=*/true, /*with_head=*/true);
+}
+
+extern "C" int sk_qwen_load_gguf_range(sk_qwen_handle* hp, const char* path,
+                                       uint32_t start_layer, uint32_t end_layer,
+                                       int with_embed, int with_head) {
+    if (!hp || !path) return -1;
+    auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
+    return load_gguf_range_impl(h, path, start_layer, end_layer,
+                                with_embed != 0, with_head != 0);
 }

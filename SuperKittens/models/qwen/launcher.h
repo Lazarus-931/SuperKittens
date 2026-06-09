@@ -84,6 +84,31 @@ int  sk_qwen_generate_n(sk_qwen_handle* h,
 void sk_qwen_reset(sk_qwen_handle* h);
 void sk_qwen_destroy(sk_qwen_handle* h);
 
+// Pipeline-parallel layer-range ABI (additive; forward/decode/prefill are
+// byte-identical). Split the forward across the layer dimension so a model
+// larger than one device fits across two, handing the fp16 residual stream
+// between stages.
+//   sk_qwen_run_layers: embed (when start_layer==0) + layers [start_layer,
+//     end_layer); copies the post-window residual (seq*d_model fp16) to
+//     out_hidden (nullable). This handle owns [start_layer, end_layer)'s KV;
+//     current_pos advances by seq.
+//   sk_qwen_resume_from_hidden: loads hidden (seq*d_model fp16) into the
+//     residual buffer, runs layers [start_layer, n_layers) + final norm +
+//     LM head + argmax -> *out_token. This handle owns [start_layer, n_layers)'s
+//     KV; current_pos advances by seq. seq must match the producing stage.
+int  sk_qwen_run_layers(sk_qwen_handle* h,
+                        const int* input_ids, uint32_t seq,
+                        uint32_t start_layer, uint32_t end_layer,
+                        void* out_hidden);
+int  sk_qwen_resume_from_hidden(sk_qwen_handle* h,
+                                const void* hidden, uint32_t seq,
+                                uint32_t start_layer, int* out_token);
+
+// Resident per-layer bulk weight bytes on this handle (qkv/o/gate/up/down + V).
+// ~Halves when a stage loads only its layer slice via the range loader — the
+// pipeline-parallel memory-win measurement.
+uint64_t sk_qwen_resident_weight_bytes(sk_qwen_handle* h);
+
 // Debug: limit forward to first N layers (0 = all). Affects subsequent forward calls.
 // When < cfg.n_layers, the post-loop final_norm + LM head still run on the
 // partial residual stream, so get_last_logits returns logits from the prefix.

@@ -1512,6 +1512,290 @@ inline void dispatch_model(
     }
 }
 
+// Pipeline-parallel layer-range dispatch (additive; dispatch_model above is
+// byte-identical and unchanged). Runs a sub-window of the layer stack so the
+// forward can be split across the layer dimension and hop the residual stream
+// between hosts.
+//   do_embed  : embed input_ids -> x_a before the loop (true only when start==0).
+//               When false, the caller must have loaded the incoming hidden
+//               state into B.x_a already (resume from a prior stage's output).
+//   start/end : run layers [start, end). KV for each layer L is written at
+//               write_pos=M.current_pos exactly as in dispatch_model.
+//   do_tail   : final RMSNorm + LM head + argmax -> output_id (true only on the
+//               last stage). When false, the residual after layer end-1 is left
+//               in B.x_a (the loop always lands the result back in x_a so the
+//               host copy-out / next-stage hand-in has a fixed buffer).
+// On return, when do_tail==false the post-window residual stream (T*d_model fp16)
+// is in B.x_a; when do_tail==true output_id holds the greedy next token.
+inline void dispatch_layer_range(
+    MTL::CommandBuffer* cmd,
+    const ModelPSOs&    P,
+    const ModelWeights& W,
+    ModelBuffers&       B,
+    const ModelParams&  M,
+    uint32_t            start_layer,
+    uint32_t            end_layer,
+    bool                do_embed,
+    bool                do_tail)
+{
+    const uint32_t T = M.batch * M.seq;
+
+    if (do_embed) {
+        auto* enc = cmd->computeCommandEncoder();
+        enc->setComputePipelineState(P.embedding_lookup);
+        enc->setBuffer(W.w_embed,   0, 0);
+        enc->setBuffer(B.input_ids, 0, 1);
+        enc->setBuffer(B.x_a,       0, 2);
+        enc->setBytes(&T,            4, 3);
+        enc->setBytes(&M.d_model,    4, 4);
+        enc->setBytes(&M.vocab_size, 4, 5);
+        const uint32_t D4 = M.d_model / 4;
+        enc->dispatchThreadgroups(MTL::Size((D4 + 127) / 128, T, 1),
+                                  MTL::Size(128, 1, 1));
+        enc->endEncoding();
+    }
+
+    // Layer window: the incoming residual is in x_a (embed wrote it, or the
+    // caller loaded the previous stage's hidden there). Ping-pong x_a<->x_b.
+    MTL::Buffer* cur = B.x_a;
+    MTL::Buffer* nxt = B.x_b;
+
+    if (end_layer > M.n_layers) end_layer = M.n_layers;
+    for (uint32_t L = start_layer; L < end_layer; ++L) {
+        const uint32_t total_after   = M.current_pos + M.seq;
+        const uint32_t kv_len        = (total_after < M.cache_max) ? total_after : M.cache_max;
+        const uint32_t logical_first = total_after - kv_len;
+        const uint32_t kv_buf_start  = logical_first % M.cache_max;
+
+        LayerParams lp;
+        lp.batch        = M.batch;
+        lp.seq          = M.seq;
+        lp.d_model      = M.d_model;
+        lp.n_heads      = M.n_heads;
+        lp.n_kv_heads   = M.n_kv_heads;
+        lp.head_dim     = M.head_dim;
+        lp.n_int        = M.n_int;
+        lp.eps          = M.eps;
+        lp.use_qk_norm  = M.use_qk_norm;
+        lp.rope_interleaved = M.rope_interleaved;
+        lp.layer_idx    = L;
+        lp.kv_buf_start = kv_buf_start;
+        lp.kv_len       = kv_len;
+        lp.cache_size   = M.cache_max;
+        lp.write_pos    = M.current_pos;
+        lp.rope_freq_base   = M.rope_freq_base;
+        lp.rope_n_ctx_orig  = M.rope_n_ctx_orig;
+        lp.rope_freq_scale  = M.rope_freq_scale;
+        lp.rope_ext_factor  = M.rope_ext_factor;
+        lp.rope_attn_factor = M.rope_attn_factor;
+        lp.rope_beta_fast   = M.rope_beta_fast;
+        lp.rope_beta_slow   = M.rope_beta_slow;
+
+        LayerBuffers lb{};
+        lb.x = cur;
+        lb.w_pre_attn_norm = W.w_pre_attn_norm;
+        lb.w_qkv             = W.w_qkv[L];
+        lb.w_qkv_inner_off   = W.w_qkv_off[L];
+        if (!W.w_v.empty()) {
+            lb.w_v             = W.w_v[L];
+            lb.w_v_inner_off   = W.w_v_off[L];
+        }
+        lb.dt_v   = W.dt_v_layer.empty()    ? W.dt_qkv : W.dt_v_layer[L];
+        lb.dt_down= W.dt_down_layer.empty() ? sk::Dtype::F16 : W.dt_down_layer[L];
+        lb.w_q_norm          = W.w_q_norm;
+        lb.w_k_norm          = W.w_k_norm;
+        lb.w_o               = W.w_o[L];
+        lb.w_o_inner_off     = W.w_o_off[L];
+        lb.w_pre_mlp_norm    = W.w_pre_mlp_norm;
+        lb.w_gate            = W.w_gate[L];
+        lb.w_gate_inner_off  = W.w_gate_off[L];
+        lb.w_up              = W.w_up[L];
+        lb.w_up_inner_off    = W.w_up_off[L];
+        lb.w_down            = W.w_down[L];
+        lb.w_down_inner_off  = W.w_down_off[L];
+        lb.rope_pos        = B.rope_pos;
+        lb.cos_tbl         = B.cos_tbl;
+        lb.sin_tbl         = B.sin_tbl;
+        lb.k_cache         = W.layer_caches[L].k;
+        lb.v_cache         = W.layer_caches[L].v;
+        lb.k_cache_q       = W.layer_caches[L].kq;
+        lb.v_cache_q       = W.layer_caches[L].vq;
+        lb.k_cache_s       = W.layer_caches[L].ks;
+        lb.v_cache_s       = W.layer_caches[L].vs;
+        lb.kv_q8           = M.kv_q8;
+        lb.x_norm          = B.x_norm;
+        lb.qkv_packed      = B.qkv_packed;
+        lb.q               = B.q;
+        lb.kv_pack         = B.kv_pack;
+        lb.k_tmp           = B.k_tmp;
+        lb.v_tmp           = B.v_tmp;
+        lb.attn_out        = B.attn_out;
+        lb.o_proj          = B.o_proj;
+        lb.y_attn          = B.y_attn;
+        lb.m_in            = B.m_in;
+        lb.mlp_out         = B.mlp_out;
+        lb.y_out           = nxt;
+        lb.gate_buf        = B.gate_buf;
+        lb.up_buf          = B.up_buf;
+        lb.q_th            = B.q_th;
+        lb.k_th            = B.k_th;
+        lb.v_th            = B.v_th;
+        lb.attn_out_seq    = B.attn_out_seq;
+        lb.attn_pm         = B.attn_pm;
+        lb.attn_ps         = B.attn_ps;
+        lb.attn_po         = B.attn_po;
+        lb.dt_qkv          = W.dt_qkv;
+        lb.dt_o            = W.dt_o;
+        lb.dt_gate         = W.dt_gate;
+        lb.dt_up           = W.dt_up;
+
+        dispatch_layer(cmd, P.layer, lb, lp);
+
+        MTL::Buffer* tmp = cur; cur = nxt; nxt = tmp;
+    }
+
+    // Land the post-window residual back in x_a so a non-tail stage exposes its
+    // output at a fixed buffer for host copy-out (and a resume stage re-enters
+    // here with its hidden in x_a). An odd layer count leaves cur==x_b; one blit
+    // moves it to x_a. (When do_tail, the tail reads `cur` directly below.)
+    if (!do_tail) {
+        if (cur != B.x_a) {
+            auto* benc = cmd->blitCommandEncoder();
+            benc->copyFromBuffer(cur, 0, B.x_a, 0, (size_t)T * M.d_model * 2);
+            benc->endEncoding();
+        }
+        return;
+    }
+
+    // Tail: final RMSNorm -> LM head (last row) -> argmax. Mirrors dispatch_model
+    // sections C/D/E exactly; `cur` holds the final residual, `nxt` is scratch.
+    {
+        auto* enc = cmd->computeCommandEncoder();
+        encode_rmsnorm(enc, P.layer.rmsnorm, cur, W.w_final_norm, 0,
+                       nxt, T, M.d_model, M.eps, P.layer.rmsnorm_t1);
+        enc->endEncoding();
+    }
+    {
+        const uint32_t last = T - 1u;
+        const uint32_t M_v = 1u, K_v = M.d_model, N_v = M.vocab_size;
+        const size_t   off_A = (size_t)last * K_v * 2;
+        const size_t   off_C = (size_t)last * N_v * 2;
+        MTL::Buffer* w_head = W.w_lm_head ? W.w_lm_head : W.w_embed;
+
+        if (W.dt_lm_head == sk::Dtype::Q8_0 && W.w_lm_head &&
+            P.layer.q8_0_matvec != nullptr) {
+            auto* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(P.layer.q8_0_matvec);
+            enc->setBuffer(nxt,           off_A,           0);
+            enc->setBuffer(W.w_lm_head,   W.off_w_lm_head, 1);
+            enc->setBuffer(B.logits,      off_C,           2);
+            enc->setBytes(&K_v, 4, 3);
+            enc->setBytes(&N_v, 4, 4);
+            enc->dispatchThreadgroups(MTL::Size((N_v + 1) / 2, 1, 1), MTL::Size(128, 1, 1));
+            enc->endEncoding();
+        } else
+        if (W.dt_lm_head == sk::Dtype::Q6_K && W.w_lm_head &&
+            P.layer.q6k_matvec != nullptr) {
+            auto* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(P.layer.q6k_matvec);
+            enc->setBuffer(nxt,           off_A,           0);
+            enc->setBuffer(W.w_lm_head,   W.off_w_lm_head, 1);
+            enc->setBuffer(B.logits,      off_C,           2);
+            enc->setBytes(&K_v, 4, 3);
+            enc->setBytes(&N_v, 4, 4);
+            enc->dispatchThreadgroups(MTL::Size((N_v + 1) / 2, 1, 1), MTL::Size(128, 1, 1));
+            enc->endEncoding();
+        } else
+        if (P.layer.gemv_t_m1 != nullptr) {
+            const size_t off_head = (w_head == W.w_lm_head) ? W.off_w_lm_head : 0;
+            auto* enc = cmd->computeCommandEncoder();
+            const bool use_2d = (P.layer.gemv_t_2dtile_m1 != nullptr);
+            enc->setComputePipelineState(use_2d ? P.layer.gemv_t_2dtile_m1
+                                                : P.layer.gemv_t_m1);
+            enc->setBuffer(nxt,      off_A,    0);
+            enc->setBuffer(w_head,   off_head, 1);
+            enc->setBuffer(B.logits, off_C,    2);
+            enc->setBytes(&N_v, 4, 3);
+            enc->setBytes(&K_v, 4, 4);
+            if (use_2d) {
+                const uint32_t OUT_ROWS_PER_TG = 64;
+                enc->dispatchThreadgroups(
+                    MTL::Size((N_v + OUT_ROWS_PER_TG - 1) / OUT_ROWS_PER_TG, 1, 1),
+                    MTL::Size(32, 16, 1));
+            } else {
+                const uint32_t BN = 128;
+                enc->dispatchThreadgroups(MTL::Size((N_v + BN - 1) / BN, 1, 1),
+                                          MTL::Size(BN, 1, 1));
+            }
+            enc->endEncoding();
+        } else {
+            const size_t off_head = (w_head == W.w_lm_head) ? W.off_w_lm_head : 0;
+            auto* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(P.layer.gemm);
+            uint32_t ldA = K_v, ldB = K_v, ldC = N_v;
+            int transA = 0, transB = 1, has_bias = 0;
+            enc->setBuffer(nxt,        off_A,    0);
+            enc->setBuffer(w_head,     off_head, 1);
+            enc->setBuffer(B.logits,   off_C,    2);
+            enc->setBytes(&M_v,      4, 3); enc->setBytes(&N_v,      4, 4);
+            enc->setBytes(&K_v,      4, 5); enc->setBytes(&ldA,      4, 6);
+            enc->setBytes(&ldB,      4, 7); enc->setBytes(&ldC,      4, 8);
+            enc->setBytes(&transA,   4, 9); enc->setBytes(&transB,   4, 10);
+            enc->setBytes(&has_bias, 4, 11);
+            enc->setBuffer(B.logits, off_C, 12);
+            enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, 1, 1),
+                                      MTL::Size(64, 1, 1));
+            enc->endEncoding();
+        }
+    }
+    {
+        const bool can_2pass = (T == 1u)
+                            && P.argmax_partial && P.argmax_reduce
+                            && B.argmax_val_buf && B.argmax_idx_buf;
+        const bool can_icb_tail = can_2pass
+                            && P.argmax_partial_icb && P.argmax_reduce_icb
+                            && B.argmax_args && B.argmax_icb;
+        if (can_icb_tail) {
+            auto* enc = cmd->computeCommandEncoder();
+            B.argmax_icb->execute(enc, 0, 2);
+            enc->endEncoding();
+        } else if (can_2pass) {
+            constexpr uint32_t ELTS_PER_TG = 16384u;
+            const uint32_t n_blocks = (M.vocab_size + ELTS_PER_TG - 1u) / ELTS_PER_TG;
+            {
+                auto* enc = cmd->computeCommandEncoder();
+                enc->setComputePipelineState(P.argmax_partial);
+                enc->setBuffer(B.logits,         0, 0);
+                enc->setBuffer(B.argmax_val_buf, 0, 1);
+                enc->setBuffer(B.argmax_idx_buf, 0, 2);
+                enc->setBytes(&M.vocab_size,     4, 3);
+                enc->dispatchThreadgroups(MTL::Size(n_blocks, 1, 1),
+                                          MTL::Size(1024, 1, 1));
+                enc->endEncoding();
+            }
+            {
+                auto* enc = cmd->computeCommandEncoder();
+                enc->setComputePipelineState(P.argmax_reduce);
+                enc->setBuffer(B.argmax_val_buf, 0, 0);
+                enc->setBuffer(B.argmax_idx_buf, 0, 1);
+                enc->setBuffer(B.output_id,      0, 2);
+                enc->setBytes(&n_blocks,         4, 3);
+                enc->dispatchThreadgroups(MTL::Size(1, 1, 1),
+                                          MTL::Size(1024, 1, 1));
+                enc->endEncoding();
+            }
+        } else {
+            auto* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(P.argmax);
+            enc->setBuffer(B.logits,    (size_t)(T - 1u) * M.vocab_size * 2, 0);
+            enc->setBuffer(B.output_id, 0, 1);
+            enc->setBytes(&M.vocab_size, 4, 2);
+            enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(1024, 1, 1));
+            enc->endEncoding();
+        }
+    }
+}
+
 } // namespace qwen
 } // namespace meow
 

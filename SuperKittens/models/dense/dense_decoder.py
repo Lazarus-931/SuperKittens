@@ -96,6 +96,18 @@ DENSE_ABI = {
     "load_gguf":              optional([ctypes.c_void_p, ctypes.c_char_p], ctypes.c_int),
     "set_rope_tables":  optional([ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p], ctypes.c_int),
     "get_last_logits":  optional([ctypes.c_void_p, ctypes.c_void_p], ctypes.c_int),
+    # Pipeline-parallel layer-range split (additive; absent in older dylibs).
+    "run_layers":             optional([ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
+                                        ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+                                        ctypes.c_void_p], ctypes.c_int),
+    "resume_from_hidden":     optional([ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32,
+                                        ctypes.c_uint32, ctypes.POINTER(ctypes.c_int32)],
+                                       ctypes.c_int),
+    # Pipeline-parallel resident-slice loader + resident-bytes probe (additive).
+    "load_gguf_range":        optional([ctypes.c_void_p, ctypes.c_char_p,
+                                        ctypes.c_uint32, ctypes.c_uint32,
+                                        ctypes.c_int, ctypes.c_int], ctypes.c_int),
+    "resident_weight_bytes":  optional([ctypes.c_void_p], ctypes.c_uint64),
 }
 
 
