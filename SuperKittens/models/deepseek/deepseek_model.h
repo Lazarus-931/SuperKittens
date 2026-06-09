@@ -280,7 +280,10 @@ inline void encode_gemm(
     enc->setBytes(&transA,   4, 9); enc->setBytes(&transB,   4, 10);
     enc->setBytes(&has_bias, 4, 11);
     enc->setBuffer(C, 0, 12);
-    enc->dispatchThreadgroups(MTL::Size((N + 63) / 64, (M + 63) / 64, 1),
+    // gemm_fp16 tiles BM=32 rows × BN=64 cols; a /64 row grid skipped rows
+    // 32..63 of every 64-row block at T>32 prefill (dense-L0 MLP), leaving the
+    // previous call's stale scratch in the skipped rows (cross-call drift).
+    enc->dispatchThreadgroups(MTL::Size((N + 63) / 64, (M + 31) / 32, 1),
                               MTL::Size(64, 1, 1));
     enc->endEncoding();
 }
@@ -1620,7 +1623,10 @@ inline void dispatch_model(
             enc->setBytes(&transA,   4, 9); enc->setBytes(&transB,   4, 10);
             enc->setBytes(&has_bias, 4, 11);
             enc->setBuffer(B.logits, row_off_c, 12);
-            enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M_v + 63) / 64, 1),
+            // gemm_fp16 tiles BM=32 rows (same latent /64 row-grid trap as
+            // encode_gemm); identical grid at M_v<=32, so V2-Lite (Q6_K head,
+            // never hits this branch) and decode/batched paths are unchanged.
+            enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M_v + 31) / 32, 1),
                                       MTL::Size(64, 1, 1));
             enc->endEncoding();
         }
