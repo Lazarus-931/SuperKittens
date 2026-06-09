@@ -147,6 +147,9 @@ struct LayerPSOs {
     MTL::ComputePipelineState* moe_mv_down;        // mul_mv_id_q8_0 (routed down)
     MTL::ComputePipelineState* moe_swiglu_f32;     // deepseek_moe_swiglu_f32
     MTL::ComputePipelineState* moe_scatter_add;    // deepseek_moe_scatter_add_f32
+    MTL::ComputePipelineState* moe_group_build = nullptr;   // T>1 grouped MoE: counting sort
+    MTL::ComputePipelineState* moe_mv_gate_grp = nullptr;   // T>1 grouped gate/up Q4_K matvec
+    MTL::ComputePipelineState* moe_mv_down_grp = nullptr;   // T>1 grouped down Q5_0 matvec
     MTL::ComputePipelineState* cast_h2f;
     MTL::ComputePipelineState* cast_f2h;
     MTL::ComputePipelineState* causal_mask_fill;
@@ -241,6 +244,8 @@ struct LayerBuffers {
     MTL::Buffer* moe_up_f32;      // [top_k, n_int] fp32
     MTL::Buffer* moe_mid_f32;     // [top_k, n_int] fp32
     MTL::Buffer* moe_down_f32;    // [top_k, d_model] fp32
+    MTL::Buffer* moe_group_off = nullptr;    // [n_expert+1] int32 (T>1 grouped MoE)
+    MTL::Buffer* moe_group_slots = nullptr;  // [T_max*top_k] int32 (T>1 grouped MoE)
     MTL::Buffer* y_out;
 };
 
@@ -1010,10 +1015,72 @@ inline void dispatch_layer(
     // Per-layer byte strides: gate/up Q4_K (144 B/256), down Q5_0 (22 B/32).
     const size_t gate_layer = (size_t)p.n_expert * p.n_int * (p.d_model / 256) * 144;
     const size_t down_layer = (size_t)p.n_expert * p.d_model * (p.n_int / 32) * 22;
-    encode_mv_id(P.moe_mv_gate, true, B.w_gate, (size_t)L * gate_layer,
-                 B.moe_x_f32, B.moe_gate_f32, p.d_model, p.n_int);
-    encode_mv_id(P.moe_mv_gate, true, B.w_up,   (size_t)L * gate_layer,
-                 B.moe_x_f32, B.moe_up_f32,   p.d_model, p.n_int);
+
+    // T>1 grouped MoE: read each expert's weights ONCE and apply to every token
+    // routed to it (counting sort -> per-expert matvec), instead of one M=1
+    // matvec per (token,slot). Same dot products, reordered weight loads. T==1
+    // (decode) keeps the per-slot path byte-identical. SK_DS_NO_MOE_GROUP escapes.
+    // NEGATIVE FINDING (M4): grouped weight-reuse loses to the per-slot path here
+    // because the per-slot matvec already rides the M4 system/L2 cache (measured
+    // 144 GB/s > 120 GB/s DRAM ceiling = the redundant expert reads are largely
+    // cached), while a grouped kernel is occupancy-bound on 10 GPU cores. Default
+    // OFF; opt-in SK_DS_MOE_GROUP=1 keeps it benchable.
+    static const bool g_moe_group = (std::getenv("SK_DS_MOE_GROUP") != nullptr);
+    const bool use_grouped = (g_moe_group && T > 1 &&
+                              P.moe_group_build && P.moe_mv_gate_grp && P.moe_mv_down_grp &&
+                              B.moe_group_off && B.moe_group_slots);
+
+    auto encode_mv_id_grp = [&](MTL::ComputePipelineState* pso, bool is_q4k,
+                                MTL::Buffer* w, size_t w_off, MTL::Buffer* src1,
+                                MTL::Buffer* dst, uint32_t in_dim, uint32_t out_rows) {
+        const uint32_t NR0   = is_q4k ? 2u : 4u;
+        const uint32_t blk_w = is_q4k ? 256u : 32u;
+        const uint64_t blk_b = is_q4k ? 144u : 22u;
+        const uint64_t nb01  = (uint64_t)(in_dim / blk_w) * blk_b;        // weight row stride
+        const uint64_t nb02  = (uint64_t)out_rows * nb01;                 // expert slab stride
+        auto* enc = cmd->computeCommandEncoder();
+        enc->setComputePipelineState(pso);
+        enc->setBuffer(w,    w_off, 0);
+        enc->setBuffer(src1, 0,     1);
+        enc->setBuffer(dst,  0,     2);
+        enc->setBuffer(B.moe_group_off,   0, 3);
+        enc->setBuffer(B.moe_group_slots, 0, 4);
+        enc->setBytes(&in_dim,   4, 5);
+        enc->setBytes(&out_rows, 4, 6);
+        enc->setBytes(&p.top_k,  4, 7);
+        enc->setBytes(&nb01, 8, 8);
+        enc->setBytes(&nb02, 8, 9);
+        enc->setThreadgroupMemoryLength(NR0 * 32 * sizeof(float), 0);
+        const uint32_t rows_per_tg = 4u * NR0;   // NSG=4 × nr0 rows
+        enc->dispatchThreadgroups(
+            MTL::Size((out_rows + rows_per_tg - 1) / rows_per_tg, p.n_expert, 1),
+            MTL::Size(4 * 32, 1, 1));
+        enc->endEncoding();
+    };
+
+    if (use_grouped) {
+        // 1. counting sort: moe_top_idx [T*top_k] -> group_off/group_slots
+        const uint32_t n_slots = T * p.top_k;
+        auto* benc = cmd->computeCommandEncoder();
+        benc->setComputePipelineState(P.moe_group_build);
+        benc->setBuffer(B.moe_top_idx,    0, 0);
+        benc->setBuffer(B.moe_group_off,  0, 1);
+        benc->setBuffer(B.moe_group_slots,0, 2);
+        benc->setBytes(&n_slots, 4, 3);
+        benc->setThreadgroupMemoryLength(64 * sizeof(int), 0);
+        benc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(64, 1, 1));
+        benc->endEncoding();
+        // 2. grouped gate/up
+        encode_mv_id_grp(P.moe_mv_gate_grp, true, B.w_gate, (size_t)L * gate_layer,
+                         B.moe_x_f32, B.moe_gate_f32, p.d_model, p.n_int);
+        encode_mv_id_grp(P.moe_mv_gate_grp, true, B.w_up,   (size_t)L * gate_layer,
+                         B.moe_x_f32, B.moe_up_f32,   p.d_model, p.n_int);
+    } else {
+        encode_mv_id(P.moe_mv_gate, true, B.w_gate, (size_t)L * gate_layer,
+                     B.moe_x_f32, B.moe_gate_f32, p.d_model, p.n_int);
+        encode_mv_id(P.moe_mv_gate, true, B.w_up,   (size_t)L * gate_layer,
+                     B.moe_x_f32, B.moe_up_f32,   p.d_model, p.n_int);
+    }
     PROF_MARK(cmd, "moe_gate_up_q4k");
 
     // SwiGLU mid = silu(gate)*up over [top_k, n_int].
@@ -1031,8 +1098,13 @@ inline void dispatch_layer(
     }
     PROF_MARK(cmd, "moe_swiglu");
 
-    encode_mv_id(P.moe_mv_down, false, B.w_down, (size_t)L * down_layer,
-                 B.moe_mid_f32, B.moe_down_f32, p.n_int, p.d_model);
+    if (use_grouped) {
+        encode_mv_id_grp(P.moe_mv_down_grp, false, B.w_down, (size_t)L * down_layer,
+                         B.moe_mid_f32, B.moe_down_f32, p.n_int, p.d_model);
+    } else {
+        encode_mv_id(P.moe_mv_down, false, B.w_down, (size_t)L * down_layer,
+                     B.moe_mid_f32, B.moe_down_f32, p.n_int, p.d_model);
+    }
     PROF_MARK(cmd, "moe_down_q5_0");
 
     // Weighted scatter-add over all T tokens: y_out[t] = residual[t] + scale*Σ score[t,s]*down[t,s].
@@ -1190,6 +1262,8 @@ struct ModelBuffers {
     MTL::Buffer* moe_up_f32;
     MTL::Buffer* moe_mid_f32;
     MTL::Buffer* moe_down_f32;
+    MTL::Buffer* moe_group_off = nullptr;
+    MTL::Buffer* moe_group_slots = nullptr;
 
     // 2-pass argmax scratch (ceil(vocab_size/16384) partials each).
     MTL::Buffer* argmax_val_buf = nullptr;
@@ -1340,6 +1414,8 @@ inline void dispatch_model(
         lb.moe_up_f32    = B.moe_up_f32;
         lb.moe_mid_f32   = B.moe_mid_f32;
         lb.moe_down_f32  = B.moe_down_f32;
+        lb.moe_group_off   = B.moe_group_off;
+        lb.moe_group_slots = B.moe_group_slots;
         lb.y_out         = nxt;
 
         dispatch_layer(cmd, P.layer, lb, lp);

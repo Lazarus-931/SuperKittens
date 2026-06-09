@@ -139,6 +139,12 @@ static bool resolve_psos(ModelPSOs& P, uint32_t dk, uint32_t dv) {
         sk::bindings_library(), sk::bindings_device(), "deepseek_mul_mv_id_q5_0");
     P.layer.moe_swiglu_f32  = sk::bindings_pso("deepseek_moe_swiglu_f32");
     P.layer.moe_scatter_add = sk::bindings_pso("deepseek_moe_scatter_add_f32");
+    // T>1 grouped MoE expert matvec (additive, prefill-only; nullptr -> per-slot fallback).
+    P.layer.moe_group_build = sk::bindings_pso("deepseek_moe_group_build");
+    P.layer.moe_mv_gate_grp = resolve_mvid_pso(
+        sk::bindings_library(), sk::bindings_device(), "deepseek_mul_mv_id_q4_K_grp");
+    P.layer.moe_mv_down_grp = resolve_mvid_pso(
+        sk::bindings_library(), sk::bindings_device(), "deepseek_mul_mv_id_q5_0_grp");
 
     // Native K-quant matvec (decode) so dense/attn/shared/LM-head stay quantized.
     P.layer.q4k_matvec  = sk::bindings_pso("q4k_matvec");
@@ -330,6 +336,9 @@ extern "C" sk_deepseek_handle* sk_deepseek_create(const sk_deepseek_config* cfg)
     h->bufs.moe_up_f32    = alloc_zero(dev, (size_t)T_max * cfg->top_k * cfg->n_int * 4);
     h->bufs.moe_mid_f32   = alloc_zero(dev, (size_t)T_max * cfg->top_k * cfg->n_int * 4);
     h->bufs.moe_down_f32  = alloc_zero(dev, (size_t)T_max * cfg->top_k * cfg->d_model * 4);
+    // T>1 grouped MoE: per-expert offsets + slot lists (counting sort scratch).
+    h->bufs.moe_group_off   = alloc_zero(dev, (size_t)(cfg->n_expert + 1) * sizeof(int32_t));
+    h->bufs.moe_group_slots = alloc_zero(dev, (size_t)T_max * cfg->top_k * sizeof(int32_t));
 
     // 2-pass argmax scratch.
     {
@@ -541,6 +550,7 @@ extern "C" void sk_deepseek_destroy(sk_deepseek_handle* hp) {
     rel(h->bufs.m_in); rel(h->bufs.shared_mid); rel(h->bufs.shared_out);
     rel(h->bufs.mlp_gate); rel(h->bufs.mlp_up);
     rel(h->bufs.moe_top_idx); rel(h->bufs.moe_top_score); rel(h->bufs.moe_hidden);
+    rel(h->bufs.moe_group_off); rel(h->bufs.moe_group_slots);
     rel(h->bufs.moe_x_f32); rel(h->bufs.moe_gate_f32); rel(h->bufs.moe_up_f32);
     rel(h->bufs.moe_mid_f32); rel(h->bufs.moe_down_f32);
     rel(h->bufs.argmax_val_buf); rel(h->bufs.argmax_idx_buf);
