@@ -225,6 +225,26 @@ SPECS: dict[str, ModelSpec] = {
                   eps=1e-6, rope_freq_base=1_000_000.0, tie_word_embeddings=1,
                   use_qk_norm=0, rope_interleaved=0, attn_qkv_bias=1),
     ),
+    # Qwen2.5-1.5B-Instruct: same "qwen2" arch as the 3B row above (config-only
+    # delta — different dims). Tied LM head (GGUF has token_embd.weight only, no
+    # output.weight) and the same Qwen2/2.5 q/k/v projection bias the in-tree
+    # bias_add path now applies (attn_qkv_bias=1). Dims verified against the GGUF
+    # metadata: block_count=28, embedding_length=1536, head_count=12,
+    # head_count_kv=2, head_dim=1536/12=128, feed_forward_length=8960,
+    # vocab=151936, rms_eps=1e-6, rope.freq_base=1e6.
+    "qwen2.5-1.5b": ModelSpec(
+        family="qwen2",
+        adapter="SuperKittens.models.qwen.qwen:Qwen",
+        hf_repo="Qwen/Qwen2.5-1.5B-Instruct",
+        weight_dir="Qwen2.5-1.5B-Instruct-GGUF",
+        gguf_name="Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
+        default_quant="q4_k_m",
+        tokenizer_family="qwen3",
+        dims=dict(n_layers=28, d_model=1536, n_heads=12, n_kv_heads=2,
+                  head_dim=128, n_int=8960, vocab_size=151936,
+                  eps=1e-6, rope_freq_base=1_000_000.0, tie_word_embeddings=1,
+                  use_qk_norm=0, rope_interleaved=0, attn_qkv_bias=1),
+    ),
     # Yi-1.5-6B-Chat (01.AI): model_type "llama" (LlamaForCausalLM) — a Llama-style
     # dense decoder from a distinct vendor. Reuses the qwen launcher/kernels; the Yi
     # adapter sets use_qk_norm=0 and rope_interleaved=1 (Llama GGUF NORM rope,
