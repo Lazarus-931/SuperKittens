@@ -1087,6 +1087,15 @@ struct ModelWeights {
     // When non-null, dispatch_model routes the final GEMM through
     // q8_0_matvec_bf16 (decode-only, T=1). nullptr → bf16 fallback.
     MTL::Buffer* w_lm_head_q8 = nullptr;
+    // Optional Q4_K-packed LM head (SK_GEMMA4_LMHEAD_Q4K). The head is the one
+    // large-N bandwidth-bound decode matvec where fewer bytes = faster; Q4_K
+    // halves the resident head bytes vs Q8_0 (0.43→0.23 GB at E2B). Held in a
+    // SEPARATE buffer (not the tied embed-lookup Q8 buffer): the embedding
+    // lookup must not eat Q4_K quant noise on the input side, and there is no
+    // Q4_K embedding-gather kernel. Filled from the scaled bf16 embed at load.
+    // When non-null and T=1, the head matvec routes q4k_matvec_bf16. Wins over
+    // w_lm_head_q8 for the head matvec (embed lookup still uses Q8/bf16).
+    MTL::Buffer* w_lm_head_q4k = nullptr;
     MTL::Buffer* w_ple_table;                 // (vocab, n_layers, PLE_dim), null if !has_ple
     // Optional Q8_0-packed PLE table (decode + prefill). When non-null the
     // ple-lookup runs gemma4_ple_lookup_q8 (gather+dequant) and the bf16
@@ -1654,25 +1663,35 @@ inline void dispatch_model(
     // q8_0_matvec_bf16 PSO is available, route through the Q8_0 matvec for a
     // ~3.8x speedup vs the bf16 tile-MMA at decode shapes. Falls back to the
     // bf16 GEMM for prefill (T>1) and when the Q8_0 buffer is absent.
+    // Q4_K head (SK_GEMMA4_LMHEAD_Q4K): the head is large-N bandwidth-bound at
+    // decode, so half the bytes (Q4_K vs Q8_0) is a direct decode win. Same
+    // binding+dispatch shape as q8_0_matvec_bf16 (grid ceil(N/2), 128 threads).
+    const bool have_q4k_lm_head =
+        (W.w_lm_head_q4k != nullptr) && (P.layer.q4k_matvec_bf16 != nullptr);
     const bool have_q8_lm_head =
         (W.w_lm_head_q8 != nullptr) && (P.layer.q8_0_matvec_bf16 != nullptr);
-    // T=1 always routes Q8 (fast). For T>1 the bf16 GEMM needs w_embed; when the
-    // bf16 embed was freed (embed-Q8 on) we must loop the Q8 matvec per row.
-    const bool use_q8_lm_head =
-        have_q8_lm_head && ((T == 1) || (W.w_embed == nullptr));
+    // T=1 always routes the quant matvec (fast). For T>1 the bf16 GEMM needs
+    // w_embed; when the bf16 embed was freed (embed-Q8 on) we loop per row.
+    const bool quant_ok = have_q4k_lm_head || have_q8_lm_head;
+    const bool use_quant_lm_head =
+        quant_ok && ((T == 1) || (W.w_embed == nullptr));
 
-    if (use_q8_lm_head) {
+    if (use_quant_lm_head) {
         uint32_t K_v = M.d_model;
         uint32_t N_v = M.vocab_size;
         const uint32_t NR0 = 2, NSG = 4, NW = 32;
         const size_t in_row_bytes  = (size_t)M.d_model * 2;     // bf16 activation
         const size_t out_row_bytes = (size_t)M.vocab_size * 2;  // bf16 logits
+        // Prefer Q4_K (fewer bytes) when present; else Q8_0.
+        MTL::ComputePipelineState* head_pso =
+            have_q4k_lm_head ? P.layer.q4k_matvec_bf16 : P.layer.q8_0_matvec_bf16;
+        MTL::Buffer* head_w = have_q4k_lm_head ? W.w_lm_head_q4k : W.w_lm_head_q8;
         for (uint32_t r = 0; r < T; ++r) {
             auto* enc = cmd->computeCommandEncoder();
-            enc->setComputePipelineState(P.layer.q8_0_matvec_bf16);
-            enc->setBuffer(nxt,            (size_t)r * in_row_bytes,  0);
-            enc->setBuffer(W.w_lm_head_q8, 0,                         1);
-            enc->setBuffer(B.logits,       (size_t)r * out_row_bytes, 2);
+            enc->setComputePipelineState(head_pso);
+            enc->setBuffer(nxt,      (size_t)r * in_row_bytes,  0);
+            enc->setBuffer(head_w,   0,                         1);
+            enc->setBuffer(B.logits, (size_t)r * out_row_bytes, 2);
             enc->setBytes(&K_v, 4, 3);
             enc->setBytes(&N_v, 4, 4);
             enc->dispatchThreadgroups(MTL::Size((N_v + NR0 - 1) / NR0, 1, 1),
