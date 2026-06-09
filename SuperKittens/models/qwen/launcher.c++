@@ -567,6 +567,12 @@ extern "C" int sk_qwen_forward_batched(sk_qwen_handle* hp,
                                        int* output_id) {
     if (!hp || !input_ids || !output_id) return -1;
     auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
+    // seq>1 is unsupported: the prefill transpose + attention dispatch with
+    // p.seq (not batch*seq) only cover lane 0's rows of the [batch*seq,H,D]
+    // buffer, leaving lanes>=1 reading uninitialized Q/K/V scratch (silent
+    // garbage). Batched callers must drive the prompt token-by-token at seq==1
+    // (the batch-aware lockstep decode path), which is bit-identical to M=1.
+    if (seq != 1) return -6;
     if (seq == 0 || seq > h->cfg.seq_max) return -2;
     if (h->current_pos + seq > h->cfg.cache_max) return -4;
     if (h->cfg.batch < 1) return -5;
