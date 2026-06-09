@@ -181,6 +181,29 @@ SPECS: dict[str, ModelSpec] = {
                   eps=1e-5, rope_freq_base=1_000_000.0, tie_word_embeddings=0,
                   use_qk_norm=0),
     ),
+    # Llama-3.2-3B-Instruct: model_type "llama" (LlamaForCausalLM) — a Llama-arch
+    # dense decoder. Reuses the qwen launcher/kernels; the Llama32 adapter sets
+    # use_qk_norm=0, rope_interleaved=1 (Llama GGUF NORM rope), and re-bakes RoPE
+    # with the llama3 scaling (theta 500000, factor 32). UNLIKE Nemotron/Mistral,
+    # the LM head is TIED (tie_word_embeddings=1): the shared core reads
+    # token_embd.weight as the head, no untied output.weight. vocab 128256.
+    # Q4_K_M (~2.0 GB; embed+output are Q8_0) fits a disk-tight host.
+    "llama-3.2-3b": ModelSpec(
+        family="llama32",
+        adapter="SuperKittens.models.llama32.llama32:Llama32",
+        hf_repo="meta-llama/Llama-3.2-3B-Instruct",
+        weight_dir="Llama-3.2-3B-Instruct-GGUF",
+        gguf_name="Llama-3.2-3B-Instruct-Q4_K_M.gguf",
+        default_quant="q4_k_m",
+        tokenizer_family="llama",
+        dims=dict(n_layers=28, d_model=3072, n_heads=24, n_kv_heads=8,
+                  head_dim=128, n_int=8192, vocab_size=128256,
+                  eps=1e-5, rope_freq_base=500000.0, tie_word_embeddings=1,
+                  use_qk_norm=0,
+                  rope_scaling=dict(rope_type="llama3", factor=32.0,
+                                    low_freq_factor=1.0, high_freq_factor=4.0,
+                                    original_max_position_embeddings=8192)),
+    ),
     "qwen3-1.7b": ModelSpec(
         family="qwen3",
         adapter="SuperKittens.models.qwen.qwen:Qwen",
