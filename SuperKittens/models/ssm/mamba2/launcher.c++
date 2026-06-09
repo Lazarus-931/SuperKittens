@@ -49,6 +49,12 @@ static bool resolve_psos(ModelPSOs& P) {
     // Production SSD; ref kernel (same signature) is the numerical fallback.
     P.layer.mamba2_ssd   = sk::bindings_pso("mamba2_ssd");
     if (!P.layer.mamba2_ssd) P.layer.mamba2_ssd = sk::bindings_pso("mamba2_ssd_ref");
+    // Optional chunked-scan prefill (SK_MAMBA2_SSD_CHUNKED=1).
+    P.layer.ssd_chunk_scan = sk::bindings_pso("mamba2_ssd_chunk_scan");
+    P.layer.ssd_chunk_prop = sk::bindings_pso("mamba2_ssd_chunk_prop");
+    P.layer.ssd_chunk_fix  = sk::bindings_pso("mamba2_ssd_chunk_fix");
+    P.layer.ssd_chunk_scan_pb4 = sk::bindings_pso("mamba2_ssd_chunk_scan_pb4");
+    P.layer.ssd_chunk_fix_pb4  = sk::bindings_pso("mamba2_ssd_chunk_fix_pb4");
     P.layer.mamba2_step  = sk::bindings_pso("mamba2_step_ref");
     if (!P.layer.mamba2_step) P.layer.mamba2_step = sk::bindings_pso("mamba2_step");
     P.layer.gate_norm    = sk::bindings_pso("gate_norm");
@@ -150,6 +156,17 @@ extern "C" sk_mamba2_handle* sk_mamba2_create(const sk_mamba2_config* cfg) {
     // split-K out_proj partials: (KS_max, d_model) fp32. KS_max=32 covers any
     // SK_MAMBA_SPLITK setting we'd reasonably bench.
     h->bufs.splitk_partial = alloc_zero(dev, (size_t)32 * D * sizeof(float));
+
+    // Chunked-SSD prefill scratch; nc_max sized for the smallest chunk (32).
+    if (h->psos.layer.ssd_chunk_scan && h->psos.layer.ssd_chunk_prop
+        && h->psos.layer.ssd_chunk_fix) {
+        const uint32_t nc_max = (cfg->seq_max + 31) / 32;
+        h->bufs.ssd_nc_max = nc_max;
+        h->bufs.ssd_chunk_states = alloc_zero(dev,
+            (size_t)cfg->batch * nc_max * H * P * N * sizeof(float));
+        h->bufs.ssd_cumdecay = alloc_zero(dev,
+            (size_t)cfg->batch * cfg->seq_max * H * sizeof(float));
+    }
 
     h->current_pos = 0;
     return reinterpret_cast<sk_mamba2_handle*>(h);
@@ -424,5 +441,6 @@ extern "C" void sk_mamba2_destroy(sk_mamba2_handle* hp) {
     rel(h->bufs.gated); rel(h->bufs.out_proj_out); rel(h->bufs.logits);
     rel(h->bufs.argmax_val_buf); rel(h->bufs.argmax_idx_buf);
     rel(h->bufs.splitk_partial);
+    rel(h->bufs.ssd_chunk_states); rel(h->bufs.ssd_cumdecay);
     delete h;
 }
