@@ -219,6 +219,116 @@ extern "C" int sk_mamba2_forward(sk_mamba2_handle* hp,
     return 0;
 }
 
+// Zero a single lane's per-layer conv/ssm state (for clean per-lane prefill).
+extern "C" void sk_mamba2_reset_lane(sk_mamba2_handle* hp, uint32_t lane) {
+    if (!hp) return;
+    auto* h = reinterpret_cast<meow::mamba2::Handle*>(hp);
+    if (lane >= h->cfg.batch) return;
+    const size_t C_in = (size_t)h->cfg.intermediate
+                      + 2 * (size_t)h->cfg.n_groups * h->cfg.state_size;
+    const size_t conv_lane = (size_t)(h->cfg.conv_kernel - 1) * C_in * 2;          // fp16
+    const size_t ssm_lane  = (size_t)h->cfg.n_heads * h->cfg.head_dim
+                           * h->cfg.state_size * sizeof(float);
+    for (auto& s : h->layer_states) {
+        if (s.conv_state)
+            std::memset((char*)s.conv_state->contents() + (size_t)lane * conv_lane,
+                        0, conv_lane);
+        if (s.ssm_state)
+            std::memset((char*)s.ssm_state->contents()  + (size_t)lane * ssm_lane,
+                        0, ssm_lane);
+    }
+}
+
+// Prefill request `lane`'s prompt into its own state slot (conv/ssm state of
+// lane i). Runs the model at batch=1, seq=len with state buffers offset to lane
+// i (kernels write from b=0 -> lands in lane i). Scratch (B.x/in_proj/...) is
+// shared and reused — prefills are sequential (waitUntilCompleted), so safe.
+// Returns lane i's greedy next-token (argmax of the prefill's last row).
+extern "C" int sk_mamba2_prefill_lane(sk_mamba2_handle* hp, uint32_t lane,
+                                      const int* input_ids, uint32_t seq,
+                                      int* output_id) {
+    if (!hp || !input_ids || seq == 0) return -1;
+    auto* h = reinterpret_cast<meow::mamba2::Handle*>(hp);
+    if (lane >= h->cfg.batch || seq > h->cfg.seq_max) return -2;
+    auto* q = sk::bindings_queue();
+    if (!q) return -3;
+
+    std::memcpy(h->bufs.tok_ids->contents(), input_ids, (size_t)seq * sizeof(int32_t));
+
+    meow::mamba2::ModelParams mp;
+    mp.batch=1; mp.seq=seq; mp.n_layers=h->cfg.n_layers; mp.d_model=h->cfg.d_model;
+    mp.intermediate=h->cfg.intermediate; mp.n_heads=h->cfg.n_heads;
+    mp.head_dim=h->cfg.head_dim; mp.state_size=h->cfg.state_size;
+    mp.n_groups=h->cfg.n_groups; mp.conv_kernel=h->cfg.conv_kernel;
+    mp.chunk_size=h->cfg.chunk_size; mp.vocab_size=h->cfg.vocab_size;
+    mp.eps=h->cfg.rms_eps; mp.dt_min=h->cfg.dt_limit_min; mp.dt_max=h->cfg.dt_limit_max;
+    mp.prefill_lane = (int32_t)lane;   // state writes go to lane i
+
+    static MTL::Buffer* s_pf_out = nullptr;
+    if (!s_pf_out) {
+        auto* dev = sk::bindings_device();
+        s_pf_out = dev->newBuffer(sizeof(int32_t), MTL::ResourceStorageModeShared);
+    }
+    std::memset(s_pf_out->contents(), 0, sizeof(int32_t));
+
+    auto* cmd = q->commandBuffer();
+    meow::mamba2::dispatch_model(cmd, h->psos, h->weights, h->bufs,
+                                 h->layer_states.data(), mp, s_pf_out);
+    cmd->commit();
+    cmd->waitUntilCompleted();
+    cmd->release();
+
+    if (output_id) std::memcpy(output_id, s_pf_out->contents(), sizeof(int32_t));
+    return 0;
+}
+
+// Lockstep batched decode: N requests, one token each in input_ids[0..N-1],
+// next-token written to output_id[0..N-1]. in/out projections run at M=N (one
+// weight read for all N rows — the serving amortization), per-lane conv ring +
+// ssm recurrent state, per-row argmax. Caller must have prefilled each lane.
+extern "C" int sk_mamba2_decode_batched(sk_mamba2_handle* hp,
+                                        const int* input_ids, uint32_t n_req,
+                                        int* output_ids) {
+    if (!hp || !input_ids || !output_ids || n_req == 0) return -1;
+    auto* h = reinterpret_cast<meow::mamba2::Handle*>(hp);
+    if (n_req > h->cfg.batch) return -2;
+    auto* q = sk::bindings_queue();
+    if (!q) return -3;
+
+    std::memcpy(h->bufs.tok_ids->contents(), input_ids, (size_t)n_req * sizeof(int32_t));
+
+    meow::mamba2::ModelParams mp;
+    mp.batch=n_req; mp.seq=1; mp.n_layers=h->cfg.n_layers; mp.d_model=h->cfg.d_model;
+    mp.intermediate=h->cfg.intermediate; mp.n_heads=h->cfg.n_heads;
+    mp.head_dim=h->cfg.head_dim; mp.state_size=h->cfg.state_size;
+    mp.n_groups=h->cfg.n_groups; mp.conv_kernel=h->cfg.conv_kernel;
+    mp.chunk_size=h->cfg.chunk_size; mp.vocab_size=h->cfg.vocab_size;
+    mp.eps=h->cfg.rms_eps; mp.dt_min=h->cfg.dt_limit_min; mp.dt_max=h->cfg.dt_limit_max;
+    mp.decode_all_rows = 1u;
+
+    static MTL::Buffer* s_bd_out = nullptr;
+    static uint32_t     s_bd_cap = 0;
+    if (s_bd_cap < n_req) {
+        if (s_bd_out) s_bd_out->release();
+        auto* dev = sk::bindings_device();
+        s_bd_out = dev->newBuffer((size_t)n_req * sizeof(int32_t),
+                                  MTL::ResourceStorageModeShared);
+        s_bd_cap = n_req;
+    }
+    std::memset(s_bd_out->contents(), 0, (size_t)n_req * sizeof(int32_t));
+
+    auto* cmd = q->commandBuffer();
+    meow::mamba2::dispatch_model(cmd, h->psos, h->weights, h->bufs,
+                                 h->layer_states.data(), mp, s_bd_out);
+    cmd->commit();
+    cmd->waitUntilCompleted();
+    cmd->release();
+
+    std::memcpy(output_ids, s_bd_out->contents(), (size_t)n_req * sizeof(int32_t));
+    h->last_seq = n_req;   // batched logits buffer holds N rows
+    return 0;
+}
+
 extern "C" int sk_mamba2_get_last_logits(sk_mamba2_handle* hp, void* out_fp16) {
     if (!hp || !out_fp16) return -1;
     auto* h = reinterpret_cast<meow::mamba2::Handle*>(hp);

@@ -70,6 +70,13 @@ typedef struct {
 sk_mamba2_handle* sk_mamba2_create(const sk_mamba2_config* cfg);
 int  sk_mamba2_forward(sk_mamba2_handle* h,
                        const int* input_ids, uint32_t seq, int* output_id);
+// Batched-decode serving. Prefill each request into its own lane, then run
+// lockstep batched decode (one weight read for all N lanes' projections).
+void sk_mamba2_reset_lane(sk_mamba2_handle* h, uint32_t lane);
+int  sk_mamba2_prefill_lane(sk_mamba2_handle* h, uint32_t lane,
+                            const int* input_ids, uint32_t seq, int* output_id);
+int  sk_mamba2_decode_batched(sk_mamba2_handle* h,
+                              const int* input_ids, uint32_t n_req, int* output_ids);
 // Dump intermediate tensor by name for HF parity testing. Names mirror
 // hf_ref.npz keys: "embed", "L{i}.{mixer_in,xBC_preconv,dt_pre,mixer_out,hidden}", "logits".
 int  sk_mamba2_dump_layer(sk_mamba2_handle* h, const char* tag,
