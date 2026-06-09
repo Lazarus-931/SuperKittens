@@ -170,6 +170,12 @@ struct LayerPSOs {
     MTL::ComputePipelineState* q8_0_matvec_bf16   = nullptr; // M=1 Q8_0 × bf16 matvec → bf16 (LM head + Q8 body projections)
     MTL::ComputePipelineState* q4k_matvec_bf16    = nullptr; // M=1 Q4_K × bf16 matvec → bf16 (Q4_K body, fit-16GB)
     MTL::ComputePipelineState* q6k_matvec_bf16    = nullptr; // M=1 Q6_K × bf16 matvec → bf16 (Q4_K_M v/down Q6_K rows)
+    // T>1 prefill bf16-I/O batched GEMM (nullable; weight-read amortized over M
+    // rows). When non-null and M>1, the body projections route here instead of
+    // looping the M=1 matvec per row.
+    MTL::ComputePipelineState* gemm_mma_q8_bf16   = nullptr;
+    MTL::ComputePipelineState* gemm_mma_q4k_bf16  = nullptr;
+    MTL::ComputePipelineState* gemm_mma_q6k_bf16  = nullptr;
     MTL::ComputePipelineState* geglu_mul          = nullptr; // gelu(gate)*up elementwise (Q8 MLP)
 };
 
@@ -287,10 +293,33 @@ inline void dispatch_layer(
 
     // Q4_K body: dispatch one body projection through the matvec PSO that matches
     // its per-layer BodyEnc tag. Q8 path unchanged (body_kquant=false).
+    // T>1 prefill: route the body projection through the bf16-I/O batched GEMM
+    // (weight read amortized over M rows) instead of looping the M=1 matvec per
+    // row. Flag SK_GEMMA4_PREFILL_MMA=0 forces the legacy per-row matvec.
+    static const bool _prefill_mma =
+        []{ const char* e = std::getenv("SK_GEMMA4_PREFILL_MMA"); return !e || e[0] != '0'; }();
     auto enc_body = [&](MTL::ComputeCommandEncoder* enc, BodyEnc e,
                         MTL::Buffer* A, size_t offA, MTL::Buffer* W, size_t offW,
                         MTL::Buffer* C, size_t offC,
                         uint32_t M, uint32_t N, uint32_t Kd, uint32_t ldC) {
+        MTL::ComputePipelineState* gemm_pso =
+            (e == BodyEnc::Q6K) ? P.gemm_mma_q6k_bf16
+          : (e == BodyEnc::Q4K) ? P.gemm_mma_q4k_bf16
+                                : P.gemm_mma_q8_bf16;
+        if (_prefill_mma && M > 1 && gemm_pso != nullptr) {
+            enc->setComputePipelineState(gemm_pso);
+            enc->setBuffer(A, offA, 0);
+            enc->setBuffer(W, offW, 1);
+            enc->setBuffer(C, offC, 2);
+            enc->setBytes(&M,   4, 3);
+            enc->setBytes(&N,   4, 4);
+            enc->setBytes(&Kd,  4, 5);
+            enc->setBytes(&ldC, 4, 6);
+            const uint32_t BM = 32, BN = 32;
+            enc->dispatchThreadgroups(MTL::Size((N + BN - 1) / BN, (M + BM - 1) / BM, 1),
+                                      MTL::Size(64, 1, 1));
+            return;
+        }
         if (B.body_kquant) {
             MTL::ComputePipelineState* pso =
                 (e == BodyEnc::Q6K) ? P.q6k_matvec_bf16 : P.q4k_matvec_bf16;

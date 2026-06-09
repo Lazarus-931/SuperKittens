@@ -80,6 +80,11 @@ static bool resolve_psos(ModelPSOs& P) {
     P.layer.q8_0_matvec_bf16   = sk::bindings_pso("q8_0_matvec_bf16");
     P.layer.q4k_matvec_bf16    = sk::bindings_pso("q4k_matvec_bf16");   // optional (Q4_K body)
     P.layer.q6k_matvec_bf16    = sk::bindings_pso("q6k_matvec_bf16");   // optional (Q4_K body v/down Q6_K)
+    // bf16-I/O batched GEMM for the T>1 prefill body (amortizes weight reads
+    // across M rows; the matvec path re-reads weights per row). Optional.
+    P.layer.gemm_mma_q8_bf16   = sk::bindings_pso("gemma4_gemm_mma_q8_bf16");
+    P.layer.gemm_mma_q4k_bf16  = sk::bindings_pso("gemma4_gemm_mma_q4k_bf16");
+    P.layer.gemm_mma_q6k_bf16  = sk::bindings_pso("gemma4_gemm_mma_q6k_bf16");
     P.layer.geglu_mul          = sk::bindings_pso("gemma4_geglu_mul");
     P.embedding_lookup     = sk::bindings_pso("embedding_lookup_bf16");
     P.embedding_lookup_q8  = sk::bindings_pso("embedding_lookup_q8_bf16");  // optional
