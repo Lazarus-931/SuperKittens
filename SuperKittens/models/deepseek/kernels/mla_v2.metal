@@ -23,6 +23,16 @@
 #define SK_MLA_V2_DV 128
 #endif
 
+// Number of simdgroups cooperating on one (q_row, head, batch). The single-SG
+// form (NSPLIT==1) walks the whole KV cache serially per head → only n_heads
+// simdgroups for the whole decode, badly under-filling the GPU. NSPLIT>1 stripes
+// the KV positions across NSPLIT simdgroups and merges their partial
+// online-softmax states (associative, so bit-equivalent ordering aside the math
+// is identical), raising occupancy to n_heads*NSPLIT simdgroups.
+#ifndef SK_MLA_V2_NSPLIT
+#define SK_MLA_V2_NSPLIT 4
+#endif
+
 struct ds4_metal_args_mla_decode_v2 {
     int32_t  ne01;
     int32_t  ne02;
@@ -58,9 +68,9 @@ struct ds4_metal_args_mla_decode_v2 {
     float    logit_softcap;
 };
 
-// One simdgroup owns one (q_row, head, batch). DK4=48 / DV4=32 are both lane
+// NSPLIT simdgroups per (q_row, head, batch). DK4=48 / DV4=32 are both lane
 // (32) -multiples-of-friendly via the strided loops below, so no padding needed.
-template<short DK, short DV>
+template<short DK, short DV, short NSPLIT>
 kernel void kernel_mla_decode_v2(
         constant ds4_metal_args_mla_decode_v2 & args,
         device const char * q,
@@ -70,12 +80,14 @@ kernel void kernel_mla_decode_v2(
         device const char * sinks,   // unused (kept for binding parity)
         device const char * pad,     // unused (kept for binding parity)
         device       char * dst,
+        threadgroup char  * shmem [[threadgroup(0)]],
         uint3   tgpig [[threadgroup_position_in_grid]],
         ushort  tiisg [[thread_index_in_simdgroup]],
         ushort  sgitg [[simdgroup_index_in_threadgroup]]) {
     constexpr short NW  = N_SIMDWIDTH;
     constexpr short DK4 = DK/4;
     constexpr short DV4 = DV/4;
+    constexpr short ACCN = DV4/NW + 1;
 
     const ushort iq3 = tgpig[2];   // batch
     const ushort iq2 = tgpig[1];   // head
@@ -101,12 +113,13 @@ kernel void kernel_mla_decode_v2(
     // Online-softmax running state; per-lane partial V accumulators.
     float M = -FLT_MAX/2;
     float S = 0.0f;
-    float4 acc[DV4/NW + 1];
-    FOR_UNROLL (short i = 0; i < DV4/NW + 1; ++i) {
+    float4 acc[ACCN];
+    FOR_UNROLL (short i = 0; i < ACCN; ++i) {
         acc[i] = 0.0f;
     }
 
-    for (int ic = 0; ic < args.ne11; ++ic) {
+    // Each simdgroup strides over the KV positions: sgitg, sgitg+NSPLIT, ...
+    for (int ic = sgitg; ic < args.ne11; ic += NSPLIT) {
         const float msk = (float) pm[ic];
         if (msk <= -MAXHALF) {
             continue;
@@ -141,26 +154,82 @@ kernel void kernel_mla_decode_v2(
         }
     }
 
-    if (S != 0.0f) {
-        const float inv = 1.0f/S;
-        const int64_t rid =
-            (int64_t)iq3*args.ne2*args.ne1 + iq2 + (int64_t)iq1*args.ne1;
-        device float4 * dst4 = (device float4 *) dst + rid*DV4;
+    // ── Cross-simdgroup merge of the NSPLIT partial (M, S, acc) states ──
+    // Single-SG fast path: no merge, no barrier, no shared memory traffic.
+    if (NSPLIT == 1) {
+        if (S != 0.0f) {
+            const float inv = 1.0f/S;
+            const int64_t rid =
+                (int64_t)iq3*args.ne2*args.ne1 + iq2 + (int64_t)iq1*args.ne1;
+            device float4 * dst4 = (device float4 *) dst + rid*DV4;
+            short slot = 0;
+            for (short i = tiisg; i < DV4; i += NW, ++slot) {
+                dst4[i] = acc[slot]*inv;
+            }
+        } else {
+            const int64_t rid =
+                (int64_t)iq3*args.ne2*args.ne1 + iq2 + (int64_t)iq1*args.ne1;
+            device float4 * dst4 = (device float4 *) dst + rid*DV4;
+            for (short i = tiisg; i < DV4; i += NW) {
+                dst4[i] = 0.0f;
+            }
+        }
+        return;
+    }
+
+    // Shared scratch: NSPLIT*(M,S) scalars + NSPLIT*DV4 float4 partial accumulators.
+    threadgroup float  * sM = (threadgroup float *) shmem;
+    threadgroup float  * sS = sM + NSPLIT;
+    threadgroup float4 * sAcc = (threadgroup float4 *)(sS + NSPLIT);
+
+    // Lane 0 of each SG writes its M/S; the per-lane acc[] are written gathered
+    // into the SG's DV4-wide row of sAcc (lane i owns dim i, i+NW, ...).
+    if (tiisg == 0) { sM[sgitg] = M; sS[sgitg] = S; }
+    {
         short slot = 0;
         for (short i = tiisg; i < DV4; i += NW, ++slot) {
-            dst4[i] = acc[slot]*inv;
+            sAcc[(int)sgitg*DV4 + i] = acc[slot];
         }
-    } else {
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // SG 0 merges all NSPLIT partials into a single online-softmax state and
+    // writes the result. Combine is the standard flash-attn two-state merge.
+    if (sgitg == 0) {
+        float Mg = -FLT_MAX/2;
+        FOR_UNROLL (short s = 0; s < NSPLIT; ++s) Mg = max(Mg, sM[s]);
+
+        float Sg = 0.0f;
+        float4 accg[ACCN];
+        FOR_UNROLL (short i = 0; i < ACCN; ++i) accg[i] = 0.0f;
+
+        for (short s = 0; s < NSPLIT; ++s) {
+            const float w = exp(sM[s] - Mg);   // rescale this partial onto Mg
+            Sg += sS[s] * w;
+            short slot = 0;
+            for (short i = tiisg; i < DV4; i += NW, ++slot) {
+                accg[slot] += sAcc[(int)s*DV4 + i] * w;
+            }
+        }
+
         const int64_t rid =
             (int64_t)iq3*args.ne2*args.ne1 + iq2 + (int64_t)iq1*args.ne1;
         device float4 * dst4 = (device float4 *) dst + rid*DV4;
-        for (short i = tiisg; i < DV4; i += NW) {
-            dst4[i] = 0.0f;
+        if (Sg != 0.0f) {
+            const float inv = 1.0f/Sg;
+            short slot = 0;
+            for (short i = tiisg; i < DV4; i += NW, ++slot) {
+                dst4[i] = accg[slot]*inv;
+            }
+        } else {
+            for (short i = tiisg; i < DV4; i += NW) {
+                dst4[i] = 0.0f;
+            }
         }
     }
 }
 
-typedef decltype(kernel_mla_decode_v2<SK_MLA_V2_DK, SK_MLA_V2_DV>) mla_decode_v2_t;
+typedef decltype(kernel_mla_decode_v2<SK_MLA_V2_DK, SK_MLA_V2_DV, SK_MLA_V2_NSPLIT>) mla_decode_v2_t;
 
 template [[host_name("kernel_mla_decode_v2_f16_dk192_dv128")]]
-kernel mla_decode_v2_t kernel_mla_decode_v2<192, 128>;
+kernel mla_decode_v2_t kernel_mla_decode_v2<192, 128, SK_MLA_V2_NSPLIT>;

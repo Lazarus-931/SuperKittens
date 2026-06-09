@@ -696,9 +696,20 @@ inline void dispatch_attn(
         enc->setBuffer(B.q_packed_f32,  0, 5);   // sinks (unused)
         enc->setBuffer(B.q_packed_f32,  0, 6);   // pad   (unused)
         enc->setBuffer(B.attn_out_f32,  0, 7);   // dst (fp32 [batch, seq, head, dv])
+        // NSPLIT simdgroups per (q,head,batch) stripe the KV cache and merge
+        // their partial online-softmax states in threadgroup scratch. Lifts
+        // occupancy from n_heads to n_heads*NSPLIT simdgroups (matches
+        // SK_MLA_V2_NSPLIT baked into mla_v2.metal).
+        constexpr uint32_t MLA_NSPLIT = 4;
+        constexpr uint32_t MLA_DV4 = 128 / 4;
+        // scratch: NSPLIT*(M,S) floats + NSPLIT*DV4 float4 partial accumulators.
+        const NS::UInteger mla_shmem =
+            MLA_NSPLIT * 2 * sizeof(float) +
+            (NS::UInteger)MLA_NSPLIT * MLA_DV4 * sizeof(float) * 4;
+        enc->setThreadgroupMemoryLength(mla_shmem, 0);
         enc->dispatchThreadgroups(
             MTL::Size(p.seq, p.n_heads, p.batch),
-            MTL::Size(32, 1, 1));   // one simdgroup per (q,head,batch)
+            MTL::Size(32 * MLA_NSPLIT, 1, 1));
         enc->endEncoding();
 
         // Cast attn_out fp32 → fp16 for the O-proj GEMM.
