@@ -314,41 +314,58 @@ extern "C" int sk_gemma4_load_from_store(sk_gemma4_handle* hp, sk::WeightStore* 
     const size_t qhd_max    = nh * hd_max;
     const size_t w_out_layer_stride = qhd_max * dm;
 
-    if (!copy_into(h->weights.w_embed, 0, store,
-                   "model.language_model.embed_tokens.weight",
-                   (size_t)c.vocab_size * dm)) return -10;
     if (!copy_into(h->weights.w_final_norm, 0, store,
                    "model.language_model.norm.weight", dm)) return -11;
 
-    // Embed scale: multiply embed table by sqrt(d_model) — in bf16.
+    // token embed (scaled by sqrt(d_model)); tied lm_head packs Q8 from it.
+    // Two paths mirror sk_gemma4_load_gguf:
+    //  - bf16-resident (w_embed != nullptr): load + scale in place, then
+    //    block-quantize the whole table into w_lm_head_q8 if allocated.
+    //  - EMBED_Q8 (SK_GEMMA4_EMBED_Q8=1 → launcher left w_embed == nullptr):
+    //    the bf16 embed must NEVER materialize. Dequant+scale+Q8-pack in row
+    //    tiles straight into w_lm_head_q8 (the tied buffer that serves BOTH the
+    //    embedding lookup and the lm_head). d_model is 32-aligned, so a per-row
+    //    tile is Q8_0-block-aligned.
     {
         const float embed_scale = std::sqrt((float)dm);
-        uint16_t* eb = (uint16_t*)h->weights.w_embed->contents();
-        const size_t n = (size_t)c.vocab_size * dm;
-        scale_bf16_inplace(eb, n, embed_scale);
-    }
-
-    // Q8_0 LM-head packing: gemma4 ties lm_head = embed_tokens, so when the
-    // launcher allocated a Q8_0 LM-head buffer we quantize the already-scaled
-    // bf16 embed table into it. dispatch_model then routes the decode-time
-    // (T=1) lm_head matvec through q8_0_matvec_bf16. Logit descale stays the
-    // same (still divides by sqrt(d_model)).
-    if (h->weights.w_lm_head_q8) {
-        const uint16_t* src = (const uint16_t*)h->weights.w_embed->contents();
-        uint8_t* dst        = (uint8_t*)h->weights.w_lm_head_q8->contents();
-        const size_t n_elems = (size_t)c.vocab_size * dm;
-        sk::quantize_q8_0_bf16(src, n_elems, dst);
-
-        // Embed-Q8 (opt-in, SK_GEMMA4_EMBED_Q8=1): the lm_head Q8 buffer is the
-        // tied (scaled) token embed in Q8 — so once it's built we can free the
-        // resident bf16 embed table (~1.3 GB at E4B). dispatch_model then runs
-        // embedding_lookup_q8_bf16 (gather+dequant from w_lm_head_q8) and loops
-        // the Q8 matvec for the T>1 prefill LM-head. Gated off by default.
-        const char* eenv = std::getenv("SK_GEMMA4_EMBED_Q8");
-        const bool embed_q8 = eenv && (eenv[0] == '1');
-        if (embed_q8) {
-            h->weights.w_embed->release();
-            h->weights.w_embed = nullptr;
+        const size_t n_embed = (size_t)c.vocab_size * dm;
+        if (h->weights.w_embed) {
+            if (!copy_into(h->weights.w_embed, 0, store,
+                           "model.language_model.embed_tokens.weight", n_embed)) return -10;
+            uint16_t* eb = (uint16_t*)h->weights.w_embed->contents();
+            scale_bf16_inplace(eb, n_embed, embed_scale);
+            if (h->weights.w_lm_head_q8) {
+                sk::quantize_q8_0_bf16(eb, n_embed,
+                                       (uint8_t*)h->weights.w_lm_head_q8->contents());
+            }
+        } else {
+            // EMBED_Q8: w_embed dropped to save the bf16 table (~1.3 GB E4B).
+            if (!h->weights.w_lm_head_q8) {
+                std::fprintf(stderr, "gemma4 weights: EMBED_Q8 but no lm_head_q8\n");
+                return -10;
+            }
+            auto* v = store->get("model.language_model.embed_tokens.weight");
+            if (!v) {
+                std::fprintf(stderr, "gemma4 weights: missing tensor 'embed_tokens.weight'\n");
+                return -10;
+            }
+            const size_t src_elem = (v->dtype == sk::Dtype::F32) ? 4u : 2u;
+            if (v->nbytes != n_embed * src_elem) {
+                std::fprintf(stderr, "gemma4 weights: size mismatch embed_tokens got %zu expect %zu\n",
+                             v->nbytes, n_embed * src_elem);
+                return -10;
+            }
+            auto* q8dst = (uint8_t*)h->weights.w_lm_head_q8->contents();
+            const size_t ROWS = 4096;
+            std::vector<uint16_t> row(ROWS * dm);
+            for (size_t r0 = 0; r0 < (size_t)c.vocab_size; r0 += ROWS) {
+                const size_t nr = std::min(ROWS, (size_t)c.vocab_size - r0);
+                const size_t e0 = r0 * dm, ne = nr * dm;
+                copy_bf16_from(row.data(), (const uint8_t*)v->data + e0 * src_elem,
+                               v->dtype, ne);
+                scale_bf16_inplace(row.data(), ne, embed_scale);
+                sk::quantize_q8_0_bf16(row.data(), ne, q8dst + (e0 / 32) * 34);
+            }
         }
     }
 
