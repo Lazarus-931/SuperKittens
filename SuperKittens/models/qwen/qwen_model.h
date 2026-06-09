@@ -23,6 +23,7 @@ struct LayerParams {
     float    eps          = 1e-6f;
     uint32_t use_qk_norm  = 1;  // 0 for Llama-arch (Nemotron-Nano): skip per-head Q/K RMSNorm
     uint32_t rope_interleaved = 0;  // 1 = interleaved/NORM RoPE (Llama GGUF, type 0); 0 = NeoX split-half (Qwen3, type 2)
+    uint32_t attn_qkv_bias = 0;  // 1 = add per-layer packed [Q|K|V] bias after QKV matvec (Qwen2/2.5)
 
     uint32_t layer_idx    = 0;
     uint32_t kv_buf_start = 0;
@@ -72,12 +73,14 @@ struct LayerPSOs {
     MTL::ComputePipelineState* q8_0_swiglu_prenorm_m1 = nullptr;  // fused residual+rmsnorm+swiglu (M=1)
     MTL::ComputePipelineState* q8_0_matvec_addres = nullptr;  // matvec + residual add (M=1)
     MTL::ComputePipelineState* split_packed;      // (T, A+B) → (T, A) + (T, B)
+    MTL::ComputePipelineState* bias_add = nullptr;  // C[t,n] += bias[n] (Qwen2/2.5 QKV bias); optional
     MTL::ComputePipelineState* rope_qk;           // split-half (NeoX) RoPE on Q, K (Qwen3)
     MTL::ComputePipelineState* rope_qk_il = nullptr;  // interleaved (NORM) RoPE (Llama GGUF); used when rope_interleaved=1
-    MTL::ComputePipelineState* attn;              // mha_causal (d=128, GQA)
+    MTL::ComputePipelineState* attn;              // mha_causal (GQA); D-specific (128/64)
+    MTL::ComputePipelineState* attn_prefill = nullptr;  // mha_causal_prefill (BR=8); seq>1, D=128 only
     // Flash-decoding split-K decode attention (long-ctx). Both non-null together.
-    MTL::ComputePipelineState* attn_split   = nullptr;  // mha_decode_split
-    MTL::ComputePipelineState* attn_combine = nullptr;  // mha_decode_combine
+    MTL::ComputePipelineState* attn_split   = nullptr;  // mha_decode_split (D-specific)
+    MTL::ComputePipelineState* attn_combine = nullptr;  // mha_decode_combine (D-specific)
     MTL::ComputePipelineState* kv_cache_write;
     // Q8_0-KV path (gated by SK_KV_Q8). All three non-null together or disabled.
     MTL::ComputePipelineState* kv_cache_write_q8 = nullptr;
@@ -98,6 +101,7 @@ struct LayerBuffers {
     MTL::Buffer* w_pre_attn_norm;     // (n_layers, d_model)
     MTL::Buffer* w_qkv;               // this layer's QKV (or Q|K-only) slab
     size_t       w_qkv_inner_off = 0; // byte offset within w_qkv to the start of layer data
+    MTL::Buffer* w_qkv_bias = nullptr;  // (n_layers, qkv_N) fp16 packed [Q|K|V] bias; null = no QKV bias
     MTL::Buffer* w_v = nullptr;       // separate V slab when V dtype splits off
     size_t       w_v_inner_off = 0;
     MTL::Buffer* w_q_norm;            // (n_layers, head_dim) — per-head Q-norm γ
@@ -251,6 +255,12 @@ inline bool gemm_sm_wins(sk::Dtype dt, uint32_t M) {
     }
 }
 
+// Threadgroup width (NSG*32) for the small-M kernel of dtype dt. Q8_0 sm is
+// one simdgroup (occupancy-tuned); Q4_K sm needs 4 (row/sub-block split).
+inline uint32_t gemm_sm_threads(sk::Dtype dt) {
+    return (dt == sk::Dtype::Q8_0) ? 32u : 128u;
+}
+
 // Encode one batched MMA GEMM: A (fp16 [M,K]) × W ([N,K] quant/fp16) → C
 // (fp16 [M,N], row stride ldC). BM=8 rows × BN=32 cols per threadgroup.
 inline void encode_gemm_mma(
@@ -285,7 +295,8 @@ inline void encode_gemm_sm(
     MTL::Buffer* A, size_t off_A,
     MTL::Buffer* W, size_t off_W,
     MTL::Buffer* C, size_t off_C,
-    uint32_t M, uint32_t N, uint32_t K, uint32_t ldC)
+    uint32_t M, uint32_t N, uint32_t K, uint32_t ldC,
+    uint32_t tg_threads = 128)
 {
     enc_barrier(enc);
     enc->setComputePipelineState(pso);
@@ -297,8 +308,10 @@ inline void encode_gemm_sm(
     enc->setBytes(&K, 4, 5);
     enc->setBytes(&ldC, 4, 6);
     constexpr uint32_t NR0 = 2;
+    // tg_threads = NSG*32: Q8_0 sm runs one simdgroup (32) for occupancy; Q4_K
+    // sm needs 4 simdgroups (128) for its row/sub-block split.
     enc->dispatchThreadgroups(MTL::Size((N + NR0 - 1) / NR0, 1, 1),
-                              MTL::Size(128, 1, 1));
+                              MTL::Size(tg_threads, 1, 1));
 }
 
 // Encode a quant matvec (M rows, looping over rows for M>1). Mirrors
@@ -314,14 +327,16 @@ inline void encode_quant_gemm(
     uint32_t M, uint32_t N, uint32_t K, uint32_t ldC = 0,
     MTL::ComputePipelineState* pso_mma = nullptr,
     MTL::ComputePipelineState* pso_sm = nullptr,
-    bool sm_wins = false)
+    bool sm_wins = false,
+    uint32_t sm_threads = 128)
 {
     if (ldC == 0) ldC = N;
     // Small-M (seq 2..8 where measured best): the multi-RHS matvec reads each
     // weight once and applies it to all M rows in registers, avoiding the BM=8
     // MMA tile's M-independent fixed floor. Bit-exact vs the per-row matvec.
     if (sm_wins && pso_sm != nullptr) {
-        encode_gemm_sm(enc, pso_sm, A, off_A, W, off_W, C, off_C, M, N, K, ldC);
+        encode_gemm_sm(enc, pso_sm, A, off_A, W, off_W, C, off_C, M, N, K, ldC,
+                       sm_threads);
         return;
     }
     // Prefill (M>1): one MMA GEMM amortizes the weight read across all M rows,
@@ -460,6 +475,22 @@ inline void encode_split(
     enc->dispatchThreads(MTL::Size(A + B, T, 1), MTL::Size(128, 1, 1));
 }
 
+// C[t, n] += bias[n] over a [T, N] fp16 buffer (Qwen2/2.5 packed QKV bias).
+// bias is bound at its per-layer byte offset so the kernel indexes [0, N).
+inline void encode_bias_add(
+    MTL::ComputeCommandEncoder* enc, MTL::ComputePipelineState* pso,
+    MTL::Buffer* C, MTL::Buffer* bias, size_t bias_off,
+    uint32_t N, uint32_t T)
+{
+    enc_barrier(enc);
+    enc->setComputePipelineState(pso);
+    enc->setBuffer(C,    0,        0);
+    enc->setBuffer(bias, bias_off, 1);
+    enc->setBytes(&N, 4, 2);
+    enc->setBytes(&T, 4, 3);
+    enc->dispatchThreads(MTL::Size(N * T, 1, 1), MTL::Size(128, 1, 1));
+}
+
 inline void encode_transpose(
     MTL::ComputeCommandEncoder* enc, MTL::ComputePipelineState* pso,
     MTL::Buffer* src, MTL::Buffer* dst,
@@ -481,7 +512,7 @@ inline void encode_rope_qk_inplace(
     MTL::Buffer* cos_tbl, size_t cos_off,
     MTL::Buffer* sin_tbl, size_t sin_off,
     uint32_t seq, uint32_t n_heads, uint32_t head_dim,
-    bool barrier_before = true)
+    bool barrier_before = true, uint32_t batch = 1)
 {
     if (barrier_before) enc_barrier(enc);
     enc->setComputePipelineState(pso);
@@ -492,9 +523,13 @@ inline void encode_rope_qk_inplace(
     enc->setBytes(&seq,      4, 4);
     enc->setBytes(&head_dim, 4, 5);
     enc->setBytes(&n_heads,  4, 6);
+    // n_rows = batch*seq. The Q/K buffer is [batch*seq, n_heads, D]; each row's
+    // rotation position is (row % seq). For batch=1 this is seq (path unchanged).
+    const uint32_t n_rows = batch * seq;
+    enc->setBytes(&n_rows,   4, 7);
     const uint32_t hd4 = (head_dim / 2) / 4;
     const uint32_t rows_per_tg = (hd4 > 0) ? (1024u / hd4) : 1u;
-    const uint32_t row_blocks = (seq + rows_per_tg - 1) / rows_per_tg;
+    const uint32_t row_blocks = (n_rows + rows_per_tg - 1) / rows_per_tg;
     enc->dispatchThreadgroups(
         MTL::Size(n_heads, row_blocks, 1),
         MTL::Size(hd4, rows_per_tg, 1));
@@ -546,11 +581,13 @@ inline void dispatch_layer(
             encode_quant_gemm(enc, pso_qkv, B.x_norm, 0, B.w_qkv, off_w_qkv,
                               B.qkv_packed, 0, T, qN + kvN, p.d_model, qkv_N,
                               gemm_mma_pso(P, B.dt_qkv),
-                              gemm_sm_pso(P, B.dt_qkv), gemm_sm_wins(B.dt_qkv, T));
+                              gemm_sm_pso(P, B.dt_qkv), gemm_sm_wins(B.dt_qkv, T),
+                              gemm_sm_threads(B.dt_qkv));
             encode_quant_gemm(enc, pso_v, B.x_norm, 0, B.w_v, B.w_v_inner_off,
                               B.qkv_packed, (size_t)(qN + kvN) * 2, T, kvN, p.d_model, qkv_N,
                               gemm_mma_pso(P, B.dt_v),
-                              gemm_sm_pso(P, B.dt_v), gemm_sm_wins(B.dt_v, T));
+                              gemm_sm_pso(P, B.dt_v), gemm_sm_wins(B.dt_v, T),
+                              gemm_sm_threads(B.dt_v));
         } else {
             encode_gemm_fallback(enc, P.gemm, P.gemv_m1, B.x_norm, 0, B.w_qkv, off_w_qkv,
                                  B.qkv_packed, T, qkv_N, p.d_model);
@@ -559,10 +596,20 @@ inline void dispatch_layer(
         encode_quant_gemm(enc, pso_qkv, B.x_norm, 0, B.w_qkv, off_w_qkv,
                           B.qkv_packed, 0, T, qkv_N, p.d_model, /*ldC=*/0,
                           gemm_mma_pso(P, B.dt_qkv),
-                          gemm_sm_pso(P, B.dt_qkv), gemm_sm_wins(B.dt_qkv, T));
+                          gemm_sm_pso(P, B.dt_qkv), gemm_sm_wins(B.dt_qkv, T),
+                          gemm_sm_threads(B.dt_qkv));
     } else {
         encode_gemm_fallback(enc, P.gemm, P.gemv_m1, B.x_norm, 0, B.w_qkv, off_w_qkv,
                              B.qkv_packed, T, qkv_N, p.d_model);
+    }
+
+    // 2b. QKV bias add (Qwen2/2.5). Broadcast per-layer packed [Q|K|V] bias over
+    // the [T, qkv_N] matvec output before the split. Flag-gated + buffer-gated so
+    // Qwen3/Llama/Mistral (attn_qkv_bias=0, w_qkv_bias=null) never reach it.
+    if (p.attn_qkv_bias && B.w_qkv_bias != nullptr && P.bias_add != nullptr) {
+        const size_t bias_off = (size_t)L * qkv_N * 2;
+        encode_bias_add(enc, P.bias_add, B.qkv_packed, B.w_qkv_bias, bias_off,
+                        qkv_N, T);
     }
 
     // 3. Splits.
@@ -594,20 +641,28 @@ inline void dispatch_layer(
             (p.rope_interleaved && P.rope_qk_il) ? P.rope_qk_il : P.rope_qk;
         encode_rope_qk_inplace(enc, rope_pso, B.q,
                                B.cos_tbl, cs_off, B.sin_tbl, cs_off,
-                               p.seq, p.n_heads, hd);
+                               p.seq, p.n_heads, hd,
+                               /*barrier_before=*/true, p.batch);
         encode_rope_qk_inplace(enc, rope_pso, B.k_tmp,
                                B.cos_tbl, cs_off, B.sin_tbl, cs_off,
                                p.seq, p.n_kv_heads, hd,
-                               /*barrier_before=*/false);
+                               /*barrier_before=*/false, p.batch);
     }
+
+    // Profiling-only stage gates (seq>1 prefill only; decode untouched). Diff
+    // GPUPROF gpu_busy with/without to attribute TTFT to xpose vs attention.
+    static const bool prof_skip_xpose = (getenv("SK_PROF_SKIP_XPOSE") != nullptr);
+    static const bool prof_skip_attn  = (getenv("SK_PROF_SKIP_ATTN")  != nullptr);
 
     MTL::Buffer* q_in = B.q;
     MTL::Buffer* k_in = B.k_tmp;
     MTL::Buffer* v_in = B.v_tmp;
-    if (p.seq > 1) {
+    if (p.seq > 1 && !prof_skip_xpose) {
         encode_transpose(enc, P.t_seq_to_head, B.q,     B.q_th, p.seq, p.n_heads,    hd);
         encode_transpose(enc, P.t_seq_to_head, B.k_tmp, B.k_th, p.seq, p.n_kv_heads, hd);
         encode_transpose(enc, P.t_seq_to_head, B.v_tmp, B.v_th, p.seq, p.n_kv_heads, hd);
+        q_in = B.q_th; k_in = B.k_th; v_in = B.v_th;
+    } else if (p.seq > 1) {
         q_in = B.q_th; k_in = B.k_th; v_in = B.v_th;
     }
 
@@ -656,7 +711,7 @@ inline void dispatch_layer(
     // from kv≈384, Hg≥4 only from kv≈1024 (4× the per-key simd_sum work delays
     // the crossover). Gates sit past the break-even so neither config regresses.
     enc_barrier(enc);
-    {
+    if (!(p.seq > 1 && prof_skip_attn)) {
         const uint32_t kv_len = p.kv_len;
         const uint32_t cache_stride = p.cache_size;
         const uint32_t Hg_attn = p.n_heads / p.n_kv_heads;
@@ -738,7 +793,15 @@ inline void dispatch_layer(
                 MTL::Size(p.n_kv_heads, (p.seq + 1) / 2, p.batch),
                 MTL::Size(Hg_attn * 2 * 32, 1, 1));
         } else {
-            enc->setComputePipelineState(P.attn);
+            // Prefill (seq>1): BR=8 variant reuses each K/V smem tile across 8
+            // query rows (vs Br=2), cutting the O(seq^2) K/V HBM re-stream ~4x.
+            // Gated on Hg*BR*32<=1024 (kernel max). Decode (seq==1) keeps Br=2.
+            constexpr uint32_t PBR = 8u;
+            const bool use_prefill = (p.seq > 1) && (P.attn_prefill != nullptr)
+                                     && (Hg_attn * PBR * 32u <= 1024u);
+            MTL::ComputePipelineState* pso_a = use_prefill ? P.attn_prefill : P.attn;
+            const uint32_t br = use_prefill ? PBR : 2u;
+            enc->setComputePipelineState(pso_a);
             enc->setBuffer(q_in,       0, 0);
             enc->setBuffer(B.k_cache,  0, 1);
             enc->setBuffer(B.v_cache,  0, 2);
@@ -749,15 +812,17 @@ inline void dispatch_layer(
             enc->setBytes(&kv_len,        4, 7);
             enc->setBytes(&cache_stride,  4, 8);
             enc->dispatchThreadgroups(
-                MTL::Size(p.n_kv_heads, (p.seq + 1) / 2, p.batch),
-                MTL::Size(Hg_attn * 2 * 32, 1, 1));
+                MTL::Size(p.n_kv_heads, (p.seq + br - 1u) / br, p.batch),
+                MTL::Size(Hg_attn * br * 32, 1, 1));
         }
     }
 
     MTL::Buffer* attn_o_in = B.attn_out;
-    if (p.seq > 1) {
+    if (p.seq > 1 && !prof_skip_xpose) {
         encode_transpose(enc, P.t_head_to_seq, B.attn_out, B.attn_out_seq,
                          p.seq, p.n_heads, hd);
+        attn_o_in = B.attn_out_seq;
+    } else if (p.seq > 1) {
         attn_o_in = B.attn_out_seq;
     }
 
@@ -767,7 +832,8 @@ inline void dispatch_layer(
         encode_quant_gemm(enc, pso_o, attn_o_in, 0, B.w_o, off_w_o,
                           B.o_proj, 0, T, p.d_model, p.n_heads * hd, /*ldC=*/0,
                           gemm_mma_pso(P, B.dt_o),
-                          gemm_sm_pso(P, B.dt_o), gemm_sm_wins(B.dt_o, T));
+                          gemm_sm_pso(P, B.dt_o), gemm_sm_wins(B.dt_o, T),
+                          gemm_sm_threads(B.dt_o));
     } else {
         encode_gemm_fallback(enc, P.gemm, P.gemv_m1, attn_o_in, 0, B.w_o, off_w_o,
                              B.o_proj, T, p.d_model, p.n_heads * hd);
@@ -849,7 +915,8 @@ inline void dispatch_layer(
             encode_quant_gemm(enc, pso_gate, B.m_in, 0, B.w_gate, off_w_gate,
                               B.gate_buf, 0, T, p.n_int, p.d_model, /*ldC=*/0,
                               gemm_mma_pso(P, B.dt_gate),
-                              gemm_sm_pso(P, B.dt_gate), gemm_sm_wins(B.dt_gate, T));
+                              gemm_sm_pso(P, B.dt_gate), gemm_sm_wins(B.dt_gate, T),
+                              gemm_sm_threads(B.dt_gate));
         } else {
             encode_gemm_fallback(enc, P.gemm, P.gemv_m1, B.m_in, 0, B.w_gate, off_w_gate,
                                  B.gate_buf, T, p.n_int, p.d_model);
@@ -858,7 +925,8 @@ inline void dispatch_layer(
             encode_quant_gemm(enc, pso_up, B.m_in, 0, B.w_up, off_w_up,
                               B.up_buf, 0, T, p.n_int, p.d_model, /*ldC=*/0,
                               gemm_mma_pso(P, B.dt_up),
-                              gemm_sm_pso(P, B.dt_up), gemm_sm_wins(B.dt_up, T));
+                              gemm_sm_pso(P, B.dt_up), gemm_sm_wins(B.dt_up, T),
+                              gemm_sm_threads(B.dt_up));
         } else {
             encode_gemm_fallback(enc, P.gemm, P.gemv_m1, B.m_in, 0, B.w_up, off_w_up,
                                  B.up_buf, T, p.n_int, p.d_model);
@@ -898,7 +966,8 @@ inline void dispatch_layer(
             encode_quant_gemm(enc, pso_down, B.up_buf, 0, B.w_down, off_w_down,
                               B.mlp_out, 0, T, p.d_model, p.n_int, /*ldC=*/0,
                               gemm_mma_pso(P, B.dt_down),
-                              gemm_sm_pso(P, B.dt_down), gemm_sm_wins(B.dt_down, T));
+                              gemm_sm_pso(P, B.dt_down), gemm_sm_wins(B.dt_down, T),
+                              gemm_sm_threads(B.dt_down));
         } else {
             encode_gemm_fallback(enc, P.gemm, P.gemv_m1, B.up_buf, 0, B.w_down, off_w_down,
                                  B.mlp_out, T, p.d_model, p.n_int);
@@ -934,6 +1003,7 @@ struct ModelParams {
     float    eps          = 1e-6f;
     uint32_t use_qk_norm  = 1;  // 0 for Llama-arch (Nemotron-Nano): skip per-head Q/K RMSNorm
     uint32_t rope_interleaved = 0;  // 1 = interleaved/NORM RoPE (Llama GGUF, type 0); 0 = NeoX (Qwen3, type 2)
+    uint32_t attn_qkv_bias = 0;  // 1 = add per-layer packed [Q|K|V] bias after QKV matvec (Qwen2/2.5)
     uint32_t current_pos  = 0;
 
     // RoPE
@@ -944,6 +1014,11 @@ struct ModelParams {
     float    rope_attn_factor = 1.f;
     float    rope_beta_fast   = 32.f;
     float    rope_beta_slow   = 1.f;
+
+    // Batched-decode: when set (seq==1, batch=N>1 lockstep-decode), the LM head
+    // projects ALL T=batch rows and argmax writes output_id[0..T]. Default 0
+    // keeps the single-row (last-position) decode/prefill path byte-identical.
+    uint32_t decode_all_rows = 0;
 
     // Debug knobs (default = full model, no capture)
     uint32_t layers_run     = 0;   // 0 → all n_layers; else only first N
@@ -987,6 +1062,7 @@ struct ModelWeights {
     MTL::Buffer* w_pre_attn_norm;
     std::vector<MTL::Buffer*> w_qkv;        // size n_layers
     std::vector<size_t>       w_qkv_off;    // size n_layers
+    MTL::Buffer* w_qkv_bias = nullptr;      // (n_layers, qkv_N) fp16 packed [Q|K|V]; null = no QKV bias
     // V-proj split: when V's GGUF dtype differs from Q/K (Q4_K_M: Q/K=Q4_K,
     // V=Q6_K, distinct block sizes) the QKV slab holds only [Q|K] and V lives
     // in its own per-layer buffer. Empty otherwise (uniform-dtype fast path).
@@ -1124,6 +1200,7 @@ inline void dispatch_model(
         lp.eps          = M.eps;
         lp.use_qk_norm  = M.use_qk_norm;
         lp.rope_interleaved = M.rope_interleaved;
+        lp.attn_qkv_bias = M.attn_qkv_bias;
         lp.layer_idx    = L;
         lp.kv_buf_start = kv_buf_start;
         lp.kv_len       = kv_len;
@@ -1142,6 +1219,7 @@ inline void dispatch_model(
         lb.w_pre_attn_norm = W.w_pre_attn_norm;
         lb.w_qkv             = W.w_qkv[L];
         lb.w_qkv_inner_off   = W.w_qkv_off[L];
+        lb.w_qkv_bias        = W.w_qkv_bias;
         if (!W.w_v.empty()) {
             lb.w_v             = W.w_v[L];
             lb.w_v_inner_off   = W.w_v_off[L];
@@ -1224,8 +1302,47 @@ inline void dispatch_model(
     // batch=1 buffer (OOB — the recurring logits-sizing bug). The result is
     // written to logits row T-1 so get_last_logits (reads logits row
     // last_seq-1 == T-1) and the argmax below both land on it.
-    {
-        const uint32_t last = T - 1u;
+    // Batched-decode (decode_all_rows): project every one of the T=batch rows so
+    // each request gets its own logits row. The M=1 / prefill default projects
+    // only row T-1 (row_lo=T-1). One matvec per row reuses the same head weight
+    // read across rows just like the per-row decode it mirrors.
+    const uint32_t head_row_lo = M.decode_all_rows ? 0u : (T - 1u);
+    // Batched-decode LM-head amortization: a per-row loop re-reads the (large)
+    // head weight T times — for a tied small model the head is ~25% of weight
+    // bytes, so the serial loop is the throughput-scaling bottleneck. When an MMA
+    // GEMM exists for the head dtype, run ONE [T,K]·[N,K] GEMM so the head weight
+    // is read once and applied to all T rows (the same bandwidth-amortization the
+    // layer projections get from gemm_sm). Falls back to the per-row loop below
+    // when no MMA path is available for the dtype.
+    bool head_batched = false;
+    if (M.decode_all_rows && T > 1u) {
+        MTL::Buffer* w_head = W.w_lm_head ? W.w_lm_head : W.w_embed;
+        const size_t off_head = W.w_lm_head ? W.off_w_lm_head : 0;
+        MTL::ComputePipelineState* head_mma =
+            (W.dt_lm_head == sk::Dtype::Q8_0 && W.w_lm_head) ? P.layer.gemm_mma_q8_0
+            : (W.dt_lm_head == sk::Dtype::Q4_K && W.w_lm_head) ? P.layer.gemm_mma_q4k
+            : (W.dt_lm_head == sk::Dtype::F16 || !W.w_lm_head) ? P.layer.gemm_mma_f16
+            : nullptr;
+        MTL::ComputePipelineState* head_sm =
+            (W.dt_lm_head == sk::Dtype::Q8_0 && W.w_lm_head) ? P.layer.gemm_mma_q8_0_sm
+            : nullptr;
+        const uint32_t K_v = M.d_model, N_v = M.vocab_size;
+        if (head_sm && gemm_sm_wins(W.dt_lm_head, T)) {
+            auto* enc = cmd->computeCommandEncoder();
+            encode_gemm_sm(enc, head_sm, nxt, 0, w_head, off_head,
+                           B.logits, 0, T, N_v, K_v, N_v,
+                           gemm_sm_threads(W.dt_lm_head));
+            enc->endEncoding();
+            head_batched = true;
+        } else if (head_mma) {
+            auto* enc = cmd->computeCommandEncoder();
+            encode_gemm_mma(enc, head_mma, nxt, 0, w_head, off_head,
+                            B.logits, 0, T, N_v, K_v, N_v);
+            enc->endEncoding();
+            head_batched = true;
+        }
+    }
+    for (uint32_t last = head_row_lo; !head_batched && last < T; ++last) {
         const uint32_t M_v = 1u, K_v = M.d_model, N_v = M.vocab_size;
         const size_t   off_A = (size_t)last * K_v * 2;
         const size_t   off_C = (size_t)last * N_v * 2;
@@ -1235,6 +1352,22 @@ inline void dispatch_model(
             P.layer.q8_0_matvec != nullptr) {
             auto* enc = cmd->computeCommandEncoder();
             enc->setComputePipelineState(P.layer.q8_0_matvec);
+            enc->setBuffer(nxt,           off_A,           0);
+            enc->setBuffer(W.w_lm_head,   W.off_w_lm_head, 1);
+            enc->setBuffer(B.logits,      off_C,           2);
+            enc->setBytes(&K_v, 4, 3);
+            enc->setBytes(&N_v, 4, 4);
+            enc->dispatchThreadgroups(MTL::Size((N_v + 1) / 2, 1, 1), MTL::Size(128, 1, 1));
+            enc->endEncoding();
+        } else
+        if (W.dt_lm_head == sk::Dtype::Q4_K && W.w_lm_head &&
+            P.layer.q4k_matvec != nullptr) {
+            // SK_QWEN_Q4K_HEAD: head requantized Q8_0→Q4_K at load (weights.c++).
+            // q4k_matvec shares the q8_0_matvec binding (B=0,A=1,C=2,K=3,N=4) and
+            // NR0=2 geometry, so this is the Q8 branch with the Q4_K PSO. Half the
+            // head bytes on the bandwidth-bound largest decode matvec.
+            auto* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(P.layer.q4k_matvec);
             enc->setBuffer(nxt,           off_A,           0);
             enc->setBuffer(W.w_lm_head,   W.off_w_lm_head, 1);
             enc->setBuffer(B.logits,      off_C,           2);
@@ -1352,6 +1485,18 @@ inline void dispatch_model(
                                       MTL::Size(1024, 1, 1));
             enc->endEncoding();
         }
+    } else if (M.decode_all_rows && M.seq == 1u) {
+        // Batched decode: argmax each request's logits row r → output_id[r].
+        // One TG per row (the single-TG argmax PSO), all in one encoder.
+        auto* enc = cmd->computeCommandEncoder();
+        enc->setComputePipelineState(P.argmax);
+        for (uint32_t r = 0; r < T; ++r) {
+            enc->setBuffer(B.logits,    (size_t)r * M.vocab_size * 2, 0);
+            enc->setBuffer(B.output_id, (size_t)r * sizeof(int32_t), 1);
+            enc->setBytes(&M.vocab_size, 4, 2);
+            enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(1024, 1, 1));
+        }
+        enc->endEncoding();
     } else {
         // Section D wrote only the last position's logits (row T-1). Argmax that
         // one row → output_id[0]. The logits base is offset to row T-1 so the
@@ -1364,6 +1509,290 @@ inline void dispatch_model(
         enc->setBytes(&M.vocab_size, 4, 2);
         enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(1024, 1, 1));
         enc->endEncoding();
+    }
+}
+
+// Pipeline-parallel layer-range dispatch (additive; dispatch_model above is
+// byte-identical and unchanged). Runs a sub-window of the layer stack so the
+// forward can be split across the layer dimension and hop the residual stream
+// between hosts.
+//   do_embed  : embed input_ids -> x_a before the loop (true only when start==0).
+//               When false, the caller must have loaded the incoming hidden
+//               state into B.x_a already (resume from a prior stage's output).
+//   start/end : run layers [start, end). KV for each layer L is written at
+//               write_pos=M.current_pos exactly as in dispatch_model.
+//   do_tail   : final RMSNorm + LM head + argmax -> output_id (true only on the
+//               last stage). When false, the residual after layer end-1 is left
+//               in B.x_a (the loop always lands the result back in x_a so the
+//               host copy-out / next-stage hand-in has a fixed buffer).
+// On return, when do_tail==false the post-window residual stream (T*d_model fp16)
+// is in B.x_a; when do_tail==true output_id holds the greedy next token.
+inline void dispatch_layer_range(
+    MTL::CommandBuffer* cmd,
+    const ModelPSOs&    P,
+    const ModelWeights& W,
+    ModelBuffers&       B,
+    const ModelParams&  M,
+    uint32_t            start_layer,
+    uint32_t            end_layer,
+    bool                do_embed,
+    bool                do_tail)
+{
+    const uint32_t T = M.batch * M.seq;
+
+    if (do_embed) {
+        auto* enc = cmd->computeCommandEncoder();
+        enc->setComputePipelineState(P.embedding_lookup);
+        enc->setBuffer(W.w_embed,   0, 0);
+        enc->setBuffer(B.input_ids, 0, 1);
+        enc->setBuffer(B.x_a,       0, 2);
+        enc->setBytes(&T,            4, 3);
+        enc->setBytes(&M.d_model,    4, 4);
+        enc->setBytes(&M.vocab_size, 4, 5);
+        const uint32_t D4 = M.d_model / 4;
+        enc->dispatchThreadgroups(MTL::Size((D4 + 127) / 128, T, 1),
+                                  MTL::Size(128, 1, 1));
+        enc->endEncoding();
+    }
+
+    // Layer window: the incoming residual is in x_a (embed wrote it, or the
+    // caller loaded the previous stage's hidden there). Ping-pong x_a<->x_b.
+    MTL::Buffer* cur = B.x_a;
+    MTL::Buffer* nxt = B.x_b;
+
+    if (end_layer > M.n_layers) end_layer = M.n_layers;
+    for (uint32_t L = start_layer; L < end_layer; ++L) {
+        const uint32_t total_after   = M.current_pos + M.seq;
+        const uint32_t kv_len        = (total_after < M.cache_max) ? total_after : M.cache_max;
+        const uint32_t logical_first = total_after - kv_len;
+        const uint32_t kv_buf_start  = logical_first % M.cache_max;
+
+        LayerParams lp;
+        lp.batch        = M.batch;
+        lp.seq          = M.seq;
+        lp.d_model      = M.d_model;
+        lp.n_heads      = M.n_heads;
+        lp.n_kv_heads   = M.n_kv_heads;
+        lp.head_dim     = M.head_dim;
+        lp.n_int        = M.n_int;
+        lp.eps          = M.eps;
+        lp.use_qk_norm  = M.use_qk_norm;
+        lp.rope_interleaved = M.rope_interleaved;
+        lp.layer_idx    = L;
+        lp.kv_buf_start = kv_buf_start;
+        lp.kv_len       = kv_len;
+        lp.cache_size   = M.cache_max;
+        lp.write_pos    = M.current_pos;
+        lp.rope_freq_base   = M.rope_freq_base;
+        lp.rope_n_ctx_orig  = M.rope_n_ctx_orig;
+        lp.rope_freq_scale  = M.rope_freq_scale;
+        lp.rope_ext_factor  = M.rope_ext_factor;
+        lp.rope_attn_factor = M.rope_attn_factor;
+        lp.rope_beta_fast   = M.rope_beta_fast;
+        lp.rope_beta_slow   = M.rope_beta_slow;
+
+        LayerBuffers lb{};
+        lb.x = cur;
+        lb.w_pre_attn_norm = W.w_pre_attn_norm;
+        lb.w_qkv             = W.w_qkv[L];
+        lb.w_qkv_inner_off   = W.w_qkv_off[L];
+        if (!W.w_v.empty()) {
+            lb.w_v             = W.w_v[L];
+            lb.w_v_inner_off   = W.w_v_off[L];
+        }
+        lb.dt_v   = W.dt_v_layer.empty()    ? W.dt_qkv : W.dt_v_layer[L];
+        lb.dt_down= W.dt_down_layer.empty() ? sk::Dtype::F16 : W.dt_down_layer[L];
+        lb.w_q_norm          = W.w_q_norm;
+        lb.w_k_norm          = W.w_k_norm;
+        lb.w_o               = W.w_o[L];
+        lb.w_o_inner_off     = W.w_o_off[L];
+        lb.w_pre_mlp_norm    = W.w_pre_mlp_norm;
+        lb.w_gate            = W.w_gate[L];
+        lb.w_gate_inner_off  = W.w_gate_off[L];
+        lb.w_up              = W.w_up[L];
+        lb.w_up_inner_off    = W.w_up_off[L];
+        lb.w_down            = W.w_down[L];
+        lb.w_down_inner_off  = W.w_down_off[L];
+        lb.rope_pos        = B.rope_pos;
+        lb.cos_tbl         = B.cos_tbl;
+        lb.sin_tbl         = B.sin_tbl;
+        lb.k_cache         = W.layer_caches[L].k;
+        lb.v_cache         = W.layer_caches[L].v;
+        lb.k_cache_q       = W.layer_caches[L].kq;
+        lb.v_cache_q       = W.layer_caches[L].vq;
+        lb.k_cache_s       = W.layer_caches[L].ks;
+        lb.v_cache_s       = W.layer_caches[L].vs;
+        lb.kv_q8           = M.kv_q8;
+        lb.x_norm          = B.x_norm;
+        lb.qkv_packed      = B.qkv_packed;
+        lb.q               = B.q;
+        lb.kv_pack         = B.kv_pack;
+        lb.k_tmp           = B.k_tmp;
+        lb.v_tmp           = B.v_tmp;
+        lb.attn_out        = B.attn_out;
+        lb.o_proj          = B.o_proj;
+        lb.y_attn          = B.y_attn;
+        lb.m_in            = B.m_in;
+        lb.mlp_out         = B.mlp_out;
+        lb.y_out           = nxt;
+        lb.gate_buf        = B.gate_buf;
+        lb.up_buf          = B.up_buf;
+        lb.q_th            = B.q_th;
+        lb.k_th            = B.k_th;
+        lb.v_th            = B.v_th;
+        lb.attn_out_seq    = B.attn_out_seq;
+        lb.attn_pm         = B.attn_pm;
+        lb.attn_ps         = B.attn_ps;
+        lb.attn_po         = B.attn_po;
+        lb.dt_qkv          = W.dt_qkv;
+        lb.dt_o            = W.dt_o;
+        lb.dt_gate         = W.dt_gate;
+        lb.dt_up           = W.dt_up;
+
+        dispatch_layer(cmd, P.layer, lb, lp);
+
+        MTL::Buffer* tmp = cur; cur = nxt; nxt = tmp;
+    }
+
+    // Land the post-window residual back in x_a so a non-tail stage exposes its
+    // output at a fixed buffer for host copy-out (and a resume stage re-enters
+    // here with its hidden in x_a). An odd layer count leaves cur==x_b; one blit
+    // moves it to x_a. (When do_tail, the tail reads `cur` directly below.)
+    if (!do_tail) {
+        if (cur != B.x_a) {
+            auto* benc = cmd->blitCommandEncoder();
+            benc->copyFromBuffer(cur, 0, B.x_a, 0, (size_t)T * M.d_model * 2);
+            benc->endEncoding();
+        }
+        return;
+    }
+
+    // Tail: final RMSNorm -> LM head (last row) -> argmax. Mirrors dispatch_model
+    // sections C/D/E exactly; `cur` holds the final residual, `nxt` is scratch.
+    {
+        auto* enc = cmd->computeCommandEncoder();
+        encode_rmsnorm(enc, P.layer.rmsnorm, cur, W.w_final_norm, 0,
+                       nxt, T, M.d_model, M.eps, P.layer.rmsnorm_t1);
+        enc->endEncoding();
+    }
+    {
+        const uint32_t last = T - 1u;
+        const uint32_t M_v = 1u, K_v = M.d_model, N_v = M.vocab_size;
+        const size_t   off_A = (size_t)last * K_v * 2;
+        const size_t   off_C = (size_t)last * N_v * 2;
+        MTL::Buffer* w_head = W.w_lm_head ? W.w_lm_head : W.w_embed;
+
+        if (W.dt_lm_head == sk::Dtype::Q8_0 && W.w_lm_head &&
+            P.layer.q8_0_matvec != nullptr) {
+            auto* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(P.layer.q8_0_matvec);
+            enc->setBuffer(nxt,           off_A,           0);
+            enc->setBuffer(W.w_lm_head,   W.off_w_lm_head, 1);
+            enc->setBuffer(B.logits,      off_C,           2);
+            enc->setBytes(&K_v, 4, 3);
+            enc->setBytes(&N_v, 4, 4);
+            enc->dispatchThreadgroups(MTL::Size((N_v + 1) / 2, 1, 1), MTL::Size(128, 1, 1));
+            enc->endEncoding();
+        } else
+        if (W.dt_lm_head == sk::Dtype::Q6_K && W.w_lm_head &&
+            P.layer.q6k_matvec != nullptr) {
+            auto* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(P.layer.q6k_matvec);
+            enc->setBuffer(nxt,           off_A,           0);
+            enc->setBuffer(W.w_lm_head,   W.off_w_lm_head, 1);
+            enc->setBuffer(B.logits,      off_C,           2);
+            enc->setBytes(&K_v, 4, 3);
+            enc->setBytes(&N_v, 4, 4);
+            enc->dispatchThreadgroups(MTL::Size((N_v + 1) / 2, 1, 1), MTL::Size(128, 1, 1));
+            enc->endEncoding();
+        } else
+        if (P.layer.gemv_t_m1 != nullptr) {
+            const size_t off_head = (w_head == W.w_lm_head) ? W.off_w_lm_head : 0;
+            auto* enc = cmd->computeCommandEncoder();
+            const bool use_2d = (P.layer.gemv_t_2dtile_m1 != nullptr);
+            enc->setComputePipelineState(use_2d ? P.layer.gemv_t_2dtile_m1
+                                                : P.layer.gemv_t_m1);
+            enc->setBuffer(nxt,      off_A,    0);
+            enc->setBuffer(w_head,   off_head, 1);
+            enc->setBuffer(B.logits, off_C,    2);
+            enc->setBytes(&N_v, 4, 3);
+            enc->setBytes(&K_v, 4, 4);
+            if (use_2d) {
+                const uint32_t OUT_ROWS_PER_TG = 64;
+                enc->dispatchThreadgroups(
+                    MTL::Size((N_v + OUT_ROWS_PER_TG - 1) / OUT_ROWS_PER_TG, 1, 1),
+                    MTL::Size(32, 16, 1));
+            } else {
+                const uint32_t BN = 128;
+                enc->dispatchThreadgroups(MTL::Size((N_v + BN - 1) / BN, 1, 1),
+                                          MTL::Size(BN, 1, 1));
+            }
+            enc->endEncoding();
+        } else {
+            const size_t off_head = (w_head == W.w_lm_head) ? W.off_w_lm_head : 0;
+            auto* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(P.layer.gemm);
+            uint32_t ldA = K_v, ldB = K_v, ldC = N_v;
+            int transA = 0, transB = 1, has_bias = 0;
+            enc->setBuffer(nxt,        off_A,    0);
+            enc->setBuffer(w_head,     off_head, 1);
+            enc->setBuffer(B.logits,   off_C,    2);
+            enc->setBytes(&M_v,      4, 3); enc->setBytes(&N_v,      4, 4);
+            enc->setBytes(&K_v,      4, 5); enc->setBytes(&ldA,      4, 6);
+            enc->setBytes(&ldB,      4, 7); enc->setBytes(&ldC,      4, 8);
+            enc->setBytes(&transA,   4, 9); enc->setBytes(&transB,   4, 10);
+            enc->setBytes(&has_bias, 4, 11);
+            enc->setBuffer(B.logits, off_C, 12);
+            enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, 1, 1),
+                                      MTL::Size(64, 1, 1));
+            enc->endEncoding();
+        }
+    }
+    {
+        const bool can_2pass = (T == 1u)
+                            && P.argmax_partial && P.argmax_reduce
+                            && B.argmax_val_buf && B.argmax_idx_buf;
+        const bool can_icb_tail = can_2pass
+                            && P.argmax_partial_icb && P.argmax_reduce_icb
+                            && B.argmax_args && B.argmax_icb;
+        if (can_icb_tail) {
+            auto* enc = cmd->computeCommandEncoder();
+            B.argmax_icb->execute(enc, 0, 2);
+            enc->endEncoding();
+        } else if (can_2pass) {
+            constexpr uint32_t ELTS_PER_TG = 16384u;
+            const uint32_t n_blocks = (M.vocab_size + ELTS_PER_TG - 1u) / ELTS_PER_TG;
+            {
+                auto* enc = cmd->computeCommandEncoder();
+                enc->setComputePipelineState(P.argmax_partial);
+                enc->setBuffer(B.logits,         0, 0);
+                enc->setBuffer(B.argmax_val_buf, 0, 1);
+                enc->setBuffer(B.argmax_idx_buf, 0, 2);
+                enc->setBytes(&M.vocab_size,     4, 3);
+                enc->dispatchThreadgroups(MTL::Size(n_blocks, 1, 1),
+                                          MTL::Size(1024, 1, 1));
+                enc->endEncoding();
+            }
+            {
+                auto* enc = cmd->computeCommandEncoder();
+                enc->setComputePipelineState(P.argmax_reduce);
+                enc->setBuffer(B.argmax_val_buf, 0, 0);
+                enc->setBuffer(B.argmax_idx_buf, 0, 1);
+                enc->setBuffer(B.output_id,      0, 2);
+                enc->setBytes(&n_blocks,         4, 3);
+                enc->dispatchThreadgroups(MTL::Size(1, 1, 1),
+                                          MTL::Size(1024, 1, 1));
+                enc->endEncoding();
+            }
+        } else {
+            auto* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(P.argmax);
+            enc->setBuffer(B.logits,    (size_t)(T - 1u) * M.vocab_size * 2, 0);
+            enc->setBuffer(B.output_id, 0, 1);
+            enc->setBytes(&M.vocab_size, 4, 2);
+            enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(1024, 1, 1));
+            enc->endEncoding();
+        }
     }
 }
 

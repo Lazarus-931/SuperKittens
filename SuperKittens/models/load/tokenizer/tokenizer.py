@@ -46,6 +46,11 @@ class Tokenizer:
         # Llama-3.1-Nemotron-Nano: chat turns end on <|eot_id|>; <|end_of_text|> is
         # the base-completion stop. Both resolve in the Llama-3 vocab.
         "nemotron": {"bos": ("<|begin_of_text|>",), "eos": ("<|eot_id|>", "<|end_of_text|>"), "pad": ("<|end_of_text|>",)},
+        # Yi-1.5-Chat (01.AI): ChatML turns end on <|im_end|> (id 7);
+        # <|endoftext|> (id 2) is the base-completion stop. <|startoftext|>
+        # (id 1) is BOS but the ChatML template starts at <|im_start|>user so
+        # bos is not prepended (chat(bos=False)). Distinct 64k vocab from Qwen.
+        "yi": {"bos": ("<|startoftext|>",), "eos": ("<|im_end|>", "<|endoftext|>"), "pad": ("<unk>",)},
         "mistral": {"bos": ("<s>",),                     "eos": ("</s>",),                        "pad": ("<pad>",)},
         # DeepSeek V2/V3 use full-width tokens for BOS/EOS in the trained vocab.
         "deepseek": {"bos": ("<｜begin▁of▁sentence｜>",),

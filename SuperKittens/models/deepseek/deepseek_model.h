@@ -129,10 +129,17 @@ struct LayerPSOs {
     MTL::ComputePipelineState* rmsnorm;
     MTL::ComputePipelineState* rmsnorm_t1 = nullptr;  // optional T=1 fast path
     MTL::ComputePipelineState* gemm;
+    // M=1 fp16 matvec. gemm_fp16 tiles BM=32 rows; at decode T=1 that wastes
+    // 31/32 of the M lanes and dispatches needless tiles. gemv_fp16_m1 computes
+    // y[1,N]=x[1,K]@W[K,N] with one column per thread (measured 1.8-3.1x over
+    // gemm_fp16 at M=1 on the dense-L0 MLP shapes). Same A=x/B=W/C=y layout.
+    MTL::ComputePipelineState* gemv_f16 = nullptr;
     MTL::ComputePipelineState* rope_tail;
     MTL::ComputePipelineState* rope_interleave;   // V3 GPT-J-style pair RoPE
     MTL::ComputePipelineState* router_v3;          // V3 sigmoid+bias+group+topk router
     MTL::ComputePipelineState* router_v2;          // V2-Lite softmax+topk router (shared moe_router)
+    MTL::ComputePipelineState* router_partial = nullptr;  // split-D occupancy router: partial dots
+    MTL::ComputePipelineState* router_reduce  = nullptr;  // split-D occupancy router: reduce+softmax+topk
     MTL::ComputePipelineState* flash_attn_vec;
     MTL::ComputePipelineState* mla_decode_v2;      // V2-Lite per-head MLA decode (dk=192, dv=128)
     MTL::ComputePipelineState* mla_kv_write;       // assemble dk=192 K + dv=128 V into per-head cache
@@ -228,6 +235,7 @@ struct LayerBuffers {
     MTL::Buffer* moe_top_idx;
     MTL::Buffer* moe_top_score;
     MTL::Buffer* moe_hidden;
+    MTL::Buffer* moe_router_partial = nullptr;  // [T][N_DSPLIT][n_expert] fp32 split-D partials
     MTL::Buffer* moe_x_f32;       // routing input cast to fp32 (mul_mv_id reads fp32)
     MTL::Buffer* moe_gate_f32;    // [top_k, n_int] fp32
     MTL::Buffer* moe_up_f32;      // [top_k, n_int] fp32
@@ -297,7 +305,30 @@ inline void encode_quant_matvec(
     enc->endEncoding();
 }
 
-// Dispatch a projection: quant matvec when dt is a K-quant, else fp16 GEMM.
+// Decode-time fp16 matvec: y[1,N] = x[1,K] @ W[K,N]. BN=128 columns/threadgroup.
+// gemv_fp16_m1 ABI: x=0, W=1, y=2, N=3, K=4 (off_Y assumed 0 - single M=1 row).
+inline void encode_gemv_m1(
+    MTL::CommandBuffer* cmd, MTL::ComputePipelineState* pso,
+    MTL::Buffer* X, size_t off_X,
+    MTL::Buffer* W, size_t off_W,
+    MTL::Buffer* Y,
+    uint32_t N, uint32_t K)
+{
+    constexpr uint32_t BN = 128;
+    auto* enc = cmd->computeCommandEncoder();
+    enc->setComputePipelineState(pso);
+    enc->setBuffer(X, off_X, 0);
+    enc->setBuffer(W, off_W, 1);
+    enc->setBuffer(Y, 0,     2);
+    enc->setBytes(&N, 4, 3);
+    enc->setBytes(&K, 4, 4);
+    enc->dispatchThreadgroups(MTL::Size((N + BN - 1) / BN, 1, 1),
+                              MTL::Size(BN, 1, 1));
+    enc->endEncoding();
+}
+
+// Dispatch a projection: quant matvec when dt is a K-quant, else fp16. At M=1
+// the fp16 path prefers gemv_fp16_m1 over the BM=32 gemm_fp16 (1.8-3.1x).
 // w_off is the byte offset into the (single, multi-layer) weight buffer; for
 // quant weights this is computed from the quant block size, for fp16 from 2 B.
 inline void encode_proj(
@@ -310,6 +341,8 @@ inline void encode_proj(
     MTL::ComputePipelineState* qpso = ds_quant_matvec_pso(P, dt);
     if (qpso) {
         encode_quant_matvec(cmd, qpso, W, off_W, X, off_X, Y, off_Y, M, N, K);
+    } else if (M == 1 && off_Y == 0 && P.gemv_f16) {
+        encode_gemv_m1(cmd, P.gemv_f16, X, off_X, W, off_W, Y, N, K);
     } else {
         // fp16 GEMM expects A=activation [M,K], B=weight [K,N]; off_Y must be 0.
         encode_gemm(cmd, P.gemm, X, off_X, W, off_W, Y, M, N, K);
@@ -575,24 +608,37 @@ inline void dispatch_attn(
         const size_t off_w_v_up = off_w_kv_b +
                                   (size_t)p.kv_lora_rank * k_out * 2;
 
-        auto* enc = cmd->computeCommandEncoder();
-        enc->setComputePipelineState(P.kv_up_pair);
-        enc->setBuffer(B.c_kv,        0,           0);  // normalized compressed-KV
-        enc->setBuffer(B.w_kv_b,      off_w_k_up,  1);
-        enc->setBuffer(B.w_kv_b,      off_w_v_up,  2);
-        enc->setBuffer(B.k_no_pe,     0,           3);
-        enc->setBuffer(B.v,           0,           4);
-        enc->setBytes(&T,             4, 5);
-        enc->setBytes(&p.kv_lora_rank, 4, 6);
-        enc->setBytes(&k_out,         4, 7);
-        enc->setBytes(&v_out,         4, 8);
-        // v2 tile-MMA: BM=32, BN=64, 128 threads. Wins from T=1 through prefill.
-        const uint32_t BM = 32, BN = 64;
-        const uint32_t max_out = (k_out > v_out) ? k_out : v_out;
-        enc->dispatchThreadgroups(
-            MTL::Size((max_out + BN - 1) / BN, (T + BM - 1) / BM, 1),
-            MTL::Size(128, 1, 1));
-        enc->endEncoding();
+        // The kv_up_pair tile-MMA owns a BM=32 row tile; at decode T=1 it runs
+        // 3/4 simdgroups + 31/32 rows on zero pad -> ~56 GB/s (latency-bound, time
+        // flat T=1..32). Two row-parallel gemv_fp16_m1 matvecs hit the bandwidth
+        // ceiling at T=1 (~122 GB/s, 2.2x). MMA still wins at prefill (T>1, where
+        // the 32-row tile amortizes the kv_b weight read), so keep it for T>1.
+        static const bool kvup_no_gevm = std::getenv("SK_DS_NO_KVUP_GEVM") != nullptr;
+        if (T == 1 && P.gemv_f16 && !kvup_no_gevm) {
+            encode_gemv_m1(cmd, P.gemv_f16, B.c_kv, 0, B.w_kv_b, off_w_k_up,
+                           B.k_no_pe, k_out, p.kv_lora_rank);
+            encode_gemv_m1(cmd, P.gemv_f16, B.c_kv, 0, B.w_kv_b, off_w_v_up,
+                           B.v,      v_out, p.kv_lora_rank);
+        } else {
+            auto* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(P.kv_up_pair);
+            enc->setBuffer(B.c_kv,        0,           0);  // normalized compressed-KV
+            enc->setBuffer(B.w_kv_b,      off_w_k_up,  1);
+            enc->setBuffer(B.w_kv_b,      off_w_v_up,  2);
+            enc->setBuffer(B.k_no_pe,     0,           3);
+            enc->setBuffer(B.v,           0,           4);
+            enc->setBytes(&T,             4, 5);
+            enc->setBytes(&p.kv_lora_rank, 4, 6);
+            enc->setBytes(&k_out,         4, 7);
+            enc->setBytes(&v_out,         4, 8);
+            // v2 tile-MMA: BM=32, BN=64, 128 threads.
+            const uint32_t BM = 32, BN = 64;
+            const uint32_t max_out = (k_out > v_out) ? k_out : v_out;
+            enc->dispatchThreadgroups(
+                MTL::Size((max_out + BN - 1) / BN, (T + BM - 1) / BM, 1),
+                MTL::Size(128, 1, 1));
+            enc->endEncoding();
+        }
     }
     PROF_MARK(cmd, "attn_kv_up");
 
@@ -861,18 +907,52 @@ inline void dispatch_layer(
     // moe_router: x fp16 (m_in), W fp16 (w_router, [D,N]) → top_idx, top_score.
     {
         const size_t router_off = (size_t)L * p.d_model * p.n_expert * 2;
-        auto* enc = cmd->computeCommandEncoder();
-        enc->setComputePipelineState(P.router_v2);
-        enc->setBuffer(B.m_in,          0,          0);
-        enc->setBuffer(B.w_router,      router_off, 1);
-        enc->setBuffer(B.moe_top_idx,   0,          2);
-        enc->setBuffer(B.moe_top_score, 0,          3);
-        enc->setBytes(&T,         4, 4);
-        enc->setBytes(&p.d_model, 4, 5);
-        enc->setBytes(&p.n_expert,4, 6);
-        enc->setBytes(&p.top_k,   4, 7);
-        enc->dispatchThreadgroups(MTL::Size(T, 1, 1), MTL::Size(256, 1, 1));
-        enc->endEncoding();
+        // Expert-split occupancy router: the single-TG moe_router pins 64
+        // experts × D=2048 onto 1 GPU core at T=1 (~2 GB/s). Spread the experts
+        // over N_EGRP threadgroups (grid.y) so N_EGRP cores each compute an
+        // expert-block with the IDENTICAL full-D dot product (bit-for-bit logits
+        // → unchanged routing), then gather+softmax+top-K in a tiny second
+        // kernel. Falls back to single-TG moe_router if PSOs failed to compile.
+        if (P.router_partial && P.router_reduce && B.moe_router_partial) {
+            constexpr uint32_t N_EGRP = 8;
+            {
+                auto* enc = cmd->computeCommandEncoder();
+                enc->setComputePipelineState(P.router_partial);
+                enc->setBuffer(B.m_in,               0,          0);
+                enc->setBuffer(B.w_router,           router_off, 1);
+                enc->setBuffer(B.moe_router_partial, 0,          2);
+                enc->setBytes(&T,         4, 4);
+                enc->setBytes(&p.d_model, 4, 5);
+                enc->setBytes(&p.n_expert,4, 6);
+                enc->dispatchThreadgroups(MTL::Size(T, N_EGRP, 1), MTL::Size(256, 1, 1));
+                enc->endEncoding();
+            }
+            {
+                auto* enc = cmd->computeCommandEncoder();
+                enc->setComputePipelineState(P.router_reduce);
+                enc->setBuffer(B.moe_router_partial, 0, 0);
+                enc->setBuffer(B.moe_top_idx,        0, 2);
+                enc->setBuffer(B.moe_top_score,      0, 3);
+                enc->setBytes(&T,         4, 4);
+                enc->setBytes(&p.n_expert,4, 6);
+                enc->setBytes(&p.top_k,   4, 7);
+                enc->dispatchThreadgroups(MTL::Size(T, 1, 1), MTL::Size(256, 1, 1));
+                enc->endEncoding();
+            }
+        } else {
+            auto* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(P.router_v2);
+            enc->setBuffer(B.m_in,          0,          0);
+            enc->setBuffer(B.w_router,      router_off, 1);
+            enc->setBuffer(B.moe_top_idx,   0,          2);
+            enc->setBuffer(B.moe_top_score, 0,          3);
+            enc->setBytes(&T,         4, 4);
+            enc->setBytes(&p.d_model, 4, 5);
+            enc->setBytes(&p.n_expert,4, 6);
+            enc->setBytes(&p.top_k,   4, 7);
+            enc->dispatchThreadgroups(MTL::Size(T, 1, 1), MTL::Size(256, 1, 1));
+            enc->endEncoding();
+        }
     }
 
     // Routing input cast fp16 → fp32 (mul_mv_id reads fp32 activations).
@@ -1104,6 +1184,7 @@ struct ModelBuffers {
     MTL::Buffer* moe_top_idx;
     MTL::Buffer* moe_top_score;
     MTL::Buffer* moe_hidden;
+    MTL::Buffer* moe_router_partial = nullptr;
     MTL::Buffer* moe_x_f32;
     MTL::Buffer* moe_gate_f32;
     MTL::Buffer* moe_up_f32;
@@ -1253,6 +1334,7 @@ inline void dispatch_model(
         lb.moe_top_idx   = B.moe_top_idx;
         lb.moe_top_score = B.moe_top_score;
         lb.moe_hidden    = B.moe_hidden;
+        lb.moe_router_partial = B.moe_router_partial;
         lb.moe_x_f32     = B.moe_x_f32;
         lb.moe_gate_f32  = B.moe_gate_f32;
         lb.moe_up_f32    = B.moe_up_f32;

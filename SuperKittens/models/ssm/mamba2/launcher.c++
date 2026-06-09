@@ -35,6 +35,13 @@ static bool resolve_psos(ModelPSOs& P) {
     P.layer.rmsnorm      = sk::bindings_pso("rmsnorm");
     P.layer.rmsnorm_t1   = sk::bindings_pso("rmsnorm_t1");  // optional T=1 fast path
     P.layer.gemm         = sk::bindings_pso("gemm_fp16");
+    // M=1 decode matvec fast paths (proper gemv vs gemm_fp16's padded BM=32 MMA).
+    if (!std::getenv("SK_MAMBA_NO_GEMV")) {
+        P.layer.gemv = sk::bindings_pso("gemv_fp16_m1");
+        P.gemv_t     = sk::bindings_pso("gemv_t_fp16_2dtile_m1");
+    }
+    P.layer.gevm_splitk_p1 = sk::bindings_pso("gevm_splitk_p1");
+    P.layer.gevm_splitk_p2 = sk::bindings_pso("gevm_splitk_p2");
     P.layer.split_packed = sk::bindings_pso("split_packed");
     P.layer.conv1d_silu  = sk::bindings_pso("conv1d_silu");
     P.layer.conv1d_silu_step   = sk::bindings_pso("conv1d_silu_step");
@@ -139,6 +146,10 @@ extern "C" sk_mamba2_handle* sk_mamba2_create(const sk_mamba2_config* cfg) {
         h->bufs.argmax_val_buf = alloc_zero(dev, (size_t)n_blocks * sizeof(float));
         h->bufs.argmax_idx_buf = alloc_zero(dev, (size_t)n_blocks * sizeof(int32_t));
     }
+
+    // split-K out_proj partials: (KS_max, d_model) fp32. KS_max=32 covers any
+    // SK_MAMBA_SPLITK setting we'd reasonably bench.
+    h->bufs.splitk_partial = alloc_zero(dev, (size_t)32 * D * sizeof(float));
 
     h->current_pos = 0;
     return reinterpret_cast<sk_mamba2_handle*>(h);
@@ -302,5 +313,6 @@ extern "C" void sk_mamba2_destroy(sk_mamba2_handle* hp) {
     rel(h->bufs.dt_raw); rel(h->bufs.xBC_post); rel(h->bufs.ssd_out);
     rel(h->bufs.gated); rel(h->bufs.out_proj_out); rel(h->bufs.logits);
     rel(h->bufs.argmax_val_buf); rel(h->bufs.argmax_idx_buf);
+    rel(h->bufs.splitk_partial);
     delete h;
 }

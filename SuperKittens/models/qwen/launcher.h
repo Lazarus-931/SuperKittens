@@ -36,6 +36,7 @@ typedef struct {
     uint32_t tie_word_embeddings;  // 1 = tie LM head to embedding (Qwen3-0.6B), 0 = separate lm_head (Qwen3-8B)
     uint32_t use_qk_norm;          // 1 = Qwen3 per-head Q/K RMSNorm; 0 = Llama-arch (Nemotron-Nano-8B) no qk-norm
     uint32_t rope_interleaved;     // 0 = split-half/NeoX RoPE (GGML type 2, Qwen3); 1 = interleaved/NORM (GGML type 0, Llama GGUF)
+    uint32_t attn_qkv_bias;        // 1 = Qwen2/Qwen2.5 additive q/k/v projection bias; 0 = no bias (Qwen3/Llama/Mistral)
 } sk_qwen_config;
 
 typedef struct {
@@ -51,12 +52,19 @@ typedef struct {
     const void* w_up;
     const void* w_down;
     const void* w_lm_head;  // optional (untied); may be null when tie_word_embeddings=1
+    const void* w_qkv_bias; // optional; (n_layers, qkv_N) packed [Q|K|V] bias. null when attn_qkv_bias=0
 } sk_qwen_weights;
 
 sk_qwen_handle* sk_qwen_create(const sk_qwen_config* cfg);
 int  sk_qwen_load_weights(sk_qwen_handle* h, const sk_qwen_weights* w);
 int  sk_qwen_forward(sk_qwen_handle* h,
                      const int* input_ids, uint32_t seq, int* output_id);
+// Batched lockstep decode: input_ids is batch*seq int32 (request-major), output_id
+// receives `batch` greedy next tokens (one per request). All requests advance from
+// the same absolute position; each reads/writes its own KV-cache slice. Requires
+// the handle to have been created with cfg.batch == N.
+int  sk_qwen_forward_batched(sk_qwen_handle* h,
+                             const int* input_ids, uint32_t seq, int* output_id);
 // Chunked prefill: process prompt_ids in fixed-size chunks (<= chunk_size, and
 // <= seq_max) through the per-step model forward, carrying KV cache + position
 // across chunks. Lets a prompt longer than seq_max prefill with scratch bounded
@@ -75,6 +83,42 @@ int  sk_qwen_generate_n(sk_qwen_handle* h,
                         int32_t eos_id);
 void sk_qwen_reset(sk_qwen_handle* h);
 void sk_qwen_destroy(sk_qwen_handle* h);
+
+// Prompt-lookup spec-decode verify forward: run `seq` (= K+1) tokens,
+// projecting the LM head at every position, and host-argmax each row into
+// out_argmax[seq]. out_argmax[i] is the greedy prediction at position i.
+// Advances current_pos by seq; caller rewinds via sk_qwen_set_pos to the
+// accepted length. Greedy/argmax only; batch=1.
+int  sk_qwen_forward_verify(sk_qwen_handle* h,
+                            const int* input_ids, uint32_t seq, int* out_argmax);
+// current_pos accessor + rewind for the verify/accept loop.
+uint32_t sk_qwen_get_pos(sk_qwen_handle* h);
+int      sk_qwen_set_pos(sk_qwen_handle* h, uint32_t pos);
+
+// Pipeline-parallel layer-range ABI (additive; forward/decode/prefill are
+// byte-identical). Split the forward across the layer dimension so a model
+// larger than one device fits across two, handing the fp16 residual stream
+// between stages.
+//   sk_qwen_run_layers: embed (when start_layer==0) + layers [start_layer,
+//     end_layer); copies the post-window residual (seq*d_model fp16) to
+//     out_hidden (nullable). This handle owns [start_layer, end_layer)'s KV;
+//     current_pos advances by seq.
+//   sk_qwen_resume_from_hidden: loads hidden (seq*d_model fp16) into the
+//     residual buffer, runs layers [start_layer, n_layers) + final norm +
+//     LM head + argmax -> *out_token. This handle owns [start_layer, n_layers)'s
+//     KV; current_pos advances by seq. seq must match the producing stage.
+int  sk_qwen_run_layers(sk_qwen_handle* h,
+                        const int* input_ids, uint32_t seq,
+                        uint32_t start_layer, uint32_t end_layer,
+                        void* out_hidden);
+int  sk_qwen_resume_from_hidden(sk_qwen_handle* h,
+                                const void* hidden, uint32_t seq,
+                                uint32_t start_layer, int* out_token);
+
+// Resident per-layer bulk weight bytes on this handle (qkv/o/gate/up/down + V).
+// ~Halves when a stage loads only its layer slice via the range loader — the
+// pipeline-parallel memory-win measurement.
+uint64_t sk_qwen_resident_weight_bytes(sk_qwen_handle* h);
 
 // Debug: limit forward to first N layers (0 = all). Affects subsequent forward calls.
 // When < cfg.n_layers, the post-loop final_norm + LM head still run on the

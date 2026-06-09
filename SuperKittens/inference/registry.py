@@ -204,6 +204,87 @@ SPECS: dict[str, ModelSpec] = {
                                     low_freq_factor=1.0, high_freq_factor=4.0,
                                     original_max_position_embeddings=8192)),
     ),
+    # Qwen2.5-3B-Instruct: model_type "qwen2" (Qwen2ForCausalLM) — the Qwen3 dense
+    # decoder MINUS per-head Q/K RMSNorm (use_qk_norm=0), same NeoX RoPE (GGML
+    # type 2, rope_interleaved=0, theta=1e6) and same gpt2/BPE tokenizer
+    # (tokenizer_family="qwen3"). Small sizes (<=3B) tie the LM head
+    # (tie_word_embeddings=1; the GGUF has no output.weight). NOTE: Qwen2/Qwen2.5
+    # ALSO carry q/k/v projection BIASES (attn_{q,k,v}.bias), which the shared
+    # dense launcher does NOT apply — so this row alone is NOT fully config-only
+    # until a QKV-bias add lands. attn_qkv_bias is set as a forward-looking flag.
+    "qwen2.5-3b": ModelSpec(
+        family="qwen2",
+        adapter="SuperKittens.models.qwen.qwen:Qwen",
+        hf_repo="Qwen/Qwen2.5-3B-Instruct",
+        weight_dir="Qwen2.5-3B-Instruct-GGUF",
+        gguf_name="Qwen2.5-3B-Instruct-Q4_K_M.gguf",
+        default_quant="q4_k_m",
+        tokenizer_family="qwen3",
+        dims=dict(n_layers=36, d_model=2048, n_heads=16, n_kv_heads=2,
+                  head_dim=128, n_int=11008, vocab_size=151936,
+                  eps=1e-6, rope_freq_base=1_000_000.0, tie_word_embeddings=1,
+                  use_qk_norm=0, rope_interleaved=0, attn_qkv_bias=1),
+    ),
+    # Qwen2.5-1.5B-Instruct: same "qwen2" arch as the 3B row above (config-only
+    # delta — different dims). Tied LM head (GGUF has token_embd.weight only, no
+    # output.weight) and the same Qwen2/2.5 q/k/v projection bias the in-tree
+    # bias_add path now applies (attn_qkv_bias=1). Dims verified against the GGUF
+    # metadata: block_count=28, embedding_length=1536, head_count=12,
+    # head_count_kv=2, head_dim=1536/12=128, feed_forward_length=8960,
+    # vocab=151936, rms_eps=1e-6, rope.freq_base=1e6.
+    "qwen2.5-1.5b": ModelSpec(
+        family="qwen2",
+        adapter="SuperKittens.models.qwen.qwen:Qwen",
+        hf_repo="Qwen/Qwen2.5-1.5B-Instruct",
+        weight_dir="Qwen2.5-1.5B-Instruct-GGUF",
+        gguf_name="Qwen2.5-1.5B-Instruct-Q4_K_M.gguf",
+        default_quant="q4_k_m",
+        tokenizer_family="qwen3",
+        dims=dict(n_layers=28, d_model=1536, n_heads=12, n_kv_heads=2,
+                  head_dim=128, n_int=8960, vocab_size=151936,
+                  eps=1e-6, rope_freq_base=1_000_000.0, tie_word_embeddings=1,
+                  use_qk_norm=0, rope_interleaved=0, attn_qkv_bias=1),
+    ),
+    # Yi-1.5-6B-Chat (01.AI): model_type "llama" (LlamaForCausalLM) — a Llama-style
+    # dense decoder from a distinct vendor. Reuses the qwen launcher/kernels; the Yi
+    # adapter sets use_qk_norm=0 and rope_interleaved=1 (Llama GGUF NORM rope,
+    # theta=5e6, no llama3 rescale). Untied LM head (output.weight, Q6_K). vocab 64000.
+    # attention_bias=False (no QKV bias). Chat is ChatML (<|im_start|>/<|im_end|>).
+    # Q4_K_M (~3.67 GB) fits a 16 GB mini.
+    "yi-1.5-6b-chat": ModelSpec(
+        family="yi",
+        adapter="SuperKittens.models.yi.yi:Yi",
+        hf_repo="01-ai/Yi-1.5-6B-Chat",
+        weight_dir="Yi-1.5-6B-Chat-GGUF",
+        gguf_name="Yi-1.5-6B-Chat-Q4_K_M.gguf",
+        default_quant="q4_k_m",
+        tokenizer_family="yi",
+        dims=dict(n_layers=32, d_model=4096, n_heads=32, n_kv_heads=4,
+                  head_dim=128, n_int=11008, vocab_size=64000,
+                  eps=1e-6, rope_freq_base=5_000_000.0, tie_word_embeddings=0,
+                  use_qk_norm=0),
+    ),
+    # Llama-3.2-1B-Instruct: same Llama arch as 3B but head_dim=64 (the 3B and
+    # all other dense families are head_dim=128). Exercises the head_dim-templated
+    # decode/causal attention (mha_*_64). Tied LM head, llama3 RoPE scaling.
+    # Q4_K_M is ~0.8 GB (embed+output Q8_0).
+    "llama-3.2-1b": ModelSpec(
+        family="llama32",
+        adapter="SuperKittens.models.llama32.llama32:Llama32",
+        hf_repo="meta-llama/Llama-3.2-1B-Instruct",
+        weight_dir="Llama-3.2-1B-Instruct-GGUF",
+        gguf_name="Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+        default_quant="q4_k_m",
+        tokenizer_family="llama",
+        dims=dict(n_layers=16, d_model=2048, n_heads=32, n_kv_heads=8,
+                  head_dim=64, n_int=8192, vocab_size=128256,
+                  eps=1e-5, rope_freq_base=500000.0, tie_word_embeddings=1,
+                  use_qk_norm=0,
+                  rope_scaling=dict(rope_type="llama3", factor=32.0,
+                                    low_freq_factor=1.0, high_freq_factor=4.0,
+                                    original_max_position_embeddings=8192)),
+
+    ),
     "qwen3-1.7b": ModelSpec(
         family="qwen3",
         adapter="SuperKittens.models.qwen.qwen:Qwen",

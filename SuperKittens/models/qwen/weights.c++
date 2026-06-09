@@ -1,10 +1,13 @@
 #include "weights.h"
 #include "qwen_model.h"
 #include "../../inference/weight_store.h"
+#include "../../inference/quantize.h"
 #include "../../inference/silicon/mmap_buffer.h"
 #include "../../kernels/runtime_bindings.h"
 #include "../load/gguf/gguf.h"
 #include "../load/safetensor/safetensor.h"
+
+#include <vector>
 
 #include <cstdio>
 #include <cstdlib>
@@ -307,6 +310,41 @@ void dequant_q8_0_to_fp16(uint16_t* dst, const uint8_t* src, size_t n_elems) {
     }
 }
 
+// Q8_0 dequant to fp32 (no fp16 round-trip). Used to feed the Q4_K requantizer
+// for the SK_QWEN_Q4K_HEAD path; going straight to fp32 avoids a double-rounding
+// (Q8_0→fp16→Q4_K) that would add error on top of the head's own quant noise.
+void dequant_q8_0_to_fp32(float* dst, const uint8_t* src, size_t n_elems) {
+    const size_t n_blocks = n_elems / 32;
+    for (size_t b = 0; b < n_blocks; ++b) {
+        const uint8_t* p = src + b * 34;
+        uint16_t scale_h;
+        std::memcpy(&scale_h, p, 2);
+        uint32_t s = scale_h;
+        uint32_t sign = (s & 0x8000u) << 16;
+        uint32_t exp  = (s >> 10) & 0x1fu;
+        uint32_t mant = s & 0x3ffu;
+        float scale;
+        if (exp == 0) {
+            if (mant == 0) { uint32_t v = sign; std::memcpy(&scale, &v, 4); }
+            else {
+                exp = 1;
+                while ((mant & 0x400u) == 0) { mant <<= 1; exp -= 1; }
+                mant &= 0x3ffu;
+                uint32_t v = sign | ((exp + 112) << 23) | (mant << 13);
+                std::memcpy(&scale, &v, 4);
+            }
+        } else if (exp == 31) {
+            uint32_t v = sign | 0x7f800000u | (mant << 13);
+            std::memcpy(&scale, &v, 4);
+        } else {
+            uint32_t v = sign | ((exp + 112) << 23) | (mant << 13);
+            std::memcpy(&scale, &v, 4);
+        }
+        const int8_t* qs = (const int8_t*)(p + 2);
+        for (int i = 0; i < 32; ++i) dst[b * 32 + i] = (float)qs[i] * scale;
+    }
+}
+
 // Decode an fp16 (bits) to float. Mirrors the inline path in dequant_q8_0.
 inline float fp16_bits_to_f32(uint16_t s) {
     uint32_t sign = (s & 0x8000u) << 16;
@@ -448,10 +486,19 @@ bool read_to_fp16(uint16_t* out, const sk::TensorView* v, size_t n_elems) {
 
 }  // namespace
 
-extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
-    if (!hp || !path) return -1;
-    auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
+// Shared GGUF loader. Loads ONLY layers [start_layer, end_layer); the embedding
+// is loaded when with_embed, the final norm + LM head when with_head. The full
+// loader sk_qwen_load_gguf delegates here with (0, n_layers, true, true) so its
+// behavior is byte-identical. The range form (sk_qwen_load_gguf_range) lets a
+// pipeline stage resident-allocate only its layer slice — layers outside
+// [start,end) keep null weight buffers (the dispatch only indexes W.w_*[L] for
+// L in its run window), so two stages hold disjoint halves of the model.
+static int load_gguf_range_impl(meow::qwen::Handle* h, const char* path,
+                                uint32_t start_layer, uint32_t end_layer,
+                                bool with_embed, bool with_head) {
+    if (!h || !path) return -1;
     const auto& c = h->cfg;
+    if (start_layer >= end_layer || end_layer > c.n_layers) return -60;
 
     auto* dev = sk::bindings_device();
     if (!dev) return -2;
@@ -485,24 +532,66 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
     const size_t ni   = c.n_int;
 
     // ── Norms + embedding (fp16 buffers, dequant from F32/Q8_0 as needed) ──
-    {
+    // with_embed gates the embedding gather (stage 0). For a TIED head the LM
+    // head reuses w_embed, so the head stage also needs it — handled below.
+    if (with_embed) {
         auto* v = store.get("token_embd.weight");
         if (!v) { std::fprintf(stderr, "gguf: missing token_embd.weight\n"); return -10; }
         if (!read_to_fp16((uint16_t*)h->weights.w_embed->contents(), v,
                           (size_t)c.vocab_size * dm)) return -11;
     }
-    {
+    if (with_head) {
         auto* v = store.get("output_norm.weight");
         if (!v) { std::fprintf(stderr, "gguf: missing output_norm.weight\n"); return -12; }
         if (!read_to_fp16((uint16_t*)h->weights.w_final_norm->contents(), v, dm)) return -13;
     }
-    {
+    if (with_head) {
+        // Tied head reuses token_embd; if this stage didn't load embed (not
+        // stage 0) the tied head still needs it — load it now.
+        if (c.tie_word_embeddings && !with_embed) {
+            auto* ve = store.get("token_embd.weight");
+            if (!ve) { std::fprintf(stderr, "gguf: missing token_embd.weight (tied head)\n"); return -10; }
+            if (!read_to_fp16((uint16_t*)h->weights.w_embed->contents(), ve,
+                              (size_t)c.vocab_size * dm)) return -11;
+        }
         // LM head keeps Q8_0 layout (V × D row-major) to enable
         // the q8_0_matvec fast path. Tied models reuse token_embd; untied use
         // output.weight. Either way, allocate a Q8_0-sized w_lm_head buffer.
         const char* tname = c.tie_word_embeddings ? "token_embd.weight" : "output.weight";
         auto* v = store.get(tname);
         if (!v) { std::fprintf(stderr, "gguf: missing %s\n", tname); return -14; }
+        // SK_QWEN_Q4K_HEAD=1: requantize the Q8_0 head (V×D row-major) to Q4_K at
+        // load time and route decode through q4k_matvec. The head is the single
+        // largest per-token decode read (vocab·d_model) and is bandwidth-bound, so
+        // halving its bytes (Q4_K 144B/256 vs Q8_0 34B/32 = 272B/256) is a direct
+        // decode lever. Mirrors gemma4 #92 (proven +6.5% on 12B, coherence-clean).
+        // Gated OFF by default; body/non-head paths stay byte-identical. Requires
+        // vocab·d_model % 256 == 0 (Q4_K super-block) and the q4k_matvec PSO.
+        const char* q4k_env = std::getenv("SK_QWEN_Q4K_HEAD");
+        const bool want_q4k_head = q4k_env && q4k_env[0] != '0';
+        if (want_q4k_head && v->dtype == sk::Dtype::Q8_0
+            && ((size_t)c.vocab_size * dm) % 256 == 0
+            && h->psos.layer.q4k_matvec != nullptr) {
+            const size_t n_elems = (size_t)c.vocab_size * dm;
+            const size_t q8_bytes = sk::dtype_bytes(sk::Dtype::Q8_0, n_elems);
+            if (v->nbytes != q8_bytes) {
+                std::fprintf(stderr, "gguf: %s Q8_0 size %zu != expected %zu\n",
+                             tname, v->nbytes, q8_bytes);
+                return -15;
+            }
+            const size_t q4k_bytes = sk::dtype_bytes(sk::Dtype::Q4_K, n_elems);
+            if (h->weights.w_lm_head) h->weights.w_lm_head->release();
+            h->weights.w_lm_head = dev->newBuffer(q4k_bytes, MTL::ResourceStorageModeShared);
+            if (!h->weights.w_lm_head) return -16;
+            std::vector<float> head_f32(n_elems);
+            dequant_q8_0_to_fp32(head_f32.data(), (const uint8_t*)v->data, n_elems);
+            sk::quantize_q4_k(head_f32.data(), n_elems,
+                              (uint8_t*)h->weights.w_lm_head->contents());
+            h->weights.off_w_lm_head = 0;
+            h->weights.dt_lm_head = sk::Dtype::Q4_K;
+            std::fprintf(stderr, "sk_qwen_load_gguf: Q4_K LM head ON (%s, %.1f MB vs %.1f MB Q8)\n",
+                         tname, q4k_bytes / 1e6, q8_bytes / 1e6);
+        } else
         if (v->dtype == sk::Dtype::Q8_0) {
             const size_t bytes = sk::dtype_bytes(sk::Dtype::Q8_0, (size_t)c.vocab_size * dm);
             if (v->nbytes != bytes) {
@@ -811,7 +900,10 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
     };
 
     char nbuf[128];
-    for (uint32_t L = 0; L < c.n_layers; ++L) {
+    // Resident-alloc ONLY this stage's layer slice. Layers outside [start,end)
+    // keep null w_*[L] (the dispatch never indexes them on this stage), so two
+    // minis hold disjoint halves of the model.
+    for (uint32_t L = start_layer; L < end_layer; ++L) {
         const size_t pre_off   = (size_t)L * dm * 2;
         const size_t qnorm_off = (size_t)L * hd * 2;
 
@@ -834,6 +926,20 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
 
         if (!load_qkv_layer(L)) return -50;
 
+        // QKV projection bias (Qwen2/2.5). Pack q|k|v (F32 in GGUF) into the
+        // per-layer band of the [n_layers, qkvN] fp16 slab, SAME column order as
+        // the packed QKV weight. Skipped entirely when attn_qkv_bias=0.
+        if (c.attn_qkv_bias && h->weights.w_qkv_bias) {
+            uint16_t* bdst = (uint16_t*)((char*)h->weights.w_qkv_bias->contents()
+                                         + (size_t)L * qkvN * 2);
+            std::snprintf(nbuf, sizeof(nbuf), "blk.%u.attn_q.bias", L);
+            if (!read_to_fp16(bdst, store.get(nbuf), Nq)) return -51;
+            std::snprintf(nbuf, sizeof(nbuf), "blk.%u.attn_k.bias", L);
+            if (!read_to_fp16(bdst + Nq, store.get(nbuf), Nkv)) return -51;
+            std::snprintf(nbuf, sizeof(nbuf), "blk.%u.attn_v.bias", L);
+            if (!read_to_fp16(bdst + Nq + Nkv, store.get(nbuf), Nkv)) return -51;
+        }
+
         std::snprintf(nbuf, sizeof(nbuf), "blk.%u.attn_output.weight", L);
         if (!load_single_tensor(nbuf, dt_o, o_layer_bytes,
                                 &h->weights.w_o[L], &h->weights.w_o_off[L])) return -53;
@@ -851,4 +957,20 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
 
     ::close(gguf_fd);
     return 0;
+}
+
+extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
+    if (!hp || !path) return -1;
+    auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
+    return load_gguf_range_impl(h, path, 0, h->cfg.n_layers,
+                                /*with_embed=*/true, /*with_head=*/true);
+}
+
+extern "C" int sk_qwen_load_gguf_range(sk_qwen_handle* hp, const char* path,
+                                       uint32_t start_layer, uint32_t end_layer,
+                                       int with_embed, int with_head) {
+    if (!hp || !path) return -1;
+    auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
+    return load_gguf_range_impl(h, path, start_layer, end_layer,
+                                with_embed != 0, with_head != 0);
 }

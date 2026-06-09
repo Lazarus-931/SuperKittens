@@ -28,6 +28,10 @@ struct Handle {
     uint32_t layers_run     = 0;
     int32_t  capture_layer  = -1;
     uint32_t last_seq       = 0;  // seq used at most recent forward (for get_capture sizing)
+    // Prompt-lookup verify: when set, the next run_step projects the LM head
+    // for ALL seq rows (routes to the shared decode_all_rows logits path) so
+    // forward_verify can host-argmax each position. Default false -> M=1 path.
+    bool     lm_head_all_rows = false;
 
     // Zero-copy mmap of the GGUF file, when used (otherwise nullptr).
     // Owns the MTL::Buffer that w_lm_head (and future mmap-backed weights)
@@ -46,7 +50,7 @@ static MTL::Buffer* alloc_zero(MTL::Device* dev, size_t bytes) {
     return b;
 }
 
-static bool resolve_psos(ModelPSOs& P) {
+static bool resolve_psos(ModelPSOs& P, uint32_t head_dim) {
     P.layer.rmsnorm        = sk::bindings_pso("rmsnorm");
     // Optional T=1 fast path (nullable). 256-thread single-row variant.
     P.layer.rmsnorm_t1     = sk::bindings_pso("rmsnorm_t1");
@@ -84,24 +88,42 @@ static bool resolve_psos(ModelPSOs& P) {
     P.layer.q8_0_swiglu_prenorm_m1 = sk::bindings_pso("q8_0_swiglu_prenorm_m1");  // optional
     P.layer.q8_0_matvec_addres = sk::bindings_pso("q8_0_matvec_addres");  // optional
     P.layer.split_packed   = sk::bindings_pso("split_packed");
+    P.layer.bias_add       = sk::bindings_pso("bias_add");   // optional; Qwen2/2.5 QKV bias
     P.layer.rope_qk        = sk::bindings_pso("qwen_rope_qk");
     P.layer.rope_qk_il     = sk::bindings_pso("qwen_rope_qk_interleaved");  // optional; Llama-arch only
-    P.layer.attn           = sk::bindings_pso("mha_causal");
+    // head_dim-specific dense attention. The kernels are templated on D; D=128
+    // (qwen/nemotron/mistral/llama-3.2-3b) keeps the original byte-identical
+    // instantiation, D=64 (llama-3.2-1b) routes to the _64 variant. Unknown D
+    // leaves attn null -> sk_qwen_create fails fast with a clear message.
+    const char* k_causal       = (head_dim == 64) ? "mha_causal_64"       : "mha_causal";
+    const char* k_split        = (head_dim == 64) ? "mha_decode_split_64" : "mha_decode_split";
+    const char* k_combine      = (head_dim == 64) ? "mha_decode_combine_64" : "mha_decode_combine";
+    P.layer.attn           = sk::bindings_pso(k_causal);
+    // Prefill-only larger-Br attention (seq>1, BR=8). D=128-only (fa_d128_prefill
+    // hardcodes D=128); for other head_dims leave null so prefill falls back to
+    // the head_dim-correct mha_causal Br=2 path. SK_NO_PREFILL_ATTN=1 forces the
+    // mha_causal path at prefill too (A/B).
+    P.layer.attn_prefill   = (head_dim == 128 && !getenv("SK_NO_PREFILL_ATTN"))
+                                 ? sk::bindings_pso("mha_causal_prefill") : nullptr;
     // SK_NO_SPLIT_ATTN=1 forces the mha_causal path everywhere (A/B + bisection).
     if (getenv("SK_NO_SPLIT_ATTN")) {
         P.layer.attn_split = nullptr;
         P.layer.attn_combine = nullptr;
     } else {
-        P.layer.attn_split   = sk::bindings_pso("mha_decode_split");    // optional; nullptr OK
-        P.layer.attn_combine = sk::bindings_pso("mha_decode_combine");  // optional; nullptr OK
+        P.layer.attn_split   = sk::bindings_pso(k_split);    // optional; nullptr OK
+        P.layer.attn_combine = sk::bindings_pso(k_combine);  // optional; nullptr OK
     }
     P.layer.kv_cache_write = sk::bindings_pso("kv_cache_write");
     // Q8_0-KV path (optional; nullptr OK). dispatch_layer only takes it when the
-    // handle allocated Q8 caches (SK_KV_Q8) AND all three resolve.
+    // handle allocated Q8 caches (SK_KV_Q8) AND all three resolve. The Q8-KV
+    // attention kernels are D=128-only (deq_kv_q8 hardcodes 128); leave them
+    // null for other head_dims so the fp16-KV path is used.
     P.layer.kv_cache_write_q8 = sk::bindings_pso("kv_cache_write_q8");
-    P.layer.attn_q8           = sk::bindings_pso("mha_causal_q8");
-    if (!getenv("SK_NO_SPLIT_ATTN"))
-        P.layer.attn_split_q8 = sk::bindings_pso("mha_decode_split_q8");
+    if (head_dim == 128) {
+        P.layer.attn_q8           = sk::bindings_pso("mha_causal_q8");
+        if (!getenv("SK_NO_SPLIT_ATTN"))
+            P.layer.attn_split_q8 = sk::bindings_pso("mha_decode_split_q8");
+    }
     P.layer.add            = sk::bindings_pso("add_f16");
     P.layer.add_rmsnorm    = sk::bindings_pso("add_rmsnorm");
     P.layer.gated_mlp      = sk::bindings_pso("gated_mlp");
@@ -126,7 +148,7 @@ static bool resolve_psos(ModelPSOs& P) {
     _CK("gemv_fp16_m1",     P.layer.gemv_m1);
     _CK("split_packed",     P.layer.split_packed);
     _CK("rope_qk",          P.layer.rope_qk);
-    _CK("mha_causal",       P.layer.attn);
+    _CK("mha_causal (head_dim-specific; 128/64)", P.layer.attn);
     _CK("kv_cache_write",   P.layer.kv_cache_write);
     _CK("add_f16",          P.layer.add);
     _CK("add_rmsnorm",      P.layer.add_rmsnorm);
@@ -149,7 +171,7 @@ extern "C" sk_qwen_handle* sk_qwen_create(const sk_qwen_config* cfg) {
 
     auto* h = new meow::qwen::Handle();
     h->cfg = *cfg;
-    if (!meow::qwen::resolve_psos(h->psos)) { delete h; return nullptr; }
+    if (!meow::qwen::resolve_psos(h->psos, cfg->head_dim)) { delete h; return nullptr; }
 
     using namespace meow::qwen;
     const uint32_t T_max = cfg->batch * cfg->seq_max;
@@ -190,6 +212,10 @@ extern "C" sk_qwen_handle* sk_qwen_create(const sk_qwen_config* cfg) {
             h->weights.w_down, h->weights.w_down_off);
     h->weights.w_lm_head       = cfg->tie_word_embeddings ? nullptr
                                   : alloc_zero(dev, (size_t)cfg->vocab_size * cfg->d_model * 2);
+    // QKV bias slab (Qwen2/2.5): per-layer packed [Q|K|V] fp16. null when no bias.
+    h->weights.w_qkv_bias      = cfg->attn_qkv_bias
+                                  ? alloc_zero(dev, (size_t)cfg->n_layers * qkv_N * 2)
+                                  : nullptr;
 
     // Per-layer K, V caches (full cache; GQA → n_kv_heads not n_heads).
     // SK_KV_Q8=1 stores K/V as Q8_0 (int8 + per-32-block fp16 scale) instead of
@@ -370,6 +396,7 @@ extern "C" int sk_qwen_load_weights(sk_qwen_handle* hp, const sk_qwen_weights* w
     cp(h->weights.w_up[0],         w->w_up);
     cp(h->weights.w_down[0],       w->w_down);
     if (h->weights.w_lm_head && w->w_lm_head) cp(h->weights.w_lm_head, w->w_lm_head);
+    if (h->weights.w_qkv_bias && w->w_qkv_bias) cp(h->weights.w_qkv_bias, w->w_qkv_bias);
     return 0;
 }
 
@@ -380,6 +407,7 @@ extern "C" void sk_qwen_reset(sk_qwen_handle* hp) {
 
 namespace meow { namespace qwen {
 static int run_step(Handle* h, MTL::CommandQueue* q, uint32_t seq);
+static int run_step_batched(Handle* h, MTL::CommandQueue* q, uint32_t seq);
 
 // WHY: one-step driver shared between sk_qwen_forward and the in-C decode
 // loop. Caller has already memcpy'd input_ids + rope_pos for `seq` tokens.
@@ -433,7 +461,88 @@ static int run_prefill_chunked(Handle* h, MTL::CommandQueue* q,
     return 0;
 }
 
+// WHY: pipeline-parallel run_layers/resume_from_hidden need the same fully
+// populated ModelParams as run_step. Mirror it here (run_step itself is left
+// inline + untouched so the production M=1 path stays byte-identical).
+static ModelParams fill_params(Handle* h, uint32_t seq) {
+    ModelParams mp;
+    mp.batch          = h->cfg.batch;
+    mp.seq            = seq;
+    mp.n_layers       = h->cfg.n_layers;
+    mp.d_model        = h->cfg.d_model;
+    mp.n_heads        = h->cfg.n_heads;
+    mp.n_kv_heads     = h->cfg.n_kv_heads;
+    mp.head_dim       = h->cfg.head_dim;
+    mp.n_int          = h->cfg.n_int;
+    mp.cache_max      = h->cfg.cache_max;
+    mp.vocab_size     = h->cfg.vocab_size;
+    mp.eps            = h->cfg.eps;
+    mp.use_qk_norm    = h->cfg.use_qk_norm;
+    mp.rope_interleaved = h->cfg.rope_interleaved;
+    mp.attn_qkv_bias  = h->cfg.attn_qkv_bias;
+    mp.current_pos    = h->current_pos;
+    mp.rope_n_ctx_orig = h->cfg.rope_n_ctx_orig;
+    mp.rope_freq_base  = h->cfg.rope_freq_base;
+    mp.rope_freq_scale = h->cfg.rope_freq_scale;
+    mp.rope_ext_factor = h->cfg.rope_ext_factor;
+    mp.rope_attn_factor = h->cfg.rope_attn_factor;
+    mp.rope_beta_fast  = h->cfg.rope_beta_fast;
+    mp.rope_beta_slow  = h->cfg.rope_beta_slow;
+    mp.layers_run      = h->layers_run;
+    mp.capture_layer   = h->capture_layer;
+    mp.kv_q8           = h->kv_q8;
+    return mp;
+}
+
 static int run_step(Handle* h, MTL::CommandQueue* q, uint32_t seq) {
+    ModelParams mp;
+    mp.batch          = h->cfg.batch;
+    mp.seq            = seq;
+    mp.n_layers       = h->cfg.n_layers;
+    mp.d_model        = h->cfg.d_model;
+    mp.n_heads        = h->cfg.n_heads;
+    mp.n_kv_heads     = h->cfg.n_kv_heads;
+    mp.head_dim       = h->cfg.head_dim;
+    mp.n_int          = h->cfg.n_int;
+    mp.cache_max      = h->cfg.cache_max;
+    mp.vocab_size     = h->cfg.vocab_size;
+    mp.eps            = h->cfg.eps;
+    mp.use_qk_norm    = h->cfg.use_qk_norm;
+    mp.rope_interleaved = h->cfg.rope_interleaved;
+    mp.attn_qkv_bias  = h->cfg.attn_qkv_bias;
+    mp.current_pos    = h->current_pos;
+    mp.rope_n_ctx_orig = h->cfg.rope_n_ctx_orig;
+    mp.rope_freq_base  = h->cfg.rope_freq_base;
+    mp.rope_freq_scale = h->cfg.rope_freq_scale;
+    mp.rope_ext_factor = h->cfg.rope_ext_factor;
+    mp.rope_attn_factor = h->cfg.rope_attn_factor;
+    mp.rope_beta_fast  = h->cfg.rope_beta_fast;
+    mp.rope_beta_slow  = h->cfg.rope_beta_slow;
+    mp.layers_run      = h->layers_run;
+    mp.capture_layer   = h->capture_layer;
+    mp.kv_q8           = h->kv_q8;
+    mp.decode_all_rows = h->lm_head_all_rows ? 1u : 0u;
+    h->last_seq        = seq;
+
+    auto* cmd = q->commandBuffer();
+    dispatch_model(cmd, h->psos, h->weights, h->bufs, mp);
+    cmd->commit();
+    cmd->waitUntilCompleted();
+    // SK_QWEN_GPUPROF: per-step GPU-busy time (GPUEnd-GPUStart). Compared against
+    // host wall/token it isolates the GPU-wait fraction — the lever that matters
+    // for a bandwidth-bound decode. No behavior change (timestamp readback only).
+    if (getenv("SK_QWEN_GPUPROF"))
+        std::fprintf(stderr, "[gpuprof] gpu_busy_us=%.1f\n",
+                     (cmd->GPUEndTime() - cmd->GPUStartTime()) * 1e6);
+    cmd->release();
+    h->current_pos += seq;
+    return 0;
+}
+
+// Batched lockstep decode: identical to run_step but sets decode_all_rows so the
+// LM head + argmax produce one output per batch row. All N requests advance from
+// the same current_pos (lockstep), each reading its own KV-cache slice.
+static int run_step_batched(Handle* h, MTL::CommandQueue* q, uint32_t seq) {
     ModelParams mp;
     mp.batch          = h->cfg.batch;
     mp.seq            = seq;
@@ -459,15 +568,13 @@ static int run_step(Handle* h, MTL::CommandQueue* q, uint32_t seq) {
     mp.layers_run      = h->layers_run;
     mp.capture_layer   = h->capture_layer;
     mp.kv_q8           = h->kv_q8;
+    mp.decode_all_rows = 1u;
     h->last_seq        = seq;
 
     auto* cmd = q->commandBuffer();
     dispatch_model(cmd, h->psos, h->weights, h->bufs, mp);
     cmd->commit();
     cmd->waitUntilCompleted();
-    // SK_QWEN_GPUPROF: per-step GPU-busy time (GPUEnd-GPUStart). Compared against
-    // host wall/token it isolates the GPU-wait fraction — the lever that matters
-    // for a bandwidth-bound decode. No behavior change (timestamp readback only).
     if (getenv("SK_QWEN_GPUPROF"))
         std::fprintf(stderr, "[gpuprof] gpu_busy_us=%.1f\n",
                      (cmd->GPUEndTime() - cmd->GPUStartTime()) * 1e6);
@@ -499,6 +606,193 @@ extern "C" int sk_qwen_forward(sk_qwen_handle* hp,
 
     std::memcpy(output_id, h->bufs.output_id->contents(),
                 (size_t)h->cfg.batch * sizeof(int32_t));
+    return 0;
+}
+
+// Batched lockstep decode. input_ids is batch*seq int32 (request-major: row r is
+// request r's seq tokens); output_id receives `batch` int32 (one greedy next
+// token per request). All requests share the same absolute position (current_pos)
+// and step together; each reads/writes its own KV-cache slice. seq is per-request.
+extern "C" int sk_qwen_forward_batched(sk_qwen_handle* hp,
+                                       const int* input_ids, uint32_t seq,
+                                       int* output_id) {
+    if (!hp || !input_ids || !output_id) return -1;
+    auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
+    // seq>1 is unsupported: the prefill transpose + attention dispatch with
+    // p.seq (not batch*seq) only cover lane 0's rows of the [batch*seq,H,D]
+    // buffer, leaving lanes>=1 reading uninitialized Q/K/V scratch (silent
+    // garbage). Batched callers must drive the prompt token-by-token at seq==1
+    // (the batch-aware lockstep decode path), which is bit-identical to M=1.
+    if (seq != 1) return -6;
+    if (seq == 0 || seq > h->cfg.seq_max) return -2;
+    if (h->current_pos + seq > h->cfg.cache_max) return -4;
+    if (h->cfg.batch < 1) return -5;
+
+    auto* q = sk::bindings_queue();
+    if (!q) return -3;
+
+    std::memcpy(h->bufs.input_ids->contents(), input_ids,
+                (size_t)h->cfg.batch * seq * sizeof(int32_t));
+
+    int32_t* pos = (int32_t*)h->bufs.rope_pos->contents();
+    for (uint32_t i = 0; i < seq; ++i) pos[i] = (int32_t)(h->current_pos + i);
+
+    int rc = meow::qwen::run_step_batched(h, q, seq);
+    if (rc) return rc;
+
+    std::memcpy(output_id, h->bufs.output_id->contents(),
+                (size_t)h->cfg.batch * sizeof(int32_t));
+    return 0;
+}
+
+// Pipeline-parallel stage 1: embed (when start_layer==0) + layers
+// [start_layer, end_layer), then copy the post-window residual stream
+// (seq * d_model fp16) out to out_hidden. KV for this stage's layers is written
+// at the current position; current_pos advances by seq (this handle owns
+// [start_layer, end_layer)'s KV). out_hidden may be null to skip the copy-out
+// (e.g. a single-process A->B chain that hands off via resume on the next call).
+extern "C" int sk_qwen_run_layers(sk_qwen_handle* hp,
+                                  const int* input_ids, uint32_t seq,
+                                  uint32_t start_layer, uint32_t end_layer,
+                                  void* out_hidden) {
+    if (!hp || !input_ids) return -1;
+    auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
+    if (seq == 0 || seq > h->cfg.seq_max) return -2;
+    if (start_layer >= end_layer || end_layer > h->cfg.n_layers) return -6;
+    if (h->current_pos + seq > h->cfg.cache_max) return -4;
+
+    auto* q = sk::bindings_queue();
+    if (!q) return -3;
+
+    std::memcpy(h->bufs.input_ids->contents(), input_ids,
+                (size_t)h->cfg.batch * seq * sizeof(int32_t));
+    int32_t* pos = (int32_t*)h->bufs.rope_pos->contents();
+    for (uint32_t i = 0; i < seq; ++i) pos[i] = (int32_t)(h->current_pos + i);
+
+    meow::qwen::ModelParams mp = meow::qwen::fill_params(h, seq);
+    h->last_seq = seq;
+
+    auto* cmd = q->commandBuffer();
+    meow::qwen::dispatch_layer_range(cmd, h->psos, h->weights, h->bufs, mp,
+                                     start_layer, end_layer,
+                                     /*do_embed=*/start_layer == 0,
+                                     /*do_tail=*/false);
+    cmd->commit();
+    cmd->waitUntilCompleted();
+    cmd->release();
+    h->current_pos += seq;
+
+    if (out_hidden) {
+        const size_t bytes = (size_t)h->cfg.batch * seq * h->cfg.d_model * 2;
+        std::memcpy(out_hidden, h->bufs.x_a->contents(), bytes);
+    }
+    return 0;
+}
+
+// Pipeline-parallel final stage: load an incoming hidden state (seq * d_model
+// fp16) into the residual buffer, run layers [start_layer, n_layers), then
+// final RMSNorm + LM head + argmax -> *out_token. KV for this stage's layers is
+// written at the current position; current_pos advances by seq (this handle
+// owns [start_layer, n_layers)'s KV). seq must match the producing stage.
+extern "C" int sk_qwen_resume_from_hidden(sk_qwen_handle* hp,
+                                          const void* hidden, uint32_t seq,
+                                          uint32_t start_layer, int* out_token) {
+    if (!hp || !hidden || !out_token) return -1;
+    auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
+    if (seq == 0 || seq > h->cfg.seq_max) return -2;
+    if (start_layer >= h->cfg.n_layers) return -6;
+    if (h->current_pos + seq > h->cfg.cache_max) return -4;
+
+    auto* q = sk::bindings_queue();
+    if (!q) return -3;
+
+    // RoPE positions for this stage's layers (same absolute positions the
+    // producing stage used; this handle tracks them via its own current_pos).
+    int32_t* pos = (int32_t*)h->bufs.rope_pos->contents();
+    for (uint32_t i = 0; i < seq; ++i) pos[i] = (int32_t)(h->current_pos + i);
+
+    const size_t bytes = (size_t)h->cfg.batch * seq * h->cfg.d_model * 2;
+    std::memcpy(h->bufs.x_a->contents(), hidden, bytes);
+
+    meow::qwen::ModelParams mp = meow::qwen::fill_params(h, seq);
+    h->last_seq = seq;
+
+    auto* cmd = q->commandBuffer();
+    meow::qwen::dispatch_layer_range(cmd, h->psos, h->weights, h->bufs, mp,
+                                     start_layer, h->cfg.n_layers,
+                                     /*do_embed=*/false,
+                                     /*do_tail=*/true);
+    cmd->commit();
+    cmd->waitUntilCompleted();
+    cmd->release();
+    h->current_pos += seq;
+
+    std::memcpy(out_token, h->bufs.output_id->contents(),
+                (size_t)h->cfg.batch * sizeof(int32_t));
+    return 0;
+}
+
+// Prompt-lookup spec-decode verify: run `seq` tokens projecting the LM head at
+// EVERY position (via the shared decode_all_rows all-rows-head primitive, set
+// through h->lm_head_all_rows in run_step), then host-argmax each logits row
+// into out_argmax[0..seq-1]. Greedy/argmax, batch=1. Advances current_pos by
+// seq (KV written for all seq slots); the caller rewinds via sk_qwen_set_pos to
+// the accepted length. Host argmax (not the GPU per-row argmax) is used so the
+// batch=1 output_id buffer is never written out of bounds.
+extern "C" int sk_qwen_forward_verify(sk_qwen_handle* hp,
+                                      const int* input_ids, uint32_t seq,
+                                      int* out_argmax) {
+    if (!hp || !input_ids || !out_argmax) return -1;
+    auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
+    if (seq == 0 || seq > h->cfg.seq_max) return -2;
+    if (h->cfg.batch != 1) return -5;
+    if (h->current_pos + seq > h->cfg.cache_max) return -4;
+
+    auto* q = sk::bindings_queue();
+    if (!q) return -3;
+
+    std::memcpy(h->bufs.input_ids->contents(), input_ids,
+                (size_t)seq * sizeof(int32_t));
+    int32_t* pos = (int32_t*)h->bufs.rope_pos->contents();
+    for (uint32_t i = 0; i < seq; ++i) pos[i] = (int32_t)(h->current_pos + i);
+
+    h->lm_head_all_rows = true;
+    int rc = meow::qwen::run_step(h, q, seq);
+    h->lm_head_all_rows = false;
+    if (rc) return rc;
+
+    // Host argmax over each of the `seq` logits rows (native __fp16 on arm64).
+    // V is large (~152k) but seq <= GEMM_SM_MAXM+1, so this is a few cheap
+    // linear scans \u2014 negligible next to the GPU forward.
+    const size_t V = h->cfg.vocab_size;
+    const __fp16* logits = (const __fp16*)h->bufs.logits->contents();
+    for (uint32_t r = 0; r < seq; ++r) {
+        const __fp16* row = logits + (size_t)r * V;
+        int best_i = 0;
+        float best_v = (float)row[0];
+        for (size_t v = 1; v < V; ++v) {
+            float fv = (float)row[v];
+            if (fv > best_v) { best_v = fv; best_i = (int)v; }
+        }
+        out_argmax[r] = best_i;
+    }
+    return 0;
+}
+
+extern "C" uint32_t sk_qwen_get_pos(sk_qwen_handle* hp) {
+    if (!hp) return 0;
+    return reinterpret_cast<meow::qwen::Handle*>(hp)->current_pos;
+}
+
+// Rewind (or set) current_pos after a verify forward accepts fewer than `seq`
+// tokens. Discards KV beyond `pos` implicitly: attention reads only kv_len =
+// current_pos, so the next forward overwrites the rejected slots. Clamped to
+// cache_max.
+extern "C" int sk_qwen_set_pos(sk_qwen_handle* hp, uint32_t pos) {
+    if (!hp) return -1;
+    auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
+    if (pos > h->cfg.cache_max) return -2;
+    h->current_pos = pos;
     return 0;
 }
 
@@ -667,4 +961,32 @@ extern "C" void sk_qwen_destroy(sk_qwen_handle* hp) {
     rel(h->bufs.argmax_args);
     if (h->bufs.argmax_icb) { delete h->bufs.argmax_icb; h->bufs.argmax_icb = nullptr; }
     delete h;
+}
+
+// Sum of the per-layer bulk weight buffer bytes actually resident on this handle
+// (qkv/o/gate/up/down + split V). Dedupes the default fan-out case (all entries
+// alias one big buffer). This is the metric that ~halves when a stage loads only
+// its layer slice via sk_qwen_load_gguf_range — the pipeline-parallel memory win.
+extern "C" uint64_t sk_qwen_resident_weight_bytes(sk_qwen_handle* hp) {
+    if (!hp) return 0;
+    auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
+    std::vector<MTL::Buffer*> seen;
+    uint64_t total = 0;
+    auto add_vec = [&](const std::vector<MTL::Buffer*>& v) {
+        for (auto* b : v) {
+            if (!b) continue;
+            bool dup = false;
+            for (auto* s : seen) if (s == b) { dup = true; break; }
+            if (dup) continue;
+            seen.push_back(b);
+            total += (uint64_t)b->length();
+        }
+    };
+    add_vec(h->weights.w_qkv);
+    add_vec(h->weights.w_o);
+    add_vec(h->weights.w_gate);
+    add_vec(h->weights.w_up);
+    add_vec(h->weights.w_down);
+    add_vec(h->weights.w_v);
+    return total;
 }
