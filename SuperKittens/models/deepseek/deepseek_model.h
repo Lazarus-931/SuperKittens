@@ -148,6 +148,12 @@ struct LayerPSOs {
     MTL::ComputePipelineState* moe_swiglu_f32;     // deepseek_moe_swiglu_f32
     MTL::ComputePipelineState* moe_scatter_add;    // deepseek_moe_scatter_add_f32
     MTL::ComputePipelineState* moe_group_build = nullptr;   // T>1 grouped MoE: counting sort
+    // Batched MMA GEMM (qwen kernel, shared) for T>1 dense projections: amortizes
+    // the weight read across the M=T rows vs the per-row quant matvec loop.
+    MTL::ComputePipelineState* gemm_mma_f16 = nullptr;
+    MTL::ComputePipelineState* gemm_mma_q4k = nullptr;
+    MTL::ComputePipelineState* gemm_mma_q6k = nullptr;
+    MTL::ComputePipelineState* gemm_mma_q8_0 = nullptr;
     MTL::ComputePipelineState* moe_mv_gate_grp = nullptr;   // T>1 grouped gate/up Q4_K matvec
     MTL::ComputePipelineState* moe_mv_down_grp = nullptr;   // T>1 grouped down Q5_0 matvec
     MTL::ComputePipelineState* cast_h2f;
@@ -336,6 +342,42 @@ inline void encode_gemv_m1(
 // the fp16 path prefers gemv_fp16_m1 over the BM=32 gemm_fp16 (1.8-3.1x).
 // w_off is the byte offset into the (single, multi-layer) weight buffer; for
 // quant weights this is computed from the quant block size, for fp16 from 2 B.
+inline MTL::ComputePipelineState* ds_gemm_mma_pso(const LayerPSOs& P, sk::Dtype dt) {
+    switch (dt) {
+        case sk::Dtype::Q4_K: return P.gemm_mma_q4k;
+        case sk::Dtype::Q6_K: return P.gemm_mma_q6k;
+        case sk::Dtype::Q8_0: return P.gemm_mma_q8_0;
+        // F16 dense weights are [K,N] (gemm_fp16 transB=0); gemm_mma_f16 wants
+        // [N,K], so the fp16 dense MLP stays on gemm_fp16 (already MMA, BM=32).
+        default:              return nullptr;
+    }
+}
+
+// Batched MMA GEMM (gemm_mma.metal, BM=32/BN=32, weight-read amortized across M
+// rows). A fp16 [M,K], W [N,K] (quant/fp16), C fp16 [M,N]. Numerically equal to
+// the per-row matvec (same accumulation, MMA tiles).
+inline void encode_gemm_mma(
+    MTL::CommandBuffer* cmd, MTL::ComputePipelineState* pso,
+    MTL::Buffer* A, size_t off_A, MTL::Buffer* W, size_t off_W,
+    MTL::Buffer* C, size_t off_C, uint32_t M, uint32_t N, uint32_t K)
+{
+    auto* enc = cmd->computeCommandEncoder();
+    enc->setComputePipelineState(pso);
+    enc->setBuffer(A, off_A, 0);
+    enc->setBuffer(W, off_W, 1);
+    enc->setBuffer(C, off_C, 2);
+    enc->setBytes(&M, 4, 3);
+    enc->setBytes(&N, 4, 4);
+    enc->setBytes(&K, 4, 5);
+    uint32_t ldC = N;
+    enc->setBytes(&ldC, 4, 6);
+    constexpr uint32_t BM = 32, BN = 32;
+    enc->dispatchThreadgroups(
+        MTL::Size((N + BN - 1) / BN, (M + BM - 1) / BM, 1),
+        MTL::Size(64, 1, 1));
+    enc->endEncoding();
+}
+
 inline void encode_proj(
     MTL::CommandBuffer* cmd, const LayerPSOs& P, sk::Dtype dt,
     MTL::Buffer* W, size_t off_W,
@@ -344,6 +386,17 @@ inline void encode_proj(
     uint32_t M, uint32_t N, uint32_t K)
 {
     MTL::ComputePipelineState* qpso = ds_quant_matvec_pso(P, dt);
+    // T>1 prefill: route dense projections through the batched MMA GEMM so the
+    // weight read amortizes over the M=T rows (the quant matvec loops M per-row
+    // matvecs, re-reading the weight each row). Numerically equal (MMA tiles).
+    // Requires off_X==0 && off_Y==0 (full-buffer A/C, as all proj call sites use).
+    // T==1 decode keeps the per-row/gevm path byte-identical. SK_DS_NO_MMA_PROJ escapes.
+    static const bool g_no_mma_proj = (std::getenv("SK_DS_NO_MMA_PROJ") != nullptr);
+    MTL::ComputePipelineState* mpso = ds_gemm_mma_pso(P, dt);
+    if (!g_no_mma_proj && M > 1 && off_X == 0 && off_Y == 0 && mpso) {
+        encode_gemm_mma(cmd, mpso, X, 0, W, off_W, Y, 0, M, N, K);
+        return;
+    }
     if (qpso) {
         encode_quant_matvec(cmd, qpso, W, off_W, X, off_X, Y, off_Y, M, N, K);
     } else if (M == 1 && off_Y == 0 && P.gemv_f16) {

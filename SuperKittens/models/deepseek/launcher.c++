@@ -145,6 +145,11 @@ static bool resolve_psos(ModelPSOs& P, uint32_t dk, uint32_t dv) {
         sk::bindings_library(), sk::bindings_device(), "deepseek_mul_mv_id_q4_K_grp");
     P.layer.moe_mv_down_grp = resolve_mvid_pso(
         sk::bindings_library(), sk::bindings_device(), "deepseek_mul_mv_id_q5_0_grp");
+    // Batched MMA GEMM (qwen kernel, shared) for T>1 dense projections.
+    P.layer.gemm_mma_f16  = sk::bindings_pso("gemm_mma_f16");
+    P.layer.gemm_mma_q4k  = sk::bindings_pso("gemm_mma_q4k");
+    P.layer.gemm_mma_q6k  = sk::bindings_pso("gemm_mma_q6k");
+    P.layer.gemm_mma_q8_0 = sk::bindings_pso("gemm_mma_q8_0");
 
     // Native K-quant matvec (decode) so dense/attn/shared/LM-head stay quantized.
     P.layer.q4k_matvec  = sk::bindings_pso("q4k_matvec");
