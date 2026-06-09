@@ -252,6 +252,12 @@ inline bool gemm_sm_wins(sk::Dtype dt, uint32_t M) {
     }
 }
 
+// Threadgroup width (NSG*32) for the small-M kernel of dtype dt. Q8_0 sm is
+// one simdgroup (occupancy-tuned); Q4_K sm needs 4 (row/sub-block split).
+inline uint32_t gemm_sm_threads(sk::Dtype dt) {
+    return (dt == sk::Dtype::Q8_0) ? 32u : 128u;
+}
+
 // Encode one batched MMA GEMM: A (fp16 [M,K]) × W ([N,K] quant/fp16) → C
 // (fp16 [M,N], row stride ldC). BM=8 rows × BN=32 cols per threadgroup.
 inline void encode_gemm_mma(
@@ -286,7 +292,8 @@ inline void encode_gemm_sm(
     MTL::Buffer* A, size_t off_A,
     MTL::Buffer* W, size_t off_W,
     MTL::Buffer* C, size_t off_C,
-    uint32_t M, uint32_t N, uint32_t K, uint32_t ldC)
+    uint32_t M, uint32_t N, uint32_t K, uint32_t ldC,
+    uint32_t tg_threads = 128)
 {
     enc_barrier(enc);
     enc->setComputePipelineState(pso);
@@ -298,8 +305,10 @@ inline void encode_gemm_sm(
     enc->setBytes(&K, 4, 5);
     enc->setBytes(&ldC, 4, 6);
     constexpr uint32_t NR0 = 2;
+    // tg_threads = NSG*32: Q8_0 sm runs one simdgroup (32) for occupancy; Q4_K
+    // sm needs 4 simdgroups (128) for its row/sub-block split.
     enc->dispatchThreadgroups(MTL::Size((N + NR0 - 1) / NR0, 1, 1),
-                              MTL::Size(128, 1, 1));
+                              MTL::Size(tg_threads, 1, 1));
 }
 
 // Encode a quant matvec (M rows, looping over rows for M>1). Mirrors
@@ -315,14 +324,16 @@ inline void encode_quant_gemm(
     uint32_t M, uint32_t N, uint32_t K, uint32_t ldC = 0,
     MTL::ComputePipelineState* pso_mma = nullptr,
     MTL::ComputePipelineState* pso_sm = nullptr,
-    bool sm_wins = false)
+    bool sm_wins = false,
+    uint32_t sm_threads = 128)
 {
     if (ldC == 0) ldC = N;
     // Small-M (seq 2..8 where measured best): the multi-RHS matvec reads each
     // weight once and applies it to all M rows in registers, avoiding the BM=8
     // MMA tile's M-independent fixed floor. Bit-exact vs the per-row matvec.
     if (sm_wins && pso_sm != nullptr) {
-        encode_gemm_sm(enc, pso_sm, A, off_A, W, off_W, C, off_C, M, N, K, ldC);
+        encode_gemm_sm(enc, pso_sm, A, off_A, W, off_W, C, off_C, M, N, K, ldC,
+                       sm_threads);
         return;
     }
     // Prefill (M>1): one MMA GEMM amortizes the weight read across all M rows,
@@ -551,11 +562,13 @@ inline void dispatch_layer(
             encode_quant_gemm(enc, pso_qkv, B.x_norm, 0, B.w_qkv, off_w_qkv,
                               B.qkv_packed, 0, T, qN + kvN, p.d_model, qkv_N,
                               gemm_mma_pso(P, B.dt_qkv),
-                              gemm_sm_pso(P, B.dt_qkv), gemm_sm_wins(B.dt_qkv, T));
+                              gemm_sm_pso(P, B.dt_qkv), gemm_sm_wins(B.dt_qkv, T),
+                              gemm_sm_threads(B.dt_qkv));
             encode_quant_gemm(enc, pso_v, B.x_norm, 0, B.w_v, B.w_v_inner_off,
                               B.qkv_packed, (size_t)(qN + kvN) * 2, T, kvN, p.d_model, qkv_N,
                               gemm_mma_pso(P, B.dt_v),
-                              gemm_sm_pso(P, B.dt_v), gemm_sm_wins(B.dt_v, T));
+                              gemm_sm_pso(P, B.dt_v), gemm_sm_wins(B.dt_v, T),
+                              gemm_sm_threads(B.dt_v));
         } else {
             encode_gemm_fallback(enc, P.gemm, P.gemv_m1, B.x_norm, 0, B.w_qkv, off_w_qkv,
                                  B.qkv_packed, T, qkv_N, p.d_model);
@@ -564,7 +577,8 @@ inline void dispatch_layer(
         encode_quant_gemm(enc, pso_qkv, B.x_norm, 0, B.w_qkv, off_w_qkv,
                           B.qkv_packed, 0, T, qkv_N, p.d_model, /*ldC=*/0,
                           gemm_mma_pso(P, B.dt_qkv),
-                          gemm_sm_pso(P, B.dt_qkv), gemm_sm_wins(B.dt_qkv, T));
+                          gemm_sm_pso(P, B.dt_qkv), gemm_sm_wins(B.dt_qkv, T),
+                          gemm_sm_threads(B.dt_qkv));
     } else {
         encode_gemm_fallback(enc, P.gemm, P.gemv_m1, B.x_norm, 0, B.w_qkv, off_w_qkv,
                              B.qkv_packed, T, qkv_N, p.d_model);
@@ -790,7 +804,8 @@ inline void dispatch_layer(
         encode_quant_gemm(enc, pso_o, attn_o_in, 0, B.w_o, off_w_o,
                           B.o_proj, 0, T, p.d_model, p.n_heads * hd, /*ldC=*/0,
                           gemm_mma_pso(P, B.dt_o),
-                          gemm_sm_pso(P, B.dt_o), gemm_sm_wins(B.dt_o, T));
+                          gemm_sm_pso(P, B.dt_o), gemm_sm_wins(B.dt_o, T),
+                          gemm_sm_threads(B.dt_o));
     } else {
         encode_gemm_fallback(enc, P.gemm, P.gemv_m1, attn_o_in, 0, B.w_o, off_w_o,
                              B.o_proj, T, p.d_model, p.n_heads * hd);
@@ -872,7 +887,8 @@ inline void dispatch_layer(
             encode_quant_gemm(enc, pso_gate, B.m_in, 0, B.w_gate, off_w_gate,
                               B.gate_buf, 0, T, p.n_int, p.d_model, /*ldC=*/0,
                               gemm_mma_pso(P, B.dt_gate),
-                              gemm_sm_pso(P, B.dt_gate), gemm_sm_wins(B.dt_gate, T));
+                              gemm_sm_pso(P, B.dt_gate), gemm_sm_wins(B.dt_gate, T),
+                              gemm_sm_threads(B.dt_gate));
         } else {
             encode_gemm_fallback(enc, P.gemm, P.gemv_m1, B.m_in, 0, B.w_gate, off_w_gate,
                                  B.gate_buf, T, p.n_int, p.d_model);
@@ -881,7 +897,8 @@ inline void dispatch_layer(
             encode_quant_gemm(enc, pso_up, B.m_in, 0, B.w_up, off_w_up,
                               B.up_buf, 0, T, p.n_int, p.d_model, /*ldC=*/0,
                               gemm_mma_pso(P, B.dt_up),
-                              gemm_sm_pso(P, B.dt_up), gemm_sm_wins(B.dt_up, T));
+                              gemm_sm_pso(P, B.dt_up), gemm_sm_wins(B.dt_up, T),
+                              gemm_sm_threads(B.dt_up));
         } else {
             encode_gemm_fallback(enc, P.gemm, P.gemv_m1, B.m_in, 0, B.w_up, off_w_up,
                                  B.up_buf, T, p.n_int, p.d_model);
@@ -921,7 +938,8 @@ inline void dispatch_layer(
             encode_quant_gemm(enc, pso_down, B.up_buf, 0, B.w_down, off_w_down,
                               B.mlp_out, 0, T, p.d_model, p.n_int, /*ldC=*/0,
                               gemm_mma_pso(P, B.dt_down),
-                              gemm_sm_pso(P, B.dt_down), gemm_sm_wins(B.dt_down, T));
+                              gemm_sm_pso(P, B.dt_down), gemm_sm_wins(B.dt_down, T),
+                              gemm_sm_threads(B.dt_down));
         } else {
             encode_gemm_fallback(enc, P.gemm, P.gemv_m1, B.up_buf, 0, B.w_down, off_w_down,
                                  B.mlp_out, T, p.d_model, p.n_int);
@@ -1280,7 +1298,8 @@ inline void dispatch_model(
         if (head_sm && gemm_sm_wins(W.dt_lm_head, T)) {
             auto* enc = cmd->computeCommandEncoder();
             encode_gemm_sm(enc, head_sm, nxt, 0, w_head, off_head,
-                           B.logits, 0, T, N_v, K_v, N_v);
+                           B.logits, 0, T, N_v, K_v, N_v,
+                           gemm_sm_threads(W.dt_lm_head));
             enc->endEncoding();
             head_batched = true;
         } else if (head_mma) {

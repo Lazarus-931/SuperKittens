@@ -22,7 +22,13 @@ using namespace metal;
 namespace sksm {
 
 constant constexpr short NW   = 32;
-constant constexpr short NSG  = 4;
+constant constexpr short NSG  = 4;     // Q4_K sm: 4 simdgroups (row/sub-block split)
+// Q8_0 sm: one simdgroup per TG. At M=2..8 on these small projection shapes the
+// kernel is occupancy-bound, not weight-bandwidth-bound (~27% of roofline at
+// M=8 with NSG=4): NSG=4 packs 128 threads into ceil(N/NR0) TGs, which starves
+// the M4 scheduler. NSG=1 launches the same TG count at 32 threads each → finer
+// work granularity, +20-36% across qkv/gate/up and the (tail-dominating) LM head.
+constant constexpr short NSG_Q8 = 1;
 constant constexpr short NR0  = 2;
 constant constexpr short NQ   = 8;
 constant constexpr uint  MAXM = 8;   // register accumulator cap
@@ -73,7 +79,7 @@ kernel void gemm_mma_q8_0_sm(
     for (short r = 0; r < NR0; ++r)
         for (uint m = 0; m < MAXM; ++m) sumf[r][m] = 0.f;
 
-    for (uint ib = ib0; ib < nb; ib += NSG * NQ) {
+    for (uint ib = ib0; ib < nb; ib += NSG_Q8 * NQ) {
         const uint kbase = ib * 32 + koff;    // global K offset of this lane's 8
         // Cast both rows' 8 int8 weights to float ONCE (out of the m-loop);
         // the per-row inner loop is then NQ fma against shared float weights,
@@ -103,13 +109,13 @@ kernel void gemm_mma_q8_0_sm(
         }
     }
 
-    // Reduce across lanes (simdgroup) then across the NSG simdgroups per row.
-    threadgroup float shmem[NR0 * NSG * MAXM];
+    // Reduce across lanes (simdgroup) then across the NSG_Q8 simdgroups per row.
+    threadgroup float shmem[NR0 * NSG_Q8 * MAXM];
     for (uint m = 0; m < M; ++m) {
         #pragma unroll
         for (short r = 0; r < NR0; ++r) {
             float v = simd_sum(sumf[r][m]);
-            if (tiisg == 0) shmem[(r * NSG + sgitg) * MAXM + m] = v;
+            if (tiisg == 0) shmem[(r * NSG_Q8 + sgitg) * MAXM + m] = v;
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -118,7 +124,7 @@ kernel void gemm_mma_q8_0_sm(
         for (uint m = 0; m < M; ++m) {
             #pragma unroll
             for (short r = 0; r < NR0; ++r) {
-                float v = (tiisg < NSG) ? shmem[(r * NSG + tiisg) * MAXM + m] : 0.0f;
+                float v = (tiisg < NSG_Q8) ? shmem[(r * NSG_Q8 + tiisg) * MAXM + m] : 0.0f;
                 v = simd_sum(v);
                 if (tiisg == 0) {
                     const uint out_row = row0 + r;
