@@ -150,6 +150,9 @@ struct LayerPSOs {
     MTL::ComputePipelineState* rope;            // standard (local)
     MTL::ComputePipelineState* prope;           // p-RoPE (global, legacy/unused for Gemma4 full-attn)
     MTL::ComputePipelineState* rope_partial;    // partial RoPE for full_attention (rot_dims arg)
+    MTL::ComputePipelineState* rope_batched = nullptr;         // local RoPE, M=N batched-decode (n_rows stride)
+    MTL::ComputePipelineState* rope_partial_batched = nullptr; // partial RoPE, M=N batched-decode
+    MTL::ComputePipelineState* qkv_norm_batched = nullptr;     // qkv split+norm, batch-major (B,H,seq,D) for M=N
     MTL::ComputePipelineState* attn_local;
     MTL::ComputePipelineState* attn_global;
     MTL::ComputePipelineState* gated_mlp_gelu;
@@ -484,19 +487,24 @@ inline void dispatch_layer(
         // Fall through past the legacy qkv_norm + rope blocks below.
     } else {
         auto* enc = E.get();
-        enc->setComputePipelineState(P.qkv_norm);
+        uint32_t T = p.batch * p.seq;
+        // Batched decode (batch>1) writes Q/K/V batch-major (B,H,seq,D) to match
+        // the kv_cache_write + attention indexing. M=1 keeps the head-major
+        // gemma4_qkv_norm (byte-identical: at batch==1 the two layouts coincide).
+        const bool qkvn_batched = (p.batch > 1) && (P.qkv_norm_batched != nullptr);
+        enc->setComputePipelineState(qkvn_batched ? P.qkv_norm_batched : P.qkv_norm);
         enc->setBuffer(B.qkv_packed, 0,         0);
         enc->setBuffer(B.gamma_q,    off_gamma, 1);
         enc->setBuffer(B.gamma_k,    off_gamma, 2);
         enc->setBuffer(B.q_norm,     0,         3);
         enc->setBuffer(B.k_tmp,      0,         4);
         enc->setBuffer(B.v_tmp,      0,         5);
-        uint32_t T = p.batch * p.seq;
         enc->setBytes(&T,            4, 6);
         enc->setBytes(&p.n_heads,    4, 7);
         enc->setBytes(&p.n_kv_heads, 4, 8);
         enc->setBytes(&p.head_dim,   4, 9);
         enc->setBytes(&p.eps,        4, 10);
+        if (qkvn_batched) enc->setBytes(&p.seq, 4, 11);
         const uint32_t slots = p.n_heads + 2u * p.n_kv_heads;
         enc->dispatchThreadgroups(MTL::Size(slots, T, 1),
                                   MTL::Size(p.head_dim, 1, 1));
@@ -527,6 +535,15 @@ inline void dispatch_layer(
     // rotated Q,K (T=1 global decode path).
     if (!use_qkv_fused) {
         auto* enc = E.get();
+        // Batched lockstep decode (batch>1): the q_norm/k_tmp buffers are
+        // (n_heads, n_rows=batch*seq, head_dim). The single-stream RoPE strides
+        // per head by `seq` and only covers `seq` rows — at batch>1 that leaves
+        // lanes>=1 unrotated. The *_batched variants stride by n_rows and rotate
+        // every row at write_pos + (row % seq). M=1 keeps the original kernels.
+        const uint32_t n_rows = p.batch * p.seq;
+        const bool rope_batched = (p.batch > 1)
+            && (p.is_global ? (P.rope_partial_batched != nullptr)
+                            : (P.rope_batched != nullptr));
         if (p.is_global) {
             // Gemma4 E-variant full_attention uses partial RoPE 0.25; the
             // gemma4_unified proportional rotary rotates the FULL global head_dim
@@ -535,6 +552,25 @@ inline void dispatch_layer(
             uint32_t rot_dims = p.full_rope_global ? p.head_dim
                                 : (p.rot_dims ? p.rot_dims
                                               : (uint32_t)(p.head_dim * 0.25f));
+            if (rope_batched) {
+                for (int qk = 0; qk < 2; ++qk) {
+                    MTL::Buffer* buf = qk == 0 ? B.q_norm : B.k_tmp;
+                    uint32_t nh = qk == 0 ? p.n_heads : p.n_kv_heads;
+                    enc->setComputePipelineState(P.rope_partial_batched);
+                    enc->setBuffer(buf, 0, 0);
+                    enc->setBuffer(buf, 0, 1);
+                    enc->setBuffer(B.cos, 0, 2);
+                    enc->setBuffer(B.sin, 0, 3);
+                    enc->setBytes(&p.seq,      4, 4);
+                    enc->setBytes(&p.head_dim, 4, 5);
+                    enc->setBytes(&nh,         4, 6);
+                    enc->setBytes(&rot_dims,   4, 7);
+                    enc->setBytes(&p.write_pos,4, 8);
+                    enc->setBytes(&n_rows,     4, 9);
+                    enc->dispatchThreadgroups(MTL::Size(nh, n_rows, 1),
+                                              MTL::Size(p.head_dim / 8, 1, 1));
+                }
+            } else {
             enc->setComputePipelineState(P.rope_partial);
             enc->setBuffer(B.q_norm, 0, 0);
             enc->setBuffer(B.q_norm, 0, 1);
@@ -559,6 +595,24 @@ inline void dispatch_layer(
             enc->setBytes(&p.write_pos,4, 8);
             enc->dispatchThreadgroups(MTL::Size(p.n_kv_heads, p.seq, 1),
                                       MTL::Size(p.head_dim / 8, 1, 1));
+            }
+        } else if (rope_batched) {
+            for (int qk = 0; qk < 2; ++qk) {
+                MTL::Buffer* buf = qk == 0 ? B.q_norm : B.k_tmp;
+                uint32_t nh = qk == 0 ? p.n_heads : p.n_kv_heads;
+                enc->setComputePipelineState(P.rope_batched);
+                enc->setBuffer(buf, 0, 0);
+                enc->setBuffer(buf, 0, 1);
+                enc->setBuffer(B.cos, 0, 2);
+                enc->setBuffer(B.sin, 0, 3);
+                enc->setBytes(&p.seq,      4, 4);
+                enc->setBytes(&p.head_dim, 4, 5);
+                enc->setBytes(&nh,         4, 6);
+                enc->setBytes(&p.write_pos,4, 7);
+                enc->setBytes(&n_rows,     4, 8);
+                enc->dispatchThreadgroups(MTL::Size(nh, n_rows, 1),
+                                          MTL::Size(p.head_dim / 8, 1, 1));
+            }
         } else {
             enc->setComputePipelineState(P.rope);
             enc->setBuffer(B.q_norm, 0, 0);
@@ -1100,6 +1154,10 @@ struct ModelParams {
     //   [1 + 4*n_layers]          final_norm       (d_model)
     //   [1 + 4*n_layers + 1]      logits           (vocab_size)
     bool     dump_enabled       = false;
+    // Batched lockstep decode (seq==1, batch=N): project + argmax ALL T=batch
+    // rows so each request gets its own next token. Default 0 keeps the
+    // single-row (last-position) decode/prefill path byte-identical.
+    uint32_t decode_all_rows    = 0;
 };
 
 struct ModelPSOs {
@@ -1841,7 +1899,19 @@ inline void dispatch_model(
     // batch*sizeof(int32_t) (one slot), so dispatching T threadgroups would
     // OOB-write past the buffer for T>1. Offset the logits view by (T-1) rows
     // and run a single threadgroup so out[0] = argmax(logits[last_row, :]).
-    {
+    if (M.decode_all_rows && M.seq == 1u && T > 1u) {
+        // Batched decode: argmax each lane's logits row r -> output_id[r].
+        // One single-TG argmax per row (handles any vocab), all in one encoder.
+        auto* enc = cmd->computeCommandEncoder();
+        enc->setComputePipelineState(P.argmax);
+        for (uint32_t r = 0; r < T; ++r) {
+            enc->setBuffer(B.logits,    (size_t)r * M.vocab_size * sizeof(uint16_t), 0);
+            enc->setBuffer(B.output_id, (size_t)r * sizeof(int32_t),                 1);
+            enc->setBytes(&M.vocab_size, 4, 2);
+            enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(1024, 1, 1));
+        }
+        enc->endEncoding();
+    } else {
         const size_t last_row_off = (size_t)(T - 1u) * (size_t)M.vocab_size * sizeof(uint16_t);
         const bool can_2pass = P.argmax_bf16_partial && P.argmax_reduce
                             && B.argmax_val_buf && B.argmax_idx_buf;

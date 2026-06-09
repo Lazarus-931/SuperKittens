@@ -235,4 +235,60 @@ void gemma4_geglu_mul(
     }
 }
 
+// Batched-decode partial RoPE: buffer (n_heads, n_rows, head_dim),
+// n_rows = batch*q_seq. Per-head stride n_rows; position write_pos + (row %
+// q_seq). Rotates the first rot_dims/2 pairs (proportional RoPE); cos/sin
+// stride head_dim/2. Only dispatched at batch>1.
+[[host_name("gemma4_rope_qk_partial_batched")]]
+[[kernel, max_total_threads_per_threadgroup(512)]]
+void gemma4_rope_qk_partial_batched(
+    device bfloat* Q          [[buffer(0)]],
+    device bfloat* K          [[buffer(1)]],
+    device const bfloat* cos  [[buffer(2)]],
+    device const bfloat* sin  [[buffer(3)]],
+    constant uint& q_seq    [[buffer(4)]],
+    constant uint& head_dim [[buffer(5)]],
+    constant uint& n_heads  [[buffer(6)]],
+    constant uint& rot_dims [[buffer(7)]],
+    constant uint& write_pos [[buffer(8)]],
+    constant uint& n_rows   [[buffer(9)]],
+    uint3 gid [[threadgroup_position_in_grid]],
+    uint3 tid [[thread_position_in_threadgroup]],
+    uint3 tpg [[threads_per_threadgroup]])
+{
+    const uint head = gid.x;
+    if (head >= n_heads) return;
+    const uint row_blk = gid.y;
+    const uint rows_per_tg = tpg.y;
+    const uint row = row_blk * rows_per_tg + tid.y;
+    if (row >= n_rows) return;
+
+    const uint rot_half = rot_dims / 2;
+    const uint hd_half  = head_dim / 2;
+    const uint hd4 = rot_half / 4;
+    const uint d4  = tid.x;
+    if (d4 >= hd4) return;
+    const uint i = d4 * 4;
+
+    // Batch-major (batch, n_heads, q_seq, head_dim) — lane b=row/q_seq, pos s=row%q_seq.
+    const uint b = row / q_seq;
+    const uint s = row % q_seq;
+    const uint pos = write_pos + s;
+    const size_t qk_off = (((size_t)(b * n_heads + head) * q_seq) + s) * head_dim;
+    const size_t cs_off = (size_t)pos * hd_half + i;
+
+    float4 q_lo = float4(*reinterpret_cast<device bfloat4*>(Q + qk_off + i));
+    float4 q_hi = float4(*reinterpret_cast<device bfloat4*>(Q + qk_off + i + hd_half));
+    float4 k_lo = float4(*reinterpret_cast<device bfloat4*>(K + qk_off + i));
+    float4 k_hi = float4(*reinterpret_cast<device bfloat4*>(K + qk_off + i + hd_half));
+
+    float4 c  = float4(*reinterpret_cast<const device bfloat4*>(cos + cs_off));
+    float4 sv = float4(*reinterpret_cast<const device bfloat4*>(sin + cs_off));
+
+    *reinterpret_cast<device bfloat4*>(Q + qk_off + i)            = bfloat4(q_lo * c - q_hi * sv);
+    *reinterpret_cast<device bfloat4*>(Q + qk_off + i + hd_half)  = bfloat4(q_lo * sv + q_hi * c);
+    *reinterpret_cast<device bfloat4*>(K + qk_off + i)            = bfloat4(k_lo * c - k_hi * sv);
+    *reinterpret_cast<device bfloat4*>(K + qk_off + i + hd_half)  = bfloat4(k_lo * sv + k_hi * c);
+}
+
 } // namespace meow::gemma4::ops

@@ -58,3 +58,59 @@ void rope_qk_bf16(
 }
 
 } // namespace meow::gemma4::rope_bf16
+
+// Batched-decode variant: buffer is (n_heads, n_rows, head_dim) with
+// n_rows = batch*q_seq (request-major lanes). Per-head stride is n_rows
+// (not q_seq), and the rotation position is write_pos + (row % q_seq) so
+// lockstep decode (q_seq==1) rotates every lane at the same position.
+// Single-stream (batch==1) would be byte-identical to rope_qk_bf16, but this
+// variant is only dispatched at batch>1 (M=1 keeps the original kernel).
+[[host_name("rope_qk_bf16_batched")]]
+[[kernel, max_total_threads_per_threadgroup(512)]]
+void rope_qk_bf16_batched(
+    device bfloat* Q          [[buffer(0)]],
+    device bfloat* K          [[buffer(1)]],
+    device const bfloat* cos  [[buffer(2)]],
+    device const bfloat* sin  [[buffer(3)]],
+    constant uint& q_seq    [[buffer(4)]],
+    constant uint& head_dim [[buffer(5)]],
+    constant uint& n_heads  [[buffer(6)]],
+    constant uint& write_pos [[buffer(7)]],
+    constant uint& n_rows   [[buffer(8)]],
+    uint3 gid [[threadgroup_position_in_grid]],
+    uint3 tid [[thread_position_in_threadgroup]],
+    uint3 tpg [[threads_per_threadgroup]])
+{
+    const uint head = gid.x;
+    if (head >= n_heads) return;
+    const uint row_blk = gid.y;
+    const uint rows_per_tg = tpg.y;
+    const uint row = row_blk * rows_per_tg + tid.y;
+    if (row >= n_rows) return;
+
+    const uint hd  = head_dim / 2;
+    const uint hd4 = hd / 4;
+    const uint d4  = tid.x;
+    if (d4 >= hd4) return;
+    const uint i = d4 * 4;
+
+    // Batch-major (batch, n_heads, q_seq, head_dim) — lane b=row/q_seq, pos s=row%q_seq.
+    const uint b = row / q_seq;
+    const uint s = row % q_seq;
+    const uint pos = write_pos + s;
+    const size_t qk_off = (((size_t)(b * n_heads + head) * q_seq) + s) * head_dim;
+    const size_t cs_off = (size_t)pos * hd + i;
+
+    float4 q_lo = float4(*reinterpret_cast<device bfloat4*>(Q + qk_off + i));
+    float4 q_hi = float4(*reinterpret_cast<device bfloat4*>(Q + qk_off + i + hd));
+    float4 k_lo = float4(*reinterpret_cast<device bfloat4*>(K + qk_off + i));
+    float4 k_hi = float4(*reinterpret_cast<device bfloat4*>(K + qk_off + i + hd));
+
+    float4 c  = float4(*reinterpret_cast<const device bfloat4*>(cos + cs_off));
+    float4 sv = float4(*reinterpret_cast<const device bfloat4*>(sin + cs_off));
+
+    *reinterpret_cast<device bfloat4*>(Q + qk_off + i)      = bfloat4(q_lo * c - q_hi * sv);
+    *reinterpret_cast<device bfloat4*>(Q + qk_off + i + hd) = bfloat4(q_lo * sv + q_hi * c);
+    *reinterpret_cast<device bfloat4*>(K + qk_off + i)      = bfloat4(k_lo * c - k_hi * sv);
+    *reinterpret_cast<device bfloat4*>(K + qk_off + i + hd) = bfloat4(k_lo * sv + k_hi * c);
+}

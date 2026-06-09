@@ -61,6 +61,9 @@ static bool resolve_psos(ModelPSOs& P) {
     P.layer.rope           = sk::bindings_pso("rope_qk_bf16");
     P.layer.prope          = sk::bindings_pso("gemma4_prope_qk");
     P.layer.rope_partial   = sk::bindings_pso("gemma4_rope_qk_partial");
+    P.layer.rope_batched         = sk::bindings_pso("rope_qk_bf16_batched");
+    P.layer.rope_partial_batched = sk::bindings_pso("gemma4_rope_qk_partial_batched");
+    P.layer.qkv_norm_batched     = sk::bindings_pso("gemma4_qkv_norm_batched");
     P.layer.attn_local     = sk::bindings_pso("gemma4_attn_local_d256");
     P.layer.attn_global    = sk::bindings_pso("gemma4_attn_global_d512");
     P.layer.gated_mlp_gelu = sk::bindings_pso("gated_mlp_bf16");
@@ -585,9 +588,87 @@ extern "C" int sk_gemma4_forward(sk_gemma4_handle* hp,
     meow::gemma4::dispatch_model(cmd, h->psos, h->weights, h->bufs, mp);
     cmd->commit();
     cmd->waitUntilCompleted();
+    if (std::getenv("SK_GEMMA4_GPUPROF"))
+        std::fprintf(stderr, "[gpuprof] gpu_busy_us=%.1f\n",
+                     (cmd->GPUEndTime() - cmd->GPUStartTime()) * 1e6);
     if (cmd->status() == MTL::CommandBufferStatusError) {
         auto* e = cmd->error();
         std::fprintf(stderr, "gemma4 forward: command buffer ERROR (status=%ld): %s\n",
+                     (long)(e ? e->code() : -1),
+                     e && e->localizedDescription() ? e->localizedDescription()->utf8String() : "?");
+    }
+    cmd->release();
+
+    h->current_pos += seq;
+
+    std::memcpy(output_id, h->bufs.output_id->contents(),
+                (size_t)h->cfg.batch * sizeof(int32_t));
+    return 0;
+}
+
+// Batched lockstep decode. input_ids is batch*seq int32 (request-major: row r is
+// request r's seq tokens); output_id receives `batch` int32 (one greedy next
+// token per request). All requests share the same absolute position
+// (current_pos) and step together; each reads/writes its own KV-cache slice.
+// seq must be 1 (prompt is driven token-by-token at seq==1, the batch-aware
+// lockstep decode path); seq>1 batched prefill is not supported.
+extern "C" int sk_gemma4_forward_batched(sk_gemma4_handle* hp,
+                                         const int* input_ids, uint32_t seq,
+                                         int* output_id) {
+    if (!hp || !input_ids || !output_id) return -1;
+    auto* h = reinterpret_cast<meow::gemma4::Handle*>(hp);
+    if (seq != 1) return -6;
+    if (h->current_pos + seq > h->cfg.cache_max) return -4;
+    if (h->cfg.batch < 1) return -5;
+
+    auto* dev = sk::bindings_device();
+    auto* q   = sk::bindings_queue();
+    if (!dev || !q) return -3;
+
+    std::memcpy(h->bufs.input_ids->contents(), input_ids,
+                (size_t)h->cfg.batch * seq * sizeof(int32_t));
+
+    meow::gemma4::ModelParams mp;
+    mp.batch              = h->cfg.batch;
+    mp.seq                = seq;
+    mp.n_layers           = h->cfg.n_layers;
+    mp.local_period       = h->cfg.local_period;
+    mp.d_model            = h->cfg.d_model;
+    mp.n_int              = h->cfg.n_int;
+    mp.n_heads            = h->cfg.n_heads;
+    mp.n_kv_heads_local   = h->cfg.n_kv_heads_local;
+    mp.n_kv_heads_global  = h->cfg.n_kv_heads_global;
+    mp.head_dim_local     = h->cfg.head_dim_local;
+    mp.head_dim_global    = h->cfg.head_dim_global;
+    mp.window             = h->cfg.window;
+    mp.cache_max          = h->cfg.cache_max;
+    mp.prope_p_pairs      = h->cfg.prope_p_pairs;
+    mp.vocab_size         = h->cfg.vocab_size;
+    mp.ple_dim            = h->cfg.ple_dim;
+    mp.has_ple            = (h->cfg.has_ple != 0);
+    mp.full_rope_global   = (h->cfg.full_rope_global != 0);
+    mp.apply_layer_scalar = (h->cfg.apply_layer_scalar != 0);
+    mp.eps                = h->cfg.eps;
+    mp.final_logit_softcap = h->cfg.final_logit_softcap;
+    mp.current_pos        = h->current_pos;
+    mp.n_int_per_layer    = h->n_int_per_layer.data();
+    mp.mlp_gate_off_e     = h->mlp_gate_off_e.data();
+    mp.mlp_down_off_e     = h->mlp_down_off_e.data();
+    mp.kv_source_layer    = h->kv_source_layer.data();
+    mp.layer_scalar_host  = h->layer_scalar_host.data();
+    mp.dump_enabled       = h->dump_enabled;
+    mp.decode_all_rows    = 1u;
+
+    auto* cmd = q->commandBuffer();
+    meow::gemma4::dispatch_model(cmd, h->psos, h->weights, h->bufs, mp);
+    cmd->commit();
+    cmd->waitUntilCompleted();
+    if (std::getenv("SK_GEMMA4_GPUPROF"))
+        std::fprintf(stderr, "[gpuprof] gpu_busy_us=%.1f\n",
+                     (cmd->GPUEndTime() - cmd->GPUStartTime()) * 1e6);
+    if (cmd->status() == MTL::CommandBufferStatusError) {
+        auto* e = cmd->error();
+        std::fprintf(stderr, "gemma4 forward_batched: command buffer ERROR (status=%ld): %s\n",
                      (long)(e ? e->code() : -1),
                      e && e->localizedDescription() ? e->localizedDescription()->utf8String() : "?");
     }
