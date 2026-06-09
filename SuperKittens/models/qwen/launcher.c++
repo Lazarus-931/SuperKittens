@@ -28,6 +28,10 @@ struct Handle {
     uint32_t layers_run     = 0;
     int32_t  capture_layer  = -1;
     uint32_t last_seq       = 0;  // seq used at most recent forward (for get_capture sizing)
+    // Prompt-lookup verify: when set, the next run_step projects the LM head
+    // for ALL seq rows (routes to the shared decode_all_rows logits path) so
+    // forward_verify can host-argmax each position. Default false -> M=1 path.
+    bool     lm_head_all_rows = false;
 
     // Zero-copy mmap of the GGUF file, when used (otherwise nullptr).
     // Owns the MTL::Buffer that w_lm_head (and future mmap-backed weights)
@@ -517,6 +521,7 @@ static int run_step(Handle* h, MTL::CommandQueue* q, uint32_t seq) {
     mp.layers_run      = h->layers_run;
     mp.capture_layer   = h->capture_layer;
     mp.kv_q8           = h->kv_q8;
+    mp.decode_all_rows = h->lm_head_all_rows ? 1u : 0u;
     h->last_seq        = seq;
 
     auto* cmd = q->commandBuffer();
@@ -724,6 +729,70 @@ extern "C" int sk_qwen_resume_from_hidden(sk_qwen_handle* hp,
 
     std::memcpy(out_token, h->bufs.output_id->contents(),
                 (size_t)h->cfg.batch * sizeof(int32_t));
+    return 0;
+}
+
+// Prompt-lookup spec-decode verify: run `seq` tokens projecting the LM head at
+// EVERY position (via the shared decode_all_rows all-rows-head primitive, set
+// through h->lm_head_all_rows in run_step), then host-argmax each logits row
+// into out_argmax[0..seq-1]. Greedy/argmax, batch=1. Advances current_pos by
+// seq (KV written for all seq slots); the caller rewinds via sk_qwen_set_pos to
+// the accepted length. Host argmax (not the GPU per-row argmax) is used so the
+// batch=1 output_id buffer is never written out of bounds.
+extern "C" int sk_qwen_forward_verify(sk_qwen_handle* hp,
+                                      const int* input_ids, uint32_t seq,
+                                      int* out_argmax) {
+    if (!hp || !input_ids || !out_argmax) return -1;
+    auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
+    if (seq == 0 || seq > h->cfg.seq_max) return -2;
+    if (h->cfg.batch != 1) return -5;
+    if (h->current_pos + seq > h->cfg.cache_max) return -4;
+
+    auto* q = sk::bindings_queue();
+    if (!q) return -3;
+
+    std::memcpy(h->bufs.input_ids->contents(), input_ids,
+                (size_t)seq * sizeof(int32_t));
+    int32_t* pos = (int32_t*)h->bufs.rope_pos->contents();
+    for (uint32_t i = 0; i < seq; ++i) pos[i] = (int32_t)(h->current_pos + i);
+
+    h->lm_head_all_rows = true;
+    int rc = meow::qwen::run_step(h, q, seq);
+    h->lm_head_all_rows = false;
+    if (rc) return rc;
+
+    // Host argmax over each of the `seq` logits rows (native __fp16 on arm64).
+    // V is large (~152k) but seq <= GEMM_SM_MAXM+1, so this is a few cheap
+    // linear scans \u2014 negligible next to the GPU forward.
+    const size_t V = h->cfg.vocab_size;
+    const __fp16* logits = (const __fp16*)h->bufs.logits->contents();
+    for (uint32_t r = 0; r < seq; ++r) {
+        const __fp16* row = logits + (size_t)r * V;
+        int best_i = 0;
+        float best_v = (float)row[0];
+        for (size_t v = 1; v < V; ++v) {
+            float fv = (float)row[v];
+            if (fv > best_v) { best_v = fv; best_i = (int)v; }
+        }
+        out_argmax[r] = best_i;
+    }
+    return 0;
+}
+
+extern "C" uint32_t sk_qwen_get_pos(sk_qwen_handle* hp) {
+    if (!hp) return 0;
+    return reinterpret_cast<meow::qwen::Handle*>(hp)->current_pos;
+}
+
+// Rewind (or set) current_pos after a verify forward accepts fewer than `seq`
+// tokens. Discards KV beyond `pos` implicitly: attention reads only kv_len =
+// current_pos, so the next forward overwrites the rejected slots. Clamped to
+// cache_max.
+extern "C" int sk_qwen_set_pos(sk_qwen_handle* hp, uint32_t pos) {
+    if (!hp) return -1;
+    auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
+    if (pos > h->cfg.cache_max) return -2;
+    h->current_pos = pos;
     return 0;
 }
 

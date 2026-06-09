@@ -1485,7 +1485,7 @@ inline void dispatch_model(
                                       MTL::Size(1024, 1, 1));
             enc->endEncoding();
         }
-    } else if (M.decode_all_rows) {
+    } else if (M.decode_all_rows && M.seq == 1u) {
         // Batched decode: argmax each request's logits row r → output_id[r].
         // One TG per row (the single-TG argmax PSO), all in one encoder.
         auto* enc = cmd->computeCommandEncoder();

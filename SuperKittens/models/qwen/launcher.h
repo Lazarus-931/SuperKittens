@@ -84,6 +84,17 @@ int  sk_qwen_generate_n(sk_qwen_handle* h,
 void sk_qwen_reset(sk_qwen_handle* h);
 void sk_qwen_destroy(sk_qwen_handle* h);
 
+// Prompt-lookup spec-decode verify forward: run `seq` (= K+1) tokens,
+// projecting the LM head at every position, and host-argmax each row into
+// out_argmax[seq]. out_argmax[i] is the greedy prediction at position i.
+// Advances current_pos by seq; caller rewinds via sk_qwen_set_pos to the
+// accepted length. Greedy/argmax only; batch=1.
+int  sk_qwen_forward_verify(sk_qwen_handle* h,
+                            const int* input_ids, uint32_t seq, int* out_argmax);
+// current_pos accessor + rewind for the verify/accept loop.
+uint32_t sk_qwen_get_pos(sk_qwen_handle* h);
+int      sk_qwen_set_pos(sk_qwen_handle* h, uint32_t pos);
+
 // Pipeline-parallel layer-range ABI (additive; forward/decode/prefill are
 // byte-identical). Split the forward across the layer dimension so a model
 // larger than one device fits across two, handing the fp16 residual stream

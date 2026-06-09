@@ -108,6 +108,12 @@ DENSE_ABI = {
                                         ctypes.c_uint32, ctypes.c_uint32,
                                         ctypes.c_int, ctypes.c_int], ctypes.c_int),
     "resident_weight_bytes":  optional([ctypes.c_void_p], ctypes.c_uint64),
+    # Prompt-lookup spec-decode verify (optional; absent in older dylibs).
+    "forward_verify":   optional([ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
+                                  ctypes.c_uint32, ctypes.POINTER(ctypes.c_int32)], ctypes.c_int),
+    "get_pos":          optional([ctypes.c_void_p], ctypes.c_uint32),
+    "set_pos":          optional([ctypes.c_void_p, ctypes.c_uint32], ctypes.c_int),
+
 }
 
 
@@ -383,6 +389,156 @@ class DenseDecoder(Model):
         rc = _load().sk_qwen_get_last_logits(self._h, out.ctypes.data)
         if rc: raise RuntimeError(f"sk_qwen_get_last_logits failed: {rc}")
         return out
+
+    # ---- Prompt-lookup speculative decoding -------------------------------
+    #
+    # No draft model: draft tokens are proposed by an n-gram lookup into the
+    # already-seen token sequence (prompt + generated). At each step the last
+    # `ngram` tokens are matched against the most recent earlier occurrence in
+    # the context; the K tokens that followed that match are the draft. One
+    # target verify forward at seq=K+1 (routed through the small-M GEMM path,
+    # seq 2..8) then greedily accepts the longest matching prefix + 1 bonus
+    # token. Output is byte-identical to plain greedy decode (exact spec-decode
+    # against argmax). When no n-gram matches, K=0 and the step is a plain T=1
+    # decode — so low-overlap workloads never regress below M=1.
+    @staticmethod
+    def _plookup_draft(ctx: list[int], ngram: int, k: int) -> list[int]:
+        """Most-recent n-gram match → up to k following tokens (or [] if none)."""
+        n = len(ctx)
+        if k <= 0 or ngram <= 0 or n < ngram + 1:
+            return []
+        suffix = ctx[n - ngram:]
+        # Search backward for the most recent earlier occurrence of `suffix`.
+        # i indexes the start of a candidate match; the match must end before
+        # the current suffix (i + ngram <= n - ngram) so the draft is real
+        # follow-on context, not the suffix itself.
+        for i in range(n - ngram - 1, -1, -1):
+            if ctx[i:i + ngram] == suffix:
+                draft = ctx[i + ngram:i + ngram + k]
+                if draft:
+                    return draft
+        return []
+
+    def generate_plookup(self, input_ids, *, max_new_tokens: int = 64,
+                         ngram: int = 3, k: int = 7,
+                         eos_id=None, eos_ids=None,
+                         stats: dict | None = None) -> list[int]:
+        """Greedy generation accelerated by prompt-lookup speculative decoding.
+
+        Lossless vs plain greedy. Returns the generated token ids. If `stats`
+        is a dict it is filled with {'steps', 'accepted', 'verify_calls',
+        'decode_calls'} for accept-length accounting.
+        """
+        lib = _load()
+        for sym in ("sk_qwen_forward_verify", "sk_qwen_get_pos", "sk_qwen_set_pos"):
+            if not hasattr(lib, sym):
+                raise RuntimeError(f"libsk.dylib missing {sym}; rebuild dylib")
+        # verify seq=k+1 must stay <= GEMM_SM_MAXM (8) to use the small-M matvec;
+        # k=7 (seq=8) is the M4 win config — the verify forward costs ~(k+1)x a
+        # decode (it barely amortizes at small M), so only a large k lets the
+        # accept length clear that floor on echo workloads. ngram=3 avoids the
+        # false-positive matches that a shorter n-gram fires on low-overlap text.
+        k = max(0, min(int(k), 7))
+        ngram = max(1, int(ngram))
+
+        ids = self._prepare_generate_ids(input_ids)
+        ids = np.ascontiguousarray(ids).reshape(-1)
+
+        stops = set()
+        if eos_ids:
+            stops |= {int(x) for x in eos_ids}
+        if eos_id is not None:
+            stops.add(int(eos_id))
+        if not stops and self.tokenizer is not None:
+            t_eos = getattr(self.tokenizer, "eos_ids", None)
+            if t_eos: stops |= {int(x) for x in t_eos}
+
+        self.reset()
+        # Prefill the prompt; first next-token is the prompt's argmax.
+        first = self.prefill_chunked(ids, chunk_size=0)
+        ctx = ids.tolist()            # full token context (prompt + generated)
+        out = [int(first)]
+        ctx.append(int(first))
+        n_steps = n_accepted = n_verify = n_decode = 0
+        if first in stops:
+            if stats is not None:
+                stats.update(steps=0, accepted=0, verify_calls=0, decode_calls=0)
+            return out
+
+        verify_in = np.empty((k + 1,), dtype=np.int32)
+        verify_out = np.empty((k + 1,), dtype=np.int32)
+
+        last = int(first)
+        while len(out) < max_new_tokens:
+            n_steps += 1
+            draft = self._plookup_draft(ctx, ngram, k)
+            if not draft:
+                # No n-gram match → plain T=1 greedy decode (M=1 path).
+                arr = np.array([last], dtype=np.int32)
+                a = self._forward(arr)
+                last = int(a[0])
+                out.append(last); ctx.append(last); n_decode += 1
+                if last in stops:
+                    break
+                continue
+
+            # Verify: input = [last] + draft (seq = len(draft)+1). The model
+            # predicts the next token at each position; verify_out[i] is the
+            # greedy token that should follow position i.
+            kk = len(draft)
+            seq = kk + 1
+            verify_in[0] = last
+            for j in range(kk):
+                verify_in[1 + j] = draft[j]
+            pos_before = int(lib.sk_qwen_get_pos(self._h))
+            rc = lib.sk_qwen_forward_verify(
+                self._h,
+                verify_in.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+                ctypes.c_uint32(seq),
+                verify_out.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)))
+            if rc:
+                raise RuntimeError(f"sk_qwen_forward_verify failed: {rc}")
+            n_verify += 1
+
+            # Greedy accept: verify_out[0] is the token after `last`. Accept
+            # draft[i] while it equals the model's prediction verify_out[i].
+            # The first mismatch's verify_out is the corrected token (the bonus).
+            n_acc = 0
+            while n_acc < kk and int(verify_out[n_acc]) == draft[n_acc]:
+                n_acc += 1
+            bonus = int(verify_out[n_acc])  # always valid: n_acc in [0, kk]
+            new_toks = draft[:n_acc] + [bonus]
+
+            # Rewind current_pos to discard rejected positions' KV. After the
+            # verify forward current_pos = pos_before + seq. We keep the input
+            # token (`last`, 1 slot) + n_acc accepted draft tokens; their KV is
+            # valid. pos_before already counts `last`'s slot was NOT yet in KV —
+            # verify wrote KV for all `seq` positions [pos_before .. +seq). The
+            # token at verify position i occupies KV slot pos_before+i. We keep
+            # slots [pos_before, pos_before + n_acc + 1) (input + accepted), so
+            # the next forward starts at pos_before + n_acc + 1.
+            keep_pos = pos_before + n_acc + 1
+            rc = lib.sk_qwen_set_pos(self._h, ctypes.c_uint32(keep_pos))
+            if rc:
+                raise RuntimeError(f"sk_qwen_set_pos failed: {rc}")
+
+            n_accepted += n_acc
+            stop_hit = False
+            for t in new_toks:
+                out.append(t); ctx.append(t)
+                if t in stops:
+                    stop_hit = True
+                    break
+                if len(out) >= max_new_tokens:
+                    break
+            last = out[-1]
+            if stop_hit or len(out) >= max_new_tokens:
+                break
+
+        if stats is not None:
+            stats.update(steps=n_steps, accepted=n_accepted,
+                         verify_calls=n_verify, decode_calls=n_decode)
+        return out[:max_new_tokens]
 
     def set_rope_tables(self, cos: np.ndarray, sin: np.ndarray) -> None:
         c = np.ascontiguousarray(cos, dtype=np.float16)
