@@ -176,6 +176,11 @@ struct LayerPSOs {
     MTL::ComputePipelineState* gemm_mma_q8_bf16   = nullptr;
     MTL::ComputePipelineState* gemm_mma_q4k_bf16  = nullptr;
     MTL::ComputePipelineState* gemm_mma_q6k_bf16  = nullptr;
+    // BM=64/NSG=4 larger-tile prefill GEMM (default; SK_GEMMA4_MMA_T64=0 reverts
+    // to the BM=32 *_bf16 kernels above). 14 KB tgmem -> ~2 threadgroups/core.
+    MTL::ComputePipelineState* gemm_mma_q8_bf16_t64n  = nullptr;
+    MTL::ComputePipelineState* gemm_mma_q4k_bf16_t64n = nullptr;
+    MTL::ComputePipelineState* gemm_mma_q6k_bf16_t64n = nullptr;
     MTL::ComputePipelineState* geglu_mul          = nullptr; // gelu(gate)*up elementwise (Q8 MLP)
 };
 
@@ -298,14 +303,22 @@ inline void dispatch_layer(
     // row. Flag SK_GEMMA4_PREFILL_MMA=0 forces the legacy per-row matvec.
     static const bool _prefill_mma =
         []{ const char* e = std::getenv("SK_GEMMA4_PREFILL_MMA"); return !e || e[0] != '0'; }();
+    // Larger-tile prefill GEMM (BM=64 NSG=4, halves W re-reads, ~2 TG/core) is the
+    // default; SK_GEMMA4_MMA_T64=0 reverts to the BM=32 *_bf16 kernels.
+    static const bool _mma_t64n =
+        []{ const char* e = std::getenv("SK_GEMMA4_MMA_T64"); return !e || e[0] != '0'; }();
     auto enc_body = [&](MTL::ComputeCommandEncoder* enc, BodyEnc e,
                         MTL::Buffer* A, size_t offA, MTL::Buffer* W, size_t offW,
                         MTL::Buffer* C, size_t offC,
                         uint32_t M, uint32_t N, uint32_t Kd, uint32_t ldC) {
         MTL::ComputePipelineState* gemm_pso =
-            (e == BodyEnc::Q6K) ? P.gemm_mma_q6k_bf16
-          : (e == BodyEnc::Q4K) ? P.gemm_mma_q4k_bf16
-                                : P.gemm_mma_q8_bf16;
+            _mma_t64n
+              ? ((e == BodyEnc::Q6K) ? P.gemm_mma_q6k_bf16_t64n
+               : (e == BodyEnc::Q4K) ? P.gemm_mma_q4k_bf16_t64n
+                                     : P.gemm_mma_q8_bf16_t64n)
+              : ((e == BodyEnc::Q6K) ? P.gemm_mma_q6k_bf16
+               : (e == BodyEnc::Q4K) ? P.gemm_mma_q4k_bf16
+                                     : P.gemm_mma_q8_bf16);
         if (_prefill_mma && M > 1 && gemm_pso != nullptr) {
             enc->setComputePipelineState(gemm_pso);
             enc->setBuffer(A, offA, 0);
@@ -315,9 +328,13 @@ inline void dispatch_layer(
             enc->setBytes(&N,   4, 4);
             enc->setBytes(&Kd,  4, 5);
             enc->setBytes(&ldC, 4, 6);
-            const uint32_t BM = 32, BN = 32;
+            // Must match the selected skg4mma tile shape in gemma4_gemm_mma.metal
+            // (BM=MR*8, BN=NSG*MC*8, NT=NSG*32): t64n BM=64 BN=32 NT=128, else 32/32/64.
+            const uint32_t BM = 64u >> (_mma_t64n ? 0 : 1);
+            const uint32_t BN = 32;
+            const uint32_t NT = _mma_t64n ? 128 : 64;
             enc->dispatchThreadgroups(MTL::Size((N + BN - 1) / BN, (M + BM - 1) / BM, 1),
-                                      MTL::Size(64, 1, 1));
+                                      MTL::Size(NT, 1, 1));
             return;
         }
         if (B.body_kquant) {

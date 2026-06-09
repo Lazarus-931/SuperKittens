@@ -85,6 +85,9 @@ static bool resolve_psos(ModelPSOs& P) {
     P.layer.gemm_mma_q8_bf16   = sk::bindings_pso("gemma4_gemm_mma_q8_bf16");
     P.layer.gemm_mma_q4k_bf16  = sk::bindings_pso("gemma4_gemm_mma_q4k_bf16");
     P.layer.gemm_mma_q6k_bf16  = sk::bindings_pso("gemma4_gemm_mma_q6k_bf16");
+    P.layer.gemm_mma_q8_bf16_t64n  = sk::bindings_pso("gemma4_gemm_mma_q8_bf16_t64n");
+    P.layer.gemm_mma_q4k_bf16_t64n = sk::bindings_pso("gemma4_gemm_mma_q4k_bf16_t64n");
+    P.layer.gemm_mma_q6k_bf16_t64n = sk::bindings_pso("gemma4_gemm_mma_q6k_bf16_t64n");
     P.layer.geglu_mul          = sk::bindings_pso("gemma4_geglu_mul");
     P.embedding_lookup     = sk::bindings_pso("embedding_lookup_bf16");
     P.embedding_lookup_q8  = sk::bindings_pso("embedding_lookup_q8_bf16");  // optional
