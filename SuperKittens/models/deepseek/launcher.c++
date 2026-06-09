@@ -102,6 +102,8 @@ static bool resolve_psos(ModelPSOs& P, uint32_t dk, uint32_t dv) {
     P.layer.rmsnorm        = sk::bindings_pso("rmsnorm");
     P.layer.rmsnorm_t1     = sk::bindings_pso("rmsnorm_t1");  // optional T=1 fast path
     P.layer.gemm           = sk::bindings_pso("gemm_fp16");
+    P.layer.gemv_f16       = std::getenv("SK_DS_NO_GEMV") ? nullptr
+                             : sk::bindings_pso("gemv_fp16_m1");  // M=1 fp16 matvec (dense-L0 MLP)
     P.layer.rope_tail      = sk::bindings_pso("kernel_dsv4_rope_tail_f32");
     P.layer.rope_interleave = sk::bindings_pso("rope_interleave_f32");
     P.layer.router_v3      = sk::bindings_pso("moe_router_v3");
