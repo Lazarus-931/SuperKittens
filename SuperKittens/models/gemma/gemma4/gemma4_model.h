@@ -1300,29 +1300,50 @@ inline void dispatch_model(
         // Then RMSnorm, combine with token-identity, scale by 1/sqrt(2).
         // HF modeling_gemma4.py:1779-1790 project_per_layer_inputs.
         {
-            auto* enc2 = cmd->computeCommandEncoder();
-            enc2->setComputePipelineState(P.layer.gemm);
             const uint32_t M_v = T;
             const uint32_t K_v = M.d_model;
             const uint32_t N_v = M.n_layers * M.ple_dim;   // 8960 for E2B
-            uint32_t ldA = K_v, ldB = N_v, ldC = N_v;
-            int transA = 0, transB = 0, has_bias = 0;
-            enc2->setBuffer(B.x_a,                          0, 0);
-            enc2->setBuffer(W.w_per_layer_model_projection, 0, 1);
-            enc2->setBuffer(B.ple_ctx_proj,                 0, 2);
-            enc2->setBytes(&M_v,     4, 3);
-            enc2->setBytes(&N_v,     4, 4);
-            enc2->setBytes(&K_v,     4, 5);
-            enc2->setBytes(&ldA,     4, 6);
-            enc2->setBytes(&ldB,     4, 7);
-            enc2->setBytes(&ldC,     4, 8);
-            enc2->setBytes(&transA,  4, 9);
-            enc2->setBytes(&transB,  4, 10);
-            enc2->setBytes(&has_bias,4, 11);
-            enc2->setBuffer(B.ple_ctx_proj, 0, 12);
-            enc2->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M_v + 63) / 64, 1),
-                                       MTL::Size(64, 1, 1));
-            enc2->endEncoding();
+            // T=1 decode: w_per_layer_model_projection is bf16 [K=d_model, N]
+            // row-major (transB=0) — the gemv_bf16_m1 layout (W[k*N+col]). At M=1
+            // the tile-MMA GEMM pads to 64 rows (63 wasted); the M=1 GEVM is the
+            // same native-matvec path the QKV/O/PLE-gate projections already take.
+            // SK_GEMMA4_PLE_CTX_GEMM=1 forces the old GEMM for byte-identical A/B.
+            static const bool _force_gemm =
+                (std::getenv("SK_GEMMA4_PLE_CTX_GEMM") != nullptr);
+            if (!_force_gemm && M_v == 1 && N_v <= 32768u
+                && P.layer.gemv_bf16_m1 != nullptr) {
+                auto* enc2 = cmd->computeCommandEncoder();
+                enc2->setComputePipelineState(P.layer.gemv_bf16_m1);
+                enc2->setBuffer(B.x_a,                          0, 0);
+                enc2->setBuffer(W.w_per_layer_model_projection, 0, 1);
+                enc2->setBuffer(B.ple_ctx_proj,                 0, 2);
+                enc2->setBytes(&N_v, 4, 3);
+                enc2->setBytes(&K_v, 4, 4);
+                enc2->dispatchThreadgroups(MTL::Size((N_v + 127) / 128, 1, 1),
+                                           MTL::Size(128, 1, 1));
+                enc2->endEncoding();
+            } else {
+                auto* enc2 = cmd->computeCommandEncoder();
+                enc2->setComputePipelineState(P.layer.gemm);
+                uint32_t ldA = K_v, ldB = N_v, ldC = N_v;
+                int transA = 0, transB = 0, has_bias = 0;
+                enc2->setBuffer(B.x_a,                          0, 0);
+                enc2->setBuffer(W.w_per_layer_model_projection, 0, 1);
+                enc2->setBuffer(B.ple_ctx_proj,                 0, 2);
+                enc2->setBytes(&M_v,     4, 3);
+                enc2->setBytes(&N_v,     4, 4);
+                enc2->setBytes(&K_v,     4, 5);
+                enc2->setBytes(&ldA,     4, 6);
+                enc2->setBytes(&ldB,     4, 7);
+                enc2->setBytes(&ldC,     4, 8);
+                enc2->setBytes(&transA,  4, 9);
+                enc2->setBytes(&transB,  4, 10);
+                enc2->setBytes(&has_bias,4, 11);
+                enc2->setBuffer(B.ple_ctx_proj, 0, 12);
+                enc2->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M_v + 63) / 64, 1),
+                                           MTL::Size(64, 1, 1));
+                enc2->endEncoding();
+            }
         }
         {
             auto* enc3 = cmd->computeCommandEncoder();
