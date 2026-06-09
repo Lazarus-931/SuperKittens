@@ -228,6 +228,22 @@ extern "C" sk_gemma4_handle* sk_gemma4_create(const sk_gemma4_config* cfg) {
             h->weights.w_lm_head_q8 = nullptr;
         }
     }
+    // Optional Q4_K LM head (SK_GEMMA4_LMHEAD_Q4K=1; default off). The head is
+    // the one large-N bandwidth-bound decode matvec, so Q4_K (0.23 GB E2B) over
+    // Q8_0 (0.43 GB) is a direct decode win. Separate buffer from the tied embed
+    // Q8 (no Q4_K embed-gather kernel; keep the input side clean). weights.c++
+    // quantizes the scaled bf16 head into it. d_model must be 256-block aligned.
+    {
+        const char* env = std::getenv("SK_GEMMA4_LMHEAD_Q4K");
+        const bool want_q4k = env && env[0] == '1';
+        if (want_q4k && (cfg->d_model % 256 == 0) && h->psos.layer.q4k_matvec_bf16) {
+            const size_t n_elems = (size_t)cfg->vocab_size * cfg->d_model;
+            const size_t q4k_bytes = (n_elems / 256) * 144;
+            h->weights.w_lm_head_q4k = alloc_zero(dev, q4k_bytes);
+        } else {
+            h->weights.w_lm_head_q4k = nullptr;
+        }
+    }
     // PLE table: Q8_0 by default (SK_GEMMA4_PLE_Q8=0 to keep bf16). Q8 is the
     // dominant E4B resident-memory win — the bf16 PLE table is ~5.6 GB at E4B
     // (vocab 262144 × n_layers 42 × ple_dim 256 × 2). Q8 ~3.0 GB; weights.c++
@@ -719,7 +735,8 @@ extern "C" void sk_gemma4_destroy(sk_gemma4_handle* hp) {
     auto* h = reinterpret_cast<meow::gemma4::Handle*>(hp);
 
     auto rel = [](MTL::Buffer* b) { if (b) b->release(); };
-    rel(h->weights.w_embed); rel(h->weights.w_lm_head_q8); rel(h->weights.w_ple_table);
+    rel(h->weights.w_embed); rel(h->weights.w_lm_head_q8); rel(h->weights.w_lm_head_q4k);
+    rel(h->weights.w_ple_table);
     rel(h->weights.w_ple_table_q8);
     rel(h->weights.w_per_layer_input_gate);
     rel(h->weights.w_per_layer_projection);

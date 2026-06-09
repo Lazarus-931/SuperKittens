@@ -338,10 +338,14 @@ extern "C" int sk_gemma4_load_from_store(sk_gemma4_handle* hp, sk::WeightStore* 
                 sk::quantize_q8_0_bf16(eb, n_embed,
                                        (uint8_t*)h->weights.w_lm_head_q8->contents());
             }
+            if (h->weights.w_lm_head_q4k) {
+                sk::quantize_q4_k_bf16(eb, n_embed,
+                                       (uint8_t*)h->weights.w_lm_head_q4k->contents());
+            }
         } else {
             // EMBED_Q8: w_embed dropped to save the bf16 table (~1.3 GB E4B).
-            if (!h->weights.w_lm_head_q8) {
-                std::fprintf(stderr, "gemma4 weights: EMBED_Q8 but no lm_head_q8\n");
+            if (!h->weights.w_lm_head_q8 && !h->weights.w_lm_head_q4k) {
+                std::fprintf(stderr, "gemma4 weights: EMBED_Q8 but no lm_head buffer\n");
                 return -10;
             }
             auto* v = store->get("model.language_model.embed_tokens.weight");
@@ -355,7 +359,8 @@ extern "C" int sk_gemma4_load_from_store(sk_gemma4_handle* hp, sk::WeightStore* 
                              v->nbytes, n_embed * src_elem);
                 return -10;
             }
-            auto* q8dst = (uint8_t*)h->weights.w_lm_head_q8->contents();
+            auto* q8dst  = h->weights.w_lm_head_q8  ? (uint8_t*)h->weights.w_lm_head_q8->contents()  : nullptr;
+            auto* q4kdst = h->weights.w_lm_head_q4k ? (uint8_t*)h->weights.w_lm_head_q4k->contents() : nullptr;
             const size_t ROWS = 4096;
             std::vector<uint16_t> row(ROWS * dm);
             for (size_t r0 = 0; r0 < (size_t)c.vocab_size; r0 += ROWS) {
@@ -364,7 +369,8 @@ extern "C" int sk_gemma4_load_from_store(sk_gemma4_handle* hp, sk::WeightStore* 
                 copy_bf16_from(row.data(), (const uint8_t*)v->data + e0 * src_elem,
                                v->dtype, ne);
                 scale_bf16_inplace(row.data(), ne, embed_scale);
-                sk::quantize_q8_0_bf16(row.data(), ne, q8dst + (e0 / 32) * 34);
+                if (q8dst)  sk::quantize_q8_0_bf16(row.data(), ne, q8dst  + (e0 / 32)  * 34);
+                if (q4kdst) sk::quantize_q4_k_bf16(row.data(), ne, q4kdst + (e0 / 256) * 144);
             }
         }
     }
@@ -663,9 +669,14 @@ extern "C" int sk_gemma4_load_gguf(sk_gemma4_handle* hp, const char* path) {
             auto* dst = (uint16_t*)h->weights.w_embed->contents();
             if (!deq_range(dst, 0, n_embed)) { std::fprintf(stderr, "gemma4 gguf: bad token_embd dtype\n"); return -11; }
             scale_bf16_inplace(dst, n_embed, esc);
+            if (h->weights.w_lm_head_q4k) {
+                sk::quantize_q4_k_bf16(dst, n_embed, (uint8_t*)h->weights.w_lm_head_q4k->contents());
+            }
         } else {
-            if (!h->weights.w_lm_head_q8) { std::fprintf(stderr, "gemma4 gguf: EMBED_Q8 but no lm_head_q8\n"); return -11; }
-            auto* q8dst = (uint8_t*)h->weights.w_lm_head_q8->contents();
+            if (!h->weights.w_lm_head_q8 && !h->weights.w_lm_head_q4k) {
+                std::fprintf(stderr, "gemma4 gguf: EMBED_Q8 but no lm_head buffer\n"); return -11; }
+            auto* q8dst  = h->weights.w_lm_head_q8  ? (uint8_t*)h->weights.w_lm_head_q8->contents()  : nullptr;
+            auto* q4kdst = h->weights.w_lm_head_q4k ? (uint8_t*)h->weights.w_lm_head_q4k->contents() : nullptr;
             const size_t ROWS = 4096;                 // tile: 4096*3840*2 = ~31 MB bf16
             std::vector<uint16_t> row(ROWS * dm);
             for (size_t r0 = 0; r0 < (size_t)c.vocab_size; r0 += ROWS) {
@@ -673,7 +684,8 @@ extern "C" int sk_gemma4_load_gguf(sk_gemma4_handle* hp, const char* path) {
                 const size_t e0 = r0 * dm, ne = nr * dm;
                 if (!deq_range(row.data(), e0, ne)) { std::fprintf(stderr, "gemma4 gguf: bad token_embd dtype\n"); return -11; }
                 scale_bf16_inplace(row.data(), ne, esc);
-                sk::quantize_q8_0_bf16(row.data(), ne, q8dst + (e0/32)*34);
+                if (q8dst)  sk::quantize_q8_0_bf16(row.data(), ne, q8dst  + (e0/32)*34);
+                if (q4kdst) sk::quantize_q4_k_bf16(row.data(), ne, q4kdst + (e0/256)*144);
             }
         }
     }
