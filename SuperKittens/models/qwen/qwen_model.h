@@ -1328,6 +1328,22 @@ inline void dispatch_model(
             enc->dispatchThreadgroups(MTL::Size((N_v + 1) / 2, 1, 1), MTL::Size(128, 1, 1));
             enc->endEncoding();
         } else
+        if (W.dt_lm_head == sk::Dtype::Q4_K && W.w_lm_head &&
+            P.layer.q4k_matvec != nullptr) {
+            // SK_QWEN_Q4K_HEAD: head requantized Q8_0→Q4_K at load (weights.c++).
+            // q4k_matvec shares the q8_0_matvec binding (B=0,A=1,C=2,K=3,N=4) and
+            // NR0=2 geometry, so this is the Q8 branch with the Q4_K PSO. Half the
+            // head bytes on the bandwidth-bound largest decode matvec.
+            auto* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(P.layer.q4k_matvec);
+            enc->setBuffer(nxt,           off_A,           0);
+            enc->setBuffer(W.w_lm_head,   W.off_w_lm_head, 1);
+            enc->setBuffer(B.logits,      off_C,           2);
+            enc->setBytes(&K_v, 4, 3);
+            enc->setBytes(&N_v, 4, 4);
+            enc->dispatchThreadgroups(MTL::Size((N_v + 1) / 2, 1, 1), MTL::Size(128, 1, 1));
+            enc->endEncoding();
+        } else
         if (W.dt_lm_head == sk::Dtype::Q6_K && W.w_lm_head &&
             P.layer.q6k_matvec != nullptr) {
             // Q4_K_M's output.weight is Q6_K; matvec straight from the quant
