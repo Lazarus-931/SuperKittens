@@ -76,7 +76,8 @@ def parse_metadata(path: str) -> dict:
 
 RT_PIPELINE     = 0xffffc05e   # newComputePipelineState — carries function name
 RT_RESOURCE     = 0xffffc00c   # labelObject — sets MTLBuffer label
-RT_NEW_BUFFER   = 0xffffc046   # newBufferWithLength:options:
+RT_NEW_BUFFER   = 0xffffc046   # newBufferWithLength:options: (older single-stream captures)
+RT_BUFFER_DESC  = 0xffffd803   # buffer descriptor (macOS 26 / Xcode 17 device-resources): handle+length+label in one record
 RT_CB           = 0xffffc013   # command buffer
 RT_ENCODER      = 0xffffc02d   # compute command encoder
 RT_SET_BUFFER   = 0xffffc030   # setBuffer:offset:atIndex:
@@ -89,6 +90,7 @@ RECORD_NAMES = {
     RT_PIPELINE: "computePipelineState",
     RT_RESOURCE: "labelObject",
     RT_NEW_BUFFER: "newBufferWithLength",
+    RT_BUFFER_DESC: "bufferDescriptor",
     RT_CB: "commandBuffer",
     RT_ENCODER: "computeCommandEncoder",
     RT_SET_BUFFER: "setBuffer",
@@ -173,6 +175,28 @@ def parse_resource(rec: Record) -> dict:
     return {"_kind": "resource", "label": label, "handle": handle}
 
 
+def parse_buffer_desc(rec: Record) -> dict | None:
+    """macOS 26 / Xcode 17 buffer descriptor (in device-resources) — handle, length, label in one record.
+
+    te='CU<b>ulul' (align=4 -> fields at offset 40): device(u64), label(C-string),
+    length(u64 @ fs+24), options(u64 @ fs+32), then a 4-byte tag + the buffer
+    handle (u64 @ fs+44). The setBuffer records in the capture stream reference
+    that same handle, so this is what links a binding index to its byte length.
+    """
+    te, fs = _parse_type_encoded(rec.payload, align=4)
+    if "ulul" not in te:
+        return None
+    pl = rec.payload
+    if fs + 52 > len(pl):
+        return None
+    label = _read_cstring(pl, fs + 8)
+    length = struct.unpack_from("<Q", pl, fs + 24)[0]
+    options = struct.unpack_from("<Q", pl, fs + 32)[0]
+    handle = struct.unpack_from("<Q", pl, fs + 44)[0]
+    return {"_kind": "bufferDesc", "handle": handle, "length": length,
+            "options": options, "label": label or None}
+
+
 def parse_cb(rec: Record) -> dict:
     return {"_kind": "commandBuffer", "label": _read_cstring(rec.payload, 40)}
 
@@ -222,17 +246,11 @@ def parse_capture(path: str) -> dict:
     """
     out: dict[str, Any] = {"command_buffers": [], "_record_counts": {}, "_unknown_record_types": {}}
 
+    # device-resources-* streams carry the buffer descriptors + (on macOS 26 /
+    # Xcode 17) the compute pipeline, so they must be walked BEFORE the capture
+    # stream's dispatch is bound — otherwise the function name and bound-buffer
+    # byte lengths are not yet known when the dispatch record is reached.
     sources: list[tuple[str, bytes]] = []
-    cpath = os.path.join(path, "capture")
-    upath = os.path.join(path, "unsorted-capture")
-    if os.path.exists(cpath):
-        with open(cpath, "rb") as f:
-            sources.append(("capture", f.read()))
-    elif os.path.exists(upath):
-        with open(upath, "rb") as f:
-            sources.append(("unsorted-capture", f.read()))
-
-    # Pre-existing / newly-created MTLBuffers can live in device-resources-* streams.
     for name in sorted(os.listdir(path)) if os.path.isdir(path) else []:
         if name.startswith("device-resources-") or name.startswith("delta-device-resources-"):
             fpath = os.path.join(path, name)
@@ -243,6 +261,15 @@ def parse_capture(path: str) -> dict:
                         sources.append((name, f.read()))
             except OSError:
                 pass
+
+    cpath = os.path.join(path, "capture")
+    upath = os.path.join(path, "unsorted-capture")
+    if os.path.exists(cpath):
+        with open(cpath, "rb") as f:
+            sources.append(("capture", f.read()))
+    elif os.path.exists(upath):
+        with open(upath, "rb") as f:
+            sources.append(("unsorted-capture", f.read()))
 
     if not sources:
         return out
@@ -276,6 +303,11 @@ def parse_capture(path: str) -> dict:
             if rec.type == RT_PIPELINE:
                 last_pipeline = parse_pipeline(rec)["function"]
 
+            elif rec.type == RT_BUFFER_DESC:
+                info = parse_buffer_desc(rec)
+                if info is not None:
+                    resources[info["handle"]] = info
+
             elif rec.type == RT_NEW_BUFFER:
                 info = parse_new_buffer(rec)
                 if info is not None:
@@ -289,6 +321,16 @@ def parse_capture(path: str) -> dict:
                     info["options"] = pending_new_buffer_options
                     pending_new_buffer_length = None
                     pending_new_buffer_options = None
+                # macOS 26: a bufferDescriptor already carries length+label for this
+                # handle, and labelObject arrives after with an empty label — merge
+                # so we never clobber a known length or a real label with the blank.
+                existing = resources.get(info["handle"])
+                if existing is not None:
+                    if not info.get("label"):
+                        info["label"] = existing.get("label")
+                    if info.get("length") is None:
+                        info["length"] = existing.get("length")
+                        info["options"] = existing.get("options")
                 resources[info["handle"]] = info
 
             elif rec.type == RT_CB:
