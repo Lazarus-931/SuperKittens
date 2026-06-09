@@ -15,6 +15,8 @@ namespace meow { namespace deepseek {
 // accumulators.
 Prof& prof() { static Prof p; return p; }
 
+int& moe_mma_override() { static int v = -1; return v; }
+
 struct Handle {
     sk_deepseek_config cfg;
     uint32_t           current_pos = 0;
@@ -145,6 +147,9 @@ static bool resolve_psos(ModelPSOs& P, uint32_t dk, uint32_t dv) {
         sk::bindings_library(), sk::bindings_device(), "deepseek_mul_mv_id_q4_K_grp");
     P.layer.moe_mv_down_grp = resolve_mvid_pso(
         sk::bindings_library(), sk::bindings_device(), "deepseek_mul_mv_id_q5_0_grp");
+    // T>1 MMA-tiled grouped MoE (simdgroup_float8x8); nullptr -> per-slot fallback.
+    P.layer.moe_mma_gate_grp = sk::bindings_pso("deepseek_moe_mma_q4k_grp");
+    P.layer.moe_mma_down_grp = sk::bindings_pso("deepseek_moe_mma_q5_0_grp");
     // Batched MMA GEMM (qwen kernel, shared) for T>1 dense projections.
     P.layer.gemm_mma_f16  = sk::bindings_pso("gemm_mma_f16");
     P.layer.gemm_mma_q4k  = sk::bindings_pso("gemm_mma_q4k");
@@ -401,6 +406,10 @@ extern "C" int sk_deepseek_load_weights(sk_deepseek_handle* hp,
     cp(h->weights.w_up,            w->w_up);
     cp(h->weights.w_down,          w->w_down);
     return 0;
+}
+
+extern "C" void sk_deepseek_set_moe_mma(int v) {
+    meow::deepseek::moe_mma_override() = v;
 }
 
 extern "C" void sk_deepseek_profile_report(uint64_t tokens) {

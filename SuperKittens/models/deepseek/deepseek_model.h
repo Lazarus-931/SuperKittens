@@ -50,6 +50,9 @@ struct Prof {
 // launcher.c++ and weights.c++ copies under -O3, so dispatch_model (inlined into
 // launcher.o) saw a different `on` flag than sk_deepseek_forward set.
 Prof& prof();
+// Runtime A/B override for the MMA-grouped MoE: -1 = use the SK_DS_NO_MOE_MMA
+// env default, 0/1 = force off/on (one process interleaves BASE vs MMA reps).
+int& moe_mma_override();
 
 // Commit `cmd`, wait, attribute its GPU time to `cat`, and reopen a fresh cmd
 // from the same queue. Only call when prof().on. `cmd` is always a retained
@@ -156,6 +159,8 @@ struct LayerPSOs {
     MTL::ComputePipelineState* gemm_mma_q8_0 = nullptr;
     MTL::ComputePipelineState* moe_mv_gate_grp = nullptr;   // T>1 grouped gate/up Q4_K matvec
     MTL::ComputePipelineState* moe_mv_down_grp = nullptr;   // T>1 grouped down Q5_0 matvec
+    MTL::ComputePipelineState* moe_mma_gate_grp = nullptr;  // T>1 MMA-tiled grouped gate/up Q4_K
+    MTL::ComputePipelineState* moe_mma_down_grp = nullptr;  // T>1 MMA-tiled grouped down Q5_0
     MTL::ComputePipelineState* cast_h2f;
     MTL::ComputePipelineState* cast_f2h;
     MTL::ComputePipelineState* causal_mask_fill;
@@ -1111,7 +1116,65 @@ inline void dispatch_layer(
         enc->endEncoding();
     };
 
-    if (use_grouped) {
+    // T>1 MMA-tiled grouped MoE (simdgroup_float8x8). The per-slot matvec is
+    // throughput-suboptimal vs an MMA tile AND was numerically wrong at T>1 (its
+    // last-row next-token disagreed with the trusted T=1 stepwise decode 4/5
+    // probes; the MMA path agrees). This reads each expert weight K-tile ONCE
+    // into TG mem and reuses it across the expert BM=32-row activation tile.
+    // gate/up Q4_K 1.81x, down Q5_0 2.45x, e2e prefill 1.43x(T=128)/1.80x(T=512).
+    // Default ON for T>1; SK_DS_NO_MOE_MMA=1 escapes. T==1 decode never reaches here.
+    static const bool g_moe_mma_env = (std::getenv("SK_DS_NO_MOE_MMA") == nullptr);
+    const int ovr = meow::deepseek::moe_mma_override();
+    const bool g_moe_mma = (ovr < 0) ? g_moe_mma_env : (ovr != 0);
+    const bool use_mma_grp = (g_moe_mma && T > 1 &&
+                              P.moe_group_build && P.moe_mma_gate_grp && P.moe_mma_down_grp &&
+                              B.moe_group_off && B.moe_group_slots);
+
+    auto encode_moe_mma_grp = [&](MTL::ComputePipelineState* pso, bool is_q4k,
+                                  MTL::Buffer* w, size_t w_off, MTL::Buffer* src1,
+                                  MTL::Buffer* dst, uint32_t in_dim, uint32_t out_rows) {
+        const uint32_t blk_w = is_q4k ? 256u : 32u;
+        const uint64_t blk_b = is_q4k ? 144u : 22u;
+        const uint64_t nb01  = (uint64_t)(in_dim / blk_w) * blk_b;   // weight row stride
+        const uint64_t nb02  = (uint64_t)out_rows * nb01;            // expert slab stride
+        constexpr uint32_t BM = 32, BN = 32, NSG = 2;
+        const uint32_t mtiles = (T * p.top_k + BM - 1) / BM;
+        auto* enc = cmd->computeCommandEncoder();
+        enc->setComputePipelineState(pso);
+        enc->setBuffer(w,    w_off, 0);
+        enc->setBuffer(src1, 0,     1);
+        enc->setBuffer(dst,  0,     2);
+        enc->setBuffer(B.moe_group_off,   0, 3);
+        enc->setBuffer(B.moe_group_slots, 0, 4);
+        enc->setBytes(&in_dim,   4, 5);
+        enc->setBytes(&out_rows, 4, 6);
+        enc->setBytes(&p.top_k,  4, 7);
+        enc->setBytes(&nb01, 8, 8);
+        enc->setBytes(&nb02, 8, 9);
+        enc->dispatchThreadgroups(
+            MTL::Size((out_rows + BN - 1) / BN, p.n_expert, mtiles),
+            MTL::Size(32 * NSG, 1, 1));
+        enc->endEncoding();
+    };
+
+    if (use_mma_grp) {
+        // 1. counting sort: moe_top_idx [T*top_k] -> group_off/group_slots
+        const uint32_t n_slots = T * p.top_k;
+        auto* benc = cmd->computeCommandEncoder();
+        benc->setComputePipelineState(P.moe_group_build);
+        benc->setBuffer(B.moe_top_idx,    0, 0);
+        benc->setBuffer(B.moe_group_off,  0, 1);
+        benc->setBuffer(B.moe_group_slots,0, 2);
+        benc->setBytes(&n_slots, 4, 3);
+        benc->setThreadgroupMemoryLength(64 * sizeof(int), 0);
+        benc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(64, 1, 1));
+        benc->endEncoding();
+        // 2. MMA-tiled grouped gate/up
+        encode_moe_mma_grp(P.moe_mma_gate_grp, true, B.w_gate, (size_t)L * gate_layer,
+                           B.moe_x_f32, B.moe_gate_f32, p.d_model, p.n_int);
+        encode_moe_mma_grp(P.moe_mma_gate_grp, true, B.w_up,   (size_t)L * gate_layer,
+                           B.moe_x_f32, B.moe_up_f32,   p.d_model, p.n_int);
+    } else if (use_grouped) {
         // 1. counting sort: moe_top_idx [T*top_k] -> group_off/group_slots
         const uint32_t n_slots = T * p.top_k;
         auto* benc = cmd->computeCommandEncoder();
@@ -1151,7 +1214,10 @@ inline void dispatch_layer(
     }
     PROF_MARK(cmd, "moe_swiglu");
 
-    if (use_grouped) {
+    if (use_mma_grp) {
+        encode_moe_mma_grp(P.moe_mma_down_grp, false, B.w_down, (size_t)L * down_layer,
+                           B.moe_mid_f32, B.moe_down_f32, p.n_int, p.d_model);
+    } else if (use_grouped) {
         encode_mv_id_grp(P.moe_mv_down_grp, false, B.w_down, (size_t)L * down_layer,
                          B.moe_mid_f32, B.moe_down_f32, p.n_int, p.d_model);
     } else {
