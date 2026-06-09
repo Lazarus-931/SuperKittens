@@ -57,6 +57,12 @@ sk_qwen_handle* sk_qwen_create(const sk_qwen_config* cfg);
 int  sk_qwen_load_weights(sk_qwen_handle* h, const sk_qwen_weights* w);
 int  sk_qwen_forward(sk_qwen_handle* h,
                      const int* input_ids, uint32_t seq, int* output_id);
+// Batched lockstep decode: input_ids is batch*seq int32 (request-major), output_id
+// receives `batch` greedy next tokens (one per request). All requests advance from
+// the same absolute position; each reads/writes its own KV-cache slice. Requires
+// the handle to have been created with cfg.batch == N.
+int  sk_qwen_forward_batched(sk_qwen_handle* h,
+                             const int* input_ids, uint32_t seq, int* output_id);
 // Chunked prefill: process prompt_ids in fixed-size chunks (<= chunk_size, and
 // <= seq_max) through the per-step model forward, carrying KV cache + position
 // across chunks. Lets a prompt longer than seq_max prefill with scratch bounded

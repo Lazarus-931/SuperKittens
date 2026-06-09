@@ -482,7 +482,7 @@ inline void encode_rope_qk_inplace(
     MTL::Buffer* cos_tbl, size_t cos_off,
     MTL::Buffer* sin_tbl, size_t sin_off,
     uint32_t seq, uint32_t n_heads, uint32_t head_dim,
-    bool barrier_before = true)
+    bool barrier_before = true, uint32_t batch = 1)
 {
     if (barrier_before) enc_barrier(enc);
     enc->setComputePipelineState(pso);
@@ -493,9 +493,13 @@ inline void encode_rope_qk_inplace(
     enc->setBytes(&seq,      4, 4);
     enc->setBytes(&head_dim, 4, 5);
     enc->setBytes(&n_heads,  4, 6);
+    // n_rows = batch*seq. The Q/K buffer is [batch*seq, n_heads, D]; each row's
+    // rotation position is (row % seq). For batch=1 this is seq (path unchanged).
+    const uint32_t n_rows = batch * seq;
+    enc->setBytes(&n_rows,   4, 7);
     const uint32_t hd4 = (head_dim / 2) / 4;
     const uint32_t rows_per_tg = (hd4 > 0) ? (1024u / hd4) : 1u;
-    const uint32_t row_blocks = (seq + rows_per_tg - 1) / rows_per_tg;
+    const uint32_t row_blocks = (n_rows + rows_per_tg - 1) / rows_per_tg;
     enc->dispatchThreadgroups(
         MTL::Size(n_heads, row_blocks, 1),
         MTL::Size(hd4, rows_per_tg, 1));
@@ -595,11 +599,12 @@ inline void dispatch_layer(
             (p.rope_interleaved && P.rope_qk_il) ? P.rope_qk_il : P.rope_qk;
         encode_rope_qk_inplace(enc, rope_pso, B.q,
                                B.cos_tbl, cs_off, B.sin_tbl, cs_off,
-                               p.seq, p.n_heads, hd);
+                               p.seq, p.n_heads, hd,
+                               /*barrier_before=*/true, p.batch);
         encode_rope_qk_inplace(enc, rope_pso, B.k_tmp,
                                B.cos_tbl, cs_off, B.sin_tbl, cs_off,
                                p.seq, p.n_kv_heads, hd,
-                               /*barrier_before=*/false);
+                               /*barrier_before=*/false, p.batch);
     }
 
     // Profiling-only stage gates (seq>1 prefill only; decode untouched). Diff
@@ -963,6 +968,11 @@ struct ModelParams {
     float    rope_beta_fast   = 32.f;
     float    rope_beta_slow   = 1.f;
 
+    // Batched-decode: when set (seq==1, batch=N>1 lockstep-decode), the LM head
+    // projects ALL T=batch rows and argmax writes output_id[0..T]. Default 0
+    // keeps the single-row (last-position) decode/prefill path byte-identical.
+    uint32_t decode_all_rows = 0;
+
     // Debug knobs (default = full model, no capture)
     uint32_t layers_run     = 0;   // 0 → all n_layers; else only first N
     int32_t  capture_layer  = -1;  // if >=0, copy post-layer residual to capture_buf
@@ -1242,8 +1252,46 @@ inline void dispatch_model(
     // batch=1 buffer (OOB — the recurring logits-sizing bug). The result is
     // written to logits row T-1 so get_last_logits (reads logits row
     // last_seq-1 == T-1) and the argmax below both land on it.
-    {
-        const uint32_t last = T - 1u;
+    // Batched-decode (decode_all_rows): project every one of the T=batch rows so
+    // each request gets its own logits row. The M=1 / prefill default projects
+    // only row T-1 (row_lo=T-1). One matvec per row reuses the same head weight
+    // read across rows just like the per-row decode it mirrors.
+    const uint32_t head_row_lo = M.decode_all_rows ? 0u : (T - 1u);
+    // Batched-decode LM-head amortization: a per-row loop re-reads the (large)
+    // head weight T times — for a tied small model the head is ~25% of weight
+    // bytes, so the serial loop is the throughput-scaling bottleneck. When an MMA
+    // GEMM exists for the head dtype, run ONE [T,K]·[N,K] GEMM so the head weight
+    // is read once and applied to all T rows (the same bandwidth-amortization the
+    // layer projections get from gemm_sm). Falls back to the per-row loop below
+    // when no MMA path is available for the dtype.
+    bool head_batched = false;
+    if (M.decode_all_rows && T > 1u) {
+        MTL::Buffer* w_head = W.w_lm_head ? W.w_lm_head : W.w_embed;
+        const size_t off_head = W.w_lm_head ? W.off_w_lm_head : 0;
+        MTL::ComputePipelineState* head_mma =
+            (W.dt_lm_head == sk::Dtype::Q8_0 && W.w_lm_head) ? P.layer.gemm_mma_q8_0
+            : (W.dt_lm_head == sk::Dtype::Q4_K && W.w_lm_head) ? P.layer.gemm_mma_q4k
+            : (W.dt_lm_head == sk::Dtype::F16 || !W.w_lm_head) ? P.layer.gemm_mma_f16
+            : nullptr;
+        MTL::ComputePipelineState* head_sm =
+            (W.dt_lm_head == sk::Dtype::Q8_0 && W.w_lm_head) ? P.layer.gemm_mma_q8_0_sm
+            : nullptr;
+        const uint32_t K_v = M.d_model, N_v = M.vocab_size;
+        if (head_sm && gemm_sm_wins(W.dt_lm_head, T)) {
+            auto* enc = cmd->computeCommandEncoder();
+            encode_gemm_sm(enc, head_sm, nxt, 0, w_head, off_head,
+                           B.logits, 0, T, N_v, K_v, N_v);
+            enc->endEncoding();
+            head_batched = true;
+        } else if (head_mma) {
+            auto* enc = cmd->computeCommandEncoder();
+            encode_gemm_mma(enc, head_mma, nxt, 0, w_head, off_head,
+                            B.logits, 0, T, N_v, K_v, N_v);
+            enc->endEncoding();
+            head_batched = true;
+        }
+    }
+    for (uint32_t last = head_row_lo; !head_batched && last < T; ++last) {
         const uint32_t M_v = 1u, K_v = M.d_model, N_v = M.vocab_size;
         const size_t   off_A = (size_t)last * K_v * 2;
         const size_t   off_C = (size_t)last * N_v * 2;
@@ -1370,6 +1418,18 @@ inline void dispatch_model(
                                       MTL::Size(1024, 1, 1));
             enc->endEncoding();
         }
+    } else if (M.decode_all_rows) {
+        // Batched decode: argmax each request's logits row r → output_id[r].
+        // One TG per row (the single-TG argmax PSO), all in one encoder.
+        auto* enc = cmd->computeCommandEncoder();
+        enc->setComputePipelineState(P.argmax);
+        for (uint32_t r = 0; r < T; ++r) {
+            enc->setBuffer(B.logits,    (size_t)r * M.vocab_size * 2, 0);
+            enc->setBuffer(B.output_id, (size_t)r * sizeof(int32_t), 1);
+            enc->setBytes(&M.vocab_size, 4, 2);
+            enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(1024, 1, 1));
+        }
+        enc->endEncoding();
     } else {
         // Section D wrote only the last position's logits (row T-1). Argmax that
         // one row → output_id[0]. The logits base is offset to row T-1 so the

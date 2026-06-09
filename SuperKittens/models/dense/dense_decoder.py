@@ -79,6 +79,8 @@ DENSE_ABI = {
     "load_weights":     ([ctypes.c_void_p, ctypes.POINTER(_Weights)], ctypes.c_int),
     "forward":          ([ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
                           ctypes.c_uint32, ctypes.POINTER(ctypes.c_int32)], ctypes.c_int),
+    "forward_batched":  optional([ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
+                          ctypes.c_uint32, ctypes.POINTER(ctypes.c_int32)], ctypes.c_int),
     "prefill_chunked":  optional([ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
                                   ctypes.c_uint32, ctypes.c_uint32,
                                   ctypes.POINTER(ctypes.c_int32)], ctypes.c_int),
@@ -244,6 +246,27 @@ class DenseDecoder(Model):
         if rc: raise RuntimeError(f"forward failed: {rc}")
         self._last_token = int(out[0])
         return self._last_token
+
+    def forward_batched(self, input_ids) -> np.ndarray:
+        """Batched lockstep decode: (batch, seq) int32 ids -> (batch,) next tokens.
+
+        All `batch` requests advance from the same position; each reads/writes its
+        own KV-cache slice. Requires cfg.batch == batch and the dylib to export
+        sk_qwen_forward_batched. Returns one greedy next token per request.
+        """
+        lib = _load()
+        if not hasattr(lib, "sk_qwen_forward_batched"):
+            raise RuntimeError("libsk.dylib has no sk_qwen_forward_batched symbol; rebuild dylib")
+        ids = np.ascontiguousarray(np.asarray(input_ids, dtype=np.int32)).reshape(-1)
+        seq = ids.size // self.cfg.batch
+        out = np.empty((self.cfg.batch,), dtype=np.int32)
+        rc = lib.sk_qwen_forward_batched(
+            self._h,
+            ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            seq,
+            out.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)))
+        if rc: raise RuntimeError(f"forward_batched failed: {rc}")
+        return out
 
     def prefill_chunked(self, input_ids, *, chunk_size: int = 0) -> int:
         """Prefill a prompt in fixed-size chunks, carrying KV + position across.

@@ -384,6 +384,7 @@ extern "C" void sk_qwen_reset(sk_qwen_handle* hp) {
 
 namespace meow { namespace qwen {
 static int run_step(Handle* h, MTL::CommandQueue* q, uint32_t seq);
+static int run_step_batched(Handle* h, MTL::CommandQueue* q, uint32_t seq);
 
 // WHY: one-step driver shared between sk_qwen_forward and the in-C decode
 // loop. Caller has already memcpy'd input_ids + rope_pos for `seq` tokens.
@@ -479,6 +480,50 @@ static int run_step(Handle* h, MTL::CommandQueue* q, uint32_t seq) {
     h->current_pos += seq;
     return 0;
 }
+
+// Batched lockstep decode: identical to run_step but sets decode_all_rows so the
+// LM head + argmax produce one output per batch row. All N requests advance from
+// the same current_pos (lockstep), each reading its own KV-cache slice.
+static int run_step_batched(Handle* h, MTL::CommandQueue* q, uint32_t seq) {
+    ModelParams mp;
+    mp.batch          = h->cfg.batch;
+    mp.seq            = seq;
+    mp.n_layers       = h->cfg.n_layers;
+    mp.d_model        = h->cfg.d_model;
+    mp.n_heads        = h->cfg.n_heads;
+    mp.n_kv_heads     = h->cfg.n_kv_heads;
+    mp.head_dim       = h->cfg.head_dim;
+    mp.n_int          = h->cfg.n_int;
+    mp.cache_max      = h->cfg.cache_max;
+    mp.vocab_size     = h->cfg.vocab_size;
+    mp.eps            = h->cfg.eps;
+    mp.use_qk_norm    = h->cfg.use_qk_norm;
+    mp.rope_interleaved = h->cfg.rope_interleaved;
+    mp.current_pos    = h->current_pos;
+    mp.rope_n_ctx_orig = h->cfg.rope_n_ctx_orig;
+    mp.rope_freq_base  = h->cfg.rope_freq_base;
+    mp.rope_freq_scale = h->cfg.rope_freq_scale;
+    mp.rope_ext_factor = h->cfg.rope_ext_factor;
+    mp.rope_attn_factor = h->cfg.rope_attn_factor;
+    mp.rope_beta_fast  = h->cfg.rope_beta_fast;
+    mp.rope_beta_slow  = h->cfg.rope_beta_slow;
+    mp.layers_run      = h->layers_run;
+    mp.capture_layer   = h->capture_layer;
+    mp.kv_q8           = h->kv_q8;
+    mp.decode_all_rows = 1u;
+    h->last_seq        = seq;
+
+    auto* cmd = q->commandBuffer();
+    dispatch_model(cmd, h->psos, h->weights, h->bufs, mp);
+    cmd->commit();
+    cmd->waitUntilCompleted();
+    if (getenv("SK_QWEN_GPUPROF"))
+        std::fprintf(stderr, "[gpuprof] gpu_busy_us=%.1f\n",
+                     (cmd->GPUEndTime() - cmd->GPUStartTime()) * 1e6);
+    cmd->release();
+    h->current_pos += seq;
+    return 0;
+}
 }}  // namespace meow::qwen
 
 extern "C" int sk_qwen_forward(sk_qwen_handle* hp,
@@ -499,6 +544,36 @@ extern "C" int sk_qwen_forward(sk_qwen_handle* hp,
     for (uint32_t i = 0; i < seq; ++i) pos[i] = (int32_t)(h->current_pos + i);
 
     int rc = meow::qwen::run_step(h, q, seq);
+    if (rc) return rc;
+
+    std::memcpy(output_id, h->bufs.output_id->contents(),
+                (size_t)h->cfg.batch * sizeof(int32_t));
+    return 0;
+}
+
+// Batched lockstep decode. input_ids is batch*seq int32 (request-major: row r is
+// request r's seq tokens); output_id receives `batch` int32 (one greedy next
+// token per request). All requests share the same absolute position (current_pos)
+// and step together; each reads/writes its own KV-cache slice. seq is per-request.
+extern "C" int sk_qwen_forward_batched(sk_qwen_handle* hp,
+                                       const int* input_ids, uint32_t seq,
+                                       int* output_id) {
+    if (!hp || !input_ids || !output_id) return -1;
+    auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
+    if (seq == 0 || seq > h->cfg.seq_max) return -2;
+    if (h->current_pos + seq > h->cfg.cache_max) return -4;
+    if (h->cfg.batch < 1) return -5;
+
+    auto* q = sk::bindings_queue();
+    if (!q) return -3;
+
+    std::memcpy(h->bufs.input_ids->contents(), input_ids,
+                (size_t)h->cfg.batch * seq * sizeof(int32_t));
+
+    int32_t* pos = (int32_t*)h->bufs.rope_pos->contents();
+    for (uint32_t i = 0; i < seq; ++i) pos[i] = (int32_t)(h->current_pos + i);
+
+    int rc = meow::qwen::run_step_batched(h, q, seq);
     if (rc) return rc;
 
     std::memcpy(output_id, h->bufs.output_id->contents(),
