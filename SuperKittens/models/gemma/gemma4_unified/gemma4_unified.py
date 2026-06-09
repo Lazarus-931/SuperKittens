@@ -76,7 +76,7 @@ class Gemma4Unified(Gemma4):
 
     @classmethod
     def from_spec(cls, spec, **overrides) -> "Gemma4Unified":
-        sk_root = Path(__file__).resolve().parents[3]
+        sk_root = Path(__file__).resolve().parents[4]
         snap = Path(overrides.pop("snapshot", None)
                     or (sk_root / "SuperKittens" / "model_weights" / spec.weight_dir))
 
