@@ -216,23 +216,12 @@ extern "C" sk_gemma4_handle* sk_gemma4_create(const sk_gemma4_config* cfg) {
     // SK_GEMMA4_LMHEAD_Q8=0 to keep the bf16 fallback (and skip the ~400 MB
     // alloc for E2B). Populated by weights.c++ when the bf16 lm_head is
     // available (tied with embed_tokens for gemma4). Forced on when EMBED_Q8.
-    {
-        const char* env = std::getenv("SK_GEMMA4_LMHEAD_Q8");
-        const bool want_q8 = embed_q8 || !env || (env[0] != '0');
-        if (want_q8 && (cfg->d_model % 32 == 0) && h->psos.layer.q8_0_matvec_bf16) {
-            const size_t n_elems  = (size_t)cfg->vocab_size * cfg->d_model;
-            const size_t n_blocks = n_elems / 32;
-            const size_t q8_bytes = n_blocks * 34;
-            h->weights.w_lm_head_q8 = alloc_zero(dev, q8_bytes);
-        } else {
-            h->weights.w_lm_head_q8 = nullptr;
-        }
-    }
     // Optional Q4_K LM head (SK_GEMMA4_LMHEAD_Q4K=1; default off). The head is
     // the one large-N bandwidth-bound decode matvec, so Q4_K (0.23 GB E2B) over
-    // Q8_0 (0.43 GB) is a direct decode win. Separate buffer from the tied embed
-    // Q8 (no Q4_K embed-gather kernel; keep the input side clean). weights.c++
-    // quantizes the scaled bf16 head into it. d_model must be 256-block aligned.
+    // Q8_0 (0.43 GB) is a direct decode win (isolated head matvec 1.87x; same
+    // ~108 GB/s, win = bytes). Separate buffer from the tied embed Q8 (no Q4_K
+    // embed-gather kernel; keep the input side clean). weights.c++ quantizes the
+    // scaled bf16 head into it. d_model must be 256-block aligned.
     {
         const char* env = std::getenv("SK_GEMMA4_LMHEAD_Q4K");
         const bool want_q4k = env && env[0] == '1';
@@ -242,6 +231,22 @@ extern "C" sk_gemma4_handle* sk_gemma4_create(const sk_gemma4_config* cfg) {
             h->weights.w_lm_head_q4k = alloc_zero(dev, q4k_bytes);
         } else {
             h->weights.w_lm_head_q4k = nullptr;
+        }
+    }
+    {
+        const char* env = std::getenv("SK_GEMMA4_LMHEAD_Q8");
+        // When the Q4_K head is on it serves the head matvec, so the Q8 head is
+        // only still needed for the tied embed lookup (embed_q8). Skip the
+        // redundant 0.43 GB Q8 head alloc otherwise.
+        bool want_q8 = embed_q8 || !env || (env[0] != '0');
+        if (h->weights.w_lm_head_q4k && !embed_q8) want_q8 = false;
+        if (want_q8 && (cfg->d_model % 32 == 0) && h->psos.layer.q8_0_matvec_bf16) {
+            const size_t n_elems  = (size_t)cfg->vocab_size * cfg->d_model;
+            const size_t n_blocks = n_elems / 32;
+            const size_t q8_bytes = n_blocks * 34;
+            h->weights.w_lm_head_q8 = alloc_zero(dev, q8_bytes);
+        } else {
+            h->weights.w_lm_head_q8 = nullptr;
         }
     }
     // PLE table: Q8_0 by default (SK_GEMMA4_PLE_Q8=0 to keep bf16). Q8 is the
