@@ -1450,9 +1450,19 @@ inline void dispatch_model(
                    nxt, T, M.d_model, M.eps, P.layer.rmsnorm_t1);
 
     {
-        const uint32_t M_v = T;
+        // PREFILL last-row LM head: sk_deepseek_forward returns only the argmax of
+        // the LAST position (argmax reads logits[(T-1)*vocab]); positions 0..T-2
+        // are never consumed. Compute the head for that one row only (M_v=1 over
+        // the last RMSNorm row), writing logits at the last-row offset so argmax
+        // is unchanged → byte-identical next-token, T cheaper (~T×) head GEMM.
+        // T==1 is the existing path (M_v=1, row 0). SK_DS_NO_LMHEAD_LAST escapes.
+        static const bool g_lmhead_all = (std::getenv("SK_DS_NO_LMHEAD_LAST") != nullptr);
+        const bool last_only = (!g_lmhead_all && T > 1u);
+        const uint32_t M_v = last_only ? 1u : T;
         const uint32_t K_v = M.d_model;
         const uint32_t N_v = M.vocab_size;
+        const size_t row_off_x = last_only ? (size_t)(T - 1) * M.d_model * 2 : 0;
+        const size_t row_off_c = last_only ? (size_t)(T - 1) * (size_t)N_v * 2 : 0;
         MTL::Buffer* lm = W.w_lm_head ? W.w_lm_head : W.w_embed;
         MTL::ComputePipelineState* lm_q = ds_quant_matvec_pso(P.layer, W.dt_lm_head);
         if (lm_q) {
@@ -1460,21 +1470,21 @@ inline void dispatch_model(
             // the same orientation the fp16 transB=1 GEMM used — so the quant
             // head is numerically identical to the fp16-dequant head, just
             // dequantized in-kernel (qwen Q6_K-LM-head pattern).
-            encode_quant_matvec(cmd, lm_q, lm, 0, nxt, 0, B.logits, 0, M_v, N_v, K_v);
+            encode_quant_matvec(cmd, lm_q, lm, 0, nxt, row_off_x, B.logits, row_off_c, M_v, N_v, K_v);
         } else {
             auto* enc = cmd->computeCommandEncoder();
             enc->setComputePipelineState(P.layer.gemm);
             uint32_t ldA = K_v, ldB = K_v, ldC = N_v;
             int transA = 0, transB = 1, has_bias = 0;
-            enc->setBuffer(nxt,        0, 0);
-            enc->setBuffer(lm,         0, 1);
-            enc->setBuffer(B.logits,   0, 2);
+            enc->setBuffer(nxt,        row_off_x, 0);
+            enc->setBuffer(lm,         0,         1);
+            enc->setBuffer(B.logits,   row_off_c, 2);
             enc->setBytes(&M_v,      4, 3); enc->setBytes(&N_v,      4, 4);
             enc->setBytes(&K_v,      4, 5); enc->setBytes(&ldA,      4, 6);
             enc->setBytes(&ldB,      4, 7); enc->setBytes(&ldC,      4, 8);
             enc->setBytes(&transA,   4, 9); enc->setBytes(&transB,   4, 10);
             enc->setBytes(&has_bias, 4, 11);
-            enc->setBuffer(B.logits, 0, 12);
+            enc->setBuffer(B.logits, row_off_c, 12);
             enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M_v + 63) / 64, 1),
                                       MTL::Size(64, 1, 1));
             enc->endEncoding();
