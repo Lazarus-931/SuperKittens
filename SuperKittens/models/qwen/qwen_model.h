@@ -495,12 +495,13 @@ inline void encode_bias_add(
 inline void encode_transpose(
     MTL::ComputeCommandEncoder* enc, MTL::ComputePipelineState* pso,
     MTL::Buffer* src, MTL::Buffer* dst,
-    uint32_t T, uint32_t H, uint32_t D)
+    uint32_t T, uint32_t H, uint32_t D,
+    size_t off_src = 0, size_t off_dst = 0, bool barrier_before = true)
 {
-    enc_barrier(enc);
+    if (barrier_before) enc_barrier(enc);
     enc->setComputePipelineState(pso);
-    enc->setBuffer(src, 0, 0);
-    enc->setBuffer(dst, 0, 1);
+    enc->setBuffer(src, off_src, 0);
+    enc->setBuffer(dst, off_dst, 1);
     enc->setBytes(&T, 4, 2);
     enc->setBytes(&H, 4, 3);
     enc->setBytes(&D, 4, 4);
@@ -659,9 +660,29 @@ inline void dispatch_layer(
     MTL::Buffer* k_in = B.k_tmp;
     MTL::Buffer* v_in = B.v_tmp;
     if (p.seq > 1 && !prof_skip_xpose) {
-        encode_transpose(enc, P.t_seq_to_head, B.q,     B.q_th, p.seq, p.n_heads,    hd);
-        encode_transpose(enc, P.t_seq_to_head, B.k_tmp, B.k_th, p.seq, p.n_kv_heads, hd);
-        encode_transpose(enc, P.t_seq_to_head, B.v_tmp, B.v_th, p.seq, p.n_kv_heads, hd);
+        if (p.batch > 1) {
+            // Batched prefill: lanes are independent [seq,H,D] blocks and the
+            // consumers (kv_cache_write, mha_causal) index (B,H,seq,D), so each
+            // lane transposes within its own slab. A single (T=batch*seq)
+            // transpose would interleave lanes' rows into one head-major block,
+            // which is the seq>1 batched corruption this loop fixes. Lane byte
+            // offset is the same for src and dst (seq*H*D elems either way).
+            const size_t q_lane  = (size_t)p.seq * p.n_heads    * hd * 2;
+            const size_t kv_lane = (size_t)p.seq * p.n_kv_heads * hd * 2;
+            for (uint32_t b = 0; b < p.batch; ++b) {
+                const bool bar = (b == 0);
+                encode_transpose(enc, P.t_seq_to_head, B.q,     B.q_th, p.seq, p.n_heads,    hd,
+                                 (size_t)b * q_lane,  (size_t)b * q_lane,  bar);
+                encode_transpose(enc, P.t_seq_to_head, B.k_tmp, B.k_th, p.seq, p.n_kv_heads, hd,
+                                 (size_t)b * kv_lane, (size_t)b * kv_lane, bar);
+                encode_transpose(enc, P.t_seq_to_head, B.v_tmp, B.v_th, p.seq, p.n_kv_heads, hd,
+                                 (size_t)b * kv_lane, (size_t)b * kv_lane, bar);
+            }
+        } else {
+            encode_transpose(enc, P.t_seq_to_head, B.q,     B.q_th, p.seq, p.n_heads,    hd);
+            encode_transpose(enc, P.t_seq_to_head, B.k_tmp, B.k_th, p.seq, p.n_kv_heads, hd);
+            encode_transpose(enc, P.t_seq_to_head, B.v_tmp, B.v_th, p.seq, p.n_kv_heads, hd);
+        }
         q_in = B.q_th; k_in = B.k_th; v_in = B.v_th;
     } else if (p.seq > 1) {
         q_in = B.q_th; k_in = B.k_th; v_in = B.v_th;
@@ -825,8 +846,16 @@ inline void dispatch_layer(
 
     MTL::Buffer* attn_o_in = B.attn_out;
     if (p.seq > 1 && !prof_skip_xpose) {
-        encode_transpose(enc, P.t_head_to_seq, B.attn_out, B.attn_out_seq,
-                         p.seq, p.n_heads, hd);
+        if (p.batch > 1) {
+            const size_t o_lane = (size_t)p.seq * p.n_heads * hd * 2;
+            for (uint32_t b = 0; b < p.batch; ++b)
+                encode_transpose(enc, P.t_head_to_seq, B.attn_out, B.attn_out_seq,
+                                 p.seq, p.n_heads, hd,
+                                 (size_t)b * o_lane, (size_t)b * o_lane, b == 0);
+        } else {
+            encode_transpose(enc, P.t_head_to_seq, B.attn_out, B.attn_out_seq,
+                             p.seq, p.n_heads, hd);
+        }
         attn_o_in = B.attn_out_seq;
     } else if (p.seq > 1) {
         attn_o_in = B.attn_out_seq;
@@ -1025,6 +1054,15 @@ struct ModelParams {
     // projects ALL T=batch rows and argmax writes output_id[0..T]. Default 0
     // keeps the single-row (last-position) decode/prefill path byte-identical.
     uint32_t decode_all_rows = 0;
+
+    // Batched (batch=N, seq>1) chunked prefill. 0 = off (all existing paths
+    // byte-identical). 1 = interior chunk: layers/KV only, skip final norm +
+    // head + argmax (serving needs logits only after the full prompt). 2 =
+    // final chunk: project each lane's LAST prompt row (b*seq+seq-1) -> logits
+    // row b, argmax -> output_id[b]. The decode_all_rows head would project
+    // all batch*seq rows (vocab×T dead work) and its argmax indexing assumes
+    // seq==1, so the prefill tail is its own path.
+    uint32_t batched_prefill = 0;
 
     // Debug knobs (default = full model, no capture)
     uint32_t layers_run     = 0;   // 0 → all n_layers; else only first N
@@ -1292,12 +1330,92 @@ inline void dispatch_model(
         MTL::Buffer* tmp = cur; cur = nxt; nxt = tmp;
     }
 
+    // Interior batched-prefill chunk: KV is written, no logits consumer yet.
+    if (M.batched_prefill == 1u) return;
+
     // C. Final RMSNorm — own encoder (single helper, not worth fusing here).
     {
         auto* enc = cmd->computeCommandEncoder();
         encode_rmsnorm(enc, P.layer.rmsnorm, cur, W.w_final_norm, 0,
                        nxt, T, M.d_model, M.eps, P.layer.rmsnorm_t1);
         enc->endEncoding();
+    }
+
+    // Final batched-prefill chunk: per-lane last-row head + argmax (see the
+    // batched_prefill field WHY). Rows are independent (disjoint outputs, the
+    // shared head weight is read-only) so the lane matvecs need no barriers;
+    // the encoder boundary orders head -> argmax.
+    if (M.batched_prefill == 2u) {
+        MTL::Buffer* w_head = W.w_lm_head ? W.w_lm_head : W.w_embed;
+        const size_t off_head = W.w_lm_head ? W.off_w_lm_head : 0;
+        MTL::ComputePipelineState* qpso =
+            W.w_lm_head ? quant_matvec_pso(P.layer, W.dt_lm_head) : nullptr;
+        const uint32_t K_v = M.d_model, N_v = M.vocab_size;
+        {
+            auto* enc = cmd->computeCommandEncoder();
+            for (uint32_t b = 0; b < M.batch; ++b) {
+                const size_t off_A = ((size_t)b * M.seq + M.seq - 1u) * K_v * 2;
+                const size_t off_C = (size_t)b * N_v * 2;
+                if (qpso) {
+                    enc->setComputePipelineState(qpso);
+                    enc->setBuffer(nxt,      off_A,    0);
+                    enc->setBuffer(w_head,   off_head, 1);
+                    enc->setBuffer(B.logits, off_C,    2);
+                    enc->setBytes(&K_v, 4, 3);
+                    enc->setBytes(&N_v, 4, 4);
+                    enc->dispatchThreadgroups(MTL::Size((N_v + 1) / 2, 1, 1),
+                                              MTL::Size(128, 1, 1));
+                } else if (P.layer.gemv_t_m1 != nullptr) {
+                    const bool use_2d = (P.layer.gemv_t_2dtile_m1 != nullptr);
+                    enc->setComputePipelineState(use_2d ? P.layer.gemv_t_2dtile_m1
+                                                        : P.layer.gemv_t_m1);
+                    enc->setBuffer(nxt,      off_A,    0);
+                    enc->setBuffer(w_head,   off_head, 1);
+                    enc->setBuffer(B.logits, off_C,    2);
+                    enc->setBytes(&N_v, 4, 3);
+                    enc->setBytes(&K_v, 4, 4);
+                    if (use_2d) {
+                        const uint32_t OUT_ROWS_PER_TG = 64;
+                        enc->dispatchThreadgroups(
+                            MTL::Size((N_v + OUT_ROWS_PER_TG - 1) / OUT_ROWS_PER_TG, 1, 1),
+                            MTL::Size(32, 16, 1));
+                    } else {
+                        const uint32_t BN = 128;
+                        enc->dispatchThreadgroups(MTL::Size((N_v + BN - 1) / BN, 1, 1),
+                                                  MTL::Size(BN, 1, 1));
+                    }
+                } else {
+                    const uint32_t M_v = 1u;
+                    uint32_t ldA = K_v, ldB = K_v, ldC = N_v;
+                    int transA = 0, transB = 1, has_bias = 0;
+                    enc->setComputePipelineState(P.layer.gemm);
+                    enc->setBuffer(nxt,      off_A,    0);
+                    enc->setBuffer(w_head,   off_head, 1);
+                    enc->setBuffer(B.logits, off_C,    2);
+                    enc->setBytes(&M_v,      4, 3); enc->setBytes(&N_v,      4, 4);
+                    enc->setBytes(&K_v,      4, 5); enc->setBytes(&ldA,      4, 6);
+                    enc->setBytes(&ldB,      4, 7); enc->setBytes(&ldC,      4, 8);
+                    enc->setBytes(&transA,   4, 9); enc->setBytes(&transB,   4, 10);
+                    enc->setBytes(&has_bias, 4, 11);
+                    enc->setBuffer(B.logits, off_C, 12);
+                    enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, 1, 1),
+                                              MTL::Size(64, 1, 1));
+                }
+            }
+            enc->endEncoding();
+        }
+        {
+            auto* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(P.argmax);
+            for (uint32_t b = 0; b < M.batch; ++b) {
+                enc->setBuffer(B.logits,    (size_t)b * N_v * 2, 0);
+                enc->setBuffer(B.output_id, (size_t)b * sizeof(int32_t), 1);
+                enc->setBytes(&N_v, 4, 2);
+                enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(1024, 1, 1));
+            }
+            enc->endEncoding();
+        }
+        return;
     }
 
     // D. LM-head GEMM (tied → reuse embedding; untied → use w_lm_head). Both (V,D) row-major → transB=1.

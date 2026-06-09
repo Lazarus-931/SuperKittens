@@ -74,6 +74,17 @@ int  sk_qwen_forward_batched(sk_qwen_handle* h,
 int  sk_qwen_prefill_chunked(sk_qwen_handle* h,
                              const int* prompt_ids, uint32_t prompt_seq,
                              uint32_t chunk_size, int* output_id);
+// Batched chunked prefill (serving, cfg.batch = N lanes): ids is batch*seq
+// int32 request-major (row b = lane b's seq prompt tokens; all lanes equal
+// length, lockstep positions). Prefills all lanes in chunks of <= chunk_size
+// (clamped to seq_max; 0 -> seq_max): per chunk the projections run as one
+// M=batch*chunk GEMM (weight read amortized across lanes x tokens, vs the
+// `seq` full weight passes of token-by-token lockstep prefill). Logits +
+// argmax run only on the final chunk; out_next[b] is lane b's greedy next
+// token after the full prompt. Does NOT reset.
+int  sk_qwen_prefill_batched(sk_qwen_handle* h,
+                             const int* ids, uint32_t seq,
+                             uint32_t chunk_size, int* out_next);
 // WHY: per-token decode loop kept in C; avoids ctypes round-trip + np alloc
 // per step. Greedy only. Returns count of tokens written into out_tokens
 // (<= n_tokens; stops early on eos_id when eos_id >= 0).
