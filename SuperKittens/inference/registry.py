@@ -204,6 +204,27 @@ SPECS: dict[str, ModelSpec] = {
                                     low_freq_factor=1.0, high_freq_factor=4.0,
                                     original_max_position_embeddings=8192)),
     ),
+    # Qwen2.5-3B-Instruct: model_type "qwen2" (Qwen2ForCausalLM) — the Qwen3 dense
+    # decoder MINUS per-head Q/K RMSNorm (use_qk_norm=0), same NeoX RoPE (GGML
+    # type 2, rope_interleaved=0, theta=1e6) and same gpt2/BPE tokenizer
+    # (tokenizer_family="qwen3"). Small sizes (<=3B) tie the LM head
+    # (tie_word_embeddings=1; the GGUF has no output.weight). NOTE: Qwen2/Qwen2.5
+    # ALSO carry q/k/v projection BIASES (attn_{q,k,v}.bias), which the shared
+    # dense launcher does NOT apply — so this row alone is NOT fully config-only
+    # until a QKV-bias add lands. attn_qkv_bias is set as a forward-looking flag.
+    "qwen2.5-3b": ModelSpec(
+        family="qwen2",
+        adapter="SuperKittens.models.qwen.qwen:Qwen",
+        hf_repo="Qwen/Qwen2.5-3B-Instruct",
+        weight_dir="Qwen2.5-3B-Instruct-GGUF",
+        gguf_name="Qwen2.5-3B-Instruct-Q4_K_M.gguf",
+        default_quant="q4_k_m",
+        tokenizer_family="qwen3",
+        dims=dict(n_layers=36, d_model=2048, n_heads=16, n_kv_heads=2,
+                  head_dim=128, n_int=11008, vocab_size=151936,
+                  eps=1e-6, rope_freq_base=1_000_000.0, tie_word_embeddings=1,
+                  use_qk_norm=0, rope_interleaved=0, attn_qkv_bias=1),
+    ),
     "qwen3-1.7b": ModelSpec(
         family="qwen3",
         adapter="SuperKittens.models.qwen.qwen:Qwen",
