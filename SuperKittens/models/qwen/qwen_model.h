@@ -950,6 +950,13 @@ struct ModelParams {
     int32_t  capture_layer  = -1;  // if >=0, copy post-layer residual to capture_buf
 
     bool     kv_q8          = false;  // Q8_0 KV cache write + attention
+
+    // Prompt-lookup spec-decode verify: project the LM head for ALL T rows (not
+    // just the last), writing logits row r for each position r. The default
+    // forward only projects row T-1 (generation reads one next-token); a verify
+    // forward at seq=K+1 needs every position's logits to argmax-check the K
+    // proposed draft tokens. Off → byte-identical to the prior single-row path.
+    bool     lm_head_all_rows = false;
 };
 
 struct ModelPSOs {
@@ -1224,8 +1231,15 @@ inline void dispatch_model(
     // batch=1 buffer (OOB — the recurring logits-sizing bug). The result is
     // written to logits row T-1 so get_last_logits (reads logits row
     // last_seq-1 == T-1) and the argmax below both land on it.
-    {
-        const uint32_t last = T - 1u;
+    // When lm_head_all_rows (prompt-lookup verify), project every row [0..T-1];
+    // otherwise just the last row (T-1). The per-row body below is a single
+    // M=1 projection at byte offsets off_A/off_C keyed on `row`; looping it K+1
+    // times reuses the exact decode-path matvec kernels (so each row's logits
+    // match a T==1 forward of the same residual). The argmax (E) still only
+    // emits output_id from the last row — verify reads per-row logits on host.
+    const uint32_t lm_first = M.lm_head_all_rows ? 0u : (T - 1u);
+    for (uint32_t row = lm_first; row < T; ++row) {
+        const uint32_t last = row;
         const uint32_t M_v = 1u, K_v = M.d_model, N_v = M.vocab_size;
         const size_t   off_A = (size_t)last * K_v * 2;
         const size_t   off_C = (size_t)last * N_v * 2;

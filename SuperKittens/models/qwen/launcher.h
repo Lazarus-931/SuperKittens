@@ -76,6 +76,17 @@ int  sk_qwen_generate_n(sk_qwen_handle* h,
 void sk_qwen_reset(sk_qwen_handle* h);
 void sk_qwen_destroy(sk_qwen_handle* h);
 
+// Prompt-lookup spec-decode verify forward: run `seq` (= K+1) tokens, projecting
+// the LM head at every position, and host-argmax each row into out_argmax[seq].
+// out_argmax[i] is the greedy prediction at position i. Advances current_pos by
+// seq and writes KV for all seq slots; caller rewinds via sk_qwen_set_pos to the
+// accepted length. Greedy/argmax only; batch=1.
+int  sk_qwen_forward_verify(sk_qwen_handle* h,
+                            const int* input_ids, uint32_t seq, int* out_argmax);
+// current_pos accessor + rewind for the verify/accept loop.
+uint32_t sk_qwen_get_pos(sk_qwen_handle* h);
+int      sk_qwen_set_pos(sk_qwen_handle* h, uint32_t pos);
+
 // Debug: limit forward to first N layers (0 = all). Affects subsequent forward calls.
 // When < cfg.n_layers, the post-loop final_norm + LM head still run on the
 // partial residual stream, so get_last_logits returns logits from the prefix.
