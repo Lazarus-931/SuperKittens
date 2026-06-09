@@ -151,10 +151,14 @@ static inline void q8_0_mv_impl(
     helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
 }
 
-// Per-row Q5_0 matvec inner loop — identical reduction shape to q8_0_mv_impl,
-// but each lane dequantizes its NQ=8 weights from the 22 B/32 Q5_0 block
-// (5th-bit plane in qh + 4-bit lows in qs). ne00 % 32 == 0 is the only
-// alignment requirement; n_int=1408 → 44 blocks/row, NO tail drop.
+// Per-row Q5_0 matvec inner loop. Each simdgroup owns its own NR0 rows over the
+// full K dimension (one simd_sum, no cross-simdgroup shmem reduction) — the same
+// independent-row layout the Q4_K path uses, which saturates ~1.4x more M4
+// bandwidth than the prior 4-SG-cooperative + tree-reduce shape (59→85 GB/s).
+// The 32 lanes tile K in NQ=8-block strides; per lane `il` selects a fixed
+// 8-wide weight slice, so the qh-bit / nibble byte+shift selection is hoisted
+// out of the inner unroll. ne00 % 32 == 0 (n_int=1408 → 44 blocks/row, no tail
+// drop). Launch grid: tgpig.x = ceil(ne01 / (NSG*NR0)).
 template<short NR0>
 static inline void q5_0_mv_impl(
         ds4_metal_args_mul_mv args,
@@ -171,9 +175,10 @@ static inline void q5_0_mv_impl(
 
     const int nb = args.ne00 / QK5_0;
 
-    const int r0 = tgpig.x * NR0;
     const int r1 = tgpig.y;
     const int im = tgpig.z;
+
+    const int first_row = (tgpig.x * NSG + sgitg) * NR0;
 
     const uint i12 = im % args.ne12;
     const uint i13 = im / args.ne12;
@@ -183,7 +188,7 @@ static inline void q5_0_mv_impl(
 
     device const block_q5_0 * ax[NR0];
     FOR_UNROLL (short row = 0; row < NR0; ++row) {
-        const uint64_t offset0 = (r0 + row)*args.nb01 +
+        const uint64_t offset0 = (first_row + row)*args.nb01 +
                                  (i12/args.r2)*args.nb02 +
                                  (i13/args.r3)*args.nb03;
         ax[row] = (device const block_q5_0 *)((device char *)src0 + offset0);
@@ -191,41 +196,47 @@ static inline void q5_0_mv_impl(
 
     float sumf[NR0] = { 0.f };
 
-    const short ix = tiisg/(NW/NQ);   // 0..3  — block step within the simdgroup
-    const short il = tiisg%(NW/NQ);   // 0..3  — which 8-wide slice of the block
-    const int   ib0 = sgitg*NQ + ix;
+    const short ix    = tiisg/(NW/NQ);          // 0..7  — block within the K stride
+    const short il    = tiisg%(NW/NQ);          // 0..3  — which 8-wide slice
+    const short base  = il*NQ;                  // first weight index 0/8/16/24
+    const short shift = (base < 16) ? 0 : 4;    // nibble half (uniform per lane)
+    const short boff  = base & 15;              // qs byte offset 0/8 (uniform per lane)
 
     float yl[NQ];
-    device const float * yb = y + ib0*QK5_0 + il*NQ;
+    device const float * yb = y + ix*QK5_0 + base;
 
-    for (int ib = ib0; ib < nb; ib += NSG*NQ) {
+    for (int ib = ix; ib < nb; ib += NQ) {
         for (short i = 0; i < NQ; ++i) yl[i] = yb[i];
 
         for (short row = 0; row < NR0; ++row) {
-            uint32_t qh;
-            qh = (uint32_t)ax[row][ib].qh[0]
-               | ((uint32_t)ax[row][ib].qh[1] <<  8)
-               | ((uint32_t)ax[row][ib].qh[2] << 16)
-               | ((uint32_t)ax[row][ib].qh[3] << 24);
-            device const uint8_t * qs = ax[row][ib].qs;
+            device const uint8_t * qs = ax[row][ib].qs + boff;
+            uint32_t qh = (uint32_t)ax[row][ib].qh[0]
+                        | ((uint32_t)ax[row][ib].qh[1] <<  8)
+                        | ((uint32_t)ax[row][ib].qh[2] << 16)
+                        | ((uint32_t)ax[row][ib].qh[3] << 24);
+            qh >>= base;
             float sumq = 0.f;
             FOR_UNROLL (short i = 0; i < NQ; ++i) {
-                const short w     = il*NQ + i;          // 0..31 weight index
-                const short bi    = w & 15;             // byte holding this nibble
-                const short shift = (w < 16) ? 0 : 4;   // low/high nibble
-                const int   lo    = (qs[bi] >> shift) & 0x0F;
-                const int   hi    = (int)((qh >> w) & 1) << 4;
+                const int lo = (qs[i] >> shift) & 0x0F;
+                const int hi = (int)((qh >> i) & 1) << 4;
                 sumq += float((lo | hi) - 16) * yl[i];
             }
             sumf[row] += sumq * float(ax[row][ib].d);
         }
-        yb += NSG*NQ*QK5_0;
+        yb += NQ*QK5_0;
     }
 
     device float * dst_f32 = (device float *)dst +
         (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
-    helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+    for (short row = 0; row < NR0 && first_row + row < args.ne01; ++row) {
+        float tot = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            dst_f32[first_row + row] = tot;
+        }
+    }
+
+    (void)shmem;
 }
 
 // Decode-time expert matvec.  The ids tensor selects the routed expert for each
