@@ -38,7 +38,11 @@ class Tokenizer:
         # turn in instruction-tuned variants.
         "gemma4":  {"bos": ("<bos>",),                   "eos": ("<eos>", "<turn|>"),             "pad": ("<pad>",)},
         "gemma":   {"bos": ("<bos>",),                   "eos": ("<end_of_turn>", "<eos>"),       "pad": ("<pad>",)},
-        "llama":   {"bos": ("<s>", "<|begin_of_text|>"), "eos": ("</s>", "<|end_of_text|>", "<|eot_id|>"), "pad": ("<pad>",)},
+        # Llama-3.x Instruct chat turns end on <|eot_id|>; <|end_of_text|> is the
+        # base-completion stop. eot FIRST so the singular eos_id (chat default)
+        # resolves to <|eot_id|> in the Llama-3 vocab (</s> is absent there); both
+        # land in _eos_ids for the multi-stop decode loop.
+        "llama":   {"bos": ("<|begin_of_text|>", "<s>"), "eos": ("<|eot_id|>", "<|end_of_text|>", "</s>"), "pad": ("<pad>",)},
         # Llama-3.1-Nemotron-Nano: chat turns end on <|eot_id|>; <|end_of_text|> is
         # the base-completion stop. Both resolve in the Llama-3 vocab.
         "nemotron": {"bos": ("<|begin_of_text|>",), "eos": ("<|eot_id|>", "<|end_of_text|>"), "pad": ("<|end_of_text|>",)},
