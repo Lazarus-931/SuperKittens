@@ -26,9 +26,46 @@
 #include <Metal/Metal.hpp>
 #include <cstdint>
 #include <cmath>
+#include <cstdlib>
+#include <string>
 
 namespace meow {
 namespace mamba2 {
+
+// SK_MAMBA_SKIP=<csv of stage tokens> drops the named decode stages from the
+// dispatch (output is garbage — for ablation timing only). Tokens:
+//   inproj outproj lmhead ssd conv gate split prenorm add embed argmax fnorm
+// Read once. Delta vs baseline us/step = that stage's GPU contribution.
+struct SkipFlags {
+    bool inproj=false, outproj=false, lmhead=false, ssd=false, conv=false,
+         gate=false, split=false, prenorm=false, add=false, embed=false,
+         argmax=false, fnorm=false;
+};
+// out_proj (N=d_model=768) under-occupies the plain gemv and runs at ~56 GB/s
+// vs ~101 for in_proj; split-K (KS K-slices → 4*KS more TGs → reduce) lifts it
+// to ~79 GB/s and the whole decode step ~+9% (227→248 tok/s on M4, KS=4).
+// On by default; SK_MAMBA_SPLITK=<KS> overrides KS, SK_MAMBA_NO_SPLITK disables.
+inline uint32_t splitk_ks() {
+    static uint32_t v = []{
+        if (std::getenv("SK_MAMBA_NO_SPLITK")) return 0u;
+        const char* e = std::getenv("SK_MAMBA_SPLITK");
+        if (e) { int k = std::atoi(e); if (k > 0) return (uint32_t)k; }
+        return 4u;
+    }();
+    return v;
+}
+inline const SkipFlags& skip_flags() {
+    static SkipFlags s = []{
+        SkipFlags f; const char* e = std::getenv("SK_MAMBA_SKIP");
+        if (e) { std::string v(e);
+            auto has=[&](const char* k){ return v.find(k)!=std::string::npos; };
+            f.inproj=has("inproj"); f.outproj=has("outproj"); f.lmhead=has("lmhead");
+            f.ssd=has("ssd"); f.conv=has("conv"); f.gate=has("gate");
+            f.split=has("split"); f.prenorm=has("prenorm"); f.add=has("add");
+            f.embed=has("embed"); f.argmax=has("argmax"); f.fnorm=has("fnorm"); }
+        return f; }();
+    return s;
+}
 
 struct LayerParams {
     uint32_t batch        = 1;
@@ -59,6 +96,10 @@ struct LayerPSOs {
     // the in/out_proj projections at 13-54 GB/s. gemv_fp16_m1 (transB=0) is a
     // real column-per-thread matvec at ~90-110 GB/s on M4 base.
     MTL::ComputePipelineState* gemv   = nullptr;   // gemv_fp16_m1 (transB=0)
+    // Split-K matvec for small-N projections (out_proj N=768 under-occupies the
+    // plain gemv). Gated on SK_MAMBA_SPLITK; nullptr → use gemv.
+    MTL::ComputePipelineState* gevm_splitk_p1 = nullptr;
+    MTL::ComputePipelineState* gevm_splitk_p2 = nullptr;
     MTL::ComputePipelineState* split_packed;
     MTL::ComputePipelineState* conv1d_silu;
     MTL::ComputePipelineState* conv1d_silu_step = nullptr;   // O(1) decode conv
@@ -121,6 +162,9 @@ struct ModelBuffers {
     // 2-pass argmax scratch (ceil(vocab_size/16384) partials each).
     MTL::Buffer* argmax_val_buf = nullptr;
     MTL::Buffer* argmax_idx_buf = nullptr;
+
+    // split-K out_proj partials (KS, d_model) fp32.
+    MTL::Buffer* splitk_partial = nullptr;
 };
 
 // ── Encode helpers ──────────────────────────────────────────────────
@@ -168,6 +212,43 @@ inline void encode_gemv_mb(
     enc->dispatchThreadgroups(MTL::Size((N + 127) / 128, 1, 1),
                               MTL::Size(128, 1, 1));
     enc->endEncoding();
+}
+
+// Split-K M=1 matvec (raises TG count for small N): KS K-slices → partial(KS,N)
+// → reduce → y. partial must be >= KS*N fp32.
+inline void encode_gevm_splitk(
+    MTL::CommandBuffer* cmd,
+    MTL::ComputePipelineState* p1, MTL::ComputePipelineState* p2,
+    MTL::Buffer* x, size_t off_x,
+    MTL::Buffer* W, size_t off_W,
+    MTL::Buffer* y, size_t off_y,
+    MTL::Buffer* partial,
+    uint32_t N, uint32_t K, uint32_t KS)
+{
+    {
+        auto* enc = cmd->computeCommandEncoder();
+        enc->setComputePipelineState(p1);
+        enc->setBuffer(x, off_x, 0);
+        enc->setBuffer(W, off_W, 1);
+        enc->setBuffer(partial, 0, 2);
+        enc->setBytes(&N, 4, 3);
+        enc->setBytes(&K, 4, 4);
+        enc->setBytes(&KS, 4, 5);
+        enc->dispatchThreadgroups(MTL::Size((N + 127) / 128, KS, 1),
+                                  MTL::Size(128, 1, 1));
+        enc->endEncoding();
+    }
+    {
+        auto* enc = cmd->computeCommandEncoder();
+        enc->setComputePipelineState(p2);
+        enc->setBuffer(partial, 0, 0);
+        enc->setBuffer(y, off_y, 1);
+        enc->setBytes(&N, 4, 2);
+        enc->setBytes(&KS, 4, 3);
+        enc->dispatchThreadgroups(MTL::Size((N + 255) / 256, 1, 1),
+                                  MTL::Size(256, 1, 1));
+        enc->endEncoding();
+    }
 }
 
 // M=1 matvec y[1,N] = x[1,K] @ W[N,K]^T (transB=1). 2D-tile: 64 rows/TG,
@@ -352,6 +433,7 @@ struct DispatchBufs {
     MTL::Buffer* w_D;
     MTL::Buffer* w_norm;
     MTL::Buffer* w_out_proj;
+    MTL::Buffer* splitk_partial = nullptr;   // (KS, d_model) fp32 scratch
 };
 
 inline void dispatch_layer(
@@ -382,30 +464,37 @@ inline void dispatch_layer(
     const size_t off_D     = (size_t)L * H * fp16;
     const size_t off_norm  = (size_t)L * E * fp16;
     const size_t off_outp  = (size_t)L * E * D * fp16;
+    const SkipFlags& SK = skip_flags();
 
     // 1. pre-norm
+    if (!SK.prenorm)
     encode_rmsnorm_mb(cmd, P.rmsnorm, b.x_in, b.w_pre_norm, off_pre,
                       b.x_norm, T, D, p.eps, P.rmsnorm_t1);
 
     // 2. in_proj: (T,D) x (D,IN_OUT) -> (T,IN_OUT). M=1 decode → gemv.
+    if (!SK.inproj) {
     if (T == 1 && P.gemv)
         encode_gemv_mb(cmd, P.gemv, b.x_norm, 0, b.w_in_proj, off_in,
                        b.in_proj_out, 0, IN_OUT, D);
     else
         encode_gemm_mb(cmd, P.gemm, b.x_norm, 0, b.w_in_proj, off_in,
                        b.in_proj_out, 0, T, IN_OUT, D);
+    }
 
     // 3. Split packed [z(E) | xBC(C_in) | dt(H)]
     //    First split: z vs (xBC+dt). Write xBC+dt into xBC_post temporarily.
+    if (!SK.split) {
     encode_split(cmd, P.split_packed, b.in_proj_out, b.z, b.xBC_post,
                  T, E, C_in + H);
     //    Second split: xBC vs dt_raw.
     encode_split(cmd, P.split_packed, b.xBC_post, b.xBC, b.dt_raw,
                  T, C_in, H);
+    }
 
     // 4. conv1d + silu on xBC (C = C_in). Decode (L=1) reads + rolls the carried
     //    (K-1)-token conv_state; prefill convolves the whole seq (state starts
     //    empty) and captures its last K-1 tokens for the first decode step.
+    if (!SK.conv) {
     if (p.is_decode && P.conv1d_silu_step && P.conv_state_capture) {
         encode_conv1d_silu_step(cmd, P.conv1d_silu_step, b.xBC, b.w_conv, off_conv,
                                 b.w_conv_b, off_convb, b.xBC_post, b.conv_state,
@@ -418,12 +507,13 @@ inline void dispatch_layer(
             encode_conv_state_capture(cmd, P.conv_state_capture, b.xBC, b.conv_state,
                                       p.batch, p.seq, C_in, K);
     }
+    }
 
     // 5. SSD reference. xBC_post layout: [x(T,E) | B(T,G*N) | C(T,G*N)] flat.
     const size_t off_x_in = 0;
     const size_t off_B_in = (size_t)E * fp16;
     const size_t off_C_in = (size_t)(E + Gv * Nv) * fp16;
-    {
+    if (!SK.ssd) {
         auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(P.mamba2_ssd);
         enc->setBuffer(b.xBC_post,  off_x_in, 0);
@@ -450,18 +540,27 @@ inline void dispatch_layer(
     }
 
     // 6. gate_norm
+    if (!SK.gate)
     encode_gate_norm(cmd, P.gate_norm, b.ssd_out, b.z,
                      b.w_norm, off_norm, b.gated, T, E, p.eps);
 
-    // 7. out_proj: (T,E)x(E,D)->(T,D). M=1 decode → gemv.
-    if (T == 1 && P.gemv)
+    // 7. out_proj: (T,E)x(E,D)->(T,D). M=1 decode → gemv (or split-K gemv).
+    if (!SK.outproj) {
+    const uint32_t KS = splitk_ks();
+    if (T == 1 && KS && P.gevm_splitk_p1 && P.gevm_splitk_p2 && b.splitk_partial)
+        encode_gevm_splitk(cmd, P.gevm_splitk_p1, P.gevm_splitk_p2,
+                           b.gated, 0, b.w_out_proj, off_outp,
+                           b.out_proj_out, 0, b.splitk_partial, D, E, KS);
+    else if (T == 1 && P.gemv)
         encode_gemv_mb(cmd, P.gemv, b.gated, 0, b.w_out_proj, off_outp,
                        b.out_proj_out, 0, D, E);
     else
         encode_gemm_mb(cmd, P.gemm, b.gated, 0, b.w_out_proj, off_outp,
                        b.out_proj_out, 0, T, D, E);
+    }
 
     // 8. residual in-place: x_in += out_proj_out  (add allows aliasing)
+    if (!SK.add)
     encode_add_f16(cmd, P.add, b.x_in, b.out_proj_out, b.x_out, T * D);
 }
 
@@ -495,9 +594,10 @@ inline void dispatch_model(
     MTL::Buffer*        output_id)
 {
     const uint32_t T = M.batch * M.seq;
+    const SkipFlags& SK = skip_flags();
 
     // A. Embedding lookup
-    {
+    if (!SK.embed) {
         auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(P.embedding_lookup);
         enc->setBuffer(W.w_embed,   0, 0);
@@ -554,15 +654,18 @@ inline void dispatch_model(
         db.w_D          = W.w_D;
         db.w_norm       = W.w_norm;
         db.w_out_proj   = W.w_out_proj;
+        db.splitk_partial = B.splitk_partial;
 
         dispatch_layer(cmd, P.layer, lp, db);
     }
 
     // C. Final RMSNorm  B.x -> B.x_norm
+    if (!SK.fnorm)
     encode_rmsnorm_mb(cmd, P.layer.rmsnorm, B.x, W.w_final_norm, 0,
                       B.x_norm, T, M.d_model, M.eps, P.layer.rmsnorm_t1);
 
     // D. LM head (tied): (T,D) x (V,D)^T → (T,V) logits. M=1 decode → gemv_t.
+    if (!SK.lmhead) {
     if (T == 1 && P.gemv_t) {
         encode_gemv_t_2dtile_mb(cmd, P.gemv_t, B.x_norm, 0, W.w_embed, 0,
                                 B.logits, 0, M.vocab_size, M.d_model);
@@ -585,9 +688,10 @@ inline void dispatch_model(
                                   MTL::Size(64, 1, 1));
         enc->endEncoding();
     }
+    }
 
     // E. Argmax over LAST token row only
-    {
+    if (!SK.argmax) {
         const size_t last_off = (size_t)(T - 1) * M.vocab_size * 2;
         const bool can_2pass = P.argmax_partial && P.argmax_reduce
                             && B.argmax_val_buf && B.argmax_idx_buf;
