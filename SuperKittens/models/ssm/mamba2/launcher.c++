@@ -151,6 +151,9 @@ extern "C" sk_mamba2_handle* sk_mamba2_create(const sk_mamba2_config* cfg) {
     // SK_MAMBA_SPLITK setting we'd reasonably bench.
     h->bufs.splitk_partial = alloc_zero(dev, (size_t)32 * D * sizeof(float));
 
+    // Batched-lane prefill last-row gather target (batch, d_model) fp16.
+    h->bufs.lanes_x = alloc_zero(dev, (size_t)cfg->batch * D * fp16);
+
     h->current_pos = 0;
     return reinterpret_cast<sk_mamba2_handle*>(h);
 }
@@ -279,6 +282,57 @@ extern "C" int sk_mamba2_prefill_lane(sk_mamba2_handle* hp, uint32_t lane,
     cmd->release();
 
     if (output_id) std::memcpy(output_id, s_pf_out->contents(), sizeof(int32_t));
+    return 0;
+}
+
+// Batched-lane prefill: ALL n_req lanes' prompts (equal length seq, lane-major
+// ids[n_req*seq]) in ONE batch=n_req forward — weights are read once instead
+// of n_req times and the GPU sees n_req× the rows/threadgroups. Kernels index
+// the batch dim, so lane b's conv/ssm state lands in slot b (no prefill_lane
+// offset). LM head runs only over the n_req gathered last rows; per-lane
+// argmax writes output_ids[0..n_req). Caller resets lanes first
+// (sk_mamba2_reset_lane), as with sequential prefill_lane.
+extern "C" int sk_mamba2_prefill_batched(sk_mamba2_handle* hp,
+                                         const int* input_ids, uint32_t seq,
+                                         uint32_t n_req, int* output_ids) {
+    if (!hp || !input_ids || !output_ids || seq == 0 || n_req == 0) return -1;
+    auto* h = reinterpret_cast<meow::mamba2::Handle*>(hp);
+    if (n_req > h->cfg.batch || seq > h->cfg.seq_max) return -2;
+    auto* q = sk::bindings_queue();
+    if (!q) return -3;
+
+    std::memcpy(h->bufs.tok_ids->contents(), input_ids,
+                (size_t)n_req * seq * sizeof(int32_t));
+
+    meow::mamba2::ModelParams mp;
+    mp.batch=n_req; mp.seq=seq; mp.n_layers=h->cfg.n_layers; mp.d_model=h->cfg.d_model;
+    mp.intermediate=h->cfg.intermediate; mp.n_heads=h->cfg.n_heads;
+    mp.head_dim=h->cfg.head_dim; mp.state_size=h->cfg.state_size;
+    mp.n_groups=h->cfg.n_groups; mp.conv_kernel=h->cfg.conv_kernel;
+    mp.chunk_size=h->cfg.chunk_size; mp.vocab_size=h->cfg.vocab_size;
+    mp.eps=h->cfg.rms_eps; mp.dt_min=h->cfg.dt_limit_min; mp.dt_max=h->cfg.dt_limit_max;
+    mp.lanes_last = n_req;
+
+    static MTL::Buffer* s_bp_out = nullptr;
+    static uint32_t     s_bp_cap = 0;
+    if (s_bp_cap < n_req) {
+        if (s_bp_out) s_bp_out->release();
+        auto* dev = sk::bindings_device();
+        s_bp_out = dev->newBuffer((size_t)n_req * sizeof(int32_t),
+                                  MTL::ResourceStorageModeShared);
+        s_bp_cap = n_req;
+    }
+    std::memset(s_bp_out->contents(), 0, (size_t)n_req * sizeof(int32_t));
+
+    auto* cmd = q->commandBuffer();
+    meow::mamba2::dispatch_model(cmd, h->psos, h->weights, h->bufs,
+                                 h->layer_states.data(), mp, s_bp_out);
+    cmd->commit();
+    cmd->waitUntilCompleted();
+    cmd->release();
+
+    std::memcpy(output_ids, s_bp_out->contents(), (size_t)n_req * sizeof(int32_t));
+    h->last_seq = n_req;   // logits buffer holds one gathered row per lane
     return 0;
 }
 
@@ -423,6 +477,6 @@ extern "C" void sk_mamba2_destroy(sk_mamba2_handle* hp) {
     rel(h->bufs.dt_raw); rel(h->bufs.xBC_post); rel(h->bufs.ssd_out);
     rel(h->bufs.gated); rel(h->bufs.out_proj_out); rel(h->bufs.logits);
     rel(h->bufs.argmax_val_buf); rel(h->bufs.argmax_idx_buf);
-    rel(h->bufs.splitk_partial);
+    rel(h->bufs.splitk_partial); rel(h->bufs.lanes_x);
     delete h;
 }
