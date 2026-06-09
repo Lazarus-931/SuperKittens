@@ -269,7 +269,9 @@ inline void encode_gemm_mma(
     enc->setBytes(&N, 4, 4);
     enc->setBytes(&K, 4, 5);
     enc->setBytes(&ldC, 4, 6);
-    constexpr uint32_t BM = 8, BN = 32;
+    // BM matches gemm_mma.metal's BM (rows/threadgroup); see the WHY there for
+    // why 32 (weight-read amortization on the bandwidth-bound quant loaders).
+    constexpr uint32_t BM = 32, BN = 32;
     enc->dispatchThreadgroups(
         MTL::Size((N + BN - 1) / BN, (M + BM - 1) / BM, 1),
         MTL::Size(64, 1, 1));
