@@ -48,6 +48,7 @@ class _Config(ctypes.Structure):
         ("tie_word_embeddings", ctypes.c_uint32),
         ("use_qk_norm",        ctypes.c_uint32),
         ("rope_interleaved",   ctypes.c_uint32),
+        ("attn_qkv_bias",      ctypes.c_uint32),
     ]
 
 
@@ -64,6 +65,7 @@ _WEIGHT_FIELDS = (
     "w_up",
     "w_down",
     "w_lm_head",
+    "w_qkv_bias",       # per-layer packed [Q|K|V] bias (Qwen2/Qwen2.5); optional
 )
 
 
@@ -132,6 +134,7 @@ class Config(CtypesConfig):
     use_qk_norm: int = 1          # 1 = per-head Q/K RMSNorm (Qwen3); 0 for Llama-arch
     rope_interleaved: int = 0     # 0 = split-half/NeoX RoPE (Qwen3, GGML type 2);
                                   # 1 = interleaved/NORM (Llama GGUF, GGML type 0)
+    attn_qkv_bias: int = 0        # 1 = Qwen2/Qwen2.5 additive q/k/v projection bias; 0 = none (Qwen3/Llama)
 
 
 class DenseDecoder(Model):
@@ -177,8 +180,8 @@ class DenseDecoder(Model):
         for name in _WEIGHT_FIELDS:
             a = weights.get(name)
             if a is None:
-                if name == "w_lm_head":
-                    # optional: only required when tie_word_embeddings == 0
+                if name in ("w_lm_head", "w_qkv_bias"):
+                    # optional: w_lm_head only when untied; w_qkv_bias only Qwen2/2.5
                     setattr(w, name, 0)
                     continue
                 raise ValueError(f"missing weight: {name}. Required: {_WEIGHT_FIELDS}")

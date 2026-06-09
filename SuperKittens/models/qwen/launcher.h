@@ -36,6 +36,7 @@ typedef struct {
     uint32_t tie_word_embeddings;  // 1 = tie LM head to embedding (Qwen3-0.6B), 0 = separate lm_head (Qwen3-8B)
     uint32_t use_qk_norm;          // 1 = Qwen3 per-head Q/K RMSNorm; 0 = Llama-arch (Nemotron-Nano-8B) no qk-norm
     uint32_t rope_interleaved;     // 0 = split-half/NeoX RoPE (GGML type 2, Qwen3); 1 = interleaved/NORM (GGML type 0, Llama GGUF)
+    uint32_t attn_qkv_bias;        // 1 = Qwen2/Qwen2.5 additive q/k/v projection bias; 0 = no bias (Qwen3/Llama/Mistral)
 } sk_qwen_config;
 
 typedef struct {
@@ -51,6 +52,7 @@ typedef struct {
     const void* w_up;
     const void* w_down;
     const void* w_lm_head;  // optional (untied); may be null when tie_word_embeddings=1
+    const void* w_qkv_bias; // optional; (n_layers, qkv_N) packed [Q|K|V] bias. null when attn_qkv_bias=0
 } sk_qwen_weights;
 
 sk_qwen_handle* sk_qwen_create(const sk_qwen_config* cfg);

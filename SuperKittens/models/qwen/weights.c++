@@ -904,6 +904,20 @@ extern "C" int sk_qwen_load_gguf(sk_qwen_handle* hp, const char* path) {
 
         if (!load_qkv_layer(L)) return -50;
 
+        // QKV projection bias (Qwen2/2.5). Pack q|k|v (F32 in GGUF) into the
+        // per-layer band of the [n_layers, qkvN] fp16 slab, SAME column order as
+        // the packed QKV weight. Skipped entirely when attn_qkv_bias=0.
+        if (c.attn_qkv_bias && h->weights.w_qkv_bias) {
+            uint16_t* bdst = (uint16_t*)((char*)h->weights.w_qkv_bias->contents()
+                                         + (size_t)L * qkvN * 2);
+            std::snprintf(nbuf, sizeof(nbuf), "blk.%u.attn_q.bias", L);
+            if (!read_to_fp16(bdst, store.get(nbuf), Nq)) return -51;
+            std::snprintf(nbuf, sizeof(nbuf), "blk.%u.attn_k.bias", L);
+            if (!read_to_fp16(bdst + Nq, store.get(nbuf), Nkv)) return -51;
+            std::snprintf(nbuf, sizeof(nbuf), "blk.%u.attn_v.bias", L);
+            if (!read_to_fp16(bdst + Nq + Nkv, store.get(nbuf), Nkv)) return -51;
+        }
+
         std::snprintf(nbuf, sizeof(nbuf), "blk.%u.attn_output.weight", L);
         if (!load_single_tensor(nbuf, dt_o, o_layer_bytes,
                                 &h->weights.w_o[L], &h->weights.w_o_off[L])) return -53;

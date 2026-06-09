@@ -84,6 +84,7 @@ static bool resolve_psos(ModelPSOs& P) {
     P.layer.q8_0_swiglu_prenorm_m1 = sk::bindings_pso("q8_0_swiglu_prenorm_m1");  // optional
     P.layer.q8_0_matvec_addres = sk::bindings_pso("q8_0_matvec_addres");  // optional
     P.layer.split_packed   = sk::bindings_pso("split_packed");
+    P.layer.bias_add       = sk::bindings_pso("bias_add");   // optional; Qwen2/2.5 QKV bias
     P.layer.rope_qk        = sk::bindings_pso("qwen_rope_qk");
     P.layer.rope_qk_il     = sk::bindings_pso("qwen_rope_qk_interleaved");  // optional; Llama-arch only
     P.layer.attn           = sk::bindings_pso("mha_causal");
@@ -194,6 +195,10 @@ extern "C" sk_qwen_handle* sk_qwen_create(const sk_qwen_config* cfg) {
             h->weights.w_down, h->weights.w_down_off);
     h->weights.w_lm_head       = cfg->tie_word_embeddings ? nullptr
                                   : alloc_zero(dev, (size_t)cfg->vocab_size * cfg->d_model * 2);
+    // QKV bias slab (Qwen2/2.5): per-layer packed [Q|K|V] fp16. null when no bias.
+    h->weights.w_qkv_bias      = cfg->attn_qkv_bias
+                                  ? alloc_zero(dev, (size_t)cfg->n_layers * qkv_N * 2)
+                                  : nullptr;
 
     // Per-layer K, V caches (full cache; GQA → n_kv_heads not n_heads).
     // SK_KV_Q8=1 stores K/V as Q8_0 (int8 + per-32-block fp16 scale) instead of
@@ -374,6 +379,7 @@ extern "C" int sk_qwen_load_weights(sk_qwen_handle* hp, const sk_qwen_weights* w
     cp(h->weights.w_up[0],         w->w_up);
     cp(h->weights.w_down[0],       w->w_down);
     if (h->weights.w_lm_head && w->w_lm_head) cp(h->weights.w_lm_head, w->w_lm_head);
+    if (h->weights.w_qkv_bias && w->w_qkv_bias) cp(h->weights.w_qkv_bias, w->w_qkv_bias);
     return 0;
 }
 
@@ -453,6 +459,7 @@ static int run_step(Handle* h, MTL::CommandQueue* q, uint32_t seq) {
     mp.eps            = h->cfg.eps;
     mp.use_qk_norm    = h->cfg.use_qk_norm;
     mp.rope_interleaved = h->cfg.rope_interleaved;
+    mp.attn_qkv_bias  = h->cfg.attn_qkv_bias;
     mp.current_pos    = h->current_pos;
     mp.rope_n_ctx_orig = h->cfg.rope_n_ctx_orig;
     mp.rope_freq_base  = h->cfg.rope_freq_base;

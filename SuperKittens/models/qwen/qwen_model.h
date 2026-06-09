@@ -23,6 +23,7 @@ struct LayerParams {
     float    eps          = 1e-6f;
     uint32_t use_qk_norm  = 1;  // 0 for Llama-arch (Nemotron-Nano): skip per-head Q/K RMSNorm
     uint32_t rope_interleaved = 0;  // 1 = interleaved/NORM RoPE (Llama GGUF, type 0); 0 = NeoX split-half (Qwen3, type 2)
+    uint32_t attn_qkv_bias = 0;  // 1 = add per-layer packed [Q|K|V] bias after QKV matvec (Qwen2/2.5)
 
     uint32_t layer_idx    = 0;
     uint32_t kv_buf_start = 0;
@@ -72,6 +73,7 @@ struct LayerPSOs {
     MTL::ComputePipelineState* q8_0_swiglu_prenorm_m1 = nullptr;  // fused residual+rmsnorm+swiglu (M=1)
     MTL::ComputePipelineState* q8_0_matvec_addres = nullptr;  // matvec + residual add (M=1)
     MTL::ComputePipelineState* split_packed;      // (T, A+B) → (T, A) + (T, B)
+    MTL::ComputePipelineState* bias_add = nullptr;  // C[t,n] += bias[n] (Qwen2/2.5 QKV bias); optional
     MTL::ComputePipelineState* rope_qk;           // split-half (NeoX) RoPE on Q, K (Qwen3)
     MTL::ComputePipelineState* rope_qk_il = nullptr;  // interleaved (NORM) RoPE (Llama GGUF); used when rope_interleaved=1
     MTL::ComputePipelineState* attn;              // mha_causal (d=128, GQA)
@@ -99,6 +101,7 @@ struct LayerBuffers {
     MTL::Buffer* w_pre_attn_norm;     // (n_layers, d_model)
     MTL::Buffer* w_qkv;               // this layer's QKV (or Q|K-only) slab
     size_t       w_qkv_inner_off = 0; // byte offset within w_qkv to the start of layer data
+    MTL::Buffer* w_qkv_bias = nullptr;  // (n_layers, qkv_N) fp16 packed [Q|K|V] bias; null = no QKV bias
     MTL::Buffer* w_v = nullptr;       // separate V slab when V dtype splits off
     size_t       w_v_inner_off = 0;
     MTL::Buffer* w_q_norm;            // (n_layers, head_dim) — per-head Q-norm γ
@@ -472,6 +475,22 @@ inline void encode_split(
     enc->dispatchThreads(MTL::Size(A + B, T, 1), MTL::Size(128, 1, 1));
 }
 
+// C[t, n] += bias[n] over a [T, N] fp16 buffer (Qwen2/2.5 packed QKV bias).
+// bias is bound at its per-layer byte offset so the kernel indexes [0, N).
+inline void encode_bias_add(
+    MTL::ComputeCommandEncoder* enc, MTL::ComputePipelineState* pso,
+    MTL::Buffer* C, MTL::Buffer* bias, size_t bias_off,
+    uint32_t N, uint32_t T)
+{
+    enc_barrier(enc);
+    enc->setComputePipelineState(pso);
+    enc->setBuffer(C,    0,        0);
+    enc->setBuffer(bias, bias_off, 1);
+    enc->setBytes(&N, 4, 2);
+    enc->setBytes(&T, 4, 3);
+    enc->dispatchThreads(MTL::Size(N * T, 1, 1), MTL::Size(128, 1, 1));
+}
+
 inline void encode_transpose(
     MTL::ComputeCommandEncoder* enc, MTL::ComputePipelineState* pso,
     MTL::Buffer* src, MTL::Buffer* dst,
@@ -582,6 +601,15 @@ inline void dispatch_layer(
     } else {
         encode_gemm_fallback(enc, P.gemm, P.gemv_m1, B.x_norm, 0, B.w_qkv, off_w_qkv,
                              B.qkv_packed, T, qkv_N, p.d_model);
+    }
+
+    // 2b. QKV bias add (Qwen2/2.5). Broadcast per-layer packed [Q|K|V] bias over
+    // the [T, qkv_N] matvec output before the split. Flag-gated + buffer-gated so
+    // Qwen3/Llama/Mistral (attn_qkv_bias=0, w_qkv_bias=null) never reach it.
+    if (p.attn_qkv_bias && B.w_qkv_bias != nullptr && P.bias_add != nullptr) {
+        const size_t bias_off = (size_t)L * qkv_N * 2;
+        encode_bias_add(enc, P.bias_add, B.qkv_packed, B.w_qkv_bias, bias_off,
+                        qkv_N, T);
     }
 
     // 3. Splits.
@@ -975,6 +1003,7 @@ struct ModelParams {
     float    eps          = 1e-6f;
     uint32_t use_qk_norm  = 1;  // 0 for Llama-arch (Nemotron-Nano): skip per-head Q/K RMSNorm
     uint32_t rope_interleaved = 0;  // 1 = interleaved/NORM RoPE (Llama GGUF, type 0); 0 = NeoX (Qwen3, type 2)
+    uint32_t attn_qkv_bias = 0;  // 1 = add per-layer packed [Q|K|V] bias after QKV matvec (Qwen2/2.5)
     uint32_t current_pos  = 0;
 
     // RoPE
@@ -1033,6 +1062,7 @@ struct ModelWeights {
     MTL::Buffer* w_pre_attn_norm;
     std::vector<MTL::Buffer*> w_qkv;        // size n_layers
     std::vector<size_t>       w_qkv_off;    // size n_layers
+    MTL::Buffer* w_qkv_bias = nullptr;      // (n_layers, qkv_N) fp16 packed [Q|K|V]; null = no QKV bias
     // V-proj split: when V's GGUF dtype differs from Q/K (Q4_K_M: Q/K=Q4_K,
     // V=Q6_K, distinct block sizes) the QKV slab holds only [Q|K] and V lives
     // in its own per-layer buffer. Empty otherwise (uniform-dtype fast path).
@@ -1170,6 +1200,7 @@ inline void dispatch_model(
         lp.eps          = M.eps;
         lp.use_qk_norm  = M.use_qk_norm;
         lp.rope_interleaved = M.rope_interleaved;
+        lp.attn_qkv_bias = M.attn_qkv_bias;
         lp.layer_idx    = L;
         lp.kv_buf_start = kv_buf_start;
         lp.kv_len       = kv_len;
@@ -1188,6 +1219,7 @@ inline void dispatch_model(
         lb.w_pre_attn_norm = W.w_pre_attn_norm;
         lb.w_qkv             = W.w_qkv[L];
         lb.w_qkv_inner_off   = W.w_qkv_off[L];
+        lb.w_qkv_bias        = W.w_qkv_bias;
         if (!W.w_v.empty()) {
             lb.w_v             = W.w_v[L];
             lb.w_v_inner_off   = W.w_v_off[L];
