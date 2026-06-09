@@ -76,11 +76,11 @@ struct LayerPSOs {
     MTL::ComputePipelineState* bias_add = nullptr;  // C[t,n] += bias[n] (Qwen2/2.5 QKV bias); optional
     MTL::ComputePipelineState* rope_qk;           // split-half (NeoX) RoPE on Q, K (Qwen3)
     MTL::ComputePipelineState* rope_qk_il = nullptr;  // interleaved (NORM) RoPE (Llama GGUF); used when rope_interleaved=1
-    MTL::ComputePipelineState* attn;              // mha_causal (d=128, GQA)
-    MTL::ComputePipelineState* attn_prefill = nullptr;  // mha_causal_prefill (BR=8); seq>1 only
+    MTL::ComputePipelineState* attn;              // mha_causal (GQA); D-specific (128/64)
+    MTL::ComputePipelineState* attn_prefill = nullptr;  // mha_causal_prefill (BR=8); seq>1, D=128 only
     // Flash-decoding split-K decode attention (long-ctx). Both non-null together.
-    MTL::ComputePipelineState* attn_split   = nullptr;  // mha_decode_split
-    MTL::ComputePipelineState* attn_combine = nullptr;  // mha_decode_combine
+    MTL::ComputePipelineState* attn_split   = nullptr;  // mha_decode_split (D-specific)
+    MTL::ComputePipelineState* attn_combine = nullptr;  // mha_decode_combine (D-specific)
     MTL::ComputePipelineState* kv_cache_write;
     // Q8_0-KV path (gated by SK_KV_Q8). All three non-null together or disabled.
     MTL::ComputePipelineState* kv_cache_write_q8 = nullptr;

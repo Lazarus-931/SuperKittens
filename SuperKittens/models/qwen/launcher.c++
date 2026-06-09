@@ -46,7 +46,7 @@ static MTL::Buffer* alloc_zero(MTL::Device* dev, size_t bytes) {
     return b;
 }
 
-static bool resolve_psos(ModelPSOs& P) {
+static bool resolve_psos(ModelPSOs& P, uint32_t head_dim) {
     P.layer.rmsnorm        = sk::bindings_pso("rmsnorm");
     // Optional T=1 fast path (nullable). 256-thread single-row variant.
     P.layer.rmsnorm_t1     = sk::bindings_pso("rmsnorm_t1");
@@ -87,26 +87,39 @@ static bool resolve_psos(ModelPSOs& P) {
     P.layer.bias_add       = sk::bindings_pso("bias_add");   // optional; Qwen2/2.5 QKV bias
     P.layer.rope_qk        = sk::bindings_pso("qwen_rope_qk");
     P.layer.rope_qk_il     = sk::bindings_pso("qwen_rope_qk_interleaved");  // optional; Llama-arch only
-    P.layer.attn           = sk::bindings_pso("mha_causal");
-    // Prefill-only larger-Br attention (seq>1). SK_NO_PREFILL_ATTN=1 forces the
-    // mha_causal Br=2 path at prefill too (A/B). nullptr → fa_d128 fallback.
-    P.layer.attn_prefill   = getenv("SK_NO_PREFILL_ATTN") ? nullptr
-                                                          : sk::bindings_pso("mha_causal_prefill");
+    // head_dim-specific dense attention. The kernels are templated on D; D=128
+    // (qwen/nemotron/mistral/llama-3.2-3b) keeps the original byte-identical
+    // instantiation, D=64 (llama-3.2-1b) routes to the _64 variant. Unknown D
+    // leaves attn null -> sk_qwen_create fails fast with a clear message.
+    const char* k_causal       = (head_dim == 64) ? "mha_causal_64"       : "mha_causal";
+    const char* k_split        = (head_dim == 64) ? "mha_decode_split_64" : "mha_decode_split";
+    const char* k_combine      = (head_dim == 64) ? "mha_decode_combine_64" : "mha_decode_combine";
+    P.layer.attn           = sk::bindings_pso(k_causal);
+    // Prefill-only larger-Br attention (seq>1, BR=8). D=128-only (fa_d128_prefill
+    // hardcodes D=128); for other head_dims leave null so prefill falls back to
+    // the head_dim-correct mha_causal Br=2 path. SK_NO_PREFILL_ATTN=1 forces the
+    // mha_causal path at prefill too (A/B).
+    P.layer.attn_prefill   = (head_dim == 128 && !getenv("SK_NO_PREFILL_ATTN"))
+                                 ? sk::bindings_pso("mha_causal_prefill") : nullptr;
     // SK_NO_SPLIT_ATTN=1 forces the mha_causal path everywhere (A/B + bisection).
     if (getenv("SK_NO_SPLIT_ATTN")) {
         P.layer.attn_split = nullptr;
         P.layer.attn_combine = nullptr;
     } else {
-        P.layer.attn_split   = sk::bindings_pso("mha_decode_split");    // optional; nullptr OK
-        P.layer.attn_combine = sk::bindings_pso("mha_decode_combine");  // optional; nullptr OK
+        P.layer.attn_split   = sk::bindings_pso(k_split);    // optional; nullptr OK
+        P.layer.attn_combine = sk::bindings_pso(k_combine);  // optional; nullptr OK
     }
     P.layer.kv_cache_write = sk::bindings_pso("kv_cache_write");
     // Q8_0-KV path (optional; nullptr OK). dispatch_layer only takes it when the
-    // handle allocated Q8 caches (SK_KV_Q8) AND all three resolve.
+    // handle allocated Q8 caches (SK_KV_Q8) AND all three resolve. The Q8-KV
+    // attention kernels are D=128-only (deq_kv_q8 hardcodes 128); leave them
+    // null for other head_dims so the fp16-KV path is used.
     P.layer.kv_cache_write_q8 = sk::bindings_pso("kv_cache_write_q8");
-    P.layer.attn_q8           = sk::bindings_pso("mha_causal_q8");
-    if (!getenv("SK_NO_SPLIT_ATTN"))
-        P.layer.attn_split_q8 = sk::bindings_pso("mha_decode_split_q8");
+    if (head_dim == 128) {
+        P.layer.attn_q8           = sk::bindings_pso("mha_causal_q8");
+        if (!getenv("SK_NO_SPLIT_ATTN"))
+            P.layer.attn_split_q8 = sk::bindings_pso("mha_decode_split_q8");
+    }
     P.layer.add            = sk::bindings_pso("add_f16");
     P.layer.add_rmsnorm    = sk::bindings_pso("add_rmsnorm");
     P.layer.gated_mlp      = sk::bindings_pso("gated_mlp");
@@ -131,7 +144,7 @@ static bool resolve_psos(ModelPSOs& P) {
     _CK("gemv_fp16_m1",     P.layer.gemv_m1);
     _CK("split_packed",     P.layer.split_packed);
     _CK("rope_qk",          P.layer.rope_qk);
-    _CK("mha_causal",       P.layer.attn);
+    _CK("mha_causal (head_dim-specific; 128/64)", P.layer.attn);
     _CK("kv_cache_write",   P.layer.kv_cache_write);
     _CK("add_f16",          P.layer.add);
     _CK("add_rmsnorm",      P.layer.add_rmsnorm);
@@ -154,7 +167,7 @@ extern "C" sk_qwen_handle* sk_qwen_create(const sk_qwen_config* cfg) {
 
     auto* h = new meow::qwen::Handle();
     h->cfg = *cfg;
-    if (!meow::qwen::resolve_psos(h->psos)) { delete h; return nullptr; }
+    if (!meow::qwen::resolve_psos(h->psos, cfg->head_dim)) { delete h; return nullptr; }
 
     using namespace meow::qwen;
     const uint32_t T_max = cfg->batch * cfg->seq_max;
