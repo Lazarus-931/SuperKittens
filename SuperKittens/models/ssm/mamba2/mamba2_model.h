@@ -54,7 +54,11 @@ struct LayerParams {
 struct LayerPSOs {
     MTL::ComputePipelineState* rmsnorm;
     MTL::ComputePipelineState* rmsnorm_t1 = nullptr;  // optional T=1 fast path
-    MTL::ComputePipelineState* gemm;          // gemm_fp16 (M=1 fast-path for decode)
+    MTL::ComputePipelineState* gemm;          // gemm_fp16 (prefill T>1)
+    // M=1 decode matvec: gemm_fp16's BM=32 MMA tile wastes 31/32 rows and runs
+    // the in/out_proj projections at 13-54 GB/s. gemv_fp16_m1 (transB=0) is a
+    // real column-per-thread matvec at ~90-110 GB/s on M4 base.
+    MTL::ComputePipelineState* gemv   = nullptr;   // gemv_fp16_m1 (transB=0)
     MTL::ComputePipelineState* split_packed;
     MTL::ComputePipelineState* conv1d_silu;
     MTL::ComputePipelineState* conv1d_silu_step = nullptr;   // O(1) decode conv
@@ -68,6 +72,9 @@ struct LayerPSOs {
 struct ModelPSOs {
     LayerPSOs layer;
     MTL::ComputePipelineState* embedding_lookup;
+    // LM head is transB=1 (tied embed (V,D)); 2dtile gemv hits ~109 GB/s vs
+    // gemm_fp16's 61 at this M=1 / N=50288 shape.
+    MTL::ComputePipelineState* gemv_t = nullptr;   // gemv_t_fp16_2dtile_m1
     MTL::ComputePipelineState* argmax;
     // Optional 2-pass fp16 argmax PSOs (≈1.8× at V=50288).
     MTL::ComputePipelineState* argmax_partial = nullptr;
@@ -140,6 +147,47 @@ inline void encode_gemm_mb(
     enc->setBuffer(C, off_C, 12);
     enc->dispatchThreadgroups(MTL::Size((N + 63) / 64, (M + 31) / 32, 1),
                               MTL::Size(64, 1, 1));
+    enc->endEncoding();
+}
+
+// M=1 matvec y[1,N] = x[1,K] @ W[K,N] (transB=0). 128 cols/TG, 128 threads.
+inline void encode_gemv_mb(
+    MTL::CommandBuffer* cmd, MTL::ComputePipelineState* pso,
+    MTL::Buffer* x, size_t off_x,
+    MTL::Buffer* W, size_t off_W,
+    MTL::Buffer* y, size_t off_y,
+    uint32_t N, uint32_t K)
+{
+    auto* enc = cmd->computeCommandEncoder();
+    enc->setComputePipelineState(pso);
+    enc->setBuffer(x, off_x, 0);
+    enc->setBuffer(W, off_W, 1);
+    enc->setBuffer(y, off_y, 2);
+    enc->setBytes(&N, 4, 3);
+    enc->setBytes(&K, 4, 4);
+    enc->dispatchThreadgroups(MTL::Size((N + 127) / 128, 1, 1),
+                              MTL::Size(128, 1, 1));
+    enc->endEncoding();
+}
+
+// M=1 matvec y[1,N] = x[1,K] @ W[N,K]^T (transB=1). 2D-tile: 64 rows/TG,
+// (32,16) threads. For the tied LM head (W = embed (V,D)).
+inline void encode_gemv_t_2dtile_mb(
+    MTL::CommandBuffer* cmd, MTL::ComputePipelineState* pso,
+    MTL::Buffer* x, size_t off_x,
+    MTL::Buffer* W, size_t off_W,
+    MTL::Buffer* y, size_t off_y,
+    uint32_t N, uint32_t K)
+{
+    auto* enc = cmd->computeCommandEncoder();
+    enc->setComputePipelineState(pso);
+    enc->setBuffer(x, off_x, 0);
+    enc->setBuffer(W, off_W, 1);
+    enc->setBuffer(y, off_y, 2);
+    enc->setBytes(&N, 4, 3);
+    enc->setBytes(&K, 4, 4);
+    enc->dispatchThreadgroups(MTL::Size((N + 63) / 64, 1, 1),
+                              MTL::Size(32, 16, 1));
     enc->endEncoding();
 }
 
@@ -339,9 +387,13 @@ inline void dispatch_layer(
     encode_rmsnorm_mb(cmd, P.rmsnorm, b.x_in, b.w_pre_norm, off_pre,
                       b.x_norm, T, D, p.eps, P.rmsnorm_t1);
 
-    // 2. in_proj GEMM: (T,D) x (D,IN_OUT) -> (T,IN_OUT)
-    encode_gemm_mb(cmd, P.gemm, b.x_norm, 0, b.w_in_proj, off_in,
-                   b.in_proj_out, 0, T, IN_OUT, D);
+    // 2. in_proj: (T,D) x (D,IN_OUT) -> (T,IN_OUT). M=1 decode → gemv.
+    if (T == 1 && P.gemv)
+        encode_gemv_mb(cmd, P.gemv, b.x_norm, 0, b.w_in_proj, off_in,
+                       b.in_proj_out, 0, IN_OUT, D);
+    else
+        encode_gemm_mb(cmd, P.gemm, b.x_norm, 0, b.w_in_proj, off_in,
+                       b.in_proj_out, 0, T, IN_OUT, D);
 
     // 3. Split packed [z(E) | xBC(C_in) | dt(H)]
     //    First split: z vs (xBC+dt). Write xBC+dt into xBC_post temporarily.
@@ -401,9 +453,13 @@ inline void dispatch_layer(
     encode_gate_norm(cmd, P.gate_norm, b.ssd_out, b.z,
                      b.w_norm, off_norm, b.gated, T, E, p.eps);
 
-    // 7. out_proj GEMM (T,E)x(E,D)->(T,D)
-    encode_gemm_mb(cmd, P.gemm, b.gated, 0, b.w_out_proj, off_outp,
-                   b.out_proj_out, 0, T, D, E);
+    // 7. out_proj: (T,E)x(E,D)->(T,D). M=1 decode → gemv.
+    if (T == 1 && P.gemv)
+        encode_gemv_mb(cmd, P.gemv, b.gated, 0, b.w_out_proj, off_outp,
+                       b.out_proj_out, 0, D, E);
+    else
+        encode_gemm_mb(cmd, P.gemm, b.gated, 0, b.w_out_proj, off_outp,
+                       b.out_proj_out, 0, T, D, E);
 
     // 8. residual in-place: x_in += out_proj_out  (add allows aliasing)
     encode_add_f16(cmd, P.add, b.x_in, b.out_proj_out, b.x_out, T * D);
@@ -506,8 +562,11 @@ inline void dispatch_model(
     encode_rmsnorm_mb(cmd, P.layer.rmsnorm, B.x, W.w_final_norm, 0,
                       B.x_norm, T, M.d_model, M.eps, P.layer.rmsnorm_t1);
 
-    // D. LM head (tied): (T,D) x (V,D)^T → (T,V) logits
-    {
+    // D. LM head (tied): (T,D) x (V,D)^T → (T,V) logits. M=1 decode → gemv_t.
+    if (T == 1 && P.gemv_t) {
+        encode_gemv_t_2dtile_mb(cmd, P.gemv_t, B.x_norm, 0, W.w_embed, 0,
+                                B.logits, 0, M.vocab_size, M.d_model);
+    } else {
         auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(P.layer.gemm);
         const uint32_t M_v = T, K_v = M.d_model, N_v = M.vocab_size;

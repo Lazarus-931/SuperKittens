@@ -35,6 +35,11 @@ static bool resolve_psos(ModelPSOs& P) {
     P.layer.rmsnorm      = sk::bindings_pso("rmsnorm");
     P.layer.rmsnorm_t1   = sk::bindings_pso("rmsnorm_t1");  // optional T=1 fast path
     P.layer.gemm         = sk::bindings_pso("gemm_fp16");
+    // M=1 decode matvec fast paths (proper gemv vs gemm_fp16's padded BM=32 MMA).
+    if (!std::getenv("SK_MAMBA_NO_GEMV")) {
+        P.layer.gemv = sk::bindings_pso("gemv_fp16_m1");
+        P.gemv_t     = sk::bindings_pso("gemv_t_fp16_2dtile_m1");
+    }
     P.layer.split_packed = sk::bindings_pso("split_packed");
     P.layer.conv1d_silu  = sk::bindings_pso("conv1d_silu");
     P.layer.conv1d_silu_step   = sk::bindings_pso("conv1d_silu_step");
