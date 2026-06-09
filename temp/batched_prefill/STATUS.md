@@ -81,26 +81,28 @@ overhead is small; attention-per-lane looping is a non-issue (attention is one
 batch-grid dispatch, only the transposes loop per lane).
 
 ### Qwen3-8B-Q4_K_M (amelia M4 base, seq_max=128, cache_max=512; colima VM ~4 GB resident)
-**Gate 1 PASS observed; TTFT table NOT cleanly measurable on this host today.**
-- A shared-dir run matching my exact launch args printed gate1 PASS (8/8 lanes
-  first-token + 32-token continuation vs token-by-token baseline, chunk=64 ==
-  single-chunk 8/8, identical-prompt lanes identical) — this exercises the
-  Q4_K MMA body, the split-V Q6_K per-layer path, and the untied Q6_K head
-  via the per-lane matvec tail. Twin-session dir collision clouds formal
-  provenance of the log lines (same script+seed → identical expected text).
-- The only TTFT combo whose bytes I verified on-disk before the collision was
-  understood: T=128 single chunk: A(tbt)=37514.5 ms, B(batched)=7321.8 ms,
-  5.12x — measured under heavy memory pressure (two 4.7 GB 8B handles + 4 GB
-  colima -> swap; pressure penalizes A's 128 weight re-reads far more than
-  B's 1-2, so treat 5.12x as pressure-amplified, not a clean number).
-- A re-run in a private dir (`~/sk-bp-a7c31`) was killed by me mid-gate1 when
-  swap hit 4.9/6 GB with two 8B handles live (16 GB box hard-reboot risk);
-  the twin's long-running 8B process could not be drained within the session
-  (and killing it was correctly denied — unattributable ownership).
-- Honest expectation for a quiet box: the 8B speedup should EXCEED the 1.7B's
-  2.6-2.7x somewhat (T weight re-reads of 4.7 GB vs 2 GB amortized to ~1-2
-  reads; serving memory shows batched wins grow with model size), but I do
-  not have a clean measurement to report.
+Clean re-run in a uniquely-named single-writer dir (`~/sk-bp-a7c31`) after the
+shared-dir collision drained and the box was otherwise idle (78-82% memory
+free at start). JSON provenance verified (`artifacts_priv/gates_8b_priv.json`).
+**Gate 1 PASS (8/8 lanes: first token + 32-token continuation vs the
+token-by-token baseline; chunk=64 == single-chunk; identical-prompt lanes
+identical)** — exercises the Q4_K MMA body, the split-V Q6_K per-layer path,
+and the untied Q6_K head via the per-lane matvec tail. T scoped to 128 only
+(T=256 was attempted in the earlier tainted runs; the long protocol could not
+be landed cleanly within the session — T=128 covers the headline).
+
+| T | chunk | A (tbt) | B (batched) | speedup | improvement |
+|---|---|---|---|---|---|
+| 128 | 128 (1 chunk) | 37912.0 ms | 7314.5 ms | 5.18x | 80.7% |
+| 128 | 64            | 37630.5 ms | 7243.0 ms | 5.20x | 80.8% |
+
+Reps tight (A ±0.7%, B ±0.2%). A's 296 ms/lockstep-step implies partial mmap
+weight eviction per step (4.7 GB weights + 4 GB colima on 16 GB); without
+colima A would improve and the ratio would compress somewhat — on this host's
+honest steady state the win is ~5.2x. An earlier tainted-shared-dir
+observation (5.12x) independently reproduces it; an earlier two-8B-handle
+private attempt was killed by me at swap 4.9/6 GB (hard-reboot risk) before
+this clean window opened.
 
 ## Bench-host notes (honesty caveats)
 - amelia ran a colima VM (~4 GB resident) throughout. For the 8B (4.7 GB mmap
@@ -129,12 +131,12 @@ batch-grid dispatch, only the transposes loop per lane).
 ## Verdict
 **POSITIVE — all three gates pass; serving TTFT improves 61.8–63.0% (2.62–2.70x)
 at N=8 on Qwen3-1.7B-Q8_0 (clean, provenance-verified), far above the 8%
-gate.** Lane continuations after batched prefill are token-identical both to
-the token-by-token lockstep baseline AND to the per-prompt batch=1 chunked
+gate; Qwen3-8B-Q4_K_M (clean private re-run): 5.18-5.20x (80.7-80.8%) at
+T=128 — the win GROWS with model size as the weight-read amortization
+predicts.** Lane continuations after batched prefill are token-identical both
+to the token-by-token lockstep baseline AND to the per-prompt batch=1 chunked
 single-stream reference; single-stream and lockstep paths are output-identical
-between baseline and patched dylibs. 8B-Q4_K_M gate-1 also passed; its TTFT
-headline could not be measured cleanly (host contention + memory pressure,
-see notes) — the one observed combo (5.12x at T=128) is pressure-amplified.
+between baseline and patched dylibs.
 
 ## Extension to other launchers (note only, not implemented)
 - **gemma4**: `gemma4_model.h` already runs batch-aware rope/qkv-norm variants
@@ -157,4 +159,5 @@ see notes) — the one observed combo (5.12x at T=128) is pressure-amplified.
   (optional-symbol-gated).
 - `temp/batched_prefill/{gates_ttft.py,single_stream.py}` — gate/bench
   drivers; `amelia/` — CLT-only build + runtime-compile env;
-  `artifacts_shared_dir/` — run-written JSONs (1.7B gates+TTFT, gate-2 pair).
+  `artifacts_shared_dir/` — run-written JSONs (1.7B gates+TTFT, gate-2 pair);
+  `artifacts_priv/gates_8b_priv.json` — clean 8B gates+TTFT (private dir).
