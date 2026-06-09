@@ -75,6 +75,7 @@ struct LayerPSOs {
     MTL::ComputePipelineState* rope_qk;           // split-half (NeoX) RoPE on Q, K (Qwen3)
     MTL::ComputePipelineState* rope_qk_il = nullptr;  // interleaved (NORM) RoPE (Llama GGUF); used when rope_interleaved=1
     MTL::ComputePipelineState* attn;              // mha_causal (d=128, GQA)
+    MTL::ComputePipelineState* attn_prefill = nullptr;  // mha_causal_prefill (BR=8); seq>1 only
     // Flash-decoding split-K decode attention (long-ctx). Both non-null together.
     MTL::ComputePipelineState* attn_split   = nullptr;  // mha_decode_split
     MTL::ComputePipelineState* attn_combine = nullptr;  // mha_decode_combine
@@ -601,13 +602,20 @@ inline void dispatch_layer(
                                /*barrier_before=*/false);
     }
 
+    // Profiling-only stage gates (seq>1 prefill only; decode untouched). Diff
+    // GPUPROF gpu_busy with/without to attribute TTFT to xpose vs attention.
+    static const bool prof_skip_xpose = (getenv("SK_PROF_SKIP_XPOSE") != nullptr);
+    static const bool prof_skip_attn  = (getenv("SK_PROF_SKIP_ATTN")  != nullptr);
+
     MTL::Buffer* q_in = B.q;
     MTL::Buffer* k_in = B.k_tmp;
     MTL::Buffer* v_in = B.v_tmp;
-    if (p.seq > 1) {
+    if (p.seq > 1 && !prof_skip_xpose) {
         encode_transpose(enc, P.t_seq_to_head, B.q,     B.q_th, p.seq, p.n_heads,    hd);
         encode_transpose(enc, P.t_seq_to_head, B.k_tmp, B.k_th, p.seq, p.n_kv_heads, hd);
         encode_transpose(enc, P.t_seq_to_head, B.v_tmp, B.v_th, p.seq, p.n_kv_heads, hd);
+        q_in = B.q_th; k_in = B.k_th; v_in = B.v_th;
+    } else if (p.seq > 1) {
         q_in = B.q_th; k_in = B.k_th; v_in = B.v_th;
     }
 
@@ -656,7 +664,7 @@ inline void dispatch_layer(
     // from kv≈384, Hg≥4 only from kv≈1024 (4× the per-key simd_sum work delays
     // the crossover). Gates sit past the break-even so neither config regresses.
     enc_barrier(enc);
-    {
+    if (!(p.seq > 1 && prof_skip_attn)) {
         const uint32_t kv_len = p.kv_len;
         const uint32_t cache_stride = p.cache_size;
         const uint32_t Hg_attn = p.n_heads / p.n_kv_heads;
@@ -738,7 +746,15 @@ inline void dispatch_layer(
                 MTL::Size(p.n_kv_heads, (p.seq + 1) / 2, p.batch),
                 MTL::Size(Hg_attn * 2 * 32, 1, 1));
         } else {
-            enc->setComputePipelineState(P.attn);
+            // Prefill (seq>1): BR=8 variant reuses each K/V smem tile across 8
+            // query rows (vs Br=2), cutting the O(seq^2) K/V HBM re-stream ~4x.
+            // Gated on Hg*BR*32<=1024 (kernel max). Decode (seq==1) keeps Br=2.
+            constexpr uint32_t PBR = 8u;
+            const bool use_prefill = (p.seq > 1) && (P.attn_prefill != nullptr)
+                                     && (Hg_attn * PBR * 32u <= 1024u);
+            MTL::ComputePipelineState* pso_a = use_prefill ? P.attn_prefill : P.attn;
+            const uint32_t br = use_prefill ? PBR : 2u;
+            enc->setComputePipelineState(pso_a);
             enc->setBuffer(q_in,       0, 0);
             enc->setBuffer(B.k_cache,  0, 1);
             enc->setBuffer(B.v_cache,  0, 2);
@@ -749,15 +765,17 @@ inline void dispatch_layer(
             enc->setBytes(&kv_len,        4, 7);
             enc->setBytes(&cache_stride,  4, 8);
             enc->dispatchThreadgroups(
-                MTL::Size(p.n_kv_heads, (p.seq + 1) / 2, p.batch),
-                MTL::Size(Hg_attn * 2 * 32, 1, 1));
+                MTL::Size(p.n_kv_heads, (p.seq + br - 1u) / br, p.batch),
+                MTL::Size(Hg_attn * br * 32, 1, 1));
         }
     }
 
     MTL::Buffer* attn_o_in = B.attn_out;
-    if (p.seq > 1) {
+    if (p.seq > 1 && !prof_skip_xpose) {
         encode_transpose(enc, P.t_head_to_seq, B.attn_out, B.attn_out_seq,
                          p.seq, p.n_heads, hd);
+        attn_o_in = B.attn_out_seq;
+    } else if (p.seq > 1) {
         attn_o_in = B.attn_out_seq;
     }
 

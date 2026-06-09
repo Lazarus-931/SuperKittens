@@ -87,6 +87,10 @@ static bool resolve_psos(ModelPSOs& P) {
     P.layer.rope_qk        = sk::bindings_pso("qwen_rope_qk");
     P.layer.rope_qk_il     = sk::bindings_pso("qwen_rope_qk_interleaved");  // optional; Llama-arch only
     P.layer.attn           = sk::bindings_pso("mha_causal");
+    // Prefill-only larger-Br attention (seq>1). SK_NO_PREFILL_ATTN=1 forces the
+    // mha_causal Br=2 path at prefill too (A/B). nullptr → fa_d128 fallback.
+    P.layer.attn_prefill   = getenv("SK_NO_PREFILL_ATTN") ? nullptr
+                                                          : sk::bindings_pso("mha_causal_prefill");
     // SK_NO_SPLIT_ATTN=1 forces the mha_causal path everywhere (A/B + bisection).
     if (getenv("SK_NO_SPLIT_ATTN")) {
         P.layer.attn_split = nullptr;

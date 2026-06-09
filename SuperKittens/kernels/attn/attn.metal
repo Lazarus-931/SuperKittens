@@ -270,6 +270,155 @@ void fa_d128(
 }
 
 
+// ── Prefill-specialized attention (seq>1) ─────────────────────────────────
+// Same flash math + GQA design as fa_d128, but BR query rows per threadgroup
+// (vs Br=2 in the decode-tuned fa_d128). BR is the K/V-tile reuse factor: each
+// Bc=64 tile is staged in smem once per TG and reused across Hg*BR simdgroups,
+// so the cooperative K/V HBM read is amortised over BR rows instead of 2. At
+// long-seq prefill mha_causal re-streams the full causal K/V seq/Br times
+// (O(seq^2) HBM); BR=8 cuts that traffic ~4x. NT = Hg*BR*32 must stay <=1024,
+// so the host gates this kernel on Hg*BR*32<=1024 (else falls back to fa_d128).
+// The per-key math (simd_sum dot, online softmax) is bit-identical to fa_d128;
+// only the threadgroup row-fan-out + tile reuse differ. Decode (seq=1) NEVER
+// dispatches this — it stays on fa_d128 (mha_causal), byte-identical.
+template<bool Causal, uint BR>
+[[kernel, max_total_threads_per_threadgroup(1024)]]
+void fa_d128_prefill(
+    device const half* Q          [[buffer(0)]],
+    device const half* K          [[buffer(1)]],
+    device const half* V          [[buffer(2)]],
+    device half*       O          [[buffer(3)]],
+    constant uint&    seq         [[buffer(4)]],
+    constant uint&   nheads       [[buffer(5)]],
+    constant uint& n_kv_heads     [[buffer(6)]],
+    constant uint& kv_len         [[buffer(7)]],
+    constant uint& cache_stride   [[buffer(8)]],
+    uint3 gid  [[threadgroup_position_in_grid]],
+    uint  lid  [[thread_index_in_threadgroup]],
+    uint  simd [[simdgroup_index_in_threadgroup]],
+    uint  lane [[thread_index_in_simdgroup]])
+{
+    constexpr uint D = 128, D4 = D / 4, Bc = 64;
+
+    const uint kv_head = gid.x;
+    const uint batch   = gid.z;
+    const uint Hg      = nheads / n_kv_heads;
+    const uint NT      = Hg * BR * 32u;
+
+    const uint q_head_local = simd / BR;
+    const uint r            = simd - q_head_local * BR;
+    const uint head         = kv_head * Hg + q_head_local;
+    const uint q_row        = gid.y * BR + r;
+    const bool active       = (q_row < seq) && (head < nheads) && (kv_head < n_kv_heads);
+
+    const size_t q_off  = (size_t)(batch * nheads     + head)    * seq          * D;
+    const size_t kv_off = (size_t)(batch * n_kv_heads + kv_head) * cache_stride * D;
+
+    threadgroup half4 k_smem[Bc * D4];
+    threadgroup half4 v_smem[Bc * D4];
+
+    const float scale = 1.0f / sqrt(float(D));
+    float4 q_reg = float4(0.0f);
+    if (active) {
+        q_reg = float4(
+            reinterpret_cast<const device half4*>(Q + q_off + (size_t)q_row * D)[lane]) * scale;
+    }
+
+    float m = -INFINITY, s = 0.0f;
+    float4 acc = float4(0.0f);
+
+    const uint q_pos = kv_len - seq + q_row;
+    const uint total_lim = Causal ? q_pos + 1u : kv_len;
+
+    // Threadgroup-uniform tile walk (last active row's causal extent), with each
+    // row's own cutoff re-imposed per key column — identical contract to fa_d128.
+    uint tg_last_row = gid.y * BR + (BR - 1u);
+    if (tg_last_row >= seq) tg_last_row = seq - 1u;
+    const uint tg_q_pos = kv_len - seq + tg_last_row;
+    const uint tg_lim   = Causal ? tg_q_pos + 1u : kv_len;
+    const uint full_tiles  = tg_lim / Bc;
+    const uint partial_lim = tg_lim - full_tiles * Bc;
+
+    for (uint t = 0; t < full_tiles; ++t) {
+        const uint c0 = t * Bc;
+        for (uint i = lid; i < Bc * D4; i += NT) {
+            const uint rr = i / D4, dd = i % D4, col = c0 + rr;
+            k_smem[i] = reinterpret_cast<const device half4*>(K + kv_off + (size_t)col * D)[dd];
+            v_smem[i] = reinterpret_cast<const device half4*>(V + kv_off + (size_t)col * D)[dd];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint j = 0; j < Bc; j += 2) {
+            const uint col0 = c0 + j, col1 = c0 + j + 1u;
+            half4 k0 = k_smem[j * D4 + lane], k1 = k_smem[(j+1) * D4 + lane];
+            float s0 = (col0 < total_lim) ? simd_sum(dot(q_reg, float4(k0))) : -INFINITY;
+            float s1 = (col1 < total_lim) ? simd_sum(dot(q_reg, float4(k1))) : -INFINITY;
+            float new_m = max(m, max(s0, s1));
+            float alpha = metal::fast::exp(m - new_m);
+            float b0    = metal::fast::exp(s0 - new_m);
+            float b1    = metal::fast::exp(s1 - new_m);
+            m   = new_m;
+            s   = fma(s, alpha, b0 + b1);
+            acc *= alpha;
+            acc += b0 * float4(v_smem[j * D4 + lane]);
+            acc += b1 * float4(v_smem[(j+1) * D4 + lane]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_none);
+    }
+
+    if (partial_lim > 0) {
+        const uint c0 = full_tiles * Bc;
+        for (uint i = lid; i < Bc * D4; i += NT) {
+            const uint rr = i / D4, dd = i % D4, col = c0 + rr;
+            if (col < tg_lim) {
+                k_smem[i] = reinterpret_cast<const device half4*>(K + kv_off + (size_t)col * D)[dd];
+                v_smem[i] = reinterpret_cast<const device half4*>(V + kv_off + (size_t)col * D)[dd];
+            } else {
+                k_smem[i] = half4(0.0h);
+                v_smem[i] = half4(0.0h);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint j = 0;
+        for (; j + 1 < partial_lim; j += 2) {
+            const uint col0 = c0 + j, col1 = c0 + j + 1u;
+            half4 k0 = k_smem[j * D4 + lane], k1 = k_smem[(j+1) * D4 + lane];
+            float s0 = (col0 < total_lim) ? simd_sum(dot(q_reg, float4(k0))) : -INFINITY;
+            float s1 = (col1 < total_lim) ? simd_sum(dot(q_reg, float4(k1))) : -INFINITY;
+            float new_m = max(m, max(s0, s1));
+            float alpha = metal::fast::exp(m - new_m);
+            float b0    = metal::fast::exp(s0 - new_m);
+            float b1    = metal::fast::exp(s1 - new_m);
+            m   = new_m;
+            s   = fma(s, alpha, b0 + b1);
+            acc *= alpha;
+            acc += b0 * float4(v_smem[j * D4 + lane]);
+            acc += b1 * float4(v_smem[(j+1) * D4 + lane]);
+        }
+        if (j < partial_lim) {
+            const uint col0 = c0 + j;
+            float score = (col0 < total_lim) ? simd_sum(dot(q_reg, float4(k_smem[j * D4 + lane])))
+                                             : -INFINITY;
+            float new_m = max(m, score);
+            float alpha = metal::fast::exp(m - new_m);
+            float beta  = metal::fast::exp(score - new_m);
+            m   = new_m;
+            s   = fma(s, alpha, beta);
+            acc *= alpha;
+            acc += beta * float4(v_smem[j * D4 + lane]);
+        }
+        threadgroup_barrier(mem_flags::mem_none);
+    }
+
+    if (active) {
+        const float inv_s = s > 0.0f ? 1.0f / s : 0.0f;
+        reinterpret_cast<device half4*>(O + q_off + (size_t)q_row * D)[lane] = half4(acc * inv_s);
+    }
+}
+
+
 // ── Q8_0 KV-cache attention ───────────────────────────────────────────────
 // K/V cached as Q8_0: int8 qs (…,kv,D) + fp16 scales (…,kv,D/32). Dequant
 // happens during the cooperative smem load, so the math loops below are
@@ -690,6 +839,14 @@ template [[host_name("mha_causal")]]
 
 template [[host_name("mha_noncausal")]]
 [[kernel]] void fa_d128<false>(
+    device const half*, device const half*, device const half*, device half*,
+    constant uint&, constant uint&, constant uint&, constant uint&, constant uint&,
+    uint3, uint, uint, uint);
+
+// Prefill-only (seq>1) larger-Br variant. BR=8 → Hg*8*32 threads: 1024 at Hg=4
+// (qwen3-4B/8B), 512 at Hg=2; host gates on Hg*BR*32<=1024.
+template [[host_name("mha_causal_prefill")]]
+[[kernel]] void fa_d128_prefill<true, 8>(
     device const half*, device const half*, device const half*, device half*,
     constant uint&, constant uint&, constant uint&, constant uint&, constant uint&,
     uint3, uint, uint, uint);
