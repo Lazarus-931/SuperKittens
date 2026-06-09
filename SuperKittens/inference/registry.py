@@ -204,6 +204,26 @@ SPECS: dict[str, ModelSpec] = {
                                     low_freq_factor=1.0, high_freq_factor=4.0,
                                     original_max_position_embeddings=8192)),
     ),
+    # Llama-3.2-1B-Instruct: identical arch to the 3B above, just smaller — same
+    # Llama32 adapter, config-only. 16 layers, d2048, 32Q/8KV head_dim 64,
+    # intermediate 8192, vocab 128256, TIED embed, llama3 rope (theta 500000).
+    # Q4_K_M (~0.8 GB; embed+output Q8_0) fits a disk-tight host.
+    "llama-3.2-1b": ModelSpec(
+        family="llama32",
+        adapter="SuperKittens.models.llama32.llama32:Llama32",
+        hf_repo="meta-llama/Llama-3.2-1B-Instruct",
+        weight_dir="Llama-3.2-1B-Instruct-GGUF",
+        gguf_name="Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+        default_quant="q4_k_m",
+        tokenizer_family="llama",
+        dims=dict(n_layers=16, d_model=2048, n_heads=32, n_kv_heads=8,
+                  head_dim=64, n_int=8192, vocab_size=128256,
+                  eps=1e-5, rope_freq_base=500000.0, tie_word_embeddings=1,
+                  use_qk_norm=0,
+                  rope_scaling=dict(rope_type="llama3", factor=32.0,
+                                    low_freq_factor=1.0, high_freq_factor=4.0,
+                                    original_max_position_embeddings=8192)),
+    ),
     "qwen3-1.7b": ModelSpec(
         family="qwen3",
         adapter="SuperKittens.models.qwen.qwen:Qwen",

@@ -1,8 +1,9 @@
-"""llama32.py — Llama-3.2-3B-Instruct adapter over the dense core.
+"""llama32.py — Llama-3.2-{1B,3B}-Instruct adapter over the dense core.
 
-Llama-3.2-3B-Instruct is ``model_type=llama`` (LlamaForCausalLM) — the same dense
-decoder the shared :class:`DenseDecoder` core drives, configured for the
-Llama-3.2 arch:
+Llama-3.2-{1B,3B}-Instruct is ``model_type=llama`` (LlamaForCausalLM) — the same
+dense decoder the shared :class:`DenseDecoder` core drives. The 1B and 3B differ
+only in dims (registry rows ``llama-3.2-1b`` / ``llama-3.2-3b``); the adapter is
+config-only across both. Configured for the Llama-3.2 arch:
 
   1. ``use_qk_norm=0`` — Llama has no per-head Q/K RMSNorm.
   2. ``rope_interleaved=1`` — as a Llama-family GGUF, llama.cpp's converter
@@ -15,7 +16,7 @@ Llama-3.2 arch:
      HF ``apply_rotary_pos_emb``. The RoPE kernel only consumes the tables, so no
      kernel change is needed.
   4. ``tie_word_embeddings=1`` — UNLIKE Nemotron/Mistral (untied ``output.weight``),
-     Llama-3.2-3B ties the LM head to the input embedding. The shared core already
+     Llama-3.2 ties the LM head to the input embedding. The shared core already
      handles the tied case: the C++ launcher reads ``token_embd.weight`` as the LM
      head when ``tie_word_embeddings=1`` (and leaves ``w_lm_head`` null). No
      plumbing change — the tie flag is a generic core config field.
@@ -65,7 +66,7 @@ def _llama3_inv_freq(head_dim: int, theta: float, *,
 
 
 class Llama32(DenseDecoder):
-    """Llama-3.2-3B-Instruct handle (own adapter; shared dense core)."""
+    """Llama-3.2-{1B,3B}-Instruct handle (own adapter; shared dense core)."""
 
     # Llama3 RoPE scaling, captured from config.json/spec by from_spec.
     # None → plain RoPE (matches the DenseDecoder default).
@@ -99,7 +100,7 @@ class Llama32(DenseDecoder):
         forcing ``use_qk_norm=0`` (Llama arch) and ``rope_interleaved=1`` (Llama
         GGUF NORM rope), and capturing the ``llama3`` rope_scaling block so
         :meth:`bake_and_set_rope` rescales inv_freq. ``tie_word_embeddings``
-        comes from config.json (true for Llama-3.2-3B) and the shared core ties
+        comes from config.json (true for Llama-3.2) and the shared core ties
         the LM head to ``token_embd.weight``.
         """
         sk_root = Path(__file__).resolve().parents[3]
