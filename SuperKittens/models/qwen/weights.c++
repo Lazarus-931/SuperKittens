@@ -441,6 +441,38 @@ void dequant_q6_k_to_fp16(uint16_t* dst, const uint8_t* src, size_t n_elems) {
     }
 }
 
+// Q6_K dequant to fp32 (no fp16 round-trip). Feeds the Q4_K requantizer for the
+// SK_QWEN_Q4K_HEAD path on Q4_K_M models (Q6_K head). Straight to fp32 avoids the
+// double-rounding (Q6_K→fp16→Q4_K) that would stack fp16 mantissa loss on top of
+// the head's own quant noise (mirrors dequant_q8_0_to_fp32). Layout identical to
+// dequant_q6_k_to_fp16.
+void dequant_q6_k_to_fp32(float* dst, const uint8_t* src, size_t n_elems) {
+    const size_t nb = n_elems / 256;
+    for (size_t b = 0; b < nb; ++b) {
+        const uint8_t* p = src + b * 210;
+        const uint8_t* ql = p;
+        const uint8_t* qh = p + 128;
+        const int8_t*  sc = (const int8_t*)(p + 128 + 64);
+        uint16_t dh; std::memcpy(&dh, p + 128 + 64 + 16, 2);
+        const float d = fp16_bits_to_f32(dh);
+        float* out = dst + b * 256;
+        for (int n = 0; n < 256; n += 128) {
+            for (int l = 0; l < 32; ++l) {
+                const int is = l / 16;
+                const int8_t q1 = (int8_t)((ql[l +  0] & 0x0F) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                const int8_t q2 = (int8_t)((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                const int8_t q3 = (int8_t)((ql[l +  0] >>   4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                const int8_t q4 = (int8_t)((ql[l + 32] >>   4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                out[n + l +  0] = d * (float)sc[is + 0] * (float)q1;
+                out[n + l + 32] = d * (float)sc[is + 2] * (float)q2;
+                out[n + l + 64] = d * (float)sc[is + 4] * (float)q3;
+                out[n + l + 96] = d * (float)sc[is + 6] * (float)q4;
+            }
+            ql += 64; qh += 32; sc += 8;
+        }
+    }
+}
+
 // F32 → FP16.
 void f32_to_fp16(uint16_t* dst, const float* src, size_t n) {
     for (size_t i = 0; i < n; ++i) {
@@ -569,14 +601,23 @@ static int load_gguf_range_impl(meow::qwen::Handle* h, const char* path,
         // vocab·d_model % 256 == 0 (Q4_K super-block) and the q4k_matvec PSO.
         const char* q4k_env = std::getenv("SK_QWEN_Q4K_HEAD");
         const bool want_q4k_head = q4k_env && q4k_env[0] != '0';
-        if (want_q4k_head && v->dtype == sk::Dtype::Q8_0
+        // Source dtype the requantizer accepts: Q8_0 (Q8 models) or Q6_K
+        // (Q4_K_M models, whose output.weight is Q6_K). Both dequant to fp32 then
+        // re-quantize to Q4_K, routing decode through q4k_matvec. Q6_K→Q4_K trims
+        // the head from 210→144 B/256 (~31%); the head is the single largest
+        // per-token decode read so this is direct aggregate-bandwidth relief.
+        const bool head_requantizable =
+            v->dtype == sk::Dtype::Q8_0 || v->dtype == sk::Dtype::Q6_K;
+        if (want_q4k_head && head_requantizable
             && ((size_t)c.vocab_size * dm) % 256 == 0
             && h->psos.layer.q4k_matvec != nullptr) {
             const size_t n_elems = (size_t)c.vocab_size * dm;
-            const size_t q8_bytes = sk::dtype_bytes(sk::Dtype::Q8_0, n_elems);
-            if (v->nbytes != q8_bytes) {
-                std::fprintf(stderr, "gguf: %s Q8_0 size %zu != expected %zu\n",
-                             tname, v->nbytes, q8_bytes);
+            const sk::Dtype src_dt = v->dtype;
+            const size_t src_bytes = sk::dtype_bytes(src_dt, n_elems);
+            if (v->nbytes != src_bytes) {
+                std::fprintf(stderr, "gguf: %s %s size %zu != expected %zu\n",
+                             tname, src_dt == sk::Dtype::Q8_0 ? "Q8_0" : "Q6_K",
+                             v->nbytes, src_bytes);
                 return -15;
             }
             const size_t q4k_bytes = sk::dtype_bytes(sk::Dtype::Q4_K, n_elems);
@@ -584,13 +625,17 @@ static int load_gguf_range_impl(meow::qwen::Handle* h, const char* path,
             h->weights.w_lm_head = dev->newBuffer(q4k_bytes, MTL::ResourceStorageModeShared);
             if (!h->weights.w_lm_head) return -16;
             std::vector<float> head_f32(n_elems);
-            dequant_q8_0_to_fp32(head_f32.data(), (const uint8_t*)v->data, n_elems);
+            if (src_dt == sk::Dtype::Q8_0)
+                dequant_q8_0_to_fp32(head_f32.data(), (const uint8_t*)v->data, n_elems);
+            else
+                dequant_q6_k_to_fp32(head_f32.data(), (const uint8_t*)v->data, n_elems);
             sk::quantize_q4_k(head_f32.data(), n_elems,
                               (uint8_t*)h->weights.w_lm_head->contents());
             h->weights.off_w_lm_head = 0;
             h->weights.dt_lm_head = sk::Dtype::Q4_K;
-            std::fprintf(stderr, "sk_qwen_load_gguf: Q4_K LM head ON (%s, %.1f MB vs %.1f MB Q8)\n",
-                         tname, q4k_bytes / 1e6, q8_bytes / 1e6);
+            std::fprintf(stderr, "sk_qwen_load_gguf: Q4_K LM head ON (%s, src=%s, %.1f MB vs %.1f MB src)\n",
+                         tname, src_dt == sk::Dtype::Q8_0 ? "Q8_0" : "Q6_K",
+                         q4k_bytes / 1e6, src_bytes / 1e6);
         } else
         if (v->dtype == sk::Dtype::Q8_0) {
             const size_t bytes = sk::dtype_bytes(sk::Dtype::Q8_0, (size_t)c.vocab_size * dm);
