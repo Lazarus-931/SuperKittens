@@ -724,6 +724,7 @@ inline void dispatch_attn(
             enc->setBytes(&p.v_head_dim,  4, 9);
             enc->setBytes(&p.cache_size,  4, 10);
             enc->setBytes(&p.write_pos,   4, 11);
+            enc->setBytes(&p.seq,         4, 12);   // per-lane KV isolation: t=b*seq+s
             enc->dispatchThreads(MTL::Size(dk, p.n_heads, T),
                                  MTL::Size(dk < 256u ? dk : 256u, 1, 1));
             enc->endEncoding();
@@ -1038,7 +1039,8 @@ inline void dispatch_layer(
     // (N_R0_Q4_K), Q5_0 nr0=4 (N_R0_Q5_0, raised from 2 with the layout switch).
     auto encode_mv_id = [&](MTL::ComputePipelineState* pso, bool is_q4k,
                             MTL::Buffer* w, size_t w_off, MTL::Buffer* src1,
-                            MTL::Buffer* dst, uint32_t in_dim, uint32_t out_rows) {
+                            MTL::Buffer* dst, uint32_t in_dim, uint32_t out_rows,
+                            bool is_down = false) {
         const uint32_t NR0   = is_q4k ? 2u : 4u;   // N_R0_Q4_K / N_R0_Q5_0
         const uint32_t blk_w = is_q4k ? 256u : 32u;
         const uint64_t blk_b = is_q4k ? 144u : 22u;
@@ -1049,8 +1051,17 @@ inline void dispatch_layer(
         a.nbi1 = (uint64_t)p.top_k * sizeof(int32_t);
         a.ne00 = (int32_t)in_dim; a.ne01 = (int32_t)out_rows; a.ne02 = (int32_t)p.n_expert;
         a.nb00 = blk_b; a.nb01 = row_blk; a.nb02 = slab;
-        a.ne10 = (int32_t)in_dim; a.ne11 = 1; a.ne12 = 1; a.ne13 = 1;
-        a.nb10 = sizeof(float); a.nb11 = (uint64_t)in_dim * sizeof(float); a.nb12 = a.nb11;
+        // gate/up: src1 = moe_x_f32[T, in_dim] — one activation row per token,
+        //   reused across all top_k experts (i11=idx%1=0; i12=token strides in_dim).
+        // down:    src1 = moe_mid_f32[T, top_k, in_dim] — per-(token,slot) SwiGLU
+        //   output. ne11=top_k so i11=idx%top_k=slot strides one in_dim row, and
+        //   i12=token strides a whole token block (top_k*in_dim). At T>1 the old
+        //   per-token-only stride read slot-0 mid for every expert (=cross-slot
+        //   bleed -> garbage lanes); harmless at T=1,top_k>1 only by accident.
+        a.ne10 = (int32_t)in_dim; a.ne11 = is_down ? (int32_t)p.top_k : 1; a.ne12 = 1; a.ne13 = 1;
+        a.nb10 = sizeof(float);
+        a.nb11 = (uint64_t)in_dim * sizeof(float);
+        a.nb12 = is_down ? (uint64_t)p.top_k * in_dim * sizeof(float) : a.nb11;
         // ne1 = top_k so the dst base offset (idx + iid1*ne1)*ne0 separates each
         // (token, slot) output into [T, top_k, out_rows]; ne1=1 collapsed s+t (prefill T>1 bug).
         a.ne0 = (int32_t)out_rows; a.ne1 = (int32_t)p.top_k; a.nb1 = (uint64_t)out_rows * sizeof(float);
@@ -1222,7 +1233,7 @@ inline void dispatch_layer(
                          B.moe_mid_f32, B.moe_down_f32, p.n_int, p.d_model);
     } else {
         encode_mv_id(P.moe_mv_down, false, B.w_down, (size_t)L * down_layer,
-                     B.moe_mid_f32, B.moe_down_f32, p.n_int, p.d_model);
+                     B.moe_mid_f32, B.moe_down_f32, p.n_int, p.d_model, /*is_down=*/true);
     }
     PROF_MARK(cmd, "moe_down_q5_0");
 
@@ -1287,6 +1298,9 @@ struct ModelParams {
     float    mscale_all_dim          = 1.0f;
     float    rope_scaling_factor     = 1.0f;
     uint32_t first_k_dense_replace   = 3;
+    // Batched lockstep decode (batch>1, seq==1): one greedy next-token per lane.
+    // The LM head + argmax run over all T=batch rows instead of the last row only.
+    uint32_t decode_all_rows         = 0u;
 };
 
 struct ModelPSOs {
@@ -1576,7 +1590,9 @@ inline void dispatch_model(
         // is unchanged → byte-identical next-token, T cheaper (~T×) head GEMM.
         // T==1 is the existing path (M_v=1, row 0). SK_DS_NO_LMHEAD_LAST escapes.
         static const bool g_lmhead_all = (std::getenv("SK_DS_NO_LMHEAD_LAST") != nullptr);
-        const bool last_only = (!g_lmhead_all && T > 1u);
+        // Batched lockstep decode needs EVERY lane row (one next-token/lane), so
+        // the last-row-only prefill shortcut must not fire there.
+        const bool last_only = (!g_lmhead_all && T > 1u && M.decode_all_rows == 0u);
         const uint32_t M_v = last_only ? 1u : T;
         const uint32_t K_v = M.d_model;
         const uint32_t N_v = M.vocab_size;
@@ -1640,6 +1656,17 @@ inline void dispatch_model(
                                           MTL::Size(1024, 1, 1));
                 enc->endEncoding();
             }
+        } else if (M.decode_all_rows) {
+            // Batched lockstep decode: one greedy next-token per lane. argmax
+            // keys on row=threadgroup_position_in_grid -> dispatch T TGs reading
+            // logits[r*V] into output_id[r]. (LM head computed all T rows above.)
+            auto* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(P.argmax);
+            enc->setBuffer(B.logits,    0, 0);
+            enc->setBuffer(B.output_id, 0, 1);
+            enc->setBytes(&M.vocab_size, 4, 2);
+            enc->dispatchThreadgroups(MTL::Size(T, 1, 1), MTL::Size(1024, 1, 1));
+            enc->endEncoding();
         } else {
             // Next-token prediction needs the LAST row's argmax only; output_id
             // holds one int, so bind logits at the last row and dispatch 1 TG
