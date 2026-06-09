@@ -43,6 +43,32 @@ def qwen_template(messages: Sequence[dict], add_generation_prompt: bool = True) 
     return "".join(parts)
 
 
+def mistral_template(messages: Sequence[dict], add_generation_prompt: bool = True) -> str:
+    """Mistral-Instruct v0.2/v0.3 format: [INST] user [/INST] assistant</s>.
+    <s> is NOT prepended here -- callers opt in via chat(bos=True). A leading
+    system message is folded into the first user turn (Mistral has no system role
+    token). add_generation_prompt is implicit: a trailing [INST] block with no
+    closing assistant turn already cues the model to answer.
+    """
+    parts = []
+    system = ""
+    pending_user = None
+    for m in messages:
+        role = m.get("role", "user").lower()
+        content = m.get("content", "")
+        if role == "system":
+            system = (system + "\n\n" + content).strip() if system else content
+        elif role == "user":
+            text = f"{system}\n\n{content}".strip() if system else content
+            system = ""
+            pending_user = text
+            parts.append(f"[INST] {text} [/INST]")
+        else:  # assistant
+            pending_user = None
+            parts.append(f"{content}</s>")
+    return "".join(parts)
+
+
 def gemma_template(messages: Sequence[dict], add_generation_prompt: bool = True) -> str:
     role_map = {"user": "user", "assistant": "model", "model": "model", "system": "user"}
     parts = []
@@ -83,4 +109,5 @@ CHAT_TEMPLATES = {
     "gemma4": gemma4_template,
     "llama": llama_template,
     "nemotron": llama_template,
+    "mistral": mistral_template,
 }

@@ -163,6 +163,24 @@ SPECS: dict[str, ModelSpec] = {
                                     low_freq_factor=1.0, high_freq_factor=4.0,
                                     original_max_position_embeddings=8192)),
     ),
+    # Mistral-7B-Instruct-v0.3: model_type "mistral" (MistralForCausalLM) — a
+    # Llama-style dense decoder. Reuses the qwen launcher/kernels; the Mistral
+    # adapter sets use_qk_norm=0 and rope_interleaved=1 (Llama GGUF NORM rope,
+    # theta=1e6, no llama3 rescale). Untied LM head (output.weight). vocab 32768.
+    # Q4_K_M (~4.4 GB) fits a 16 GB mini.
+    "mistral-7b-v0.3": ModelSpec(
+        family="mistral",
+        adapter="SuperKittens.models.mistral.mistral:Mistral",
+        hf_repo="mistralai/Mistral-7B-Instruct-v0.3",
+        weight_dir="Mistral-7B-Instruct-v0.3-GGUF",
+        gguf_name="Mistral-7B-Instruct-v0.3-Q4_K_M.gguf",
+        default_quant="q4_k_m",
+        tokenizer_family="mistral",
+        dims=dict(n_layers=32, d_model=4096, n_heads=32, n_kv_heads=8,
+                  head_dim=128, n_int=14336, vocab_size=32768,
+                  eps=1e-5, rope_freq_base=1_000_000.0, tie_word_embeddings=0,
+                  use_qk_norm=0),
+    ),
     "qwen3-1.7b": ModelSpec(
         family="qwen3",
         adapter="SuperKittens.models.qwen.qwen:Qwen",
