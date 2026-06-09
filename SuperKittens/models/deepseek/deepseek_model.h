@@ -133,6 +133,8 @@ struct LayerPSOs {
     MTL::ComputePipelineState* rope_interleave;   // V3 GPT-J-style pair RoPE
     MTL::ComputePipelineState* router_v3;          // V3 sigmoid+bias+group+topk router
     MTL::ComputePipelineState* router_v2;          // V2-Lite softmax+topk router (shared moe_router)
+    MTL::ComputePipelineState* router_partial = nullptr;  // split-D occupancy router: partial dots
+    MTL::ComputePipelineState* router_reduce  = nullptr;  // split-D occupancy router: reduce+softmax+topk
     MTL::ComputePipelineState* flash_attn_vec;
     MTL::ComputePipelineState* mla_decode_v2;      // V2-Lite per-head MLA decode (dk=192, dv=128)
     MTL::ComputePipelineState* mla_kv_write;       // assemble dk=192 K + dv=128 V into per-head cache
@@ -228,6 +230,7 @@ struct LayerBuffers {
     MTL::Buffer* moe_top_idx;
     MTL::Buffer* moe_top_score;
     MTL::Buffer* moe_hidden;
+    MTL::Buffer* moe_router_partial = nullptr;  // [T][N_DSPLIT][n_expert] fp32 split-D partials
     MTL::Buffer* moe_x_f32;       // routing input cast to fp32 (mul_mv_id reads fp32)
     MTL::Buffer* moe_gate_f32;    // [top_k, n_int] fp32
     MTL::Buffer* moe_up_f32;      // [top_k, n_int] fp32
@@ -861,18 +864,52 @@ inline void dispatch_layer(
     // moe_router: x fp16 (m_in), W fp16 (w_router, [D,N]) → top_idx, top_score.
     {
         const size_t router_off = (size_t)L * p.d_model * p.n_expert * 2;
-        auto* enc = cmd->computeCommandEncoder();
-        enc->setComputePipelineState(P.router_v2);
-        enc->setBuffer(B.m_in,          0,          0);
-        enc->setBuffer(B.w_router,      router_off, 1);
-        enc->setBuffer(B.moe_top_idx,   0,          2);
-        enc->setBuffer(B.moe_top_score, 0,          3);
-        enc->setBytes(&T,         4, 4);
-        enc->setBytes(&p.d_model, 4, 5);
-        enc->setBytes(&p.n_expert,4, 6);
-        enc->setBytes(&p.top_k,   4, 7);
-        enc->dispatchThreadgroups(MTL::Size(T, 1, 1), MTL::Size(256, 1, 1));
-        enc->endEncoding();
+        // Expert-split occupancy router: the single-TG moe_router pins 64
+        // experts × D=2048 onto 1 GPU core at T=1 (~2 GB/s). Spread the experts
+        // over N_EGRP threadgroups (grid.y) so N_EGRP cores each compute an
+        // expert-block with the IDENTICAL full-D dot product (bit-for-bit logits
+        // → unchanged routing), then gather+softmax+top-K in a tiny second
+        // kernel. Falls back to single-TG moe_router if PSOs failed to compile.
+        if (P.router_partial && P.router_reduce && B.moe_router_partial) {
+            constexpr uint32_t N_EGRP = 8;
+            {
+                auto* enc = cmd->computeCommandEncoder();
+                enc->setComputePipelineState(P.router_partial);
+                enc->setBuffer(B.m_in,               0,          0);
+                enc->setBuffer(B.w_router,           router_off, 1);
+                enc->setBuffer(B.moe_router_partial, 0,          2);
+                enc->setBytes(&T,         4, 4);
+                enc->setBytes(&p.d_model, 4, 5);
+                enc->setBytes(&p.n_expert,4, 6);
+                enc->dispatchThreadgroups(MTL::Size(T, N_EGRP, 1), MTL::Size(256, 1, 1));
+                enc->endEncoding();
+            }
+            {
+                auto* enc = cmd->computeCommandEncoder();
+                enc->setComputePipelineState(P.router_reduce);
+                enc->setBuffer(B.moe_router_partial, 0, 0);
+                enc->setBuffer(B.moe_top_idx,        0, 2);
+                enc->setBuffer(B.moe_top_score,      0, 3);
+                enc->setBytes(&T,         4, 4);
+                enc->setBytes(&p.n_expert,4, 6);
+                enc->setBytes(&p.top_k,   4, 7);
+                enc->dispatchThreadgroups(MTL::Size(T, 1, 1), MTL::Size(256, 1, 1));
+                enc->endEncoding();
+            }
+        } else {
+            auto* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(P.router_v2);
+            enc->setBuffer(B.m_in,          0,          0);
+            enc->setBuffer(B.w_router,      router_off, 1);
+            enc->setBuffer(B.moe_top_idx,   0,          2);
+            enc->setBuffer(B.moe_top_score, 0,          3);
+            enc->setBytes(&T,         4, 4);
+            enc->setBytes(&p.d_model, 4, 5);
+            enc->setBytes(&p.n_expert,4, 6);
+            enc->setBytes(&p.top_k,   4, 7);
+            enc->dispatchThreadgroups(MTL::Size(T, 1, 1), MTL::Size(256, 1, 1));
+            enc->endEncoding();
+        }
     }
 
     // Routing input cast fp16 → fp32 (mul_mv_id reads fp32 activations).
@@ -1104,6 +1141,7 @@ struct ModelBuffers {
     MTL::Buffer* moe_top_idx;
     MTL::Buffer* moe_top_score;
     MTL::Buffer* moe_hidden;
+    MTL::Buffer* moe_router_partial = nullptr;
     MTL::Buffer* moe_x_f32;
     MTL::Buffer* moe_gate_f32;
     MTL::Buffer* moe_up_f32;
@@ -1253,6 +1291,7 @@ inline void dispatch_model(
         lb.moe_top_idx   = B.moe_top_idx;
         lb.moe_top_score = B.moe_top_score;
         lb.moe_hidden    = B.moe_hidden;
+        lb.moe_router_partial = B.moe_router_partial;
         lb.moe_x_f32     = B.moe_x_f32;
         lb.moe_gate_f32  = B.moe_gate_f32;
         lb.moe_up_f32    = B.moe_up_f32;

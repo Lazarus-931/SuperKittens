@@ -127,6 +127,8 @@ static bool resolve_psos(ModelPSOs& P, uint32_t dk, uint32_t dv) {
 
     // V2-Lite MLA + Q4_K MoE path.
     P.layer.router_v2     = sk::bindings_pso("moe_router");
+    P.layer.router_partial = sk::bindings_pso("moe_router_partial");  // split-D occupancy router
+    P.layer.router_reduce  = sk::bindings_pso("moe_router_reduce");
     P.layer.mla_decode_v2 = sk::bindings_pso("kernel_mla_decode_v2_f16_dk192_dv128");
     P.layer.mla_kv_write  = sk::bindings_pso("deepseek_mla_kv_write");
     P.layer.moe_mv_gate   = resolve_mvid_pso(
@@ -318,6 +320,8 @@ extern "C" sk_deepseek_handle* sk_deepseek_create(const sk_deepseek_config* cfg)
     h->bufs.moe_top_idx   = alloc_zero(dev, (size_t)T_max * cfg->top_k * sizeof(int32_t));
     h->bufs.moe_top_score = alloc_zero(dev, (size_t)T_max * cfg->top_k * 2);
     h->bufs.moe_hidden    = alloc_zero(dev, (size_t)T_max * cfg->top_k * cfg->n_int * 2);
+    // expert-split router full per-expert logits: [T][n_expert] fp32.
+    h->bufs.moe_router_partial = alloc_zero(dev, (size_t)T_max * cfg->n_expert * 4);
     // fp32 scratch for the per-expert mul_mv_id MoE path.
     h->bufs.moe_x_f32     = alloc_zero(dev, (size_t)T_max * cfg->d_model * 4);
     h->bufs.moe_gate_f32  = alloc_zero(dev, (size_t)T_max * cfg->top_k * cfg->n_int * 4);
