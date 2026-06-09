@@ -216,15 +216,17 @@ extern "C" sk_gemma4_handle* sk_gemma4_create(const sk_gemma4_config* cfg) {
     // SK_GEMMA4_LMHEAD_Q8=0 to keep the bf16 fallback (and skip the ~400 MB
     // alloc for E2B). Populated by weights.c++ when the bf16 lm_head is
     // available (tied with embed_tokens for gemma4). Forced on when EMBED_Q8.
-    // Optional Q4_K LM head (SK_GEMMA4_LMHEAD_Q4K=1; default off). The head is
-    // the one large-N bandwidth-bound decode matvec, so Q4_K (0.23 GB E2B) over
-    // Q8_0 (0.43 GB) is a direct decode win (isolated head matvec 1.87x; same
-    // ~108 GB/s, win = bytes). Separate buffer from the tied embed Q8 (no Q4_K
-    // embed-gather kernel; keep the input side clean). weights.c++ quantizes the
-    // scaled bf16 head into it. d_model must be 256-block aligned.
+    // Q4_K LM head (SK_GEMMA4_LMHEAD_Q4K; default ON, =0 to disable). The head is
+    // the one large-N bandwidth-bound decode matvec, so Q4_K over Q8_0 is half the
+    // head bytes = a direct decode win at no measured coherence cost. Validated:
+    // E2B 48/48 token-match (#90); 12B-unified 8/8 first-step top-8 logit overlap
+    // + coherent over 40 tok, +6.5% per-tok decode and -0.5 GB resident vs Q8 head.
+    // Separate buffer from the tied embed Q8 (no Q4_K embed-gather kernel; keep the
+    // input side clean). weights.c++ quantizes the scaled bf16 head into it.
+    // d_model must be 256-block aligned (E2B/E4B 2560, 12B-unified 3840 all align).
     {
         const char* env = std::getenv("SK_GEMMA4_LMHEAD_Q4K");
-        const bool want_q4k = env && env[0] == '1';
+        const bool want_q4k = !env || env[0] != '0';
         if (want_q4k && (cfg->d_model % 256 == 0) && h->psos.layer.q4k_matvec_bf16) {
             const size_t n_elems = (size_t)cfg->vocab_size * cfg->d_model;
             const size_t q4k_bytes = (n_elems / 256) * 144;
