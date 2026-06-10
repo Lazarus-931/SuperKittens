@@ -95,6 +95,12 @@ int  sk_deepseek_forward(sk_deepseek_handle* h,
 // batch int32 (one greedy next-token/lane). batch==1 == single-stream forward.
 int  sk_deepseek_forward_batched(sk_deepseek_handle* h,
                                  const int* input_ids, int* output_id);
+// Batched chunked prefill: ids = batch*seq int32 (request-major, equal-length
+// lockstep lanes), chunks of <= chunk_size (0 = seq_max) per dispatch; logits/
+// argmax only on the final chunk. out_next = batch int32 greedy next tokens.
+int  sk_deepseek_prefill_batched(sk_deepseek_handle* h,
+                                 const int* ids, uint32_t seq,
+                                 uint32_t chunk_size, int* out_next);
 void sk_deepseek_reset(sk_deepseek_handle* h);
 void sk_deepseek_destroy(sk_deepseek_handle* h);
 

@@ -1304,6 +1304,13 @@ struct ModelParams {
     // Batched lockstep decode (batch>1, seq==1): one greedy next-token per lane.
     // The LM head + argmax run over all T=batch rows instead of the last row only.
     uint32_t decode_all_rows         = 0u;
+    // Batched (batch>1, seq>1) chunked prefill. 1 = interior chunk: KV is
+    // written, no logits consumer yet -> skip final norm + head + argmax.
+    // 2 = final chunk: per-lane last-row head + per-lane argmax (the standard
+    // T>1 tail projects only the GLOBAL last row = lane N-1; decode_all_rows
+    // would project all batch*seq rows and its argmax writes T entries into the
+    // batch-sized output_id).
+    uint32_t batched_prefill         = 0u;
 };
 
 struct ModelPSOs {
@@ -1582,8 +1589,53 @@ inline void dispatch_model(
 
     PROF_MARK(cmd, "layers_total");
 
+    if (M.batched_prefill == 1u) return;
+
     encode_rmsnorm(cmd, P.layer.rmsnorm, cur, W.w_final_norm, 0,
                    nxt, T, M.d_model, M.eps, P.layer.rmsnorm_t1);
+
+    if (M.batched_prefill == 2u) {
+        MTL::Buffer* lm = W.w_lm_head ? W.w_lm_head : W.w_embed;
+        MTL::ComputePipelineState* lm_q = ds_quant_matvec_pso(P.layer, W.dt_lm_head);
+        const uint32_t K_v = M.d_model;
+        const uint32_t N_v = M.vocab_size;
+        for (uint32_t b = 0; b < M.batch; ++b) {
+            const size_t off_x = ((size_t)b * M.seq + M.seq - 1u) * K_v * 2;
+            const size_t off_c = (size_t)b * (size_t)N_v * 2;
+            if (lm_q) {
+                encode_quant_matvec(cmd, lm_q, lm, 0, nxt, off_x,
+                                    B.logits, off_c, 1u, N_v, K_v);
+            } else {
+                const uint32_t M_v = 1u;
+                uint32_t ldA = K_v, ldB = K_v, ldC = N_v;
+                int transA = 0, transB = 1, has_bias = 0;
+                auto* enc = cmd->computeCommandEncoder();
+                enc->setComputePipelineState(P.layer.gemm);
+                enc->setBuffer(nxt,        off_x, 0);
+                enc->setBuffer(lm,         0,     1);
+                enc->setBuffer(B.logits,   off_c, 2);
+                enc->setBytes(&M_v,      4, 3); enc->setBytes(&N_v,      4, 4);
+                enc->setBytes(&K_v,      4, 5); enc->setBytes(&ldA,      4, 6);
+                enc->setBytes(&ldB,      4, 7); enc->setBytes(&ldC,      4, 8);
+                enc->setBytes(&transA,   4, 9); enc->setBytes(&transB,   4, 10);
+                enc->setBytes(&has_bias, 4, 11);
+                enc->setBuffer(B.logits, off_c, 12);
+                enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, 1, 1),
+                                          MTL::Size(64, 1, 1));
+                enc->endEncoding();
+            }
+        }
+        // argmax keys row on threadgroup position (logits[r*V] -> output_id[r]);
+        // per-lane logits sit in rows 0..batch-1 (off_c above).
+        auto* enc = cmd->computeCommandEncoder();
+        enc->setComputePipelineState(P.argmax);
+        enc->setBuffer(B.logits,    0, 0);
+        enc->setBuffer(B.output_id, 0, 1);
+        enc->setBytes(&M.vocab_size, 4, 2);
+        enc->dispatchThreadgroups(MTL::Size(M.batch, 1, 1), MTL::Size(1024, 1, 1));
+        enc->endEncoding();
+        return;
+    }
 
     {
         // PREFILL last-row LM head: sk_deepseek_forward returns only the argmax of

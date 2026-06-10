@@ -625,6 +625,112 @@ extern "C" int sk_deepseek_forward_batched(sk_deepseek_handle* hp,
     return 0;
 }
 
+// Batched chunked prefill: ids is batch*seq int32 (request-major: row b is lane
+// b's seq prompt tokens; all lanes the same length, lockstep positions). Runs
+// the prompt in chunks of <= chunk_size (clamped to seq_max): each chunk's
+// projections run at M=batch*chunk so the weight stream amortizes across lanes
+// AND tokens, vs. the token-by-token serving prefill paying `seq` full
+// weight-read passes. Logits/argmax run only on the final chunk; out_next[b]
+// receives lane b's greedy next token. chunk_size 0 -> seq_max. Does NOT
+// reset; lanes share current_pos (lockstep), per-lane KV via mla_kv_write_b's
+// b=t/seq cache regions.
+extern "C" int sk_deepseek_prefill_batched(sk_deepseek_handle* hp,
+                                           const int* ids, uint32_t seq,
+                                           uint32_t chunk_size, int* out_next) {
+    if (!hp || !ids || !out_next) return -1;
+    auto* h = reinterpret_cast<meow::deepseek::Handle*>(hp);
+    if (seq == 0) return -2;
+    if (h->cfg.batch < 1) return -5;
+    uint32_t step = (chunk_size == 0) ? h->cfg.seq_max : chunk_size;
+    if (step > h->cfg.seq_max) step = h->cfg.seq_max;
+    if (h->current_pos + seq > h->cfg.cache_max) return -4;
+
+    auto* q = sk::bindings_queue();
+    if (!q) return -3;
+
+    int32_t* in_ids = (int32_t*)h->bufs.input_ids->contents();
+    int32_t* pos    = (int32_t*)h->bufs.rope_pos->contents();
+    const uint32_t batch = h->cfg.batch;
+
+    for (uint32_t s = 0; s < seq; ) {
+        const uint32_t remaining = seq - s;
+        const uint32_t this_seq  = (remaining < step) ? remaining : step;
+        for (uint32_t b = 0; b < batch; ++b)
+            std::memcpy(in_ids + (size_t)b * this_seq, ids + (size_t)b * seq + s,
+                        (size_t)this_seq * sizeof(int32_t));
+        // rope_interleave_f32 reads pos[i3*ne01 + i1]: pos[b*seq + i] for Q
+        // (ne01=seq, ne03=batch) and pos[r], r=b*seq+i for k_pe (ne01=batch*seq)
+        // -> per-lane repeated fill (the single-stream fill covers lane 0 only).
+        for (uint32_t b = 0; b < batch; ++b)
+            for (uint32_t i = 0; i < this_seq; ++i)
+                pos[(size_t)b * this_seq + i] = (int32_t)(h->current_pos + i);
+        const bool final_chunk = (s + this_seq == seq);
+
+        meow::deepseek::ModelParams mp;
+        mp.batch          = h->cfg.batch;
+        mp.seq            = this_seq;
+        mp.n_layers       = h->cfg.n_layers;
+        mp.d_model        = h->cfg.d_model;
+        mp.n_int          = h->cfg.n_int;
+        mp.shared_n_int   = h->cfg.shared_n_int;
+        mp.dense_n_int    = h->cfg.dense_n_int ? h->cfg.dense_n_int : h->cfg.shared_n_int;
+        mp.n_heads        = h->cfg.n_heads;
+        mp.qk_nope_dim    = h->cfg.qk_nope_dim;
+        mp.qk_rope_dim    = h->cfg.qk_rope_dim;
+        mp.v_head_dim     = h->cfg.v_head_dim;
+        mp.q_lora_rank    = h->cfg.q_lora_rank;
+        mp.kv_lora_rank   = h->cfg.kv_lora_rank;
+        mp.n_expert       = h->cfg.n_expert;
+        mp.top_k          = h->cfg.top_k;
+        mp.cache_max      = h->cfg.cache_max;
+        mp.moe_quant      = (h->cfg.moe_quant == 1) ? meow::deepseek::MoeQuant::INT2_DS4
+                                                    : meow::deepseek::MoeQuant::FP16;
+        mp.vocab_size     = h->cfg.vocab_size;
+        mp.eps            = h->cfg.eps;
+        mp.current_pos    = h->current_pos;
+        mp.rope_n_ctx_orig = h->cfg.rope_n_ctx_orig;
+        mp.rope_freq_base  = h->cfg.rope_freq_base;
+        mp.rope_freq_scale = h->cfg.rope_freq_scale;
+        mp.rope_ext_factor = h->cfg.rope_ext_factor;
+        mp.rope_attn_factor = h->cfg.rope_attn_factor;
+        mp.rope_beta_fast  = h->cfg.rope_beta_fast;
+        mp.rope_beta_slow  = h->cfg.rope_beta_slow;
+        mp.has_q_lora            = (h->cfg.has_q_lora != 0);
+        mp.router_has_bias       = (h->cfg.router_has_bias != 0);
+        mp.rope_interleave       = (h->cfg.rope_interleave != 0);
+        mp.norm_topk_prob        = (h->cfg.norm_topk_prob != 0);
+        mp.n_group               = h->cfg.n_group;
+        mp.topk_group            = h->cfg.topk_group;
+        mp.routed_scaling        = h->cfg.routed_scaling_factor;
+        mp.mscale_all_dim        = h->cfg.mscale_all_dim;
+        mp.rope_scaling_factor   = h->cfg.rope_scaling_factor;
+        mp.first_k_dense_replace = h->cfg.first_k_dense_replace;
+        mp.batched_prefill       = final_chunk ? 2u : 1u;
+
+        auto* cmd = q->commandBuffer();
+        cmd->retain();
+        meow::deepseek::dispatch_model(cmd, h->psos, h->weights, h->bufs, mp);
+        cmd->commit();
+        cmd->waitUntilCompleted();
+        if (cmd->status() == MTL::CommandBufferStatusError) {
+            auto* e = cmd->error();
+            std::fprintf(stderr, "ds prefill_batched: command buffer ERROR (status=%ld): %s\n",
+                         (long)(e ? e->code() : -1),
+                         e && e->localizedDescription() ? e->localizedDescription()->utf8String() : "?");
+            cmd->release();
+            return -7;
+        }
+        cmd->release();
+
+        h->current_pos += this_seq;
+        s += this_seq;
+    }
+
+    std::memcpy(out_next, h->bufs.output_id->contents(),
+                (size_t)batch * sizeof(int32_t));
+    return 0;
+}
+
 extern "C" void sk_deepseek_destroy(sk_deepseek_handle* hp) {
     if (!hp) return;
     auto* h = reinterpret_cast<meow::deepseek::Handle*>(hp);
