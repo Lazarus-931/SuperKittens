@@ -1158,6 +1158,16 @@ struct ModelParams {
     // rows so each request gets its own next token. Default 0 keeps the
     // single-row (last-position) decode/prefill path byte-identical.
     uint32_t decode_all_rows    = 0;
+
+    // Batched (batch=N, seq>1) chunked prefill. 0 = off (all existing paths
+    // byte-identical). 1 = interior chunk: layers/KV only, skip final norm +
+    // head + descale + softcap + argmax (serving needs logits only after the
+    // full prompt). 2 = final chunk: project each lane's LAST prompt row
+    // (b*seq+seq-1) -> logits row b, then descale + softcap + argmax ->
+    // output_id[b]. The decode_all_rows head would project all batch*seq rows
+    // (vocab x T dead work) and its argmax requires seq==1, so the prefill
+    // tail is its own path.
+    uint32_t batched_prefill    = 0;
 };
 
 struct ModelPSOs {
@@ -1755,6 +1765,9 @@ inline void dispatch_model(
         MTL::Buffer* tmp = cur; cur = nxt; nxt = tmp;
     }
 
+    // Interior batched-prefill chunk: KV is written, no logits consumer yet.
+    if (M.batched_prefill == 1u) return;
+
     // C. Final RMSNorm
     {
         auto* enc = cmd->computeCommandEncoder();
@@ -1780,6 +1793,91 @@ inline void dispatch_model(
     if (M.dump_enabled) {
         const size_t base = 1 + (size_t)4 * M.n_layers;
         _dump_blit_row(cmd, nxt, B.dump_stash, T, M.d_model, base * M.d_model);
+    }
+
+    // Final batched-prefill chunk: per-lane last-row head + descale + softcap +
+    // argmax (see the batched_prefill field WHY). The lane matvecs have
+    // disjoint outputs and a read-only head weight, so one encoder serves all
+    // lanes; encoder boundaries order head -> descale -> softcap -> argmax.
+    if (M.batched_prefill == 2u) {
+        const uint32_t K_v = M.d_model;
+        const uint32_t N_v = M.vocab_size;
+        const size_t in_row_bytes  = (size_t)M.d_model * 2;
+        const size_t out_row_bytes = (size_t)M.vocab_size * 2;
+        const bool q4k_head = (W.w_lm_head_q4k != nullptr) && (P.layer.q4k_matvec_bf16 != nullptr);
+        const bool q8_head  = (W.w_lm_head_q8  != nullptr) && (P.layer.q8_0_matvec_bf16 != nullptr);
+        {
+            auto* enc = cmd->computeCommandEncoder();
+            for (uint32_t b = 0; b < M.batch; ++b) {
+                const size_t off_A = ((size_t)b * M.seq + M.seq - 1u) * in_row_bytes;
+                const size_t off_C = (size_t)b * out_row_bytes;
+                if (q4k_head || q8_head) {
+                    const uint32_t NR0 = 2;
+                    enc->setComputePipelineState(q4k_head ? P.layer.q4k_matvec_bf16
+                                                          : P.layer.q8_0_matvec_bf16);
+                    enc->setBuffer(nxt, off_A, 0);
+                    enc->setBuffer(q4k_head ? W.w_lm_head_q4k : W.w_lm_head_q8, 0, 1);
+                    enc->setBuffer(B.logits, off_C, 2);
+                    enc->setBytes(&K_v, 4, 3);
+                    enc->setBytes(&N_v, 4, 4);
+                    enc->dispatchThreadgroups(MTL::Size((N_v + NR0 - 1) / NR0, 1, 1),
+                                              MTL::Size(128, 1, 1));
+                } else {
+                    const uint32_t M_v = 1u;
+                    uint32_t ldA = K_v, ldB = K_v, ldC = N_v;
+                    int transA = 0, transB = 1, has_bias = 0;
+                    enc->setComputePipelineState(P.layer.gemm);
+                    enc->setBuffer(nxt,       off_A, 0);
+                    enc->setBuffer(W.w_embed, 0,     1);
+                    enc->setBuffer(B.logits,  off_C, 2);
+                    enc->setBytes(&M_v,      4, 3); enc->setBytes(&N_v,    4, 4);
+                    enc->setBytes(&K_v,      4, 5); enc->setBytes(&ldA,    4, 6);
+                    enc->setBytes(&ldB,      4, 7); enc->setBytes(&ldC,    4, 8);
+                    enc->setBytes(&transA,   4, 9); enc->setBytes(&transB, 4, 10);
+                    enc->setBytes(&has_bias, 4, 11);
+                    enc->setBuffer(B.logits, off_C, 12);
+                    enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, 1, 1),
+                                              MTL::Size(64, 1, 1));
+                }
+            }
+            enc->endEncoding();
+        }
+        // Lane logits live in rows 0..batch — descale/softcap span batch*vocab.
+        const uint32_t n_lane = M.batch * M.vocab_size;
+        {
+            auto* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(P.logit_descale);
+            enc->setBuffer(B.logits, 0, 0);
+            float inv_scale = 1.0f / std::sqrt((float)M.d_model);
+            enc->setBytes(&n_lane,    4, 1);
+            enc->setBytes(&inv_scale, 4, 2);
+            uint32_t groups = ((n_lane / 4u) + 127u) / 128u;
+            enc->dispatchThreadgroups(MTL::Size(groups, 1, 1), MTL::Size(128, 1, 1));
+            enc->endEncoding();
+        }
+        if (M.final_logit_softcap > 0.0f) {
+            auto* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(P.logit_softcap);
+            enc->setBuffer(B.logits, 0, 0);
+            float cap = M.final_logit_softcap;
+            enc->setBytes(&n_lane, 4, 1);
+            enc->setBytes(&cap,    4, 2);
+            uint32_t groups = ((n_lane / 4u) + 127u) / 128u;
+            enc->dispatchThreadgroups(MTL::Size(groups, 1, 1), MTL::Size(128, 1, 1));
+            enc->endEncoding();
+        }
+        {
+            auto* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(P.argmax);
+            for (uint32_t b = 0; b < M.batch; ++b) {
+                enc->setBuffer(B.logits,    (size_t)b * out_row_bytes,   0);
+                enc->setBuffer(B.output_id, (size_t)b * sizeof(int32_t), 1);
+                enc->setBytes(&M.vocab_size, 4, 2);
+                enc->dispatchThreadgroups(MTL::Size(1, 1, 1), MTL::Size(1024, 1, 1));
+            }
+            enc->endEncoding();
+        }
+        return;
     }
 
     // D. LM head GEMM (tied with input embedding).
