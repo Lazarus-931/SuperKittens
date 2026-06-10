@@ -100,6 +100,17 @@ int sk_gemma4_forward_batched(sk_gemma4_handle* h,
                               const int* input_ids, uint32_t seq,
                               int* output_id);
 
+// Batched (batch=N, seq>1) chunked prefill. ids is batch*seq int32
+// (request-major; all lanes the same length, lockstep positions). Runs chunks
+// of <= chunk_size (0 -> seq_max; clamped to seq_max) with one M=batch*chunk
+// GEMM pass per chunk; logits + argmax only on the final chunk (per-lane LAST
+// row, with gemma's logit descale + softcap). out_next receives `batch` greedy
+// next tokens. Advances current_pos by seq; does NOT reset. Token-exact while
+// seq <= window (local-layer ring eviction; see launcher.c++ WHY).
+int sk_gemma4_prefill_batched(sk_gemma4_handle* h,
+                              const int* ids, uint32_t seq,
+                              uint32_t chunk_size, int* out_next);
+
 // Reset the per-sequence KV-cache cursor (does NOT zero the cache buffers;
 // stale data is shadowed once new K/V is written over it).
 void sk_gemma4_reset(sk_gemma4_handle* h);

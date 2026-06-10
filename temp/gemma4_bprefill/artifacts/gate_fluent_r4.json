@@ -1,0 +1,35 @@
+{
+ "first_match": [
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+  true
+ ],
+ "cont_match": [
+  false,
+  false,
+  false,
+  false,
+  true,
+  false,
+  true,
+  true
+ ],
+ "same_prompt_ok": true,
+ "perm_next_ok": true,
+ "perm_cont_ok": true,
+ "A_text": [
+  ",,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,",
+  " measured bandwidth of the..\n.\n.\n.\n.\n.\n.\n.\n.\n..\n..\n..",
+  ",1,,,,,,,,,,,,.1.1.1,.1.1...1..1",
+  ". The microbial. The microbial. The microbial. The microbial.. The microbial............1111",
+  ".\n\n.\n.\n\n.1.1.1.1.1.1.1.1.1.1.1.1.",
+  ". Today laser altimetry. Today.1.1.1.1.1.1.1.1.1.1.1111",
+  " to. The final emission stage. The final. The. The...................",
+  ". Reservoir managers, city planners, and insurance. Reservoir managers,, city planners, and. Reservoir managers,,,,,,11111"
+ ]
+}
