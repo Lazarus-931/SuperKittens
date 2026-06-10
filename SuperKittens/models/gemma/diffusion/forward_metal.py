@@ -362,60 +362,65 @@ class DiffusionGemmaMetal:
         rope_ff = w.f32("rope_freqs.weight")
 
         for il in range(cfg.n_layers):
-            swa = cfg.is_swa[il]
-            hd = cfg.head_dim(il)
-            n_kv = cfg.n_kv_heads[il]
-            base, use_ff = cfg.rope_params(il)
-            ff = rope_ff if use_ff else None
+            # drain ObjC autoreleases per layer: without a pool the bridge
+            # pins every MTLBuffer proxy until process exit (~0.85 GB/layer
+            # leak that out-grew the box even with cache eviction)
+            with objc.autorelease_pool():
+                swa = cfg.is_swa[il]
+                hd = cfg.head_dim(il)
+                n_kv = cfg.n_kv_heads[il]
+                base, use_ff = cfg.rope_params(il)
+                ff = rope_ff if use_ff else None
 
-            h = rms_norm(x, cfg.eps, w.f32(f"blk.{il}.attn_norm.weight"))
+                h = rms_norm(x, cfg.eps, w.f32(f"blk.{il}.attn_norm.weight"))
 
-            q = self._gemm_f32(f"blk.{il}.attn_q.weight", h, cfg.n_heads * hd)
-            k_raw = self._gemm_f32(f"blk.{il}.attn_k.weight", h, n_kv * hd)
-            vname = f"blk.{il}.attn_v.weight"
-            v_raw = self._gemm_f32(vname, h, n_kv * hd) if vname in self.gg.tensors else k_raw
+                q = self._gemm_f32(f"blk.{il}.attn_q.weight", h, cfg.n_heads * hd)
+                k_raw = self._gemm_f32(f"blk.{il}.attn_k.weight", h, n_kv * hd)
+                vname = f"blk.{il}.attn_v.weight"
+                v_raw = self._gemm_f32(vname, h, n_kv * hd) if vname in self.gg.tensors else k_raw
 
-            q = rms_norm(q.reshape(N, cfg.n_heads, hd), cfg.eps,
-                         w.f32(f"blk.{il}.attn_q_norm.weight"))
-            k = rms_norm(k_raw.reshape(N, n_kv, hd), cfg.eps,
-                         w.f32(f"blk.{il}.attn_k_norm.weight"))
-            v = rms_norm(v_raw.reshape(N, n_kv, hd), cfg.eps)
-            q = rope_neox(q, pos, base, ff)
-            k = rope_neox(k, pos, base, ff)
-            dmp("q_pos", il, q); dmp("k_pos", il, k); dmp("v_normed", il, v)
+                q = rms_norm(q.reshape(N, cfg.n_heads, hd), cfg.eps,
+                             w.f32(f"blk.{il}.attn_q_norm.weight"))
+                k = rms_norm(k_raw.reshape(N, n_kv, hd), cfg.eps,
+                             w.f32(f"blk.{il}.attn_k_norm.weight"))
+                v = rms_norm(v_raw.reshape(N, n_kv, hd), cfg.eps)
+                q = rope_neox(q, pos, base, ff)
+                k = rope_neox(k, pos, base, ff)
+                dmp("q_pos", il, q); dmp("k_pos", il, k); dmp("v_normed", il, v)
 
-            mask = build_mask(P, C, swa, cfg.window, n_cols=_pad32(N))
-            o = self._attention(il, q, k, v, mask)
-            attn = self._gemm_f32(f"blk.{il}.attn_output.weight", o, cfg.d_model)
-            attn = rms_norm(attn, cfg.eps, w.f32(f"blk.{il}.post_attention_norm.weight"))
-            attn_out = (attn + x).astype(F32)
-            dmp("attn_out", il, attn_out)
+                mask = build_mask(P, C, swa, cfg.window, n_cols=_pad32(N))
+                o = self._attention(il, q, k, v, mask)
+                attn = self._gemm_f32(f"blk.{il}.attn_output.weight", o, cfg.d_model)
+                attn = rms_norm(attn, cfg.eps, w.f32(f"blk.{il}.post_attention_norm.weight"))
+                attn_out = (attn + x).astype(F32)
+                dmp("attn_out", il, attn_out)
 
-            m = rms_norm(attn_out, cfg.eps, w.f32(f"blk.{il}.ffn_norm.weight"))
-            g_ = gelu_tanh(self._gemm_f32(f"blk.{il}.ffn_gate.weight", m, cfg.n_ff))
-            u_ = self._gemm_f32(f"blk.{il}.ffn_up.weight", m, cfg.n_ff)
-            mlp = self._gemm_f32(f"blk.{il}.ffn_down.weight", g_ * u_, cfg.d_model)
-            mlp = rms_norm(mlp, cfg.eps, w.f32(f"blk.{il}.post_ffw_norm_1.weight"))
-            dmp("ffn_mlp", il, mlp)
+                m = rms_norm(attn_out, cfg.eps, w.f32(f"blk.{il}.ffn_norm.weight"))
+                g_ = gelu_tanh(self._gemm_f32(f"blk.{il}.ffn_gate.weight", m, cfg.n_ff))
+                u_ = self._gemm_f32(f"blk.{il}.ffn_up.weight", m, cfg.n_ff)
+                mlp = self._gemm_f32(f"blk.{il}.ffn_down.weight", g_ * u_, cfg.d_model)
+                mlp = rms_norm(mlp, cfg.eps, w.f32(f"blk.{il}.post_ffw_norm_1.weight"))
+                dmp("ffn_mlp", il, mlp)
 
-            e_in = rms_norm(attn_out, cfg.eps, w.f32(f"blk.{il}.pre_ffw_norm_2.weight"))
-            moe = self._moe(il, attn_out, e_in)
-            moe = rms_norm(moe, cfg.eps, w.f32(f"blk.{il}.post_ffw_norm_2.weight"))
-            dmp("ffn_moe", il, moe)
+                e_in = rms_norm(attn_out, cfg.eps, w.f32(f"blk.{il}.pre_ffw_norm_2.weight"))
+                moe = self._moe(il, attn_out, e_in)
+                moe = rms_norm(moe, cfg.eps, w.f32(f"blk.{il}.post_ffw_norm_2.weight"))
+                dmp("ffn_moe", il, moe)
 
-            f = rms_norm(mlp + moe, cfg.eps, w.f32(f"blk.{il}.post_ffw_norm.weight"))
-            cur = (f + attn_out).astype(F32)
-            cur[:P] *= w.f32(f"blk.{il}.enc_layer_output_scale.weight")[0]
-            cur[P:] *= w.f32(f"blk.{il}.layer_output_scale.weight")[0]
-            dmp("l_out", il, cur)
-            x = cur
-            self.wb.evict_prefix(f"blk.{il}.")
+                f = rms_norm(mlp + moe, cfg.eps, w.f32(f"blk.{il}.post_ffw_norm.weight"))
+                cur = (f + attn_out).astype(F32)
+                cur[:P] *= w.f32(f"blk.{il}.enc_layer_output_scale.weight")[0]
+                cur[P:] *= w.f32(f"blk.{il}.layer_output_scale.weight")[0]
+                dmp("l_out", il, cur)
+                x = cur
+                self.wb.evict_prefix(f"blk.{il}.")
             gc.collect()  # drop Metal buffers + mmap windows deterministically
 
         x = rms_norm(x, cfg.eps, w.f32("output_norm.weight"))
         dmp("result_norm", -1, x)
 
-        logits = self._gemm_f32("token_embd.weight", x[P:], cfg.vocab_size)
+        with objc.autorelease_pool():
+            logits = self._gemm_f32("token_embd.weight", x[P:], cfg.vocab_size)
         cap = F32(cfg.final_logit_softcap)
         logits = (np.tanh(logits / cap) * cap).astype(F32)
         dmp("result_output", -1, logits)
