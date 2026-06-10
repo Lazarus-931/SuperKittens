@@ -174,7 +174,25 @@ def dequant_rows(buf: np.ndarray, type_name: str, k: int) -> np.ndarray:
         return _dequant_q4k(buf, k)
     if type_name == "Q6_K":
         return _dequant_q6k(buf, k)
+    if type_name == "Q5_0":
+        return _dequant_q5_0(buf, k)
     raise ValueError(f"dequant for {type_name} not implemented")
+
+
+def _dequant_q5_0(buf: np.ndarray, k: int) -> np.ndarray:
+    r = buf.shape[0]
+    nb = k // 32
+    b = buf.reshape(r * nb, 22)
+    d = _f16(b[:, 0:2].copy().view(np.uint16)[:, 0])           # [B]
+    qh = b[:, 2:6].copy().view(np.uint32)[:, 0]                # [B]
+    qs = b[:, 6:22].astype(np.uint32)                          # [B, 16]
+    j = np.arange(16, dtype=np.uint32)
+    x0 = (qs & 0x0F) | (((qh[:, None] >> j) & 1) << 4)
+    x1 = (qs >> 4)   | (((qh[:, None] >> (j + 16)) & 1) << 4)
+    y = np.empty((b.shape[0], 32), np.float32)
+    y[:, :16] = (x0.astype(np.int32) - 16) * d[:, None]
+    y[:, 16:] = (x1.astype(np.int32) - 16) * d[:, None]
+    return y.reshape(r, k)
 
 
 def _dequant_q4k(buf: np.ndarray, k: int) -> np.ndarray:

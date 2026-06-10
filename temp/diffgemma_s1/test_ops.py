@@ -70,6 +70,14 @@ def rand_q6k_rows(n, k):
     return raw.reshape(n, nb * 210)
 
 
+def rand_q5_0_rows(n, k):
+    nb = k // 32
+    raw = rng.integers(0, 256, (n, nb, 22), dtype=np.uint8)
+    d = rng.uniform(0.001, 0.02, (n, nb)).astype(np.float16)
+    raw[:, :, 0:2] = d.view(np.uint8).reshape(n, nb, 2)
+    return raw.reshape(n, nb * 22)
+
+
 ok = True
 
 # f16 GEMM, ragged M/N + ldc band
@@ -83,8 +91,9 @@ ok &= check("gemm_mma_f16", got, want, 2e-2)
 # quant GEMMs vs numpy dequant (mutual validation of kernel + gguf_io)
 for tname, kern, gen in [("Q8_0", "gemm_mma_q8_0", rand_q8_rows),
                          ("Q4_K", "gemm_mma_q4k", rand_q4k_rows),
-                         ("Q6_K", "gemm_mma_q6k", rand_q6k_rows)]:
-    K = 768 if tname != "Q8_0" else 704
+                         ("Q6_K", "gemm_mma_q6k", rand_q6k_rows),
+                         ("Q5_0", "dg_gemm_mma_q5_0", rand_q5_0_rows)]:
+    K = 704 if tname in ("Q8_0", "Q5_0") else 768
     N, M = 95, 33
     raw = gen(N, K)
     wf = dequant_rows(raw, tname, K)
@@ -93,17 +102,31 @@ for tname, kern, gen in [("Q8_0", "gemm_mma_q8_0", rand_q8_rows),
     want = a.astype(np.float32) @ wf.T
     ok &= check(f"gemm_mma {tname}", got, want, 2e-2)
 
-# masked softmax kernel vs numpy (incl pad cols)
+# f32-out QK^T GEMM survives score magnitudes past the fp16 ceiling
+M, K, N = 33, 512, 64
+a = (rng.standard_normal((M, K)) * 45).astype(np.float16)
+w = (rng.standard_normal((N, K)) * 45).astype(np.float16)
+a_buf = ctx.buf_from(a); w_buf = ctx.buf_from(w); c_buf = ctx.buf_empty(M * N * 4)
+b = fm.GemmBatch(ctx)
+b.gemm("dg_gemm_qkt_f32", a_buf, 0, w_buf, 0, c_buf, 0, M, N, K)
+b.run()
+got = ctx.read(c_buf, np.float32, (M, N))
+want = a.astype(np.float32) @ w.astype(np.float32).T
+assert np.abs(want).max() > 65504, "test should exceed fp16 range"
+ok &= check("dg_gemm_qkt_f32 (range)", got, want, 2e-2)
+
+# masked softmax kernel vs numpy (f32 scores in, f16 probs out, pad cols)
 Ntok, Np, H = 69, 96, 4
-s = (rng.standard_normal((H * Ntok, Np)) * 4).astype(np.float16)
+s = (rng.standard_normal((H * Ntok, Np)) * 4).astype(np.float32)
 mask = build_mask(13, Ntok - 13, True, 24, n_cols=Np)
 s_buf = ctx.buf_from(s)
+p_buf = ctx.buf_empty(H * Ntok * Np * 2)
 m_buf = ctx.buf_from(mask)
 b = fm.GemmBatch(ctx)
-b.softmax_mask(s_buf, m_buf, rows=H * Ntok, ncols=Np, ntok=Ntok, scale=1.0)
+b.softmax_mask(s_buf, p_buf, m_buf, rows=H * Ntok, ncols=Np, ntok=Ntok, scale=1.0)
 b.run()
-got = ctx.read(s_buf, np.float16, (H * Ntok, Np))
-want = softmax(np.tile(mask, (H, 1)) + s.astype(np.float32))
+got = ctx.read(p_buf, np.float16, (H * Ntok, Np))
+want = softmax(np.tile(mask, (H, 1)) + s)
 ok &= check("dg_softmax_mask", got, want, 2e-2)
 
 # GEMM-composed attention vs numpy (GQA, dual dims, region mask)

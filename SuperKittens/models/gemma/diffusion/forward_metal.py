@@ -35,7 +35,7 @@ _KERNEL_SOURCES = [
 ]
 _MMA_BY_TYPE = {"F16": "gemm_mma_f16", "BF16": "gemm_mma_bf16",
                 "Q8_0": "gemm_mma_q8_0", "Q4_K": "gemm_mma_q4k",
-                "Q6_K": "gemm_mma_q6k"}
+                "Q6_K": "gemm_mma_q6k", "Q5_0": "dg_gemm_mma_q5_0"}
 
 
 def _pad32(n: int) -> int:
@@ -110,6 +110,8 @@ class WeightBufs:
         base = ti.offset // page * page
         delta = ti.offset - base
         length = (delta + ti.nbytes + page - 1) // page * page
+        if base + length > os.path.getsize(self.gg.path):
+            raise RuntimeError("page-rounded window past EOF (last tensor)")
         # MAP_PRIVATE + writable prot: the bridge requires a writable buffer
         # object for the void* arg; pages stay clean (we never write).
         mm = mmap.mmap(self._f.fileno(), length, flags=mmap.MAP_PRIVATE,
@@ -137,10 +139,14 @@ class WeightBufs:
         if hit is not None:
             return hit
         ti = self.gg.tensors[name]
+        ent = None
         if self.nocopy_ok:
-            buf, delta, mm = self._map(ti)
-            ent = (buf, delta, ti, mm)
-        else:
+            try:
+                buf, delta, mm = self._map(ti)
+                ent = (buf, delta, ti, mm)
+            except RuntimeError:
+                pass  # e.g. page-rounded window past EOF: copy just this one
+        if ent is None:
             arr = np.frombuffer(self.gg.mm, dtype=np.uint8, count=ti.nbytes,
                                 offset=ti.offset)
             ent = (self.ctx.buf_from(arr), 0, ti, None)
@@ -176,16 +182,17 @@ class GemmBatch:
             Metal.MTLSizeMake((N + 31) // 32, (M + 31) // 32, 1),
             Metal.MTLSizeMake(64, 1, 1))
 
-    def softmax_mask(self, s_buf, mask_buf, rows: int, ncols: int, ntok: int,
-                     scale: float = 1.0):
+    def softmax_mask(self, s_buf, p_buf, mask_buf, rows: int, ncols: int,
+                     ntok: int, scale: float = 1.0):
         enc = self.enc
-        self._keep += [s_buf, mask_buf]
+        self._keep += [s_buf, p_buf, mask_buf]
         enc.setComputePipelineState_(self.ctx.pso("dg_softmax_mask"))
         enc.setBuffer_offset_atIndex_(s_buf, 0, 0)
-        enc.setBuffer_offset_atIndex_(mask_buf, 0, 1)
-        enc.setBytes_length_atIndex_(self._u32(ncols), 4, 2)
-        enc.setBytes_length_atIndex_(self._u32(ntok), 4, 3)
-        enc.setBytes_length_atIndex_(np.float32(scale).tobytes(), 4, 4)
+        enc.setBuffer_offset_atIndex_(p_buf, 0, 1)
+        enc.setBuffer_offset_atIndex_(mask_buf, 0, 2)
+        enc.setBytes_length_atIndex_(self._u32(ncols), 4, 3)
+        enc.setBytes_length_atIndex_(self._u32(ntok), 4, 4)
+        enc.setBytes_length_atIndex_(np.float32(scale).tobytes(), 4, 5)
         enc.dispatchThreadgroups_threadsPerThreadgroup_(
             Metal.MTLSizeMake(rows, 1, 1), Metal.MTLSizeMake(256, 1, 1))
 
@@ -257,21 +264,22 @@ class DiffusionGemmaMetal:
         k_buf = self.ctx.buf_from(kp)
         vt_buf = self.ctx.buf_from(vtp)
         m_buf = self.ctx.buf_from(np.ascontiguousarray(mask[:, :Np]))
-        s_buf = self.ctx.buf_empty(H * N * Np * 2)
+        s_buf = self.ctx.buf_empty(H * N * Np * 4)   # f32 scores (kq needs range)
+        p_buf = self.ctx.buf_empty(H * N * Np * 2)   # f16 probs
         o_buf = self.ctx.buf_empty(H * N * hd * 2)
 
         b = GemmBatch(self.ctx)
         for h in range(H):
             g = h // gqa
-            b.gemm("gemm_mma_f16", q_buf, h * N * hd * 2, k_buf, g * Np * hd * 2,
-                   s_buf, h * N * Np * 2, M=N, N=Np, K=hd, ldc=Np)
+            b.gemm("dg_gemm_qkt_f32", q_buf, h * N * hd * 2, k_buf, g * Np * hd * 2,
+                   s_buf, h * N * Np * 4, M=N, N=Np, K=hd, ldc=Np)
         b.barrier()
-        b.softmax_mask(s_buf, m_buf, rows=H * N, ncols=Np, ntok=N,
+        b.softmax_mask(s_buf, p_buf, m_buf, rows=H * N, ncols=Np, ntok=N,
                        scale=cfg.attn_scale)
         b.barrier()
         for h in range(H):
             g = h // gqa
-            b.gemm("gemm_mma_f16", s_buf, h * N * Np * 2, vt_buf, g * hd * Np * 2,
+            b.gemm("gemm_mma_f16", p_buf, h * N * Np * 2, vt_buf, g * hd * Np * 2,
                    o_buf, h * N * hd * 2, M=N, N=hd, K=Np, ldc=hd)
         b.run()
 
