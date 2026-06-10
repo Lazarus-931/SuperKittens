@@ -15,7 +15,6 @@ loop, fp16 activation casts at each hop. Stage 3 moves the glue on-device.
 from __future__ import annotations
 
 import gc
-import mmap
 import os
 from pathlib import Path
 
@@ -24,7 +23,7 @@ import objc  # noqa: F401
 import Metal  # type: ignore[import-not-found]
 
 from .config import DiffusionGemmaConfig
-from .gguf_io import GGUFFile, TensorInfo
+from .gguf_io import GGUFFile
 from .graph_ref import (F32, Weights, build_mask, embed_tokens, gelu_tanh,
                         moe_route, rms_norm, rope_neox)
 
@@ -95,75 +94,47 @@ class MetalCtx:
 
 
 class WeightBufs:
-    """Per-tensor MTLBuffers over the GGUF. No-copy mmap windows when the
-    bridge cooperates (verified per process at init), else lazy copies."""
+    """Persistent per-ROLE scratch MTLBuffers, refilled by memcpy per layer.
+
+    Allocation history on the 16 GB host: (1) MAP_PRIVATE no-copy windows —
+    GPU access turned touched pages into un-evictable anonymous memory, box
+    down twice; (2) per-tensor copied buffers, even with per-layer eviction +
+    autorelease pools — Metal-side allocation churn (~0.85 GB/layer, outside
+    process rss) still swap-stormed the host. Persistent slots make Metal
+    allocation a one-time ~1.5 GB and the steady state pure memcpy."""
 
     def __init__(self, ctx: MetalCtx, gg: GGUFFile):
         self.ctx = ctx
         self.gg = gg
-        self._cache: dict[str, tuple] = {}
-        self._f = open(gg.path, "rb")
-        # No-copy is opt-in: the bridge only takes WRITABLE buffers, and GPU
-        # access to MAP_PRIVATE+PROT_WRITE windows turned every touched weight
-        # byte into anonymous memory (system swap storm took the host down
-        # twice; process rss stayed flat at ~0.4 GB). The copy path + per-layer
-        # eviction bounds anonymous memory at ~1 layer of weights.
-        self.nocopy_ok = os.environ.get("SK_DG_NOCOPY") == "1" and self._probe_nocopy()
+        self._slots: dict[str, tuple] = {}      # role -> (buf, capacity)
+        self._occupant: dict[str, str] = {}     # role -> tensor name in slot
+        self._cap: dict[str, int] = {}
+        for name, ti in gg.tensors.items():
+            r = self._role(name)
+            self._cap[r] = max(self._cap.get(r, 0), ti.nbytes)
 
-    def _map(self, ti: TensorInfo):
-        page = mmap.ALLOCATIONGRANULARITY
-        base = ti.offset // page * page
-        delta = ti.offset - base
-        length = (delta + ti.nbytes + page - 1) // page * page
-        if base + length > os.path.getsize(self.gg.path):
-            raise RuntimeError("page-rounded window past EOF (last tensor)")
-        # MAP_PRIVATE + writable prot: the bridge requires a writable buffer
-        # object for the void* arg; pages stay clean (we never write).
-        mm = mmap.mmap(self._f.fileno(), length, flags=mmap.MAP_PRIVATE,
-                       prot=mmap.PROT_READ | mmap.PROT_WRITE, offset=base)
-        buf = self.ctx.device.newBufferWithBytesNoCopy_length_options_deallocator_(
-            mm, length, Metal.MTLResourceStorageModeShared, None)
-        if buf is None:
-            raise RuntimeError("newBufferWithBytesNoCopy returned None")
-        return buf, delta, mm
-
-    def _probe_nocopy(self) -> bool:
-        try:
-            ti = min(self.gg.tensors.values(), key=lambda t: t.nbytes)
-            buf, delta, mm = self._map(ti)
-            got = bytes(buf.contents().as_buffer(delta + 16)[delta:delta + 16])
-            want = bytes(self.gg.mm[ti.offset:ti.offset + 16])
-            return got == want
-        except Exception as e:  # noqa: BLE001
-            print(f"[weights] no-copy probe failed ({e}); falling back to copies")
-            return False
+    @staticmethod
+    def _role(name: str) -> str:
+        parts = name.split(".")
+        return parts[2] if parts[0] == "blk" else parts[0]
 
     def get(self, name: str) -> tuple:
-        """-> (MTLBuffer, byte_offset, TensorInfo)"""
-        hit = self._cache.get(name)
-        if hit is not None:
-            return hit
+        """-> (MTLBuffer, byte_offset, TensorInfo, None); fills the role slot."""
         ti = self.gg.tensors[name]
-        ent = None
-        if self.nocopy_ok:
-            try:
-                buf, delta, mm = self._map(ti)
-                ent = (buf, delta, ti, mm)
-            except RuntimeError:
-                pass  # e.g. page-rounded window past EOF: copy just this one
-        if ent is None:
-            arr = np.frombuffer(self.gg.mm, dtype=np.uint8, count=ti.nbytes,
-                                offset=ti.offset)
-            ent = (self.ctx.buf_from(arr), 0, ti, None)
-        self._cache[name] = ent
-        return ent
+        role = self._role(name)
+        slot = self._slots.get(role)
+        if slot is None:
+            buf = self.ctx.buf_empty(self._cap[role])
+            self._slots[role] = slot = (buf, self._cap[role])
+        buf, cap = slot
+        if self._occupant.get(role) != name:
+            mv = buf.contents().as_buffer(cap)
+            mv[:ti.nbytes] = self.gg.mm[ti.offset:ti.offset + ti.nbytes]
+            self._occupant[role] = name
+        return (buf, 0, ti, None)
 
     def evict_prefix(self, prefix: str):
-        """Drop cached buffers/mmaps for one layer once it has run: a 16 GB
-        model's windows can't all stay resident on a 16 GB box (the late-layer
-        kill was the process croaking under memory pressure, not a kernel)."""
-        for k in [k for k in self._cache if k.startswith(prefix)]:
-            del self._cache[k]
+        return  # slots are persistent; kept for driver-loop compatibility
 
 
 class GemmBatch:
@@ -414,7 +385,7 @@ class DiffusionGemmaMetal:
                 dmp("l_out", il, cur)
                 x = cur
                 self.wb.evict_prefix(f"blk.{il}.")
-            gc.collect()  # drop Metal buffers + mmap windows deterministically
+            gc.collect()
 
         x = rms_norm(x, cfg.eps, w.f32("output_norm.weight"))
         dmp("result_norm", -1, x)
