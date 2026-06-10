@@ -103,7 +103,12 @@ class WeightBufs:
         self.gg = gg
         self._cache: dict[str, tuple] = {}
         self._f = open(gg.path, "rb")
-        self.nocopy_ok = self._probe_nocopy()
+        # No-copy is opt-in: the bridge only takes WRITABLE buffers, and GPU
+        # access to MAP_PRIVATE+PROT_WRITE windows turned every touched weight
+        # byte into anonymous memory (system swap storm took the host down
+        # twice; process rss stayed flat at ~0.4 GB). The copy path + per-layer
+        # eviction bounds anonymous memory at ~1 layer of weights.
+        self.nocopy_ok = os.environ.get("SK_DG_NOCOPY") == "1" and self._probe_nocopy()
 
     def _map(self, ti: TensorInfo):
         page = mmap.ALLOCATIONGRANULARITY

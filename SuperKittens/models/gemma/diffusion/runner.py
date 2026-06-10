@@ -32,7 +32,10 @@ def make_dump(dump_dir: str | None, names: set[str]):
     def dump(name: str, il: int, arr: np.ndarray):
         if names and name not in names:
             return
-        np.save(d / f"{name}.{il}.npy", np.asarray(arr))
+        try:
+            np.save(d / f"{name}.{il}.npy", np.asarray(arr))
+        except OSError as e:  # diagnostics must not kill a long forward
+            print(f"[dump] skipped {name}.{il}: {e}", file=sys.stderr)
     return dump
 
 
