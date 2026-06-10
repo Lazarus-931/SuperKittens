@@ -15,6 +15,7 @@ loop, fp16 activation casts at each hop. Stage 3 moves the glue on-device.
 from __future__ import annotations
 
 import gc
+import mmap
 import os
 from pathlib import Path
 
@@ -131,6 +132,16 @@ class WeightBufs:
             mv = buf.contents().as_buffer(cap)
             mv[:ti.nbytes] = self.gg.mm[ti.offset:ti.offset + ti.nbytes]
             self._occupant[role] = name
+            # release the streamed file pages right away: clean cache pages
+            # are evictable but their resident growth (15.6 GB/forward) is
+            # what kept shoving the 16 GB host into swap
+            try:
+                pg = mmap.PAGESIZE
+                a = ti.offset - (ti.offset % pg)
+                ln = (ti.offset + ti.nbytes + pg - 1) // pg * pg - a
+                self.gg.mm.madvise(mmap.MADV_DONTNEED, a, ln)
+            except (AttributeError, ValueError, OSError):
+                pass
         return (buf, 0, ti, None)
 
     def evict_prefix(self, prefix: str):
