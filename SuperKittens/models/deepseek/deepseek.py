@@ -77,6 +77,9 @@ DEEPSEEK_ABI = {
                       ctypes.c_uint32, ctypes.POINTER(ctypes.c_int32)], ctypes.c_int),
     "forward_batched": optional([ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
                                  ctypes.POINTER(ctypes.c_int32)], ctypes.c_int),
+    "prefill_batched": optional([ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
+                                 ctypes.c_uint32, ctypes.c_uint32,
+                                 ctypes.POINTER(ctypes.c_int32)], ctypes.c_int),
     "reset":        ([ctypes.c_void_p], None),
     "destroy":      ([ctypes.c_void_p], None),
 }
@@ -293,6 +296,37 @@ class DeepSeek(Model):
             ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
             out.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)))
         if rc: raise RuntimeError(f"forward_batched failed: {rc}")
+        return out
+
+    def prefill_batched(self, input_ids, *, chunk_size: int = 0) -> np.ndarray:
+        """Batched chunked prefill: (batch, seq) request-major ids -> (batch,)
+        greedy next tokens.
+
+        All ``cfg.batch`` lanes prefill in lockstep through chunks of
+        ``chunk_size`` (<= seq_max; 0 uses seq_max): per chunk the projections
+        run at M=batch*chunk, amortizing the weight stream across lanes AND
+        prompt tokens — vs. driving ``_forward_batched`` token-by-token, one
+        full weight-read pass per prompt position. Requires the dylib to export
+        ``sk_deepseek_prefill_batched``. Does NOT reset; call ``reset()`` first
+        for fresh sequences.
+        """
+        lib = _load()
+        if not hasattr(lib, "sk_deepseek_prefill_batched"):
+            raise RuntimeError("libsk.dylib has no sk_deepseek_prefill_batched; rebuild dylib")
+        ids = np.ascontiguousarray(np.asarray(input_ids, dtype=np.int32)).reshape(-1)
+        if ids.size % self.cfg.batch:
+            raise ValueError(f"ids size {ids.size} not divisible by batch {self.cfg.batch}")
+        seq = ids.size // self.cfg.batch
+        out = np.empty((self.cfg.batch,), dtype=np.int32)
+        cs = int(chunk_size) if chunk_size and chunk_size > 0 else 0
+        rc = lib.sk_deepseek_prefill_batched(
+            self._h,
+            ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            ctypes.c_uint32(seq),
+            ctypes.c_uint32(cs),
+            out.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)))
+        if rc:
+            raise RuntimeError(f"sk_deepseek_prefill_batched failed: {rc}")
         return out
 
     def generate_batched(self, prompts, *, max_new_tokens: int = 64,

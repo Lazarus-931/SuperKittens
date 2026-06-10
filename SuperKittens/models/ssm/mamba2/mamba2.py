@@ -99,6 +99,9 @@ class Mamba2Model(Model):
         "prefill_lane":     optional([ctypes.c_void_p, ctypes.c_uint32,
                                       ctypes.POINTER(ctypes.c_int), ctypes.c_uint32,
                                       ctypes.POINTER(ctypes.c_int)], ctypes.c_int),
+        "prefill_batched":  optional([ctypes.c_void_p, ctypes.POINTER(ctypes.c_int),
+                                      ctypes.c_uint32, ctypes.c_uint32,
+                                      ctypes.POINTER(ctypes.c_int)], ctypes.c_int),
         "decode_batched":   optional([ctypes.c_void_p, ctypes.POINTER(ctypes.c_int),
                                       ctypes.c_uint32, ctypes.POINTER(ctypes.c_int)], ctypes.c_int),
     }
@@ -174,7 +177,36 @@ class Mamba2Model(Model):
                 break
         return out
 
-    def generate_batched(self, prompts, *, max_new_tokens: int = 64):
+    def prefill_batched(self, prompts):
+        """Prefill N lanes' EQUAL-LENGTH prompts in ONE batch=N forward.
+
+        One weight read for all N prompts (vs N sequential prefill_lane
+        forwards) and N× the threadgroups for the occupancy-starved SSD scan.
+        Resets each lane's state, then returns the per-lane greedy first
+        tokens; lane states are left ready for sk_mamba2_decode_batched.
+        """
+        import ctypes as C
+        N = len(prompts)
+        if N == 0:
+            return []
+        if N > self.cfg.batch:
+            raise ValueError(f"N={N} > cfg.batch={self.cfg.batch}")
+        seq = len(prompts[0])
+        if any(len(p) != seq for p in prompts):
+            raise ValueError("prefill_batched requires equal-length prompts")
+        if not hasattr(self._lib, "sk_mamba2_prefill_batched"):
+            raise RuntimeError("dylib missing batched-prefill ABI")
+        for lane in range(N):
+            self._lib.sk_mamba2_reset_lane(self._h, lane)
+        flat = (C.c_int * (N * seq))(*[int(t) for p in prompts for t in p])
+        outb = (C.c_int * N)()
+        rc = self._lib.sk_mamba2_prefill_batched(self._h, flat, seq, N, outb)
+        if rc != 0:
+            raise RuntimeError(f"prefill_batched rc={rc}")
+        return [int(outb[i]) for i in range(N)]
+
+    def generate_batched(self, prompts, *, max_new_tokens: int = 64,
+                         batched_prefill: bool = False):
         """Greedy lockstep batched decode of N requests (serving path).
 
         Each prompt is prefilled into its own lane's conv+ssm state, then the
@@ -184,7 +216,8 @@ class Mamba2Model(Model):
         means each lane's tokens match its single-stream M=1 run.
 
         prompts: list of token-id lists (len <= cfg.batch). Returns list of
-        per-lane generated token-id lists (greedy).
+        per-lane generated token-id lists (greedy). batched_prefill=True runs
+        all prompts in one batch=N forward (equal lengths only).
         """
         import ctypes as C
         N = len(prompts)
@@ -195,18 +228,23 @@ class Mamba2Model(Model):
         if not hasattr(self._lib, "sk_mamba2_decode_batched"):
             raise RuntimeError("dylib missing batched-decode ABI")
 
-        # Per-lane prefill: each request's prompt -> its lane's state.
         cur = [0] * N
         out = [[] for _ in range(N)]
-        for lane, ids in enumerate(prompts):
-            self._lib.sk_mamba2_reset_lane(self._h, lane)
-            arr = (C.c_int * len(ids))(*[int(x) for x in ids])
-            o = C.c_int(0)
-            rc = self._lib.sk_mamba2_prefill_lane(self._h, lane, arr, len(ids), C.byref(o))
-            if rc != 0:
-                raise RuntimeError(f"prefill_lane({lane}) rc={rc}")
-            cur[lane] = int(o.value)
-            out[lane].append(cur[lane])
+        if batched_prefill:
+            cur = self.prefill_batched(prompts)
+            for lane in range(N):
+                out[lane].append(cur[lane])
+        else:
+            # Per-lane prefill: each request's prompt -> its lane's state.
+            for lane, ids in enumerate(prompts):
+                self._lib.sk_mamba2_reset_lane(self._h, lane)
+                arr = (C.c_int * len(ids))(*[int(x) for x in ids])
+                o = C.c_int(0)
+                rc = self._lib.sk_mamba2_prefill_lane(self._h, lane, arr, len(ids), C.byref(o))
+                if rc != 0:
+                    raise RuntimeError(f"prefill_lane({lane}) rc={rc}")
+                cur[lane] = int(o.value)
+                out[lane].append(cur[lane])
 
         # Lockstep batched decode.
         inbuf  = (C.c_int * N)()

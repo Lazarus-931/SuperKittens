@@ -86,6 +86,9 @@ DENSE_ABI = {
     "prefill_chunked":  optional([ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
                                   ctypes.c_uint32, ctypes.c_uint32,
                                   ctypes.POINTER(ctypes.c_int32)], ctypes.c_int),
+    "prefill_batched":  optional([ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
+                                  ctypes.c_uint32, ctypes.c_uint32,
+                                  ctypes.POINTER(ctypes.c_int32)], ctypes.c_int),
     "generate_n":       optional([ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
                                   ctypes.c_uint32, ctypes.POINTER(ctypes.c_int32),
                                   ctypes.c_uint32, ctypes.c_int32], ctypes.c_int),
@@ -316,6 +319,37 @@ class DenseDecoder(Model):
             raise RuntimeError(f"sk_qwen_prefill_chunked failed: {rc}")
         self._last_token = int(out[0])
         return self._last_token
+
+    def prefill_batched(self, input_ids, *, chunk_size: int = 0) -> np.ndarray:
+        """Batched chunked prefill: (batch, seq) request-major ids -> (batch,)
+        greedy next tokens.
+
+        All ``cfg.batch`` lanes prefill in lockstep through chunks of
+        ``chunk_size`` (<= seq_max; 0 uses seq_max): per chunk the projections
+        run as one M=batch*chunk GEMM, so the weight stream is amortized across
+        lanes AND prompt tokens — vs. driving ``forward_batched`` token-by-token,
+        which pays one full weight-read pass per prompt position. Requires the
+        dylib to export ``sk_qwen_prefill_batched``. Does NOT reset; call
+        ``reset()`` first for fresh sequences.
+        """
+        lib = _load()
+        if not hasattr(lib, "sk_qwen_prefill_batched"):
+            raise RuntimeError("libsk.dylib has no sk_qwen_prefill_batched symbol; rebuild dylib")
+        ids = np.ascontiguousarray(np.asarray(input_ids, dtype=np.int32)).reshape(-1)
+        if ids.size % self.cfg.batch:
+            raise ValueError(f"ids size {ids.size} not divisible by batch {self.cfg.batch}")
+        seq = ids.size // self.cfg.batch
+        out = np.empty((self.cfg.batch,), dtype=np.int32)
+        cs = int(chunk_size) if chunk_size and chunk_size > 0 else 0
+        rc = lib.sk_qwen_prefill_batched(
+            self._h,
+            ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            ctypes.c_uint32(seq),
+            ctypes.c_uint32(cs),
+            out.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)))
+        if rc:
+            raise RuntimeError(f"sk_qwen_prefill_batched failed: {rc}")
+        return out
 
     def _forward(self, input_ids: np.ndarray) -> np.ndarray:
         """Model-base contract: take int32 ids, return (batch,) int32 argmax."""

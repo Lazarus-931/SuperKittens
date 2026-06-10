@@ -45,6 +45,19 @@ Wiring seq>1 prefill through `gemm_mma` (f16/Q8_0/Q4_K MMA) gives **2.5–5.8× 
 seq=2–8 verify cost drops from 4.6–5.8× to 1.0–2.8× of a single decode. Decode (M=1)
 unchanged. Spec-decode still net-negative on M4 4B (draft tax + accept ceiling); 8B under test.
 
+## Serving prefill — batched N-lane seq>1 (local main, June 9, not yet PR'd)
+
+N-lane serving used to prefill prompts token-by-token (the only batch-correct path).
+Three additive, flag-gated levers fixed that; all lane-isolated (8/8 token-for-token vs
+the sequential baseline), old paths byte-identical, decode aggregate unchanged ±2%:
+
+| Lever | Model | serving TTFT (N=8) |
+|---|---|---|
+| `sk_qwen_prefill_batched` (chunked batch×seq; fix was lane-0-only transposes) | Qwen3-1.7B-Q8 | **2.62–2.70×** (T=128/256, amelia; 2.64–2.66× reproduced lexie) |
+| same | Qwen3-8B-Q4_K_M | **5.18–5.20×** (T=128, amelia; win grows with model size) |
+| `sk_mamba2_prefill_batched` (one B=N forward; host-side gaps only) | Mamba2-130m | 1.21–1.35× (N=2–8, derek) |
+| `SK_MAMBA2_SSD_CHUNKED` (PB=4 p-blocked scan; plain chunking regresses) | Mamba2-130m | 1.25–1.42× single-stream TTFT; **2.0× N=8 combined** with lane-batch |
+
 ## SSM
 
 | Model      | SK tok/s | HF fp32 baseline | Notes |

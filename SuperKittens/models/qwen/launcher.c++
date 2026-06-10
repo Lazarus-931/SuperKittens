@@ -586,6 +586,29 @@ static int run_step_batched(Handle* h, MTL::CommandQueue* q, uint32_t seq) {
     h->current_pos += seq;
     return 0;
 }
+
+// Batched (batch=N, seq>1) prefill chunk. batched_prefill routes dispatch_layer
+// to per-lane transposes (lanes stay independent (B,H,seq,D) blocks for the
+// already-batch-indexed kv_cache_write/mha_causal) and the tail to a per-lane
+// last-row head + argmax on the final chunk only. Caller has memcpy'd
+// input_ids (request-major [batch, seq]) + rope_pos for this chunk.
+static int run_step_prefill_batched(Handle* h, MTL::CommandQueue* q,
+                                    uint32_t seq, bool final_chunk) {
+    ModelParams mp = fill_params(h, seq);
+    mp.batched_prefill = final_chunk ? 2u : 1u;
+    h->last_seq = seq;
+
+    auto* cmd = q->commandBuffer();
+    dispatch_model(cmd, h->psos, h->weights, h->bufs, mp);
+    cmd->commit();
+    cmd->waitUntilCompleted();
+    if (getenv("SK_QWEN_GPUPROF"))
+        std::fprintf(stderr, "[gpuprof] gpu_busy_us=%.1f\n",
+                     (cmd->GPUEndTime() - cmd->GPUStartTime()) * 1e6);
+    cmd->release();
+    h->current_pos += seq;
+    return 0;
+}
 }}  // namespace meow::qwen
 
 extern "C" int sk_qwen_forward(sk_qwen_handle* hp,
@@ -622,11 +645,11 @@ extern "C" int sk_qwen_forward_batched(sk_qwen_handle* hp,
                                        int* output_id) {
     if (!hp || !input_ids || !output_id) return -1;
     auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
-    // seq>1 is unsupported: the prefill transpose + attention dispatch with
-    // p.seq (not batch*seq) only cover lane 0's rows of the [batch*seq,H,D]
-    // buffer, leaving lanes>=1 reading uninitialized Q/K/V scratch (silent
-    // garbage). Batched callers must drive the prompt token-by-token at seq==1
-    // (the batch-aware lockstep decode path), which is bit-identical to M=1.
+    // seq>1 is unsupported HERE: run_step_batched's decode_all_rows tail
+    // projects all batch*seq rows and its argmax assumes seq==1. Batched
+    // seq>1 prompt ingestion goes through sk_qwen_prefill_batched (per-lane
+    // transposes + lane-last-row head); this entrypoint stays the lockstep
+    // decode step, bit-identical to M=1.
     if (seq != 1) return -6;
     if (seq == 0 || seq > h->cfg.seq_max) return -2;
     if (h->current_pos + seq > h->cfg.cache_max) return -4;
@@ -646,6 +669,51 @@ extern "C" int sk_qwen_forward_batched(sk_qwen_handle* hp,
 
     std::memcpy(output_id, h->bufs.output_id->contents(),
                 (size_t)h->cfg.batch * sizeof(int32_t));
+    return 0;
+}
+
+// Batched chunked prefill: ids is batch*seq int32 (request-major: row b is lane
+// b's seq prompt tokens; all lanes the same length, lockstep positions). Runs
+// the prompt in chunks of <= chunk_size (clamped to seq_max): each chunk's
+// projections are ONE M=batch*chunk GEMM, so the weight stream is amortized
+// across lanes AND tokens — vs. the token-by-token serving prefill that pays
+// `seq` full weight-read passes. Logits/argmax run only on the final chunk
+// (serving needs the next token only after the whole prompt); out_next[b]
+// receives lane b's greedy next token. chunk_size 0 -> seq_max. Does NOT
+// reset; lanes share current_pos (lockstep), KV per lane via its cache slice.
+extern "C" int sk_qwen_prefill_batched(sk_qwen_handle* hp,
+                                       const int* ids, uint32_t seq,
+                                       uint32_t chunk_size, int* out_next) {
+    if (!hp || !ids || !out_next) return -1;
+    auto* h = reinterpret_cast<meow::qwen::Handle*>(hp);
+    if (seq == 0) return -2;
+    if (h->cfg.batch < 1) return -5;
+    uint32_t step = (chunk_size == 0) ? h->cfg.seq_max : chunk_size;
+    if (step > h->cfg.seq_max) step = h->cfg.seq_max;
+    if (h->current_pos + seq > h->cfg.cache_max) return -4;
+
+    auto* q = sk::bindings_queue();
+    if (!q) return -3;
+
+    int32_t* in_ids = (int32_t*)h->bufs.input_ids->contents();
+    int32_t* pos    = (int32_t*)h->bufs.rope_pos->contents();
+    const uint32_t batch = h->cfg.batch;
+    for (uint32_t s = 0; s < seq; ) {
+        const uint32_t remaining = seq - s;
+        const uint32_t this_seq = (remaining < step) ? remaining : step;
+        for (uint32_t b = 0; b < batch; ++b)
+            std::memcpy(in_ids + (size_t)b * this_seq, ids + (size_t)b * seq + s,
+                        (size_t)this_seq * sizeof(int32_t));
+        for (uint32_t i = 0; i < this_seq; ++i)
+            pos[i] = (int32_t)(h->current_pos + i);
+        const bool final_chunk = (s + this_seq == seq);
+        if (int rc = meow::qwen::run_step_prefill_batched(h, q, this_seq, final_chunk))
+            return rc;
+        s += this_seq;
+    }
+
+    std::memcpy(out_next, h->bufs.output_id->contents(),
+                (size_t)batch * sizeof(int32_t));
     return 0;
 }
 
