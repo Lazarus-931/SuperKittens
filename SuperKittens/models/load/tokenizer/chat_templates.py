@@ -99,6 +99,49 @@ def gemma4_template(messages: Sequence[dict], add_generation_prompt: bool = True
     return "".join(parts)
 
 
+PHI4_REASONING_SYSTEM = (
+    "You are Phi, a language model trained by Microsoft to help users. Your role "
+    "as an assistant involves thoroughly exploring questions through a systematic "
+    "thinking process before providing the final precise and accurate solutions. "
+    "This requires engaging in a comprehensive cycle of analysis, summarizing, "
+    "exploration, reassessment, reflection, backtracing, and iteration to develop "
+    "well-considered thinking process. Please structure your response into two "
+    "main sections: Thought and Solution using the specified format: <think> "
+    "{Thought section} </think> {Solution section}. In the Thought section, detail "
+    "your reasoning process in steps. Each step should include detailed "
+    "considerations such as analysing questions, summarizing relevant findings, "
+    "brainstorming new ideas, verifying the accuracy of the current steps, refining "
+    "any errors, and revisiting previous steps. In the Solution section, based on "
+    "various attempts, explorations, and reflections from the Thought section, "
+    "systematically present the final solution that you deem correct. The Solution "
+    "section should be logical, accurate, and concise and detail necessary steps "
+    "needed to reach the conclusion. Now, try to solve the following question "
+    "through the above guidelines:"
+)
+
+
+def phi4_template(messages: Sequence[dict], add_generation_prompt: bool = True) -> str:
+    """Phi-4(-reasoning) ChatML-with-<|im_sep|> format (no newlines between turns).
+    The official template hardcodes the reasoning system preamble; an explicit
+    leading system message in `messages` replaces it. No BOS is prepended.
+    """
+    system = PHI4_REASONING_SYSTEM
+    body = []
+    for m in messages:
+        role = m.get("role", "user").lower()
+        content = m.get("content", "")
+        if role == "system":
+            system = content
+        elif role == "user":
+            body.append(f"<|im_start|>user<|im_sep|>{content}<|im_end|>")
+        else:
+            body.append(f"<|im_start|>assistant<|im_sep|>{content}<|im_end|>")
+    parts = [f"<|im_start|>system<|im_sep|>{system}<|im_end|>"] + body
+    if add_generation_prompt:
+        parts.append("<|im_start|>assistant<|im_sep|>")
+    return "".join(parts)
+
+
 CHAT_TEMPLATES = {
     "deepseek": deepseek_template,
     "ds4": deepseek_template,
@@ -111,4 +154,5 @@ CHAT_TEMPLATES = {
     "nemotron": llama_template,
     "mistral": mistral_template,
     "yi": qwen_template,
+    "phi4": phi4_template,
 }

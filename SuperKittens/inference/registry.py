@@ -264,6 +264,27 @@ SPECS: dict[str, ModelSpec] = {
                   eps=1e-6, rope_freq_base=5_000_000.0, tie_word_embeddings=0,
                   use_qk_norm=0),
     ),
+    # Phi-4-reasoning (14B): model_type "phi3" (Phi3ForCausalLM) — a dense decoder
+    # the shared core drives config-only: use_qk_norm=0, rope_interleaved=0 (phi3
+    # GGUFs are NOT q/k-permuted → NeoX/type-2, the core default), plain RoPE
+    # theta=500000 (rope_scaling null, partial_rotary_factor 1.0 = full 128-dim),
+    # untied LM head, no QKV bias, no sliding window. vocab 100352 (tiktoken-style).
+    # ARTIFACT: phi3 GGUFs fuse attn_qkv + gate_up(ffn_up); gguf_name points at the
+    # one-time repack (models/phi4/repack_phi3_gguf.py — bit-exact row split).
+    # Q4_K_M (~8.4 GiB) fits a 16 GB mini with clamped cache_max.
+    "phi4-reasoning": ModelSpec(
+        family="phi4",
+        adapter="SuperKittens.models.phi4.phi4:Phi4",
+        hf_repo="microsoft/Phi-4-reasoning",
+        weight_dir="Phi-4-reasoning-GGUF",
+        gguf_name="microsoft_Phi-4-reasoning-Q4_K_M-sk.gguf",
+        default_quant="q4_k_m",
+        tokenizer_family="phi4",
+        dims=dict(n_layers=40, d_model=5120, n_heads=40, n_kv_heads=10,
+                  head_dim=128, n_int=17920, vocab_size=100352,
+                  eps=1e-5, rope_freq_base=500000.0, tie_word_embeddings=0,
+                  use_qk_norm=0, rope_interleaved=0),
+    ),
     # Llama-3.2-1B-Instruct: same Llama arch as 3B but head_dim=64 (the 3B and
     # all other dense families are head_dim=128). Exercises the head_dim-templated
     # decode/causal attention (mha_*_64). Tied LM head, llama3 RoPE scaling.
