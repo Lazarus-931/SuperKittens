@@ -146,8 +146,8 @@ class GGUFFile:
         if rows is not None:
             buf = buf[rows]
         out = dequant_rows(buf, ti.type_name, k)
-        if rows is None and len(ti.shape) > 1:
-            out = out.reshape(tuple(ti.shape[::-1]))
+        if rows is None:
+            out = out.reshape(tuple(ti.shape[::-1]))  # 1-d tensors flatten to [k]
         return out
 
 
