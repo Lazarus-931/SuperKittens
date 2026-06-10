@@ -395,7 +395,9 @@ inline void encode_gemm(
     enc->setBytes(&transA,   4, 9); enc->setBytes(&transB,   4, 10);
     enc->setBytes(&has_bias, 4, 11);
     enc->setBuffer(C, 0, 12);
-    enc->dispatchThreadgroups(MTL::Size((N + 63) / 64, (M + 63) / 64, 1),
+    // gemm_fp16 tiles BM=32 rows; a /64 row grid skips rows 32..63 of each
+    // 64-block at M>32 (same bug class fixed in deepseek_model.h).
+    enc->dispatchThreadgroups(MTL::Size((N + 63) / 64, (M + 31) / 32, 1),
                               MTL::Size(64, 1, 1));
 }
 
