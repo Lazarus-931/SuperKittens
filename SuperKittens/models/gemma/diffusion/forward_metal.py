@@ -14,7 +14,7 @@ loop, fp16 activation casts at each hop. Stage 3 moves the glue on-device.
 """
 from __future__ import annotations
 
-import math
+import gc
 import mmap
 import os
 from pathlib import Path
@@ -152,6 +152,13 @@ class WeightBufs:
             ent = (self.ctx.buf_from(arr), 0, ti, None)
         self._cache[name] = ent
         return ent
+
+    def evict_prefix(self, prefix: str):
+        """Drop cached buffers/mmaps for one layer once it has run: a 16 GB
+        model's windows can't all stay resident on a 16 GB box (the late-layer
+        kill was the process croaking under memory pressure, not a kernel)."""
+        for k in [k for k in self._cache if k.startswith(prefix)]:
+            del self._cache[k]
 
 
 class GemmBatch:
@@ -397,6 +404,8 @@ class DiffusionGemmaMetal:
             cur[P:] *= w.f32(f"blk.{il}.layer_output_scale.weight")[0]
             dmp("l_out", il, cur)
             x = cur
+            self.wb.evict_prefix(f"blk.{il}.")
+            gc.collect()  # drop Metal buffers + mmap windows deterministically
 
         x = rms_norm(x, cfg.eps, w.f32("output_norm.weight"))
         dmp("result_norm", -1, x)
