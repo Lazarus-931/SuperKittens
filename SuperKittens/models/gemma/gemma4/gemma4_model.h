@@ -429,7 +429,7 @@ inline void dispatch_layer(
             enc->setBytes(&transB,   4, 10);
             enc->setBytes(&has_bias, 4, 11);
             enc->setBuffer(B.qkv_packed, 0, 12);
-            enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M + 63) / 64, 1),
+            enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M + 31) / 32, 1),
                                       MTL::Size(64, 1, 1));
         }
     }
@@ -765,7 +765,7 @@ inline void dispatch_layer(
             enc->setBytes(&transB,   4, 10);
             enc->setBytes(&has_bias, 4, 11);
             enc->setBuffer(B.o_proj, 0, 12);
-            enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M + 63) / 64, 1),
+            enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M + 31) / 32, 1),
                                       MTL::Size(64, 1, 1));
         }
     }
@@ -1036,7 +1036,7 @@ inline void dispatch_ple_inject(
             enc->setBytes(&transB,   4, 10);
             enc->setBytes(&has_bias, 4, 11);
             enc->setBuffer(B.ple_gate_out, 0, 12);
-            enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M + 63) / 64, 1),
+            enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M + 31) / 32, 1),
                                       MTL::Size(64, 1, 1));
             enc->endEncoding();
         }
@@ -1084,7 +1084,7 @@ inline void dispatch_ple_inject(
         enc->setBytes(&transB,   4, 10);
         enc->setBytes(&has_bias, 4, 11);
         enc->setBuffer(B.ple_proj_back, 0, 12);
-        enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M + 63) / 64, 1),
+        enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M + 31) / 32, 1),
                                   MTL::Size(64, 1, 1));
         enc->endEncoding();
     }
@@ -1454,7 +1454,7 @@ inline void dispatch_model(
                 enc2->setBytes(&transB,  4, 10);
                 enc2->setBytes(&has_bias,4, 11);
                 enc2->setBuffer(B.ple_ctx_proj, 0, 12);
-                enc2->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M_v + 63) / 64, 1),
+                enc2->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M_v + 31) / 32, 1),
                                            MTL::Size(64, 1, 1));
                 enc2->endEncoding();
             }
@@ -1942,7 +1942,7 @@ inline void dispatch_model(
         enc->setBytes(&transB,   4, 10);
         enc->setBytes(&has_bias, 4, 11);
         enc->setBuffer(B.logits, 0, 12);
-        enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M_v + 63) / 64, 1),
+        enc->dispatchThreadgroups(MTL::Size((N_v + 63) / 64, (M_v + 31) / 32, 1),
                                   MTL::Size(64, 1, 1));
         enc->endEncoding();
     }
