@@ -60,6 +60,24 @@ class MetalCtx:
             raise RuntimeError(f"metal compile failed: {err}")
         self.lib = lib
         self._pso = {}
+        self._scratch = {}
+
+    def scratch(self, tag: str, nbytes: int):
+        """Persistent grow-only buffer per call-site tag. Per-call Metal
+        alloc/free churn (activations, ~3 GB/forward) swap-stormed the 16 GB
+        host once generation ran many forwards in one process — same failure
+        class Stage 1 hit with weights, same fix."""
+        b = self._scratch.get(tag)
+        if b is None or b.length() < nbytes:
+            b = self.buf_empty(nbytes)
+            self._scratch[tag] = b
+        return b
+
+    def scratch_fill(self, tag: str, arr: np.ndarray):
+        arr = np.ascontiguousarray(arr)
+        b = self.scratch(tag, arr.nbytes)
+        b.contents().as_buffer(arr.nbytes)[:] = arr.tobytes()
+        return b
 
     def pso(self, name: str):
         p = self._pso.get(name)
@@ -255,17 +273,21 @@ class DiffusionGemmaMetal:
                 pass
         return self.ctx.read(o_buf, np.float32, (C, d))
 
-    def _sc_signal(self, sc_logits: np.ndarray, sc_temp_inv: float,
-                   sc_use: float) -> np.ndarray:
-        """PR dg_canvas_embed SC subgraph -> sc_sig f32 [C, d_model]."""
+    def _sc_signal(self, sc_logits: np.ndarray | None, sc_temp_inv: float,
+                   sc_use: float, probs16: np.ndarray | None = None) -> np.ndarray:
+        """PR dg_canvas_embed SC subgraph -> sc_sig f32 [C, d_model].
+        probs16 (precomputed softmax(prev/t) f16) lets the generation loop
+        free the 268 MB raw-logit block between forwards."""
         cfg, w = self.cfg, self.w
-        C, V = sc_logits.shape
-        # softmax(prev raw logits / prev t), fp16 on the wire like the
-        # reference (ggml converts the f32 probs to the f16 vec_dot type)
-        probs16 = np.empty((C, V), np.float16)
-        for c0 in range(0, C, 32):
-            c1 = min(c0 + 32, C)
-            probs16[c0:c1] = softmax(sc_logits[c0:c1] * F32(sc_temp_inv)).astype(np.float16)
+        if probs16 is None:
+            assert sc_logits is not None
+            C, V = sc_logits.shape
+            # softmax(prev raw logits / prev t), fp16 on the wire like the
+            # reference (ggml converts the f32 probs to the f16 vec_dot type)
+            probs16 = np.empty((C, V), np.float16)
+            for c0 in range(0, C, 32):
+                c1 = min(c0 + 32, C)
+                probs16[c0:c1] = softmax(sc_logits[c0:c1] * F32(sc_temp_inv)).astype(np.float16)
         if self.sc_embt_path is not None:
             soft = self._sc_soft_embed(probs16)
         else:  # oracle-style host fallback (slow: full embed dequant per step)
@@ -299,8 +321,8 @@ class DiffusionGemmaMetal:
         amax = float(np.abs(a).max(initial=0.0))
         if amax > 3.0e4:
             print(f"[warn] fp16 activation near overflow ({amax:.1f}) into {wname}")
-        a_buf = self.ctx.buf_from(a.astype(np.float16))
-        c_buf = self.ctx.buf_empty(M * N * 2)
+        a_buf = self.ctx.scratch_fill(f"A:{wname}", a.astype(np.float16))
+        c_buf = self.ctx.scratch(f"C:{wname}", M * N * 2)
         b = GemmBatch(self.ctx)
         self._wgemm(b, wname, a_buf, 0, c_buf, 0, M, N, K, row0=row0)
         b.run()
@@ -323,13 +345,13 @@ class DiffusionGemmaMetal:
         vtp = np.zeros((Kv, hd, Np), np.float16)
         vtp[:, :, :N] = v.transpose(1, 2, 0)
 
-        q_buf = self.ctx.buf_from(qp)
-        k_buf = self.ctx.buf_from(kp)
-        vt_buf = self.ctx.buf_from(vtp)
-        m_buf = self.ctx.buf_from(np.ascontiguousarray(mask[:, :Np]))
-        s_buf = self.ctx.buf_empty(H * N * Np * 4)   # f32 scores (kq needs range)
-        p_buf = self.ctx.buf_empty(H * N * Np * 2)   # f16 probs
-        o_buf = self.ctx.buf_empty(H * N * hd * 2)
+        q_buf = self.ctx.scratch_fill("attn_q", qp)
+        k_buf = self.ctx.scratch_fill("attn_k", kp)
+        vt_buf = self.ctx.scratch_fill("attn_vt", vtp)
+        m_buf = self.ctx.scratch_fill("attn_mask", np.ascontiguousarray(mask[:, :Np]))
+        s_buf = self.ctx.scratch("attn_s", H * N * Np * 4)   # f32 scores (kq needs range)
+        p_buf = self.ctx.scratch("attn_p", H * N * Np * 2)   # f16 probs
+        o_buf = self.ctx.scratch("attn_o", H * N * hd * 2)
 
         b = GemmBatch(self.ctx)
         for h in range(H):
@@ -362,47 +384,55 @@ class DiffusionGemmaMetal:
         gu_name = f"blk.{il}.ffn_gate_up_exps.weight"
         dn_name = f"blk.{il}.ffn_down_exps.weight"
 
+        d, nff = cfg.d_model, cfg.n_ff_exp
         experts = []
+        r0 = 0
         for e in np.unique(sel):
             tok, slot = np.nonzero(sel == e)
-            experts.append((int(e), tok, slot))
+            experts.append((int(e), tok, slot, r0))
+            r0 += len(tok)
+        m_total = r0
+
+        # All hit experts share three persistent row-packed scratch buffers
+        # (per-expert alloc/free churned ~GBs of Metal allocations per
+        # forward; fine for one Stage-1 forward, deadly across a generation)
+        cap_rows = N * cfg.n_expert_used
+        a_buf = self.ctx.scratch("moe_a", cap_rows * d * 2)
+        c_buf = self.ctx.scratch("moe_c", cap_rows * 2 * nff * 2)
+        d_buf = self.ctx.scratch("moe_d", cap_rows * d * 2)
+        packed = np.concatenate([e_in[tok] for _, tok, _, _ in experts]).astype(np.float16)
+        a_buf.contents().as_buffer(packed.nbytes)[:] = packed.tobytes()
 
         # stage A: gate_up for every hit expert in one command buffer
         b = GemmBatch(self.ctx)
-        stage = []
-        for e, tok, slot in experts:
-            m = len(tok)
-            a_buf = self.ctx.buf_from(e_in[tok].astype(np.float16))
-            c_buf = self.ctx.buf_empty(m * 2 * cfg.n_ff_exp * 2)
-            self._wgemm(b, gu_name, a_buf, 0, c_buf, 0, M=m, N=2 * cfg.n_ff_exp,
-                        K=cfg.d_model, row0=e * 2 * cfg.n_ff_exp)
-            stage.append((e, tok, slot, c_buf, m))
+        for e, tok, _, r0 in experts:
+            self._wgemm(b, gu_name, a_buf, r0 * d * 2, c_buf, r0 * 2 * nff * 2,
+                        M=len(tok), N=2 * nff, K=d, row0=e * 2 * nff)
         b.run()
 
-        # host geglu, then stage B: down for every hit expert
+        # host geglu (whole packed block), then stage B: down per expert
+        gu = self.ctx.read(c_buf, np.float16, (m_total, 2 * nff)).astype(F32)
+        act = (gelu_tanh(gu[:, :nff]) * gu[:, nff:]).astype(np.float16)
+        a_buf.contents().as_buffer(act.nbytes)[:] = act.tobytes()
         b = GemmBatch(self.ctx)
-        stage2 = []
-        for e, tok, slot, c_buf, m in stage:
-            gu = self.ctx.read(c_buf, np.float16, (m, 2 * cfg.n_ff_exp)).astype(F32)
-            act = gelu_tanh(gu[:, :cfg.n_ff_exp]) * gu[:, cfg.n_ff_exp:]
-            a_buf = self.ctx.buf_from(act.astype(np.float16))
-            d_buf = self.ctx.buf_empty(m * cfg.d_model * 2)
-            self._wgemm(b, dn_name, a_buf, 0, d_buf, 0, M=m, N=cfg.d_model,
-                        K=cfg.n_ff_exp, row0=e * cfg.d_model)
-            stage2.append((e, tok, slot, d_buf, m))
+        for e, tok, _, r0 in experts:
+            self._wgemm(b, dn_name, a_buf, r0 * nff * 2, d_buf, r0 * d * 2,
+                        M=len(tok), N=d, K=nff, row0=e * d)
         b.run()
 
-        moe = np.zeros((N, cfg.d_model), dtype=F32)
-        for e, tok, slot, d_buf, m in stage2:
-            d_ = self.ctx.read(d_buf, np.float16, (m, cfg.d_model)).astype(F32)
-            moe[tok] += d_ * down_s[e] * wts[tok, slot][:, None]
+        dn = self.ctx.read(d_buf, np.float16, (m_total, d)).astype(F32)
+        moe = np.zeros((N, d), dtype=F32)
+        for e, tok, slot, r0 in experts:
+            moe[tok] += dn[r0:r0 + len(tok)] * down_s[e] * wts[tok, slot][:, None]
         return moe
 
     # -- forward ---------------------------------------------------------------
 
     def forward(self, ids: np.ndarray, P: int, sc_logits: np.ndarray | None = None,
-                sc_temp_inv: float = 1.0, sc_use: float = 1.0) -> np.ndarray:
-        """sc_logits=None -> the Stage-1-validated zero-SC unified forward."""
+                sc_temp_inv: float = 1.0, sc_use: float = 1.0,
+                sc_probs16: np.ndarray | None = None) -> np.ndarray:
+        """sc_logits=None and sc_probs16=None -> the Stage-1-validated zero-SC
+        unified forward."""
         cfg, w = self.cfg, self.w
         ids = np.asarray(ids)
         N = len(ids)
@@ -411,9 +441,10 @@ class DiffusionGemmaMetal:
         dmp = self.dump or (lambda name, il, arr: None)
 
         sc_sig = None
-        if sc_logits is not None:
+        if sc_logits is not None or sc_probs16 is not None:
             with objc.autorelease_pool():
-                sc_sig = self._sc_signal(sc_logits, sc_temp_inv, sc_use)
+                sc_sig = self._sc_signal(sc_logits, sc_temp_inv, sc_use,
+                                         probs16=sc_probs16)
             dmp("sc_sig", -1, sc_sig)
         x = embed_tokens(w, cfg, ids, P, sc_sig=sc_sig)
         dmp("inp_region", -1, x)
@@ -480,6 +511,9 @@ class DiffusionGemmaMetal:
         with objc.autorelease_pool():
             logits = self._gemm_f32("token_embd.weight", x[P:], cfg.vocab_size)
         cap = F32(cfg.final_logit_softcap)
-        logits = (np.tanh(logits / cap) * cap).astype(F32)
+        # in-place softcap: the expression form held ~3 extra 268 MB transients
+        np.divide(logits, cap, out=logits)
+        np.tanh(logits, out=logits)
+        np.multiply(logits, cap, out=logits)
         dmp("result_output", -1, logits)
         return logits
