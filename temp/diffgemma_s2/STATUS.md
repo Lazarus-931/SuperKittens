@@ -100,7 +100,7 @@ possible in principle on exact f32 ties; the synthetic gate quantified it at
 Reference cli's own final answer (same run): thought channel reasoning +
 "The capital of France is Paris." — 7 steps, 30.5 s/step CPU.
 
-## Gate 3 — e2e coherent generation
+## Gate 3 — e2e coherent generation: GREEN (3/3 prompts)
 
 Full SK loop (Metal forward + SC + sampler) via generate.py under
 tools/run_gate3.sh (caffeinate -is, detached, watchdog swap>3.5G /
@@ -124,15 +124,94 @@ fix holds over a full 12-forward generation. Output (verbatim):
 > `    *   Identify city: Paris.`
 > `State the answer clearly.<channel|>The capital of France is Paris.`
 
-GATE3_MORE_PLACEHOLDER
+### pq "What is 2+2?" (P=23) — run gen/pq_s16
 
-## Gate 4 — cross-check vs llama-diffusion-cli
+8 steps (adaptive stop), wall 395.6 s, fw 388.4 s, sampler 5.1 s, 0 mask
+tokens, trim 48, EXIT 0. H_mean 0.576 -> 0.0015, accepted 98 -> 256.
+Canvas beyond the cut is pure `<eos>` padding. Output (verbatim):
 
-GATE4_PLACEHOLDER
+> `<|channel>thought`
+> `The user is asking for the sum of 2 and 2. This is a basic arithmetic question.`
+> `2 + 2 = 4.`
+> `Provide the answer directly.<channel|>2 + 2 = 4<turn|>`
+
+### p2 "Write a haiku about the ocean." (P=24) — run gen/p2_s16
+
+14 steps (adaptive stop), wall 695.5 s, fw 682.4 s, sampler 9.2 s, 0 mask
+tokens, EXIT 0. Creative prompt = high-entropy start: H_mean 2.75 -> 1.3e-4,
+accepted 7 -> 256 (vs 126/98 step-0 accepts on the QA prompts). The model
+filled the entire 256-token canvas (no EOS): brainstorm list, three haiku
+drafts with self-critique and per-line syllable counts, closed the thought
+channel, and began the final answer — truncated by canvas length, not by
+incoherence. Full-canvas detok (verbatim, condensed):
+
+> `<|channel>thought` … `*   Waves, tides, salt, blue, deep, vast, sand,
+> shore, shells, crashing, rhythmic, endless, blue, foam.` … three drafted
+> haikus each with `*Critique:*` … `*   *Syllable count:*` …
+> `Crashing waves on shore, / Endless secrets in the deep, / Salt mist fills
+> the air.<channel|>Crashing waves on shore,`
+
+`output.txt` shows only the first 31 tokens: `trim_canvas`'s stride-2
+repetition heuristic false-fires on the comma-separated brainstorm list
+(the comma token repeats at stride 2 ≥ 6 times). Detok artifact in the
+reference-cli-style trim, NOT a generation defect — keep in mind for
+Stage 3 if trimmed output looks short on listy generations.
+
+**Gate 3 GREEN on all three prompts**: fluent prompt-relevant text, both
+simple-QA prompts answered correctly, 0 mask tokens in every final canvas,
+logits finite every step (generate.py raises otherwise), swap flat ~1.0-1.1 G
+and disk free ~11.7 G throughout (bcb5b61 scratch fix holds across 8/12/14
+forward generations).
+
+## Gate 4 — cross-check vs llama-diffusion-cli: GREEN
+
+**GREEN — qualitative agreement.** Uninstrumented `llama-diffusion-cli`
+(CPU, prompt-KV cache on), same prompt/seed/S as the SK p1 run
+(`-p "What is the capital of France?" --diffusion-eb-max-steps 16
+--seed 1234 -n 256`), run gen/cli_p1_s16.log:
+
+> `<|channel>thought`
+> `The user is asking for the capital of France.`
+> `    *   Entity: France.`
+> `    *   Question: Capital.`
+> `The capital of France is Paris.<channel|>The capital of France is Paris.`
+
+8 steps, 238.8 s total, 29.85 s/step. Same final answer and same
+thought-channel structure as SK p1; trajectories diverge in step count
+(8 vs 12) and thought wording as expected — the cli's chat template
+prepends the system/think turns identically, but GPU f16 forward numerics
+differ from CPU f32, so per-step accept sets drift after step 1 while both
+converge to the correct answer. (Token-level sampler identity on shared
+logits is already proven by Gate 2.) Swap flat 1044 M, disk ≥ 11.7 G
+during the run.
 
 ## Stage-3 baseline numbers
 
-GATE5_PLACEHOLDER
+All runs: amelia M4 16 GB, C=256, S=16, seed 1234, SC on, Q4_K_M 26B-A4B.
+
+| run | prompt | steps used | wall (s) | wall/step | fw (s) | sampler (s) | fw share |
+|---|---|---|---|---|---|---|---|
+| p1_s16 | capital of France (P=23) | 12 | 604.8 | 50.4 | 593.8 | 7.7 | 98.2% |
+| pq_s16 | 2+2 (P=23) | 8 | 395.6 | 49.5 | 388.4 | 5.1 | 98.2% |
+| p2_s16 | ocean haiku (P=24) | 14 | 695.5 | 49.7 | 682.4 | 9.2 | 98.1% |
+
+- Per-step forward: step 0 (zero-SC) 44.9-46.0 s; steps ≥ 1 (SC active)
+  48.5-52.2 s, median ~49 s — consistent with the 43.8/50.8 s bit-regression
+  timings, so queue-window contention cost ≲ a few percent.
+- Host sampler 0.6-0.7 s/step; residual (probs16 conversion, IO, detok)
+  ~0.3 s/step. **The Metal forward is 98% of wall — it is the entire
+  Stage-3 surface.** Encode/sampler-side levers are noise at this split.
+- Adaptive stop is doing real work: 8/12/14 steps used of S=16, and steps
+  scale with prompt entropy (QA converges fastest, creative slowest).
+- Reference CPU cli on the same box: 29.85 s/step — the CPU reference
+  currently BEATS the SK GPU forward ~1.65× per step. The SK forward
+  (T=279 prefill-shaped, per-step full-canvas recompute, MoE expert
+  streaming over a 15 GB-resident Q4_K_M model) is unoptimized
+  Stage-2 correctness plumbing; closing (then inverting) that gap is the
+  Stage-3 objective. Candidate levers, in lab-evidence order: prompt-KV
+  reuse across steps (the cli already does this), Q4_K MoE GEMM port
+  (~4× over fp16 swiglu_pair, proven out-of-tree), gemm_mma for the
+  T=279 dense projections.
 
 ## Tools (this dir, all run on amelia from ~/sk-diffg-s2b)
 
@@ -145,7 +224,8 @@ GATE5_PLACEHOLDER
   through the SK sampler, diffs every decision field, deletes consumed logits.
 - `make_embt.py` — one-time [d_model, vocab] f16 transposed embed (1.48 GB,
   amelia ~/sk-diffg-s2b/dg_embT_f16.bin) for the GPU SC soft-embed stream.
-- `run_gate3.sh` — watchdogged e2e generation (swap>5.5G / disk<400M / 3600s).
+- `run_gate3.sh` — watchdogged e2e generation (swap>3.5G / disk<4G / 3600s).
+- `run_queue2.sh` — sequential pq/p2 gate-3 runs + watchdogged gate-4 cli.
 - `compare_eb.py`, `eb_ref_harness.cpp`, `rng_dump.cpp` — Stage-2a synthetic
   sampler gate (committed earlier, still pass).
 
@@ -176,8 +256,13 @@ Scratch reuse is also slightly faster: 43.8 s zero-SC / 50.8 s SC (was
 
 - amelia root volume runs ~2.5-4.8 GB free with the embT + dumps in place;
   every logits file is 268 MB — delete as consumed (gate2 streams + deletes).
-- A GGUF→derek transfer (`cat ~/diffgemma-gguf/...gguf`) was running through
-  amelia during the correctness runs; timing-sensitive numbers (Gate 5) were
-  taken TRANSFER_NOTE_PLACEHOLDER.
+- A GGUF→derek transfer (chunked `tail -c +N ~/diffgemma-gguf/...gguf`)
+  was streaming from amelia around the Gate-3 window (chunk resumed at byte
+  4.2e9 at 01:09:35, definitively concurrent with the pq/p2/cli runs; p1
+  overlap uncertain). It consumes network + disk-read only; per-step fw_s is
+  consistent across all three SK runs (and with the pre-queue 43.8/50.8 s
+  bit-regression timings), so the Gate-5 numbers carry at most a few percent
+  of contention noise. A ~3.6 GB-RSS Virtualization VM was also resident the
+  whole time.
 - Stale `/Users/amelia/SuperKittens` partial copy exists; the lab runs pin
   PYTHONPATH=~/sk-diffg-s2b so the rsynced tree wins. Don't import without it.
