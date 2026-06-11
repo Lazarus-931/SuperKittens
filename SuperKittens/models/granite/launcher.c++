@@ -248,9 +248,11 @@ extern "C" int sk_granite_load_gguf(sk_granite_handle* hp, const char* path) {
         return -10;
     }
 
-    // Layer types: head_count_kv is a per-layer U32 array; 0 = mamba (recurrent).
+    // Layer types: head_count_kv is a per-layer int array (I32 in the official
+    // GGUFs); 0 = mamba (recurrent), >0 = attention.
     const auto* kvh = sk::gguf::meta_find(gm, "granitehybrid.attention.head_count_kv");
-    if (!kvh || kvh->type != sk::gguf::V_ARRAY || kvh->arr_type != sk::gguf::V_U32
+    if (!kvh || kvh->type != sk::gguf::V_ARRAY
+        || (kvh->arr_type != sk::gguf::V_U32 && kvh->arr_type != sk::gguf::V_I32)
         || kvh->arr_len != c.n_layers) {
         std::fprintf(stderr, "granite gguf: head_count_kv array missing/mismatched\n");
         return -11;
