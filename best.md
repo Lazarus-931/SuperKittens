@@ -31,6 +31,7 @@ vs llama.cpp on a clean-`main` regression sweep.
 | nemotron-Nano-8B (Llama-3.1) | **21.58** | derek | yes | interleaved/NORM RoPE for Llama GGUFs fixed the degeneration ([#79]); shared dense core |
 | gemma4-E2B (PLE, KV-share) | **~21** | derek | yes | Q8 body+lmhead ([#69]/[#72]) |
 | Mistral-7B-Instruct-v0.3 | **19.93** | amelia | yes | config-only over DenseDecoder + interleaved RoPE ([#84]) |
+| Phi-4-reasoning 14B (phi3 arch) | **10.49** | amelia | yes | config-only over DenseDecoder + one-time fused-tensor GGUF repack; amelia-with-colima number — expect ≥Qwen3-14B on lexie (local main, June 10) |
 | gemma4-E4B (own ckpt, 42L) | **9.86** | — | yes | PLE-table + embed Q8 fixed the 1.44→9.86 paging cliff ([#74]) |
 | gemma4-unified-12B (distinct arch) | **8.2–8.4** | derek | yes | Q4_K body (q4k/q6k_matvec_bf16) fits under the ~12 GB Metal wired limit + fp16-subnormal embed-dequant fix ([#78]) |
 
