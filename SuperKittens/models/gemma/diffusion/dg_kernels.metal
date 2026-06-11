@@ -12,6 +12,7 @@
 //                    overflow (no 1/sqrt(d) pre-scale in this family) and
 //                    costs softmax precision.
 // dg_softmax_mask  : masked row softmax, f32 scores in -> f16 probs out.
+// dg_geglu         : gelu_tanh(G) * U elementwise (strided rows), f16.
 
 // ── Q5_0 tile loader. block = 32 weights, 22 B: half d, u32 qh, 16 nibble
 // bytes. w = d * (((qs nibble) | (qh bit << 4)) - 16); element wk uses qh
@@ -173,4 +174,27 @@ kernel void dg_softmax_mask(
     for (uint c = tid; c < ncols; c += tptg) {
         prow[c] = (half)(exp(row[c] * scale + mrow[c] - rmax) * inv);
     }
+}
+
+// ── GEGLU between the gate_up and down GEMMs (was a host round trip: read
+// back gu, numpy gelu_tanh, re-upload). f32 math like the host/oracle path.
+// G/U row strides let one kernel serve the MoE packed [gate|up] block
+// (ldg = ldu = 2*nff, U = G + nff) and the dense pair (separate buffers).
+kernel void dg_geglu(
+    device const half *G    [[buffer(0)]],
+    device const half *U    [[buffer(1)]],
+    device half       *A    [[buffer(2)]],
+    constant uint     &ncol [[buffer(3)]],
+    constant uint     &ldg  [[buffer(4)]],
+    constant uint     &ldu  [[buffer(5)]],
+    constant uint     &nrow [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{
+    const uint r = gid / ncol;
+    const uint j = gid % ncol;
+    if (r >= nrow) return;
+    const float g = (float)G[(size_t)r * ldg + j];
+    const float u = (float)U[(size_t)r * ldu + j];
+    const float t = 0.7978845608028654f * (g + 0.044715f * g * g * g);
+    A[(size_t)r * ncol + j] = (half)(0.5f * g * (1.0f + precise::tanh(t)) * u);
 }

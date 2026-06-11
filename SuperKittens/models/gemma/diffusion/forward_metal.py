@@ -14,9 +14,13 @@ loop, fp16 activation casts at each hop. Stage 3 moves the glue on-device.
 """
 from __future__ import annotations
 
+import contextlib
+import ctypes
 import gc
 import mmap
 import os
+import time
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -42,6 +46,45 @@ def _pad32(n: int) -> int:
     return (n + 31) // 32 * 32
 
 
+class Timing:
+    """Per-forward stage accounting (wall + GPU + bytes). Collection is a few
+    thousand clock reads per 50 s forward — always on; printing is opt-in
+    (DG_TIMING=1) so A/B runs and profiling read the same code path."""
+
+    def __init__(self):
+        self.wall = defaultdict(float)
+        self.gpu = defaultdict(float)
+        self.bytes = defaultdict(int)
+        self.n = defaultdict(int)
+
+    def reset(self):
+        self.wall.clear(); self.gpu.clear(); self.bytes.clear(); self.n.clear()
+
+    @contextlib.contextmanager
+    def t(self, key: str, nbytes: int = 0):
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.wall[key] += time.perf_counter() - t0
+            self.bytes[key] += nbytes
+            self.n[key] += 1
+
+    def report(self, total_s: float) -> str:
+        rows = ["%-22s %8s %8s %8s %6s" % ("stage", "wall_s", "gpu_s", "GB", "n")]
+        acc = 0.0
+        for k in sorted(self.wall, key=lambda k: -self.wall[k]):
+            w = self.wall[k]
+            if "(nested)" not in k:     # envelope keys overlap their components
+                acc += w
+            g = self.gpu.get(k, 0.0)
+            gb = self.bytes[k] / 1e9
+            rows.append("%-22s %8.2f %8.2f %8.2f %6d" % (k, w, g, gb, self.n[k]))
+        rows.append("%-22s %8.2f  (forward %.2f, untracked %.2f)"
+                    % ("TOTAL tracked", acc, total_s, total_s - acc))
+        return "\n".join(rows)
+
+
 class MetalCtx:
     """Device + queue + runtime-compiled PSOs (CLT-only hosts: no metallib)."""
 
@@ -61,6 +104,29 @@ class MetalCtx:
         self.lib = lib
         self._pso = {}
         self._scratch = {}
+        self.tim = Timing()
+        self._mmaps: list = []   # ctypes views: no-copy mappings live forever
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.mmap.restype = ctypes.c_void_p
+        libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,
+                              ctypes.c_int, ctypes.c_int, ctypes.c_longlong]
+        self._libc = libc
+
+    def map_nocopy(self, fd: int, offset: int, length: int):
+        """MAP_SHARED + PROT_READ file region as a no-copy MTLBuffer. Python's
+        mmap module can't hand pyobjc a writable view of a PROT_READ mapping,
+        so the map is made via libc and wrapped with ctypes."""
+        addr = self._libc.mmap(None, length, mmap.PROT_READ, mmap.MAP_SHARED,
+                               fd, offset)
+        if addr in (None, ctypes.c_void_p(-1).value):
+            raise OSError(ctypes.get_errno(), f"mmap({offset}, {length})")
+        view = (ctypes.c_char * length).from_address(addr)
+        buf = self.device.newBufferWithBytesNoCopy_length_options_deallocator_(
+            view, length, Metal.MTLResourceStorageModeShared, None)
+        if buf is None:
+            raise RuntimeError(f"no-copy buffer failed ({length} B)")
+        self._mmaps.append(view)
+        return buf
 
     def scratch(self, tag: str, nbytes: int):
         """Persistent grow-only buffer per call-site tag. Per-call Metal
@@ -74,9 +140,10 @@ class MetalCtx:
         return b
 
     def scratch_fill(self, tag: str, arr: np.ndarray):
-        arr = np.ascontiguousarray(arr)
-        b = self.scratch(tag, arr.nbytes)
-        b.contents().as_buffer(arr.nbytes)[:] = arr.tobytes()
+        with self.tim.t("h2d:acts", arr.nbytes):
+            arr = np.ascontiguousarray(arr)
+            b = self.scratch(tag, arr.nbytes)
+            b.contents().as_buffer(arr.nbytes)[:] = arr.tobytes()
         return b
 
     def pso(self, name: str):
@@ -108,8 +175,50 @@ class MetalCtx:
 
     def read(self, buf, dtype, shape, offset: int = 0) -> np.ndarray:
         n = int(np.prod(shape)) * np.dtype(dtype).itemsize
-        mv = buf.contents().as_buffer(offset + n)[offset:offset + n]
-        return np.frombuffer(mv, dtype=dtype).reshape(shape).copy()
+        with self.tim.t("d2h:acts", n):
+            mv = buf.contents().as_buffer(offset + n)[offset:offset + n]
+            return np.frombuffer(mv, dtype=dtype).reshape(shape).copy()
+
+
+class MappedWeights:
+    """No-copy weight binding: MAP_SHARED + PROT_READ regions of the GGUF,
+    wrapped as MTLBuffers (llama.cpp's Metal mmap pattern; regions split at
+    tensor boundaries to fit device.maxBufferLength).
+
+    This is NOT the Stage-1 MAP_PRIVATE disaster: PRIVATE pages turn anonymous
+    (un-evictable) on GPU touch, while SHARED read-only pages stay clean file
+    cache the pager can drop freely — the GPU faults in exactly what it reads
+    and the per-step disk traffic is only the evicted share, not the whole
+    15.6 GB the memcpy+MADV_DONTNEED streaming path re-read every forward."""
+
+    def __init__(self, ctx: MetalCtx, gg: GGUFFile):
+        self.ctx = ctx
+        self.gg = gg
+        self._bind: dict[str, tuple] = {}    # name -> (buf, offset_in_buf)
+        fd = gg._f.fileno()
+        pg = mmap.PAGESIZE
+        maxlen = int(ctx.device.maxBufferLength())
+        infos = sorted(gg.tensors.values(), key=lambda ti: ti.offset)
+        regions: list[list] = []             # [page_start, end, [tis]]
+        for ti in infos:
+            end = ti.offset + ti.nbytes
+            if regions and (end + pg - 1) // pg * pg - regions[-1][0] <= maxlen:
+                regions[-1][1] = max(regions[-1][1], end)
+                regions[-1][2].append(ti)
+            else:
+                regions.append([ti.offset // pg * pg, end, [ti]])
+        for start, end, tis in regions:
+            buf = ctx.map_nocopy(fd, start, (end + pg - 1) // pg * pg - start)
+            for ti in tis:
+                self._bind[ti.name] = (buf, ti.offset - start)
+
+    def get(self, name: str) -> tuple:
+        ti = self.gg.tensors[name]
+        buf, delta = self._bind[name]
+        return (buf, delta, ti, None)
+
+    def evict_prefix(self, prefix: str):
+        return  # the pager owns residency
 
 
 class WeightBufs:
@@ -147,8 +256,9 @@ class WeightBufs:
             self._slots[role] = slot = (buf, self._cap[role])
         buf, cap = slot
         if self._occupant.get(role) != name:
-            mv = buf.contents().as_buffer(cap)
-            mv[:ti.nbytes] = self.gg.mm[ti.offset:ti.offset + ti.nbytes]
+            with self.ctx.tim.t(f"wb:{role}", ti.nbytes):
+                mv = buf.contents().as_buffer(cap)
+                mv[:ti.nbytes] = self.gg.mm[ti.offset:ti.offset + ti.nbytes]
             self._occupant[role] = name
             # release the streamed file pages right away: clean cache pages
             # are evictable but their resident growth (15.6 GB/forward) is
@@ -170,8 +280,9 @@ class GemmBatch:
     """Record gemm_mma / dg_softmax_mask dispatches into one command buffer;
     memory barriers split dependent stages. run() commits + waits."""
 
-    def __init__(self, ctx: MetalCtx):
+    def __init__(self, ctx: MetalCtx, label: str = "gemm"):
         self.ctx = ctx
+        self.label = label
         self.cmd = ctx.queue.commandBuffer()
         self.enc = self.cmd.computeCommandEncoder()
         self._keep: list = []   # encoder retains resources, but keep pyobjc refs too
@@ -213,8 +324,11 @@ class GemmBatch:
 
     def run(self):
         self.enc.endEncoding()
-        self.cmd.commit()
-        self.cmd.waitUntilCompleted()
+        key = f"gpu:{self.label}"
+        with self.ctx.tim.t(key):
+            self.cmd.commit()
+            self.cmd.waitUntilCompleted()
+        self.ctx.tim.gpu[key] += max(0.0, self.cmd.GPUEndTime() - self.cmd.GPUStartTime())
         if self.cmd.error() is not None:
             raise RuntimeError(f"command buffer failed: {self.cmd.error()}")
 
@@ -227,50 +341,40 @@ class DiffusionGemmaMetal:
         self.gg = GGUFFile(gguf_path)
         self.cfg = cfg
         self.ctx = MetalCtx()
-        self.wb = WeightBufs(self.ctx, self.gg)
+        # DG_WEIGHTS=stream: Stage-2 memcpy streaming, kept as a fallback
+        self.wb = (WeightBufs(self.ctx, self.gg)
+                   if os.environ.get("DG_WEIGHTS") == "stream"
+                   else MappedWeights(self.ctx, self.gg))
         self.w = Weights(self.gg)   # F32 sidecars (norms, scales, router)
         self.dump = None            # optional (name, il, arr) tap
         # self-conditioning soft-embed: transposed dequantized embed
-        # [d_model, vocab] f16 on disk (make_embt.py), streamed per chunk
-        # through a persistent slot like every other weight
+        # [d_model, vocab] f16 on disk (make_embt.py), no-copy mapped
         self.sc_embt_path = sc_embt_path
-        self._sc_bufs = None        # (probs_buf, chunk_buf, out_buf, mm)
-        self.sc_chunk_rows = 352    # 8 chunks x 352 = 2816; 184.5 MB slot
+        self._sc_bufs = None        # (probs_buf, embt_buf, out_buf, file)
 
     # -- self-conditioning -------------------------------------------------------
 
     def _sc_soft_embed(self, probs16: np.ndarray) -> np.ndarray:
-        """probs16 fp16 [C, V] @ embed [V, d] -> f32 [C, d] via the streamed
+        """probs16 fp16 [C, V] @ embed [V, d] -> f32 [C, d] via the no-copy
         transposed-embed GEMM (dg_gemm_qkt_f32: f16 inputs, f32 C — matches
         the reference's f16 sc_embT matmul, f32-accumulated)."""
         cfg = self.cfg
         C, V = probs16.shape
         d = cfg.d_model
-        rows = self.sc_chunk_rows
-        assert d % rows == 0
         if self._sc_bufs is None:
             f = open(self.sc_embt_path, "rb")
-            mm = mmap.mmap(f.fileno(), 0, prot=mmap.PROT_READ)
-            assert len(mm) == d * V * 2, "embT size mismatch (expect [d, V] f16)"
-            self._sc_bufs = (self.ctx.buf_empty(C * V * 2),
-                             self.ctx.buf_empty(rows * V * 2),
-                             self.ctx.buf_empty(C * d * 4), mm)
-        p_buf, w_buf, o_buf, mm = self._sc_bufs
-        p_buf.contents().as_buffer(C * V * 2)[:] = probs16.tobytes()
-        for r0 in range(0, d, rows):
-            nbytes = rows * V * 2
-            w_buf.contents().as_buffer(nbytes)[:] = mm[r0 * V * 2:r0 * V * 2 + nbytes]
-            b = GemmBatch(self.ctx)
-            b.gemm("dg_gemm_qkt_f32", p_buf, 0, w_buf, 0, o_buf, r0 * 4,
-                   M=C, N=rows, K=V, ldc=d)
-            b.run()
-            try:
-                pg = mmap.PAGESIZE
-                a = (r0 * V * 2) // pg * pg
-                mm.madvise(mmap.MADV_DONTNEED, a,
-                           (nbytes + (r0 * V * 2) - a + pg - 1) // pg * pg)
-            except (AttributeError, ValueError, OSError):
-                pass
+            assert os.fstat(f.fileno()).st_size == d * V * 2, \
+                "embT size mismatch (expect [d, V] f16)"
+            w_buf = self.ctx.map_nocopy(f.fileno(), 0, d * V * 2)
+            self._sc_bufs = (self.ctx.buf_empty(C * V * 2), w_buf,
+                             self.ctx.buf_empty(C * d * 4), f)
+        p_buf, w_buf, o_buf, _ = self._sc_bufs
+        with self.ctx.tim.t("h2d:acts", C * V * 2):
+            p_buf.contents().as_buffer(C * V * 2)[:] = probs16.tobytes()
+        b = GemmBatch(self.ctx, "sc_embed")
+        b.gemm("dg_gemm_qkt_f32", p_buf, 0, w_buf, 0, o_buf, 0,
+               M=C, N=d, K=V, ldc=d)
+        b.run()
         return self.ctx.read(o_buf, np.float32, (C, d))
 
     def _sc_signal(self, sc_logits: np.ndarray | None, sc_temp_inv: float,
@@ -323,7 +427,7 @@ class DiffusionGemmaMetal:
             print(f"[warn] fp16 activation near overflow ({amax:.1f}) into {wname}")
         a_buf = self.ctx.scratch_fill(f"A:{wname}", a.astype(np.float16))
         c_buf = self.ctx.scratch(f"C:{wname}", M * N * 2)
-        b = GemmBatch(self.ctx)
+        b = GemmBatch(self.ctx, WeightBufs._role(wname))
         self._wgemm(b, wname, a_buf, 0, c_buf, 0, M, N, K, row0=row0)
         b.run()
         return self.ctx.read(c_buf, np.float16, (M, N)).astype(F32)
@@ -339,11 +443,12 @@ class DiffusionGemmaMetal:
         gqa = H // Kv
         Np = _pad32(N)
 
-        qp = np.ascontiguousarray(q.transpose(1, 0, 2)).astype(np.float16)   # [H,N,hd]
-        kp = np.zeros((Kv, Np, hd), np.float16)
-        kp[:, :N] = k.transpose(1, 0, 2)
-        vtp = np.zeros((Kv, hd, Np), np.float16)
-        vtp[:, :, :N] = v.transpose(1, 2, 0)
+        with self.ctx.tim.t("host:attn_pack"):
+            qp = np.ascontiguousarray(q.transpose(1, 0, 2)).astype(np.float16)   # [H,N,hd]
+            kp = np.zeros((Kv, Np, hd), np.float16)
+            kp[:, :N] = k.transpose(1, 0, 2)
+            vtp = np.zeros((Kv, hd, Np), np.float16)
+            vtp[:, :, :N] = v.transpose(1, 2, 0)
 
         q_buf = self.ctx.scratch_fill("attn_q", qp)
         k_buf = self.ctx.scratch_fill("attn_k", kp)
@@ -353,7 +458,7 @@ class DiffusionGemmaMetal:
         p_buf = self.ctx.scratch("attn_p", H * N * Np * 2)   # f16 probs
         o_buf = self.ctx.scratch("attn_o", H * N * hd * 2)
 
-        b = GemmBatch(self.ctx)
+        b = GemmBatch(self.ctx, "attn")
         for h in range(H):
             g = h // gqa
             b.gemm("dg_gemm_qkt_f32", q_buf, h * N * hd * 2, k_buf, g * Np * hd * 2,
@@ -376,7 +481,8 @@ class DiffusionGemmaMetal:
     def _moe(self, il: int, attn_out: np.ndarray, e_in: np.ndarray) -> np.ndarray:
         cfg = self.cfg
         N = attn_out.shape[0]
-        sel, wts = moe_route(self.w, cfg, attn_out, il)
+        with self.ctx.tim.t("host:moe_route"):
+            sel, wts = moe_route(self.w, cfg, attn_out, il)
         if self.dump:
             self.dump("moe_sel", il, sel.astype(np.int32))
             self.dump("moe_wts", il, wts)
@@ -400,11 +506,12 @@ class DiffusionGemmaMetal:
         a_buf = self.ctx.scratch("moe_a", cap_rows * d * 2)
         c_buf = self.ctx.scratch("moe_c", cap_rows * 2 * nff * 2)
         d_buf = self.ctx.scratch("moe_d", cap_rows * d * 2)
-        packed = np.concatenate([e_in[tok] for _, tok, _, _ in experts]).astype(np.float16)
-        a_buf.contents().as_buffer(packed.nbytes)[:] = packed.tobytes()
+        with self.ctx.tim.t("host:moe_pack"):
+            packed = np.concatenate([e_in[tok] for _, tok, _, _ in experts]).astype(np.float16)
+            a_buf.contents().as_buffer(packed.nbytes)[:] = packed.tobytes()
 
         # stage A: gate_up for every hit expert in one command buffer
-        b = GemmBatch(self.ctx)
+        b = GemmBatch(self.ctx, "moe_gu")
         for e, tok, _, r0 in experts:
             self._wgemm(b, gu_name, a_buf, r0 * d * 2, c_buf, r0 * 2 * nff * 2,
                         M=len(tok), N=2 * nff, K=d, row0=e * 2 * nff)
@@ -412,18 +519,20 @@ class DiffusionGemmaMetal:
 
         # host geglu (whole packed block), then stage B: down per expert
         gu = self.ctx.read(c_buf, np.float16, (m_total, 2 * nff)).astype(F32)
-        act = (gelu_tanh(gu[:, :nff]) * gu[:, nff:]).astype(np.float16)
-        a_buf.contents().as_buffer(act.nbytes)[:] = act.tobytes()
-        b = GemmBatch(self.ctx)
+        with self.ctx.tim.t("host:moe_geglu"):
+            act = (gelu_tanh(gu[:, :nff]) * gu[:, nff:]).astype(np.float16)
+            a_buf.contents().as_buffer(act.nbytes)[:] = act.tobytes()
+        b = GemmBatch(self.ctx, "moe_down")
         for e, tok, _, r0 in experts:
             self._wgemm(b, dn_name, a_buf, r0 * nff * 2, d_buf, r0 * d * 2,
                         M=len(tok), N=d, K=nff, row0=e * d)
         b.run()
 
         dn = self.ctx.read(d_buf, np.float16, (m_total, d)).astype(F32)
-        moe = np.zeros((N, d), dtype=F32)
-        for e, tok, slot, r0 in experts:
-            moe[tok] += dn[r0:r0 + len(tok)] * down_s[e] * wts[tok, slot][:, None]
+        with self.ctx.tim.t("host:moe_scatter"):
+            moe = np.zeros((N, d), dtype=F32)
+            for e, tok, slot, r0 in experts:
+                moe[tok] += dn[r0:r0 + len(tok)] * down_s[e] * wts[tok, slot][:, None]
         return moe
 
     # -- forward ---------------------------------------------------------------
@@ -439,14 +548,18 @@ class DiffusionGemmaMetal:
         C = N - P
         pos = np.arange(N, dtype=np.int64)
         dmp = self.dump or (lambda name, il, arr: None)
+        tim = self.ctx.tim
+        tim.reset()
+        t_fw0 = time.perf_counter()
 
         sc_sig = None
         if sc_logits is not None or sc_probs16 is not None:
-            with objc.autorelease_pool():
+            with tim.t("sc(nested)"), objc.autorelease_pool():
                 sc_sig = self._sc_signal(sc_logits, sc_temp_inv, sc_use,
                                          probs16=sc_probs16)
             dmp("sc_sig", -1, sc_sig)
-        x = embed_tokens(w, cfg, ids, P, sc_sig=sc_sig)
+        with tim.t("host:embed"):
+            x = embed_tokens(w, cfg, ids, P, sc_sig=sc_sig)
         dmp("inp_region", -1, x)
         rope_ff = w.f32("rope_freqs.weight")
 
@@ -461,59 +574,72 @@ class DiffusionGemmaMetal:
                 base, use_ff = cfg.rope_params(il)
                 ff = rope_ff if use_ff else None
 
-                h = rms_norm(x, cfg.eps, w.f32(f"blk.{il}.attn_norm.weight"))
+                with tim.t("host:norms"):
+                    h = rms_norm(x, cfg.eps, w.f32(f"blk.{il}.attn_norm.weight"))
 
                 q = self._gemm_f32(f"blk.{il}.attn_q.weight", h, cfg.n_heads * hd)
                 k_raw = self._gemm_f32(f"blk.{il}.attn_k.weight", h, n_kv * hd)
                 vname = f"blk.{il}.attn_v.weight"
                 v_raw = self._gemm_f32(vname, h, n_kv * hd) if vname in self.gg.tensors else k_raw
 
-                q = rms_norm(q.reshape(N, cfg.n_heads, hd), cfg.eps,
-                             w.f32(f"blk.{il}.attn_q_norm.weight"))
-                k = rms_norm(k_raw.reshape(N, n_kv, hd), cfg.eps,
-                             w.f32(f"blk.{il}.attn_k_norm.weight"))
-                v = rms_norm(v_raw.reshape(N, n_kv, hd), cfg.eps)
-                q = rope_neox(q, pos, base, ff)
-                k = rope_neox(k, pos, base, ff)
+                with tim.t("host:qkv_norm_rope"):
+                    q = rms_norm(q.reshape(N, cfg.n_heads, hd), cfg.eps,
+                                 w.f32(f"blk.{il}.attn_q_norm.weight"))
+                    k = rms_norm(k_raw.reshape(N, n_kv, hd), cfg.eps,
+                                 w.f32(f"blk.{il}.attn_k_norm.weight"))
+                    v = rms_norm(v_raw.reshape(N, n_kv, hd), cfg.eps)
+                    q = rope_neox(q, pos, base, ff)
+                    k = rope_neox(k, pos, base, ff)
                 dmp("q_pos", il, q); dmp("k_pos", il, k); dmp("v_normed", il, v)
 
-                mask = build_mask(P, C, swa, cfg.window, n_cols=_pad32(N))
+                with tim.t("host:mask"):
+                    mask = build_mask(P, C, swa, cfg.window, n_cols=_pad32(N))
                 o = self._attention(il, q, k, v, mask)
                 attn = self._gemm_f32(f"blk.{il}.attn_output.weight", o, cfg.d_model)
-                attn = rms_norm(attn, cfg.eps, w.f32(f"blk.{il}.post_attention_norm.weight"))
-                attn_out = (attn + x).astype(F32)
+                with tim.t("host:norms"):
+                    attn = rms_norm(attn, cfg.eps, w.f32(f"blk.{il}.post_attention_norm.weight"))
+                    attn_out = (attn + x).astype(F32)
                 dmp("attn_out", il, attn_out)
 
-                m = rms_norm(attn_out, cfg.eps, w.f32(f"blk.{il}.ffn_norm.weight"))
+                with tim.t("host:norms"):
+                    m = rms_norm(attn_out, cfg.eps, w.f32(f"blk.{il}.ffn_norm.weight"))
                 g_ = gelu_tanh(self._gemm_f32(f"blk.{il}.ffn_gate.weight", m, cfg.n_ff))
                 u_ = self._gemm_f32(f"blk.{il}.ffn_up.weight", m, cfg.n_ff)
                 mlp = self._gemm_f32(f"blk.{il}.ffn_down.weight", g_ * u_, cfg.d_model)
-                mlp = rms_norm(mlp, cfg.eps, w.f32(f"blk.{il}.post_ffw_norm_1.weight"))
+                with tim.t("host:norms"):
+                    mlp = rms_norm(mlp, cfg.eps, w.f32(f"blk.{il}.post_ffw_norm_1.weight"))
                 dmp("ffn_mlp", il, mlp)
 
-                e_in = rms_norm(attn_out, cfg.eps, w.f32(f"blk.{il}.pre_ffw_norm_2.weight"))
+                with tim.t("host:norms"):
+                    e_in = rms_norm(attn_out, cfg.eps, w.f32(f"blk.{il}.pre_ffw_norm_2.weight"))
                 moe = self._moe(il, attn_out, e_in)
-                moe = rms_norm(moe, cfg.eps, w.f32(f"blk.{il}.post_ffw_norm_2.weight"))
+                with tim.t("host:norms"):
+                    moe = rms_norm(moe, cfg.eps, w.f32(f"blk.{il}.post_ffw_norm_2.weight"))
                 dmp("ffn_moe", il, moe)
 
-                f = rms_norm(mlp + moe, cfg.eps, w.f32(f"blk.{il}.post_ffw_norm.weight"))
-                cur = (f + attn_out).astype(F32)
-                cur[:P] *= w.f32(f"blk.{il}.enc_layer_output_scale.weight")[0]
-                cur[P:] *= w.f32(f"blk.{il}.layer_output_scale.weight")[0]
+                with tim.t("host:norms"):
+                    f = rms_norm(mlp + moe, cfg.eps, w.f32(f"blk.{il}.post_ffw_norm.weight"))
+                    cur = (f + attn_out).astype(F32)
+                    cur[:P] *= w.f32(f"blk.{il}.enc_layer_output_scale.weight")[0]
+                    cur[P:] *= w.f32(f"blk.{il}.layer_output_scale.weight")[0]
                 dmp("l_out", il, cur)
                 x = cur
                 self.wb.evict_prefix(f"blk.{il}.")
-            gc.collect()
+            with tim.t("host:gc"):
+                gc.collect()
 
         x = rms_norm(x, cfg.eps, w.f32("output_norm.weight"))
         dmp("result_norm", -1, x)
 
         with objc.autorelease_pool():
             logits = self._gemm_f32("token_embd.weight", x[P:], cfg.vocab_size)
-        cap = F32(cfg.final_logit_softcap)
-        # in-place softcap: the expression form held ~3 extra 268 MB transients
-        np.divide(logits, cap, out=logits)
-        np.tanh(logits, out=logits)
-        np.multiply(logits, cap, out=logits)
+        with tim.t("host:softcap"):
+            cap = F32(cfg.final_logit_softcap)
+            # in-place softcap: the expression form held ~3 extra 268 MB transients
+            np.divide(logits, cap, out=logits)
+            np.tanh(logits, out=logits)
+            np.multiply(logits, cap, out=logits)
         dmp("result_output", -1, logits)
+        if os.environ.get("DG_TIMING"):
+            print(tim.report(time.perf_counter() - t_fw0), flush=True)
         return logits
