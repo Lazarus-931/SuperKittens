@@ -16,7 +16,7 @@ static int dispatch(const char* kname, void* A, void* B, void* C, void* bias,
     auto* bBias = has_bias ? sk::bindings_device()->newBuffer(bbb, MTL::ResourceStorageModeShared) : nullptr;
     if (bBias) memcpy(bBias->contents(), bias, bbb);
 
-    uint32_t gx = (N + 63) / 64, gy = (M + 63) / 64;
+    uint32_t gx = (N + 63) / 64, gy = (M + 31) / 32;  // gemm_fp16 BM=32 rows
 
     auto* cmd = sk::bindings_queue()->commandBuffer();
     auto* enc = cmd->computeCommandEncoder();

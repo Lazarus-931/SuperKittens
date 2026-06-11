@@ -52,10 +52,19 @@ class Tokenizer:
         # bos is not prepended (chat(bos=False)). Distinct 64k vocab from Qwen.
         "yi": {"bos": ("<|startoftext|>",), "eos": ("<|im_end|>", "<|endoftext|>"), "pad": ("<unk>",)},
         "mistral": {"bos": ("<s>",),                     "eos": ("</s>",),                        "pad": ("<pad>",)},
+        # Phi-4(-reasoning): GPT-lineage tiktoken-style vocab. Chat turns end on
+        # <|im_end|> (100265); <|endoftext|> (100257) doubles as BOS and the
+        # base-completion stop. Pad is the repurposed <|dummy_85|> (100349).
+        "phi4": {"bos": ("<|endoftext|>",), "eos": ("<|im_end|>", "<|endoftext|>"), "pad": ("<|dummy_85|>",)},
         # DeepSeek V2/V3 use full-width tokens for BOS/EOS in the trained vocab.
         "deepseek": {"bos": ("<｜begin▁of▁sentence｜>",),
                      "eos": ("<｜end▁of▁sentence｜>",),
                      "pad": ("<｜end▁of▁sentence｜>",)},
+        # Granite 4.x: GPT-2-lineage BPE (dbrx pre-tokenizer); <|end_of_text|>
+        # (100257) is BOS and EOS both (GGUF bos_token_id == eos_token_id),
+        # add_bos=False so generation prompts are raw completions.
+        "granite": {"bos": ("<|end_of_text|>",), "eos": ("<|end_of_text|>",),
+                    "pad": ("<|pad|>", "<|end_of_text|>")},
     }
     _DEFAULT_SPECIALS: ClassVar[dict] = {
         "bos": ("<|im_start|>", "<bos>", "<s>", "<|startoftext|>"),

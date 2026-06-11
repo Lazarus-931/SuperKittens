@@ -242,6 +242,32 @@ class Gemma4(Model):
             raise RuntimeError(f"sk_gemma4_forward_batched failed: {ret}")
         return out
 
+    def prefill_batched(self, input_ids: np.ndarray, chunk_size: int = 0) -> np.ndarray:
+        """Batched chunked prefill: input_ids is (batch, seq) int32 (request-major,
+        equal-length lockstep lanes); returns (batch,) int32 greedy next tokens.
+        One M=batch*chunk GEMM pass per chunk amortizes the weight stream across
+        lanes AND tokens (vs. forward_batched seq=1 x T). chunk_size 0 -> seq_max.
+        Token-exact while seq <= cfg.window (local-attention ring eviction)."""
+        ids = np.ascontiguousarray(input_ids, dtype=np.int32)
+        if ids.ndim != 2 or ids.shape[0] != self.cfg.batch:
+            raise ValueError(f"need (batch={self.cfg.batch}, seq) ids, got {ids.shape}")
+        fn = getattr(_load(), "sk_gemma4_prefill_batched", None)
+        if fn is None:
+            raise RuntimeError("libsk.dylib has no sk_gemma4_prefill_batched; rebuild dylib")
+        fn.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
+                       ctypes.c_uint32, ctypes.c_uint32,
+                       ctypes.POINTER(ctypes.c_int32)]
+        fn.restype = ctypes.c_int
+        out = np.empty((self.cfg.batch,), dtype=np.int32)
+        ret = fn(self._h,
+                 ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+                 ctypes.c_uint32(ids.shape[1]),
+                 ctypes.c_uint32(chunk_size),
+                 out.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)))
+        if ret:
+            raise RuntimeError(f"sk_gemma4_prefill_batched failed: {ret}")
+        return out
+
     def set_dump_enabled(self, enabled: bool):
         _load().sk_gemma4_set_dump_enabled(self._h, 1 if enabled else 0)
 

@@ -681,6 +681,100 @@ extern "C" int sk_gemma4_forward_batched(sk_gemma4_handle* hp,
     return 0;
 }
 
+// Batched chunked prefill: ids is batch*seq int32 (request-major: row b is lane
+// b's seq prompt tokens; all lanes the same length, lockstep positions). Runs
+// the prompt in chunks of <= chunk_size (clamped to seq_max): each chunk's
+// projections are ONE M=batch*chunk GEMM pass, so the weight stream is
+// amortized across lanes AND tokens — vs. the token-by-token serving prefill
+// that pays `seq` full weight-read passes. Logits (per-lane last row, with
+// gemma's descale + softcap) and argmax run only on the final chunk;
+// out_next[b] receives lane b's greedy next token. chunk_size 0 -> seq_max.
+// Does NOT reset; lanes share current_pos (lockstep), KV per lane via its
+// cache slice. SWA exactness bound (same as the single-stream seq>1 path):
+// local-layer KV is a ring of size `window`, so a chunk's tail overwrites the
+// oldest in-window keys of its own interior rows once current_pos+seq exceeds
+// window — prompts must satisfy seq <= window for token-exact prefill.
+extern "C" int sk_gemma4_prefill_batched(sk_gemma4_handle* hp,
+                                         const int* ids, uint32_t seq,
+                                         uint32_t chunk_size, int* out_next) {
+    if (!hp || !ids || !out_next) return -1;
+    auto* h = reinterpret_cast<meow::gemma4::Handle*>(hp);
+    if (seq == 0) return -2;
+    if (h->cfg.batch < 1) return -5;
+    uint32_t step = (chunk_size == 0) ? h->cfg.seq_max : chunk_size;
+    if (step > h->cfg.seq_max) step = h->cfg.seq_max;
+    if (h->current_pos + seq > h->cfg.cache_max) return -4;
+
+    auto* dev = sk::bindings_device();
+    auto* q   = sk::bindings_queue();
+    if (!dev || !q) return -3;
+
+    int32_t* in_ids = (int32_t*)h->bufs.input_ids->contents();
+    const uint32_t batch = h->cfg.batch;
+    for (uint32_t s = 0; s < seq; ) {
+        const uint32_t remaining = seq - s;
+        const uint32_t this_seq = (remaining < step) ? remaining : step;
+        for (uint32_t b = 0; b < batch; ++b)
+            std::memcpy(in_ids + (size_t)b * this_seq, ids + (size_t)b * seq + s,
+                        (size_t)this_seq * sizeof(int32_t));
+        const bool final_chunk = (s + this_seq == seq);
+
+        meow::gemma4::ModelParams mp;
+        mp.batch              = h->cfg.batch;
+        mp.seq                = this_seq;
+        mp.n_layers           = h->cfg.n_layers;
+        mp.local_period       = h->cfg.local_period;
+        mp.d_model            = h->cfg.d_model;
+        mp.n_int              = h->cfg.n_int;
+        mp.n_heads            = h->cfg.n_heads;
+        mp.n_kv_heads_local   = h->cfg.n_kv_heads_local;
+        mp.n_kv_heads_global  = h->cfg.n_kv_heads_global;
+        mp.head_dim_local     = h->cfg.head_dim_local;
+        mp.head_dim_global    = h->cfg.head_dim_global;
+        mp.window             = h->cfg.window;
+        mp.cache_max          = h->cfg.cache_max;
+        mp.prope_p_pairs      = h->cfg.prope_p_pairs;
+        mp.vocab_size         = h->cfg.vocab_size;
+        mp.ple_dim            = h->cfg.ple_dim;
+        mp.has_ple            = (h->cfg.has_ple != 0);
+        mp.full_rope_global   = (h->cfg.full_rope_global != 0);
+        mp.apply_layer_scalar = (h->cfg.apply_layer_scalar != 0);
+        mp.eps                = h->cfg.eps;
+        mp.final_logit_softcap = h->cfg.final_logit_softcap;
+        mp.current_pos        = h->current_pos;
+        mp.n_int_per_layer    = h->n_int_per_layer.data();
+        mp.mlp_gate_off_e     = h->mlp_gate_off_e.data();
+        mp.mlp_down_off_e     = h->mlp_down_off_e.data();
+        mp.kv_source_layer    = h->kv_source_layer.data();
+        mp.layer_scalar_host  = h->layer_scalar_host.data();
+        mp.dump_enabled       = h->dump_enabled;
+        mp.batched_prefill    = final_chunk ? 2u : 1u;
+
+        auto* cmd = q->commandBuffer();
+        meow::gemma4::dispatch_model(cmd, h->psos, h->weights, h->bufs, mp);
+        cmd->commit();
+        cmd->waitUntilCompleted();
+        if (std::getenv("SK_GEMMA4_GPUPROF"))
+            std::fprintf(stderr, "[gpuprof] gpu_busy_us=%.1f\n",
+                         (cmd->GPUEndTime() - cmd->GPUStartTime()) * 1e6);
+        if (cmd->status() == MTL::CommandBufferStatusError) {
+            auto* e = cmd->error();
+            std::fprintf(stderr, "gemma4 prefill_batched: command buffer ERROR (status=%ld): %s\n",
+                         (long)(e ? e->code() : -1),
+                         e && e->localizedDescription() ? e->localizedDescription()->utf8String() : "?");
+            cmd->release();
+            return -7;
+        }
+        cmd->release();
+        h->current_pos += this_seq;
+        s += this_seq;
+    }
+
+    std::memcpy(out_next, h->bufs.output_id->contents(),
+                (size_t)batch * sizeof(int32_t));
+    return 0;
+}
+
 extern "C" int sk_gemma4_get_last_logits(sk_gemma4_handle* hp, void* out_fp16) {
     if (!hp || !out_fp16) return -1;
     auto* h = reinterpret_cast<meow::gemma4::Handle*>(hp);
