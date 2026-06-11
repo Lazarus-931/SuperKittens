@@ -38,9 +38,17 @@ MoE expert GEMM loop itself (the suspected lever-1) is NOT the cost; its
 | stream (Stage-2 prod, baseline) | 44.9 | 47.6 | — |
 | mapped (no-copy MAP_SHARED) | 44.45 | 42.97 | bit-identical both legs |
 | resident 4 GB (3.91 pinned) | 40.97 | 42.81 | bit-identical both legs |
-| resident 6 GB | (pending) | (pending) | budget-only change |
-| resident 7 GB | (pending) | (pending) | budget-only change |
-| + pread streaming (lever B) | (pending) | (pending) | (pending) |
+| resident 6 GB (5.94 pinned) | 44.49 REGRESS | 45.16 REGRESS | swap 1.8->2.3G climbing |
+| + pread streaming (lever B, 4 GB) | **15.58** | **16.55** | bit-identical both legs; swap flat 1.73G |
+| pread + 6 GB re-probe | 15.48 | 17.71 | swap 1.7->2.85G; pins compressed — NO WIN, budget stays 4 GB |
+| pread + 3 threads (lever C probe) | (pending) | (pending) | (pending) |
+
+Resident 6 GB regression anatomy: pinned MTLBuffers are anonymous memory,
+not wired — at 5.94 GB pinned next to the ~4 GB colima VM the compressor
+took ~2.5 GB of them mid-forward (RSS 5.9 -> 3.4 GB, swap climbing), so the
+GPU re-faulted pins from swap instead of weights from the GGUF. Practical
+pin ceiling at mmap-stream pressure: ~4 GB budget. Re-test 5-6 GB after
+lever B (F_NOCACHE removes the page-cache pressure squeezing the pins).
 
 ## Levers
 

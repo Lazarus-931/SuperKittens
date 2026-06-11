@@ -22,6 +22,7 @@ import mmap
 import os
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -260,10 +261,36 @@ class WeightBufs:
         # (~0.36 GB/s measured) and needed DONTNEED to avoid filling the
         # page cache with bytes that are about to be re-read anyway
         self._fd = None
+        self._pool = None
         if os.environ.get("DG_STREAM_IO", "pread") == "pread" and hasattr(os, "preadv"):
             self._fd = os.open(gg.path, os.O_RDONLY)
             with contextlib.suppress(AttributeError, OSError):
                 fcntl.fcntl(self._fd, fcntl.F_NOCACHE, 1)
+            # preadv releases the GIL and pread-with-offset is fd-thread-safe:
+            # N spans in flight lifts the NOCACHE read off QD1
+            nthr = int(os.environ.get("DG_STREAM_THREADS", "1"))
+            if nthr > 1:
+                self._pool = ThreadPoolExecutor(nthr)
+                self._nthr = nthr
+
+    def _pread_span(self, mv, file_off: int, lo: int, hi: int):
+        done = lo
+        while done < hi:
+            got = os.preadv(self._fd, [mv[done:hi]], file_off + done)
+            if got <= 0:
+                raise OSError(f"pread short read at +{done}")
+            done += got
+
+    def _pread_into(self, mv, file_off: int, nbytes: int):
+        if self._pool is not None and nbytes > (32 << 20):
+            step = -(-nbytes // self._nthr) & ~0x3FFF      # 16K-aligned spans
+            spans = [(o, min(o + step, nbytes)) for o in range(0, nbytes, step)]
+            futs = [self._pool.submit(self._pread_span, mv, file_off, lo, hi)
+                    for lo, hi in spans]
+            for f in futs:
+                f.result()
+        else:
+            self._pread_span(mv, file_off, 0, nbytes)
 
     @staticmethod
     def _role(name: str) -> str:
@@ -283,13 +310,7 @@ class WeightBufs:
             with self.ctx.tim.t(f"wb:{role}", ti.nbytes):
                 mv = buf.contents().as_buffer(cap)
                 if self._fd is not None:
-                    done = 0
-                    while done < ti.nbytes:
-                        got = os.preadv(self._fd, [mv[done:ti.nbytes]],
-                                        ti.offset + done)
-                        if got <= 0:
-                            raise OSError(f"pread short at {name}+{done}")
-                        done += got
+                    self._pread_into(mv, ti.offset, ti.nbytes)
                 else:
                     mv[:ti.nbytes] = self.gg.mm[ti.offset:ti.offset + ti.nbytes]
                     _dontneed(self.gg.mm, ti.offset, ti.nbytes)
