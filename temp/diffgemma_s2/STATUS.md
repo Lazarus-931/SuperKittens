@@ -102,7 +102,29 @@ Reference cli's own final answer (same run): thought channel reasoning +
 
 ## Gate 3 — e2e coherent generation
 
-GATE3_PLACEHOLDER
+Full SK loop (Metal forward + SC + sampler) via generate.py under
+tools/run_gate3.sh (caffeinate -is, detached, watchdog swap>3.5G /
+disk<4G / 3600s). All prompts use the reference cli's own chat template
+(`<bos><|turn>system\n<|think|>\n<turn|>\n<|turn>user\n{msg}<turn|>\n
+<|turn>model\n`); every id file was detokenized against
+tokenizer.ggml.tokens and matched the intended text exactly. S=16,
+seed=1234, C=256, SC on. Lab tree verified == repo tip by md5 before runs.
+
+### p1 "What is the capital of France?" (P=23) — run gen/p1_s16
+
+12 steps (adaptive stop), wall 604.8 s, fw 593.8 s, sampler 7.7 s,
+0 mask tokens in canvas, logits finite every step (generate.py raises
+otherwise), trim 45. H_mean 0.464 -> 0.0017, accepted 126 -> 252,
+swap flat ~1.1 G, disk drift ~170 MB over the run — the bcb5b61 scratch
+fix holds over a full 12-forward generation. Output (verbatim):
+
+> `<|channel>thought`
+> `The user is asking for the capital of France.`
+> `    *   Identify country: France.`
+> `    *   Identify city: Paris.`
+> `State the answer clearly.<channel|>The capital of France is Paris.`
+
+GATE3_MORE_PLACEHOLDER
 
 ## Gate 4 — cross-check vs llama-diffusion-cli
 
