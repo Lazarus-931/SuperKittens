@@ -402,6 +402,19 @@ SPECS: dict[str, ModelSpec] = {
                   head_dim=128, n_int=25600, vocab_size=151936,
                   eps=1e-6, rope_freq_base=1_000_000.0, tie_word_embeddings=0),
     ),
+    # DiffusionGemma 26B-A4B: block text-diffusion MoE on a gemma4 backbone
+    # (llama.cpp PR #24423 is the runtime reference). Stage-1 adapter exposes
+    # the unified zero-SC forward only; the entropy-bound sampler is Stage 2.
+    # Dims live in the GGUF metadata (config_from_gguf), not here.
+    "diffgemma-26b": ModelSpec(
+        family="diffgemma",
+        adapter="SuperKittens.models.gemma.diffusion.adapter:DiffusionGemma",
+        hf_repo="unsloth/diffusiongemma-26B-A4B-it-GGUF",
+        weight_dir="diffgemma-26b",
+        gguf_name="diffusiongemma-26B-A4B-it-Q4_K_M.gguf",
+        default_quant="q4_k_m",
+        tokenizer_family="gemma4",
+    ),
 }
 
 
