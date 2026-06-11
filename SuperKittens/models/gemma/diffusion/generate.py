@@ -70,24 +70,40 @@ def trim_canvas(canvas: np.ndarray, eog: set[int]) -> int:
     return cut
 
 
+def probs16_of(logits: np.ndarray, temp_inv: float, _chunk: int = 32) -> np.ndarray:
+    """softmax(logits * temp_inv) -> f16, chunked; same math _sc_signal runs,
+    pulled forward so the raw 268 MB f32 block can be freed between forwards
+    (anonymous footprint drives swapfile growth on the 16 GB / tight-disk host)."""
+    from .graph_ref import softmax
+    C, V = logits.shape
+    out = np.empty((C, V), np.float16)
+    for c0 in range(0, C, _chunk):
+        c1 = min(c0 + _chunk, C)
+        out[c0:c1] = softmax(logits[c0:c1] * F32(temp_inv)).astype(np.float16)
+    return out
+
+
 def run_block(model, cfg, prompt_ids: np.ndarray, params: EBParams,
               use_sc: bool, log, mode: str = "gpu"):
     """One denoising block; returns (argmax_canvas, steps_run, timings)."""
     C = cfg.canvas_length
     P = len(prompt_ids)
     smp = EntropyBoundSampler(params, cfg.vocab_size, C)
-    prev_logits = None
+    prev_logits = None      # cpu mode (oracle keeps the sc_logits contract)
+    prev_probs = None       # gpu mode (precomputed softmax, raw logits freed)
     fw_s = smp_s = 0.0
     step = None
     while not smp.finished:
         ids = np.concatenate([prompt_ids, smp.canvas.astype(np.int32)])
         t0 = time.time()
-        if use_sc and prev_logits is not None:
-            # step 0 (sc_use=0 in the reference) is bit-identical to zero-SC:
-            # sig*0 == 0 and x+0 == x — skip the 1.5 GB embT stream entirely
+        if use_sc and prev_probs is not None:
+            logits = model.forward(ids, P, sc_probs16=prev_probs, sc_use=1.0)
+        elif use_sc and prev_logits is not None:
             logits = model.forward(ids, P, sc_logits=prev_logits,
                                    sc_temp_inv=float(smp.prev_temp_inv), sc_use=1.0)
         else:
+            # step 0 (sc_use=0 in the reference) is bit-identical to zero-SC:
+            # sig*0 == 0 and x+0 == x — skip the 1.5 GB embT stream entirely
             logits = model.forward(ids, P)
         t1 = time.time()
         if not np.isfinite(logits).all():
@@ -96,7 +112,12 @@ def run_block(model, cfg, prompt_ids: np.ndarray, params: EBParams,
         t2 = time.time()
         fw_s += t1 - t0
         smp_s += t2 - t1
-        prev_logits = logits
+        if use_sc and not smp.finished:
+            if mode == "gpu":
+                prev_probs = probs16_of(logits, float(smp.prev_temp_inv))
+            else:
+                prev_logits = logits
+        del logits
         rec = {"step": step.step_idx, "t": round(step.t, 4),
                "accepted": int(step.accepted.sum()), "held": step.held,
                "H_mean": round(step.entropy_mean, 5), "finished": step.finished,
