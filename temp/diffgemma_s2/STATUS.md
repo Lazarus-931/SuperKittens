@@ -71,7 +71,34 @@ data corruption (subnormal-class inputs to BLAS kernels).
 
 ## Gate 2 — sampler parity on REAL reference logits
 
-GATE2_PLACEHOLDER
+**GREEN — TOKEN-IDENTICAL, 0/70 fields mismatched.**
+
+Setup: instrumented `llama-diffusion-cli` (DG_EB_DUMP, throttle ≤ 2 logits
+files on disk), prompt "What is the capital of France?" through the cli's own
+chat template (P=23: `<|turn>system\n<|think|>\n<turn|>\n<|turn>user\n…`),
+S=10, seed=1234, C=256, CPU reference w/ prompt-KV cache. Consumer
+(tools/gate2_real_logits.py) replays the SK sampler on the exact per-step
+logits the reference consumed and diffs EVERY decision field.
+
+| step | t | max\|ΔH\| | accepted | held | Hbar | fin |
+|---|---|---|---|---|---|---|
+| 0 | 0.80 | 2.4e-7 | 122 | 0 | 0.468 | no |
+| 1 | 0.76 | 2.4e-7 | 189 | 0 | 0.311 | no |
+| 2 | 0.72 | 2.4e-7 | 205 | 0 | 0.265 | no |
+| 3 | 0.68 | 1.2e-7 | 214 | 0 | 0.123 | no |
+| 4 | 0.64 | 1.2e-7 | 230 | 0 | 0.068 | no |
+| 5 | 0.60 | 6.0e-8 | 243 | 0 | 0.0085 | no |
+| 6 | 0.56 | 1.5e-8 | 255 | 1 | 0.0016 | **yes** |
+
+All of: working canvas, RNG draws (u, renoise), entropy (≤2.4e-7), argmax,
+multinomial picks, accept-sets, renoised canvas, held counter, and the
+adaptive stop — identical on real logits, every step. The documented
+cum-plateau flip risk did not materialize on this trajectory (it remains
+possible in principle on exact f32 ties; the synthetic gate quantified it at
+2/1792 discarded picks).
+
+Reference cli's own final answer (same run): thought channel reasoning +
+"The capital of France is Paris." — 7 steps, 30.5 s/step CPU.
 
 ## Gate 3 — e2e coherent generation
 

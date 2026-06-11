@@ -62,7 +62,7 @@ def main() -> int:
     proc = subprocess.Popen(
         [args.cli, "-m", args.gguf, "-p", args.prompt,
          "--diffusion-eb-max-steps", str(args.steps),
-         "--seed", str(args.seed), "-n", str(args.n_predict), "-st"],
+         "--seed", str(args.seed), "-n", str(args.n_predict)],
         stdout=cli_log, stderr=subprocess.STDOUT,
         stdin=subprocess.DEVNULL, env=env)
 
