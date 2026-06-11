@@ -60,6 +60,11 @@ class Tokenizer:
         "deepseek": {"bos": ("<｜begin▁of▁sentence｜>",),
                      "eos": ("<｜end▁of▁sentence｜>",),
                      "pad": ("<｜end▁of▁sentence｜>",)},
+        # Granite 4.x: GPT-2-lineage BPE (dbrx pre-tokenizer); <|end_of_text|>
+        # (100257) is BOS and EOS both (GGUF bos_token_id == eos_token_id),
+        # add_bos=False so generation prompts are raw completions.
+        "granite": {"bos": ("<|end_of_text|>",), "eos": ("<|end_of_text|>",),
+                    "pad": ("<|pad|>", "<|end_of_text|>")},
     }
     _DEFAULT_SPECIALS: ClassVar[dict] = {
         "bos": ("<|im_start|>", "<bos>", "<s>", "<|startoftext|>"),
