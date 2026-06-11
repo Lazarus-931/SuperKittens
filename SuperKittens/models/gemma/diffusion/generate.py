@@ -82,11 +82,11 @@ def run_block(model, cfg, prompt_ids: np.ndarray, params: EBParams,
     while not smp.finished:
         ids = np.concatenate([prompt_ids, smp.canvas.astype(np.int32)])
         t0 = time.time()
-        if use_sc:
-            sc = prev_logits if prev_logits is not None else np.zeros((C, cfg.vocab_size), F32)
-            sc_use = 0.0 if smp.step_idx == 0 else 1.0
-            logits = model.forward(ids, P, sc_logits=sc,
-                                   sc_temp_inv=float(smp.prev_temp_inv), sc_use=sc_use)
+        if use_sc and prev_logits is not None:
+            # step 0 (sc_use=0 in the reference) is bit-identical to zero-SC:
+            # sig*0 == 0 and x+0 == x — skip the 1.5 GB embT stream entirely
+            logits = model.forward(ids, P, sc_logits=prev_logits,
+                                   sc_temp_inv=float(smp.prev_temp_inv), sc_use=1.0)
         else:
             logits = model.forward(ids, P)
         t1 = time.time()
