@@ -46,6 +46,19 @@ def _pad32(n: int) -> int:
     return (n + 31) // 32 * 32
 
 
+def _dontneed(mm, offset: int, nbytes: int):
+    """Drop the file-cache pages behind a consumed mmap range. Clean pages are
+    evictable anyway, but letting them accumulate (15.6 GB/forward when
+    streaming) is what kept shoving the 16 GB host into swap."""
+    try:
+        pg = mmap.PAGESIZE
+        a = offset - (offset % pg)
+        ln = (offset + nbytes + pg - 1) // pg * pg - a
+        mm.madvise(mmap.MADV_DONTNEED, a, ln)
+    except (AttributeError, ValueError, OSError):
+        pass
+
+
 class Timing:
     """Per-forward stage accounting (wall + GPU + bytes). Collection is a few
     thousand clock reads per 50 s forward — always on; printing is opt-in
@@ -260,20 +273,72 @@ class WeightBufs:
                 mv = buf.contents().as_buffer(cap)
                 mv[:ti.nbytes] = self.gg.mm[ti.offset:ti.offset + ti.nbytes]
             self._occupant[role] = name
-            # release the streamed file pages right away: clean cache pages
-            # are evictable but their resident growth (15.6 GB/forward) is
-            # what kept shoving the 16 GB host into swap
-            try:
-                pg = mmap.PAGESIZE
-                a = ti.offset - (ti.offset % pg)
-                ln = (ti.offset + ti.nbytes + pg - 1) // pg * pg - a
-                self.gg.mm.madvise(mmap.MADV_DONTNEED, a, ln)
-            except (AttributeError, ValueError, OSError):
-                pass
+            _dontneed(self.gg.mm, ti.offset, ti.nbytes)
         return (buf, 0, ti, None)
 
     def evict_prefix(self, prefix: str):
         return  # slots are persistent; kept for driver-loop compatibility
+
+
+class ResidentWeights:
+    """Budgeted resident weight cache. The dense backbone (embed/head, attn,
+    dense ffn, SC projections — ~1.6 GB) is copied once into permanent
+    MTLBuffers; expert layers are pinned in layer order while total resident
+    stays under SK_DG_RESIDENT_GB; the remainder streams through the
+    WeightBufs memcpy+DONTNEED slots.
+
+    Why not the pager (MappedWeights): on the 16 GB host the 15.6 GB working
+    set cannot stay file-cache-resident, so every forward re-faults nearly
+    the whole model from SSD at ~0.4 GB/s — measured break-even with
+    streaming. Pinned anonymous copies are not evictable as clean cache, so
+    the per-step disk traffic is capped at (model - budget) bytes; the budget
+    must leave room for the colima VM + OS + activations or the host swaps
+    (watchdog territory)."""
+
+    def __init__(self, ctx: MetalCtx, gg: GGUFFile):
+        self.ctx = ctx
+        self.gg = gg
+        self.stream = WeightBufs(ctx, gg)
+        budget = int(float(os.environ.get("SK_DG_RESIDENT_GB", "6.0")) * 1e9)
+        self._res: dict[str, tuple] = {}
+
+        def is_gemm(ti):
+            return ti.name.endswith(".weight") and ti.type_name != "F32"
+
+        backbone = [ti for ti in gg.tensors.values()
+                    if is_gemm(ti) and "_exps" not in ti.name]
+        experts = sorted((ti for ti in gg.tensors.values()
+                          if is_gemm(ti) and "_exps" in ti.name),
+                         key=lambda ti: (int(ti.name.split(".")[1]), ti.name))
+        used = 0
+        for ti in backbone:                       # mandatory, even over budget
+            self._pin(ti)
+            used += ti.nbytes
+        n_exp = 0
+        for ti in experts:                        # fixed prefix in layer order
+            if used + ti.nbytes > budget:
+                break
+            self._pin(ti)
+            used += ti.nbytes
+            n_exp += 1
+        print(f"[resident] {used / 1e9:.2f} GB pinned ({len(backbone)} backbone"
+              f" + {n_exp}/{len(experts)} expert tensors; budget"
+              f" {budget / 1e9:.2f} GB)", flush=True)
+
+    def _pin(self, ti):
+        with objc.autorelease_pool():
+            buf = self.ctx.buf_empty(ti.nbytes)
+            buf.contents().as_buffer(ti.nbytes)[:] = \
+                self.gg.mm[ti.offset:ti.offset + ti.nbytes]
+            self._res[ti.name] = (buf, 0, ti, None)
+        _dontneed(self.gg.mm, ti.offset, ti.nbytes)
+
+    def get(self, name: str) -> tuple:
+        r = self._res.get(name)
+        return r if r is not None else self.stream.get(name)
+
+    def evict_prefix(self, prefix: str):
+        return
 
 
 class GemmBatch:
@@ -341,10 +406,11 @@ class DiffusionGemmaMetal:
         self.gg = GGUFFile(gguf_path)
         self.cfg = cfg
         self.ctx = MetalCtx()
-        # DG_WEIGHTS=stream: Stage-2 memcpy streaming, kept as a fallback
-        self.wb = (WeightBufs(self.ctx, self.gg)
-                   if os.environ.get("DG_WEIGHTS") == "stream"
-                   else MappedWeights(self.ctx, self.gg))
+        # DG_WEIGHTS: resident (default) | stream (Stage-2 memcpy) | mapped
+        # (no-copy pager binding; measured break-even with stream on 16 GB)
+        mode = os.environ.get("DG_WEIGHTS", "resident")
+        self.wb = {"stream": WeightBufs, "mapped": MappedWeights,
+                   "resident": ResidentWeights}[mode](self.ctx, self.gg)
         self.w = Weights(self.gg)   # F32 sidecars (norms, scales, router)
         self.dump = None            # optional (name, il, arr) tap
         # self-conditioning soft-embed: transposed dequantized embed
