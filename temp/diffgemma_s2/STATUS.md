@@ -1,0 +1,111 @@
+# DiffusionGemma Stage 2 — sampler + self-conditioning + e2e generation
+
+Continues temp/diffgemma_s1/STATUS.md (forward parity). Goal: close the
+EntropyBound sampler on real reference logits, verify the self-conditioning
+(SC) subgraph, and produce coherent end-to-end generations on the SK stack.
+
+Reference: llama.cpp PR #24423 @ c84e85af (amelia `~/llamacpp-diffg`, CPU
+Release, GGML_CPU_REPACK=OFF — the build cache had drifted to REPACK=ON and
+was reconfigured back before any Stage-2 runs). Model:
+diffusiongemma-26B-A4B-it-Q4_K_M (read-only, amelia `~/diffgemma-gguf`).
+Lab: amelia `~/sk-diffg-s2b`.
+
+## Gate 1 — SC subgraph verification: GREEN
+
+### Op-for-op review (oracle graph_ref.sc_signal/embed_tokens vs PR
+`dg_canvas_embed`, src/models/diffusion-gemma.cpp)
+
+| PR op | SK oracle | note |
+|---|---|---|
+| `soft_max(scale(sc_logits, sc_temp_inv))` | `softmax(sc_logits * sc_temp_inv)` | f32 |
+| `mul_mat(sc_embT, probs)` (embed dequant+T, f16) | chunked `probs @ embed_rows` f32 | ggml side accumulates the 262144-long dot in f16 lanes |
+| `scale(soft, sqrt(n_embd))` | `* sqrt(2816)` | |
+| `build_norm(soft, sc_pre_norm, RMS)` | `rms_norm(soft, eps, self_cond_pre_norm)` | scaled rms |
+| `gelu(mul_mat(sc_gate, normed))` | `gelu_tanh(normed @ gate.T)` | ggml_gelu = tanh approx |
+| `mul_mat(sc_up, normed)` | `normed @ up.T` | |
+| `mul_mat(sc_down, g*u)` | `(g*u) @ down.T` | |
+| `scale(sc_sig, sc_use)` | `* sc_use` | {0,1} runtime gate |
+| `add(canvas, sc_sig)` then `rms_norm` (no scale) | `embed_tokens(..., sc_sig)` | add BEFORE the canvas rms, both sides |
+
+SC temp contract (PR EB sampler): step k's forward conditions on
+softmax(L_{k-1} / t_{k-1}) — `prev_temp_inv`, gated off (sc_use=0) at k=0.
+sampler.py exposes exactly this (`prev_temp_inv` updated at end of step);
+generate.py skips the SC compute entirely at step 0 (sig*0 == 0 bit-exactly).
+
+### Empirical (instrumented reference: cb(sc_sig) + cb_eval tensor dump in
+the server — tools/instrument_sc_dump.py; driver tools/gate1_sc.py)
+
+Inputs: p1 prompt (P=20), canvas0 = sampler(seed 1234) random init, L0 =
+reference zero-SC logits on canvas0, canvas1 = sampler step-0 renoise,
+S=16 ⇒ t0=0.8 (sc_temp_inv=1.25). Reference forwards ~30 s each (CPU).
+
+| check | result |
+|---|---|
+| ref sc_sig at use_sc=0 | all-zero exactly (gate semantics confirmed) |
+| sc_sig oracle-vs-ref [256,2816] | rel_rms 4.4e-4, cos 0.9999999, max_abs 0.014 (signal rms 5.37) |
+| inp_region canvas rows oracle-vs-ref | rel_rms 4.2e-4, cos 0.99999991 |
+| inp_region prompt rows oracle-vs-ref | bit-exact (0.0) |
+| ref SC effect on step-1 logits (L1_sc vs L1_nosc) | rel_rms 1.35, argmax agree 99.6% — SC is a first-order input, the check has teeth |
+
+(GPU leg + envelope below: gate1b)
+
+GPU leg (forward_metal._sc_signal: probs f16 on the wire, embT [d,V] f16
+streamed in 8x352-row chunks through dg_gemm_qkt_f32, MLP on quant GEMM):
+
+| check | result |
+|---|---|
+| sc_sig GPU-vs-ref | rel_rms 6.8e-4, cos 0.99999977 |
+| step-1 logits GPU-vs-ref, SC ACTIVE | argmax-canvas **256/256 = 100%**, rel_rms 0.133 |
+| step-1 logits GPU-vs-ref, zero-SC control | argmax-canvas 100%, rel_rms 0.256 |
+| logits finite | yes, |max| = 29.80/29.71 (softcap 30) |
+
+SC-active agreement is BETTER than the zero-SC envelope on the same canvas
+(SC sharpens the distributions: canvas1 carries one denoise step of signal).
+GPU forwards 47.5 s (zero-SC) / 52.2 s (SC) warm — the SC stream costs ~5 s.
+
+Benign noise note: numpy-on-Accelerate raises FP flags
+(divide-by-zero/overflow/invalid "in matmul") in the host router matmul and
+in f64 comparison dots; outputs verified finite + softcap-bounded, and the
+SC-active forward still lands argmax-100% vs the reference. Flag noise, not
+data corruption (subnormal-class inputs to BLAS kernels).
+
+## Gate 2 — sampler parity on REAL reference logits
+
+GATE2_PLACEHOLDER
+
+## Gate 3 — e2e coherent generation
+
+GATE3_PLACEHOLDER
+
+## Gate 4 — cross-check vs llama-diffusion-cli
+
+GATE4_PLACEHOLDER
+
+## Stage-3 baseline numbers
+
+GATE5_PLACEHOLDER
+
+## Tools (this dir, all run on amelia from ~/sk-diffg-s2b)
+
+- `instrument_diffusion.py` — per-step logits+decision dumps in the reference
+  EB sampler (DG_EB_DUMP / DG_EB_DUMP_THROTTLE keeps ≤ 2×268 MB on disk).
+- `instrument_sc_dump.py` — names sc_sig in the model graph + cb_eval named-
+  tensor dumps in diffusion-gemma-server (DG_DUMP_TENSORS/DG_DUMP_DIR).
+- `gate1_sc.py` / `gate1b_gpu.sh` — Gate-1 drivers (server + oracle + GPU).
+- `gate2_real_logits.py` — spawns the instrumented cli, streams its dumps
+  through the SK sampler, diffs every decision field, deletes consumed logits.
+- `make_embt.py` — one-time [d_model, vocab] f16 transposed embed (1.48 GB,
+  amelia ~/sk-diffg-s2b/dg_embT_f16.bin) for the GPU SC soft-embed stream.
+- `run_gate3.sh` — watchdogged e2e generation (swap>5.5G / disk<400M / 3600s).
+- `compare_eb.py`, `eb_ref_harness.cpp`, `rng_dump.cpp` — Stage-2a synthetic
+  sampler gate (committed earlier, still pass).
+
+## Host notes
+
+- amelia root volume runs ~2.5-4.8 GB free with the embT + dumps in place;
+  every logits file is 268 MB — delete as consumed (gate2 streams + deletes).
+- A GGUF→derek transfer (`cat ~/diffgemma-gguf/...gguf`) was running through
+  amelia during the correctness runs; timing-sensitive numbers (Gate 5) were
+  taken TRANSFER_NOTE_PLACEHOLDER.
+- Stale `/Users/amelia/SuperKittens` partial copy exists; the lab runs pin
+  PYTHONPATH=~/sk-diffg-s2b so the rsynced tree wins. Don't import without it.
