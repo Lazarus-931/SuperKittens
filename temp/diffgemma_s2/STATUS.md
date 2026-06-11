@@ -127,6 +127,29 @@ GATE5_PLACEHOLDER
 - `compare_eb.py`, `eb_ref_harness.cpp`, `rng_dump.cpp` — Stage-2a synthetic
   sampler gate (committed earlier, still pass).
 
+## Memory war story, Stage-2 edition (multi-forward generation)
+
+Stage-1 stabilized ONE forward per process; generation runs many. First two
+e2e attempts died during step 3 (first: external SIGKILL — kernel got there
+first; second: the disk watchdog, correctly): system swap grew ~800 MB/30 s
+during forwards, macOS swapfiles consumed the ~2 GB-free root volume, and the
+box headed for the Stage-1 disk-exhaustion failure mode. Telemetry
+(gen/*/mem.log): swap 1.57→2.35 GB in 30 s, disk free 2.1 GB→264 MB in 60 s.
+
+Fix (commit bcb5b61), forward verified bit-identical pre/post on both the
+zero-SC and SC legs:
+- persistent grow-only activation scratch in MetalCtx (per-call-site tag):
+  every _gemm_f32 A/C, attention q/k/vt/mask/s/p/o, and a packed-MoE rewrite
+  (all hit experts share three row-packed scratch buffers + offsets instead
+  of ~3 GB/forward of per-expert MTLBuffer alloc/free churn);
+- generation loop converts each step's logits to the next step's SC probs
+  (f16) immediately and frees the raw 268 MB f32 block (`probs16_of`);
+- in-place final softcap (the expression form held ~3 extra 268 MB
+  transients at the highest-pressure moment).
+Also freed: Gate-1 logit artifacts (~1.3 GB) after the bit-regression diff.
+Scratch reuse is also slightly faster: 43.8 s zero-SC / 50.8 s SC (was
+47.5/52.2).
+
 ## Host notes
 
 - amelia root volume runs ~2.5-4.8 GB free with the embT + dumps in place;

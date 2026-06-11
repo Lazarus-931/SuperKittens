@@ -18,6 +18,8 @@ while kill -0 $PID 2>/dev/null; do
   sleep 30; SECS=$((SECS+30))
   swap=$(sysctl -n vm.swapusage | awk '{print $6}' | tr -d M)
   free=$(df -m /System/Volumes/Data | tail -1 | awk '{print $4}')
+  rss=$(ps -o rss= -p $PID 2>/dev/null)
+  echo "t=$SECS rss_kb=$rss swap=${swap}M diskfree=${free}M freepct=$(memory_pressure -Q 2>/dev/null | awk -F': ' '/percentage/{print $2}')" >> $out/mem.log
   if (( ${swap%.*} > 5500 )); then echo "WATCHDOG swap=${swap}M KILL" >> $out/run.log; kill -9 $PID; exit 3; fi
   if (( free < 400 )); then echo "WATCHDOG diskfree=${free}M KILL" >> $out/run.log; kill -9 $PID; exit 4; fi
   if (( SECS > 3600 )); then echo "WATCHDOG timeout KILL" >> $out/run.log; kill -9 $PID; exit 5; fi
