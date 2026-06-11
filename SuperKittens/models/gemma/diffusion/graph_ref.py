@@ -108,11 +108,37 @@ class Weights:
 
 # -- region-aware unified forward (CPU f32 reference) -------------------------
 
-def embed_tokens(w: Weights, cfg: DiffusionGemmaConfig, ids: np.ndarray, P: int) -> np.ndarray:
+def embed_tokens(w: Weights, cfg: DiffusionGemmaConfig, ids: np.ndarray, P: int,
+                 sc_sig: np.ndarray | None = None) -> np.ndarray:
+    """Region embedding. Canvas rows: rmsnorm_noscale(embed*sqrt(d) [+ sc_sig]);
+    sc_sig is the (already sc_use-gated) self-conditioning signal."""
     x = w.dq("token_embd.weight", rows=np.asarray(ids, np.int64))
     x = x * F32(np.sqrt(F32(cfg.d_model)))
-    x[P:] = rms_norm(x[P:], cfg.eps)        # canvas rows: rmsnorm no-scale (zero-SC)
+    canvas = x[P:] if sc_sig is None else (x[P:] + sc_sig).astype(F32)
+    x[P:] = rms_norm(canvas, cfg.eps)
     return x.astype(F32)
+
+
+def sc_signal(w: Weights, cfg: DiffusionGemmaConfig, sc_logits: np.ndarray,
+              sc_temp_inv: float, sc_use: float, soft: np.ndarray | None = None,
+              _vchunk: int = 16384) -> np.ndarray:
+    """Self-conditioning gated MLP (PR dg_canvas_embed): softmax(prev raw
+    logits / prev t) -> soft-embedding -> rms*pre_norm -> down(gelu(gate)*up),
+    scaled by the runtime {0,1} sc_use gate. `soft` lets the Metal driver
+    inject its GPU soft-embedding; the oracle computes it chunked f32."""
+    C = sc_logits.shape[0]
+    if soft is None:
+        probs = softmax(sc_logits * F32(sc_temp_inv))
+        soft = np.zeros((C, cfg.d_model), dtype=F32)
+        for v0 in range(0, cfg.vocab_size, _vchunk):
+            v1 = min(v0 + _vchunk, cfg.vocab_size)
+            soft += probs[:, v0:v1] @ w.dq("token_embd.weight", rows=slice(v0, v1))
+    soft = soft * F32(np.sqrt(F32(cfg.d_model)))
+    normed = rms_norm(soft, cfg.eps, w.f32("self_cond_pre_norm.weight"))
+    g = gelu_tanh(normed @ w.dq("self_cond_gate.weight").T)
+    u = normed @ w.dq("self_cond_up.weight").T
+    sig = (g * u) @ w.dq("self_cond_down.weight").T
+    return (sig * F32(sc_use)).astype(F32)
 
 
 def moe_route(w: Weights, cfg: DiffusionGemmaConfig, attn_out: np.ndarray, il: int):
@@ -130,15 +156,21 @@ def moe_route(w: Weights, cfg: DiffusionGemmaConfig, attn_out: np.ndarray, il: i
 
 
 def forward_cpu(gg: GGUFFile, cfg: DiffusionGemmaConfig, ids: np.ndarray,
-                P: int, dump=None) -> np.ndarray:
-    """Unified [prompt|canvas] zero-SC forward; returns canvas logits f32 [C, V]."""
+                P: int, dump=None, sc_logits: np.ndarray | None = None,
+                sc_temp_inv: float = 1.0, sc_use: float = 1.0) -> np.ndarray:
+    """Unified [prompt|canvas] forward; returns canvas logits f32 [C, V].
+    sc_logits=None -> the Stage-1-validated zero-SC forward."""
     w = Weights(gg)
     N = len(ids)
     C = N - P
     pos = np.arange(N, dtype=np.int64)
     dmp = dump or (lambda name, il, arr: None)
 
-    x = embed_tokens(w, cfg, np.asarray(ids), P)
+    sc_sig = None
+    if sc_logits is not None:
+        sc_sig = sc_signal(w, cfg, sc_logits, sc_temp_inv, sc_use)
+        dmp("sc_sig", -1, sc_sig)
+    x = embed_tokens(w, cfg, np.asarray(ids), P, sc_sig=sc_sig)
     dmp("inp_region", -1, x)
 
     rope_ff = w.f32("rope_freqs.weight")

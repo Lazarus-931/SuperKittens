@@ -49,6 +49,10 @@ def main(argv=None) -> int:
     ap.add_argument("--layers", type=int, default=0, help="truncate to first N layers (debug)")
     ap.add_argument("--dump-dir", default=None)
     ap.add_argument("--dump-names", default="l_out")
+    ap.add_argument("--sc-logits", default=None,
+                    help="prev-step raw canvas logits f32 [C,V] (enables SC, use_sc=1)")
+    ap.add_argument("--sc-temp-inv", type=float, default=1.0)
+    ap.add_argument("--sc-embt", default=None, help="dg_embT_f16.bin for the GPU SC path")
     args = ap.parse_args(argv)
 
     prompt = np.fromfile(args.prompt_ids, dtype=np.int32)
@@ -66,15 +70,21 @@ def main(argv=None) -> int:
         cfg.n_layers = args.layers
     dump = make_dump(args.dump_dir, set(filter(None, args.dump_names.split(","))))
 
+    sc = {}
+    if args.sc_logits:
+        sc_arr = np.fromfile(args.sc_logits, dtype=np.float32).reshape(
+            cfg.canvas_length, cfg.vocab_size)
+        sc = {"sc_logits": sc_arr, "sc_temp_inv": args.sc_temp_inv, "sc_use": 1.0}
+
     t0 = time.time()
     if args.mode == "cpu":
         from .graph_ref import forward_cpu
-        logits = forward_cpu(gg, cfg, ids, P, dump=dump)
+        logits = forward_cpu(gg, cfg, ids, P, dump=dump, **sc)
     else:
         from .forward_metal import DiffusionGemmaMetal
-        m = DiffusionGemmaMetal(args.gguf, cfg)
+        m = DiffusionGemmaMetal(args.gguf, cfg, sc_embt_path=args.sc_embt)
         m.dump = dump
-        logits = m.forward(ids, P)
+        logits = m.forward(ids, P, **sc)
     dt = time.time() - t0
 
     logits.astype(np.float32).tofile(args.out)

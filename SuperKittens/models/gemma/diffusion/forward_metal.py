@@ -26,7 +26,7 @@ import Metal  # type: ignore[import-not-found]
 from .config import DiffusionGemmaConfig
 from .gguf_io import GGUFFile
 from .graph_ref import (F32, Weights, build_mask, embed_tokens, gelu_tanh,
-                        moe_route, rms_norm, rope_neox)
+                        moe_route, rms_norm, rope_neox, softmax)
 
 _SK_ROOT = Path(__file__).resolve().parents[3]
 _KERNEL_SOURCES = [
@@ -204,13 +204,82 @@ class GemmBatch:
 class DiffusionGemmaMetal:
     """Stage-1 unified zero-SC forward. forward(ids, P) -> canvas logits f32."""
 
-    def __init__(self, gguf_path: str, cfg: DiffusionGemmaConfig):
+    def __init__(self, gguf_path: str, cfg: DiffusionGemmaConfig,
+                 sc_embt_path: str | None = None):
         self.gg = GGUFFile(gguf_path)
         self.cfg = cfg
         self.ctx = MetalCtx()
         self.wb = WeightBufs(self.ctx, self.gg)
         self.w = Weights(self.gg)   # F32 sidecars (norms, scales, router)
         self.dump = None            # optional (name, il, arr) tap
+        # self-conditioning soft-embed: transposed dequantized embed
+        # [d_model, vocab] f16 on disk (make_embt.py), streamed per chunk
+        # through a persistent slot like every other weight
+        self.sc_embt_path = sc_embt_path
+        self._sc_bufs = None        # (probs_buf, chunk_buf, out_buf, mm)
+        self.sc_chunk_rows = 352    # 8 chunks x 352 = 2816; 184.5 MB slot
+
+    # -- self-conditioning -------------------------------------------------------
+
+    def _sc_soft_embed(self, probs16: np.ndarray) -> np.ndarray:
+        """probs16 fp16 [C, V] @ embed [V, d] -> f32 [C, d] via the streamed
+        transposed-embed GEMM (dg_gemm_qkt_f32: f16 inputs, f32 C — matches
+        the reference's f16 sc_embT matmul, f32-accumulated)."""
+        cfg = self.cfg
+        C, V = probs16.shape
+        d = cfg.d_model
+        rows = self.sc_chunk_rows
+        assert d % rows == 0
+        if self._sc_bufs is None:
+            f = open(self.sc_embt_path, "rb")
+            mm = mmap.mmap(f.fileno(), 0, prot=mmap.PROT_READ)
+            assert len(mm) == d * V * 2, "embT size mismatch (expect [d, V] f16)"
+            self._sc_bufs = (self.ctx.buf_empty(C * V * 2),
+                             self.ctx.buf_empty(rows * V * 2),
+                             self.ctx.buf_empty(C * d * 4), mm)
+        p_buf, w_buf, o_buf, mm = self._sc_bufs
+        p_buf.contents().as_buffer(C * V * 2)[:] = probs16.tobytes()
+        for r0 in range(0, d, rows):
+            nbytes = rows * V * 2
+            w_buf.contents().as_buffer(nbytes)[:] = mm[r0 * V * 2:r0 * V * 2 + nbytes]
+            b = GemmBatch(self.ctx)
+            b.gemm("dg_gemm_qkt_f32", p_buf, 0, w_buf, 0, o_buf, r0 * 4,
+                   M=C, N=rows, K=V, ldc=d)
+            b.run()
+            try:
+                pg = mmap.PAGESIZE
+                a = (r0 * V * 2) // pg * pg
+                mm.madvise(mmap.MADV_DONTNEED, a,
+                           (nbytes + (r0 * V * 2) - a + pg - 1) // pg * pg)
+            except (AttributeError, ValueError, OSError):
+                pass
+        return self.ctx.read(o_buf, np.float32, (C, d))
+
+    def _sc_signal(self, sc_logits: np.ndarray, sc_temp_inv: float,
+                   sc_use: float) -> np.ndarray:
+        """PR dg_canvas_embed SC subgraph -> sc_sig f32 [C, d_model]."""
+        cfg, w = self.cfg, self.w
+        C, V = sc_logits.shape
+        # softmax(prev raw logits / prev t), fp16 on the wire like the
+        # reference (ggml converts the f32 probs to the f16 vec_dot type)
+        probs16 = np.empty((C, V), np.float16)
+        for c0 in range(0, C, 32):
+            c1 = min(c0 + 32, C)
+            probs16[c0:c1] = softmax(sc_logits[c0:c1] * F32(sc_temp_inv)).astype(np.float16)
+        if self.sc_embt_path is not None:
+            soft = self._sc_soft_embed(probs16)
+        else:  # oracle-style host fallback (slow: full embed dequant per step)
+            soft = np.zeros((C, cfg.d_model), F32)
+            pf = probs16.astype(F32)
+            for v0 in range(0, V, 16384):
+                v1 = min(v0 + 16384, V)
+                soft += pf[:, v0:v1] @ self.w.dq("token_embd.weight", rows=slice(v0, v1))
+        soft = soft * F32(np.sqrt(F32(cfg.d_model)))
+        normed = rms_norm(soft, cfg.eps, w.f32("self_cond_pre_norm.weight"))
+        g = gelu_tanh(self._gemm_f32("self_cond_gate.weight", normed, cfg.n_ff))
+        u = self._gemm_f32("self_cond_up.weight", normed, cfg.n_ff)
+        sig = self._gemm_f32("self_cond_down.weight", g * u, cfg.d_model)
+        return (sig * F32(sc_use)).astype(F32)
 
     # -- helpers ---------------------------------------------------------------
 
@@ -331,7 +400,9 @@ class DiffusionGemmaMetal:
 
     # -- forward ---------------------------------------------------------------
 
-    def forward(self, ids: np.ndarray, P: int) -> np.ndarray:
+    def forward(self, ids: np.ndarray, P: int, sc_logits: np.ndarray | None = None,
+                sc_temp_inv: float = 1.0, sc_use: float = 1.0) -> np.ndarray:
+        """sc_logits=None -> the Stage-1-validated zero-SC unified forward."""
         cfg, w = self.cfg, self.w
         ids = np.asarray(ids)
         N = len(ids)
@@ -339,7 +410,12 @@ class DiffusionGemmaMetal:
         pos = np.arange(N, dtype=np.int64)
         dmp = self.dump or (lambda name, il, arr: None)
 
-        x = embed_tokens(w, cfg, ids, P)
+        sc_sig = None
+        if sc_logits is not None:
+            with objc.autorelease_pool():
+                sc_sig = self._sc_signal(sc_logits, sc_temp_inv, sc_use)
+            dmp("sc_sig", -1, sc_sig)
+        x = embed_tokens(w, cfg, ids, P, sc_sig=sc_sig)
         dmp("inp_region", -1, x)
         rope_ff = w.f32("rope_freqs.weight")
 
