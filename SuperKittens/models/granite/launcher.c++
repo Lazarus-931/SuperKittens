@@ -52,6 +52,9 @@ static bool resolve_psos(PSOs& P) {
     P.add_scaled         = sk::bindings_pso("granite_add_scaled_f16");
     P.embedding_lookup   = sk::bindings_pso("embedding_lookup");
     P.argmax             = sk::bindings_pso("argmax");
+    // optional: batched-lane serving GEMMs (batch>1 paths fail loud without them)
+    P.gemm_mma_q8        = sk::bindings_pso("gemm_mma_q8_0");
+    P.gemm_sm_q8         = sk::bindings_pso("gemm_mma_q8_0_sm");
 
     #define _CK(name, val) if (!(val)) { std::fprintf(stderr, "granite launcher: missing PSO " name "\n"); return false; }
     _CK("rmsnorm",            P.rmsnorm);
@@ -182,7 +185,10 @@ extern "C" sk_granite_handle* sk_granite_create(const sk_granite_config* cfg) {
     if (!meow::granite::resolve_psos(h->psos)) { delete h; return nullptr; }
 
     using namespace meow::granite;
-    const uint32_t T_max = cfg->seq_max;
+    if (h->cfg.batch == 0) h->cfg.batch = 1;
+    const uint32_t batch = h->cfg.batch;
+    // Scratch rows cover batch lanes × seq_max tokens (batch=1: unchanged).
+    const uint32_t T_max = batch * cfg->seq_max;
     const uint32_t D     = cfg->d_model;
     const uint32_t E     = cfg->d_inner;
     const uint32_t C_in  = E + 2 * cfg->ssm_n_groups * cfg->ssm_state;
@@ -197,13 +203,13 @@ extern "C" sk_granite_handle* sk_granite_create(const sk_granite_config* cfg) {
 
     auto& b = h->bufs;
     b.input_ids   = alloc_zero(dev, (size_t)T_max * sizeof(int32_t));
-    b.output_id   = alloc_zero(dev, sizeof(int32_t));
+    b.output_id   = alloc_zero(dev, (size_t)batch * sizeof(int32_t));
     b.x_a         = alloc_zero(dev, (size_t)T_max * D * 2);
     b.x_b         = alloc_zero(dev, (size_t)T_max * D * 2);
     b.x_norm      = alloc_zero(dev, (size_t)T_max * D * 2);
     b.ffn_inp     = alloc_zero(dev, (size_t)T_max * D * 2);
     b.mixer_out   = alloc_zero(dev, (size_t)T_max * D * 2);
-    b.logits      = alloc_zero(dev, (size_t)cfg->vocab_size * 2);
+    b.logits      = alloc_zero(dev, (size_t)batch * cfg->vocab_size * 2);
     b.in_proj_out = alloc_zero(dev, (size_t)T_max * IN_OUT * 2);
     b.z           = alloc_zero(dev, (size_t)T_max * E * 2);
     b.xBC         = alloc_zero(dev, (size_t)T_max * C_in * 2);
@@ -222,6 +228,7 @@ extern "C" sk_granite_handle* sk_granite_create(const sk_granite_config* cfg) {
     b.gate_buf    = alloc_zero(dev, (size_t)T_max * cfg->n_int * 2);
     b.up_buf      = alloc_zero(dev, (size_t)T_max * cfg->n_int * 2);
     b.mlp_out     = alloc_zero(dev, (size_t)T_max * D * 2);
+    b.lanes_x     = alloc_zero(dev, (size_t)batch * D * 2);
 
     return reinterpret_cast<sk_granite_handle*>(h);
 }
@@ -365,8 +372,8 @@ extern "C" int sk_granite_load_gguf(sk_granite_handle* hp, const char* path) {
             lw.wo = copy_q8_0(dev, store, nm, (size_t)D * qN);
             if (!lw.wq || !lw.wk || !lw.wv || !lw.wo) return -40;
 
-            ls.k_cache = alloc_zero(dev, (size_t)c.cache_max * kvN * 2);
-            ls.v_cache = alloc_zero(dev, (size_t)c.cache_max * kvN * 2);
+            ls.k_cache = alloc_zero(dev, (size_t)c.batch * c.cache_max * kvN * 2);
+            ls.v_cache = alloc_zero(dev, (size_t)c.batch * c.cache_max * kvN * 2);
         } else {
             std::snprintf(nm, sizeof(nm), "blk.%u.ssm_in.weight", L);
             lw.ssm_in = copy_q8_0(dev, store, nm, (size_t)IN_OUT * D);
@@ -415,8 +422,9 @@ extern "C" int sk_granite_load_gguf(sk_granite_handle* hp, const char* path) {
             std::snprintf(nm, sizeof(nm), "blk.%u.ssm_norm.weight", L);
             if (!copy_f32_as_fp16(lw.ssm_norm, 0, store, nm, E)) return -47;
 
-            ls.conv_state = alloc_zero(dev, (size_t)(K - 1) * C_in * 2);
-            ls.ssm_state  = alloc_zero(dev, (size_t)H * c.ssm_head_dim * N * sizeof(float));
+            ls.conv_state = alloc_zero(dev, (size_t)c.batch * (K - 1) * C_in * 2);
+            ls.ssm_state  = alloc_zero(dev, (size_t)c.batch * H * c.ssm_head_dim
+                                            * N * sizeof(float));
         }
 
         std::snprintf(nm, sizeof(nm), "blk.%u.ffn_gate.weight", L);
@@ -471,6 +479,50 @@ static int run_step(Handle* h, MTL::CommandQueue* q, uint32_t seq) {
     return 0;
 }
 
+// Batched lockstep step (decode or token-by-token prompt ingestion): same
+// Params as run_step plus batch=N and the per-row head/argmax tail. Lanes
+// share current_pos; per-lane state via the kernels' batch indexing.
+static int run_step_batched(Handle* h, MTL::CommandQueue* q, uint32_t seq,
+                            uint32_t lanes_last) {
+    Params p;
+    p.batch       = h->cfg.batch;
+    p.seq         = seq;
+    p.decode_all_rows = (seq == 1u) ? 1u : 0u;
+    p.lanes_last  = lanes_last;
+    p.n_layers    = h->cfg.n_layers;
+    p.d_model     = h->cfg.d_model;
+    p.n_heads     = h->cfg.n_heads;
+    p.n_kv_heads  = h->cfg.n_kv_heads;
+    p.head_dim    = h->cfg.head_dim;
+    p.n_int       = h->cfg.n_int;
+    p.d_inner     = h->cfg.d_inner;
+    p.ssm_heads   = h->cfg.ssm_n_heads;
+    p.ssm_pdim    = h->cfg.ssm_head_dim;
+    p.ssm_state   = h->cfg.ssm_state;
+    p.ssm_groups  = h->cfg.ssm_n_groups;
+    p.ssm_conv    = h->cfg.ssm_conv;
+    p.vocab_size  = h->cfg.vocab_size;
+    p.cache_max   = h->cfg.cache_max;
+    p.current_pos = h->current_pos;
+    p.eps         = h->cfg.eps;
+    p.embedding_scale = h->cfg.embedding_scale;
+    p.residual_scale  = h->cfg.residual_scale;
+    p.attention_scale = h->cfg.attention_scale;
+    p.logit_scale     = h->cfg.logit_scale;
+    h->last_seq = seq;
+
+    auto* cmd = q->commandBuffer();
+    dispatch_model(cmd, h->psos, h->weights, h->states, h->bufs, p);
+    cmd->commit();
+    cmd->waitUntilCompleted();
+    if (getenv("SK_GRANITE_GPUPROF"))
+        std::fprintf(stderr, "[gpuprof] gpu_busy_us=%.1f\n",
+                     (cmd->GPUEndTime() - cmd->GPUStartTime()) * 1e6);
+    cmd->release();
+    h->current_pos += seq;
+    return 0;
+}
+
 }}  // namespace meow::granite
 
 extern "C" int sk_granite_forward(sk_granite_handle* hp,
@@ -489,6 +541,66 @@ extern "C" int sk_granite_forward(sk_granite_handle* hp,
     std::memcpy(h->bufs.input_ids->contents(), input_ids, (size_t)seq * sizeof(int32_t));
     if (int rc = meow::granite::run_step(h, q, seq)) return rc;
     std::memcpy(output_id, h->bufs.output_id->contents(), sizeof(int32_t));
+    return 0;
+}
+
+extern "C" int sk_granite_forward_batched(sk_granite_handle* hp,
+                                          const int* input_ids, uint32_t seq,
+                                          int* output_id) {
+    if (!hp || !input_ids || !output_id) return -1;
+    auto* h = reinterpret_cast<meow::granite::Handle*>(hp);
+    if (!h->loaded) return -7;
+    // seq>1 lockstep ingestion would need a per-lane interior head; prompts go
+    // token-by-token here or in one sk_granite_prefill_batched forward.
+    if (seq != 1) return -6;
+    if (h->cfg.batch < 1) return -5;
+    if (!h->psos.gemm_sm_q8 && !h->psos.gemm_mma_q8 && h->cfg.batch > 1)
+        return -8;  // batched GEMMs missing from the kernel library
+    if (h->current_pos + 1 > h->cfg.cache_max) return -4;
+    auto* q = sk::bindings_queue();
+    if (!q) return -3;
+
+    std::memcpy(h->bufs.input_ids->contents(), input_ids,
+                (size_t)h->cfg.batch * sizeof(int32_t));
+    if (int rc = meow::granite::run_step_batched(h, q, 1, 0)) return rc;
+    std::memcpy(output_id, h->bufs.output_id->contents(),
+                (size_t)h->cfg.batch * sizeof(int32_t));
+    return 0;
+}
+
+extern "C" int sk_granite_prefill_batched(sk_granite_handle* hp,
+                                          const int* ids, uint32_t seq,
+                                          int* output_ids) {
+    if (!hp || !ids || !output_ids) return -1;
+    auto* h = reinterpret_cast<meow::granite::Handle*>(hp);
+    if (!h->loaded) return -7;
+    if (seq == 0 || seq > h->cfg.seq_max) return -2;
+    if (h->cfg.batch < 1) return -5;
+    if (!h->psos.gemm_mma_q8) return -8;
+    if (h->current_pos != 0) return -6;  // mamba state demands a fresh sequence
+    if (seq > h->cfg.cache_max) return -4;
+    auto* q = sk::bindings_queue();
+    if (!q) return -3;
+
+    std::memcpy(h->bufs.input_ids->contents(), ids,
+                (size_t)h->cfg.batch * seq * sizeof(int32_t));
+    if (int rc = meow::granite::run_step_batched(h, q, seq, h->cfg.batch))
+        return rc;
+    std::memcpy(output_ids, h->bufs.output_id->contents(),
+                (size_t)h->cfg.batch * sizeof(int32_t));
+    return 0;
+}
+
+extern "C" int sk_granite_get_logits_row(sk_granite_handle* hp, uint32_t lane,
+                                         void* out_fp16) {
+    if (!hp || !out_fp16) return -1;
+    auto* h = reinterpret_cast<meow::granite::Handle*>(hp);
+    if (lane >= h->cfg.batch) return -2;
+    if (h->last_seq == 0) return -3;
+    std::memcpy(out_fp16,
+                (const char*)h->bufs.logits->contents()
+                    + (size_t)lane * h->cfg.vocab_size * 2,
+                (size_t)h->cfg.vocab_size * 2);
     return 0;
 }
 
@@ -571,6 +683,6 @@ extern "C" void sk_granite_destroy(sk_granite_handle* hp) {
     rel(b.z); rel(b.xBC); rel(b.dt_raw); rel(b.xBC_post); rel(b.ssd_out);
     rel(b.gated); rel(b.q); rel(b.k_tmp); rel(b.v_tmp); rel(b.attn_out);
     rel(b.q_th); rel(b.k_th); rel(b.v_th); rel(b.attn_out_seq);
-    rel(b.gate_buf); rel(b.up_buf); rel(b.mlp_out);
+    rel(b.gate_buf); rel(b.up_buf); rel(b.mlp_out); rel(b.lanes_x);
     delete h;
 }

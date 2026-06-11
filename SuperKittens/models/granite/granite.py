@@ -55,6 +55,15 @@ GRANITE_ABI = {
     "get_pos":         optional([ctypes.c_void_p], ctypes.c_uint32),
     "reset":           ([ctypes.c_void_p], None),
     "destroy":         ([ctypes.c_void_p], None),
+    # batched-lane serving (older dylibs lack these; methods raise cleanly)
+    "forward_batched": optional([ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
+                                 ctypes.c_uint32, ctypes.POINTER(ctypes.c_int32)],
+                                ctypes.c_int),
+    "prefill_batched": optional([ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32),
+                                 ctypes.c_uint32, ctypes.POINTER(ctypes.c_int32)],
+                                ctypes.c_int),
+    "get_logits_row":  optional([ctypes.c_void_p, ctypes.c_uint32,
+                                 ctypes.c_void_p], ctypes.c_int),
 }
 
 _lib = None
@@ -138,6 +147,82 @@ class Granite(Model):
         if rc:
             raise RuntimeError(f"sk_granite_get_last_logits failed: {rc}")
         return out
+
+    # ── batched-lane serving (cfg.batch = N lockstep lanes) ──────────────
+
+    def logits_row(self, lane: int) -> np.ndarray:
+        lib = _load()
+        if not hasattr(lib, "sk_granite_get_logits_row"):
+            raise RuntimeError("dylib lacks sk_granite_get_logits_row")
+        out = np.empty((self.cfg.vocab_size,), dtype=np.float16)
+        rc = lib.sk_granite_get_logits_row(self._h, lane, out.ctypes.data)
+        if rc:
+            raise RuntimeError(f"sk_granite_get_logits_row failed: {rc}")
+        return out
+
+    def forward_batched(self, tokens) -> np.ndarray:
+        """One lockstep step: tokens (batch,) -> greedy next tokens (batch,)."""
+        lib = _load()
+        if not hasattr(lib, "sk_granite_forward_batched"):
+            raise RuntimeError("dylib lacks sk_granite_forward_batched")
+        ids = np.ascontiguousarray(np.asarray(tokens, dtype=np.int32)).reshape(-1)
+        if ids.size != self.cfg.batch:
+            raise ValueError(f"need {self.cfg.batch} tokens, got {ids.size}")
+        out = np.empty((self.cfg.batch,), dtype=np.int32)
+        rc = lib.sk_granite_forward_batched(
+            self._h,
+            ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)), 1,
+            out.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)))
+        if rc:
+            raise RuntimeError(f"sk_granite_forward_batched failed: {rc}")
+        return out
+
+    def prefill_batched(self, prompts) -> np.ndarray:
+        """All N equal-length prompts in ONE batch=N forward (fresh handle
+        state required); returns per-lane greedy first tokens (batch,)."""
+        lib = _load()
+        if not hasattr(lib, "sk_granite_prefill_batched"):
+            raise RuntimeError("dylib lacks sk_granite_prefill_batched")
+        rows = [np.asarray(p, dtype=np.int32).reshape(-1) for p in prompts]
+        if len(rows) != self.cfg.batch:
+            raise ValueError(f"need {self.cfg.batch} prompts, got {len(rows)}")
+        seq = rows[0].size
+        if any(r.size != seq for r in rows):
+            raise ValueError("prefill_batched requires equal-length prompts")
+        flat = np.ascontiguousarray(np.stack(rows).reshape(-1))
+        out = np.empty((self.cfg.batch,), dtype=np.int32)
+        rc = lib.sk_granite_prefill_batched(
+            self._h,
+            flat.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)), seq,
+            out.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)))
+        if rc:
+            raise RuntimeError(f"sk_granite_prefill_batched failed: {rc}")
+        return out
+
+    def generate_batched(self, prompts, *, max_new_tokens: int = 64,
+                         batched_prefill: bool = False):
+        """Greedy lockstep serving: N equal-length prompts -> N token lists.
+        Prefill is token-by-token lockstep (default) or one batched forward;
+        decode is sk_granite_forward_batched either way. Resets the handle."""
+        rows = [np.asarray(p, dtype=np.int32).reshape(-1) for p in prompts]
+        if len(rows) != self.cfg.batch:
+            raise ValueError(f"need {self.cfg.batch} prompts, got {len(rows)}")
+        seq = rows[0].size
+        if any(r.size != seq for r in rows):
+            raise ValueError("generate_batched requires equal-length prompts")
+        self.reset()
+        if batched_prefill:
+            cur = self.prefill_batched(rows)
+        else:
+            mat = np.stack(rows)
+            for t in range(seq):
+                cur = self.forward_batched(mat[:, t])
+        outs = [[int(c)] for c in cur]
+        for _ in range(int(max_new_tokens) - 1):
+            cur = self.forward_batched(cur)
+            for lane, c in enumerate(cur):
+                outs[lane].append(int(c))
+        return outs
 
     def generate(self, input_ids, *, max_new_tokens: int = 64,
                  temperature: float = 0.0, top_p: float = 1.0,

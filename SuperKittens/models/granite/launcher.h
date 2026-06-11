@@ -15,7 +15,7 @@ extern "C" {
 #endif
 
 typedef struct {
-    uint32_t batch;        // 1 (single-stream stage 1)
+    uint32_t batch;        // serving lanes (1 = single-stream stage 1)
     uint32_t seq_max;      // max tokens per forward (prompt must fit ONE prefill:
                            // chunked mamba prefill would zero-pad each chunk's conv left edge)
     uint32_t cache_max;    // attention KV capacity
@@ -54,6 +54,31 @@ int sk_granite_load_gguf(sk_granite_handle* h, const char* path);
 // One forward (prefill seq>1 or decode seq==1); greedy argmax -> *output_id.
 int sk_granite_forward(sk_granite_handle* h,
                        const int* input_ids, uint32_t seq, int* output_id);
+
+// Lockstep batched decode (cfg.batch = N serving lanes): input_ids[batch] (one
+// token per lane), output_id[batch] greedy next tokens. All lanes advance from
+// the same current_pos; each reads/writes its own KV-cache slice (4 attention
+// layers) and conv/ssm state slice (36 mamba2 layers). seq must be 1; lockstep
+// prompt ingestion is either token-by-token through this entrypoint or one
+// sk_granite_prefill_batched call. Requires cfg.batch == N at create.
+int sk_granite_forward_batched(sk_granite_handle* h,
+                               const int* input_ids, uint32_t seq,
+                               int* output_id);
+
+// Batched-lane prefill: all cfg.batch lanes' EQUAL-LENGTH prompts (lane-major
+// ids[batch*seq]) in ONE batch=N forward — weights read once instead of once
+// per lane per token. Same stage-1 scope as sk_granite_forward: the prompt
+// must fit one forward (seq <= seq_max; chunking would re-zero-pad the mamba
+// conv left edge), and the handle must be fresh (current_pos == 0; mamba state
+// demands a fresh sequence). output_ids[0..batch) = per-lane greedy first
+// tokens; lane states are left ready for sk_granite_forward_batched decode.
+int sk_granite_prefill_batched(sk_granite_handle* h,
+                               const int* ids, uint32_t seq, int* output_ids);
+
+// fp16 logits row of lane `lane` after a batched forward (vocab_size entries,
+// post logit_scale). After single-stream calls only lane 0 is valid.
+int sk_granite_get_logits_row(sk_granite_handle* h, uint32_t lane,
+                              void* out_fp16);
 
 // Greedy loop in C: prefill prompt then decode n_tokens (stops at eos_id >= 0).
 // Returns number of tokens written, or negative error.
