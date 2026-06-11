@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import fcntl
 import gc
 import mmap
 import os
@@ -253,6 +254,16 @@ class WeightBufs:
         for name, ti in gg.tensors.items():
             r = self._role(name)
             self._cap[r] = max(self._cap.get(r, 0), ti.nbytes)
+        # streamed tensors are re-read fully every step: F_NOCACHE pread
+        # straight into the slot runs at SSD sequential rate, where the
+        # mmap-slice memcpy paid single-threaded page-fault servicing
+        # (~0.36 GB/s measured) and needed DONTNEED to avoid filling the
+        # page cache with bytes that are about to be re-read anyway
+        self._fd = None
+        if os.environ.get("DG_STREAM_IO", "pread") == "pread" and hasattr(os, "preadv"):
+            self._fd = os.open(gg.path, os.O_RDONLY)
+            with contextlib.suppress(AttributeError, OSError):
+                fcntl.fcntl(self._fd, fcntl.F_NOCACHE, 1)
 
     @staticmethod
     def _role(name: str) -> str:
@@ -271,9 +282,18 @@ class WeightBufs:
         if self._occupant.get(role) != name:
             with self.ctx.tim.t(f"wb:{role}", ti.nbytes):
                 mv = buf.contents().as_buffer(cap)
-                mv[:ti.nbytes] = self.gg.mm[ti.offset:ti.offset + ti.nbytes]
+                if self._fd is not None:
+                    done = 0
+                    while done < ti.nbytes:
+                        got = os.preadv(self._fd, [mv[done:ti.nbytes]],
+                                        ti.offset + done)
+                        if got <= 0:
+                            raise OSError(f"pread short at {name}+{done}")
+                        done += got
+                else:
+                    mv[:ti.nbytes] = self.gg.mm[ti.offset:ti.offset + ti.nbytes]
+                    _dontneed(self.gg.mm, ti.offset, ti.nbytes)
             self._occupant[role] = name
-            _dontneed(self.gg.mm, ti.offset, ti.nbytes)
         return (buf, 0, ti, None)
 
     def evict_prefix(self, prefix: str):
