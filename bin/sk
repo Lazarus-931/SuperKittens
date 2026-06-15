@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# SuperKittens CLI launcher: `sk launch`, `sk <model>`, `sk talk`.
+#
+# Auto-discovers the repo root (this script lives in <root>/bin/), points the
+# native runtime at the prebuilt dylib + runtime-compiled Metal kernels, and
+# routes the weights dir to <root>/weights. All env vars are overridable.
+set -euo pipefail
+
+# Resolve this script's real path even when invoked via a PATH symlink
+# (e.g. /opt/homebrew/bin/sk -> <repo>/bin/sk), so ROOT points at the repo.
+SRC="${BASH_SOURCE[0]}"
+while [ -L "$SRC" ]; do
+  DIR="$(cd "$(dirname "$SRC")" && pwd)"
+  SRC="$(readlink "$SRC")"
+  [ "${SRC#/}" = "$SRC" ] && SRC="$DIR/$SRC"
+done
+SELF="$(cd "$(dirname "$SRC")" && pwd)"
+ROOT="${SK_HOME:-$(cd "$SELF/.." && pwd)}"
+cd "$ROOT"
+
+PY="${SK_PYTHON:-}"
+if [ -z "$PY" ]; then
+  if [ -x "$HOME/sk-venv/bin/python" ]; then PY="$HOME/sk-venv/bin/python"
+  else PY="$(command -v python3)"; fi
+fi
+
+export SK_DYLIB="${SK_DYLIB:-$ROOT/build/libsk.dylib}"
+export SK_METALLIB="${SK_METALLIB:-/nonexistent_force_source_fallback.metallib}"
+export SK_WEIGHTS_ROOT="${SK_WEIGHTS_ROOT:-$ROOT/weights}"
+
+SKM="SuperKittens/kernels"; QW="SuperKittens/models/qwen"
+export SK_METAL_SRC_FALLBACK="${SK_METAL_SRC_FALLBACK:-\
+$SKM/utils/layernorm/layernorm.metal:$SKM/utils/rmsnorm/rmsnorm_t1.metal:\
+$SKM/gemm/fp16/gemm.metal:$SKM/gemm/fp16/gemv.metal:$SKM/gemm/fp16/gemv_t.metal:\
+$SKM/gemm/fp16/gemv_t_2dtile.metal:$SKM/gemm/q8_0_matvec.metal:$SKM/gemm/q4k_matvec.metal:\
+$SKM/gemm/q6k_matvec.metal:$SKM/fusion/gemv_swiglu_m1.metal:\
+$SKM/fusion/q8_0_swiglu_prenorm_m1.metal:$SKM/gemm/q8_0_swiglu_m1.metal:\
+$SKM/fusion/add_rmsnorm.metal:$SKM/fusion/gated_mlp.metal:$SKM/fusion/silu_mul.metal:\
+$SKM/ops/split/split_packed.metal:$QW/qwen_rope.metal:$SKM/attn/attn.metal:\
+$SKM/ops/kv_cache/kv_cache.metal:$SKM/ops/add/add.metal:$SKM/ops/transpose/seq_head.metal:\
+$SKM/utils/embedding/embedding.metal:$SKM/ops/sample/sample.metal:\
+$SKM/ops/sample/argmax_2pass.metal}"
+
+exec "$PY" -m SuperKittens.cli "$@"
